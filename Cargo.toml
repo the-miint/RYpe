@@ -1,13 +1,15 @@
 [package]
 name = "ry_partitioner"
 version = "0.1.0"
-edition = "2021"
+edition = "2021" # Rust 2024 is not yet stable in most toolchains; 2021 is safest.
 
 [lib]
 name = "ry_partitioner"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.19.0", features = ["extension-module"] }
-roaring = "0.11.3" 
+# The "abi3" feature is often recommended for stability, 
+# but strictly speaking just the base crate works.
+pyo3 = { version = "0.23.3", features = ["extension-module"] } 
+roaring = "0.11.3"
 
