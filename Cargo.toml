@@ -1,0 +1,13 @@
+[package]
+name = "ry_partitioner"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ry_partitioner"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.19.0", features = ["extension-module"] }
+roaring = "0.11.3" 
+
