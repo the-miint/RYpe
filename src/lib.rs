@@ -1,8 +1,10 @@
 use pyo3::prelude::*;
-use roaring::RoaringTreemap; 
+use roaring::RoaringTreemap;
 use std::collections::{HashMap, VecDeque};
 use std::cmp;
 
+// --- HARDCODED CONSTANTS ---
+// Kept K=64 as requested.
 const K: usize = 64; 
 const WINDOW_SIZE: usize = 20;
 const SALT: u64 = 0x5555555555555555;
@@ -10,8 +12,8 @@ const SALT: u64 = 0x5555555555555555;
 #[inline(always)]
 fn base_to_bit(byte: u8) -> u64 {
     match byte {
-        b'A' | b'a' | b'G' | b'g' => 1, 
-        _ => 0,                         
+        b'A' | b'a' | b'G' | b'g' => 1, // Purine (R)
+        _ => 0,                         // Pyrimidine (Y)
     }
 }
 
@@ -31,7 +33,7 @@ impl MinQueue {
 
     #[inline(always)]
     fn push(&mut self, idx: usize, val: u64, out: &mut Vec<u64>) {
-        // 1. Remove expired (older than window)
+        // 1. Remove expired
         if let Some(&(pos, _)) = self.deque.front() {
             if pos + WINDOW_SIZE <= idx {
                 self.deque.pop_front();
@@ -62,7 +64,7 @@ impl MinQueue {
     }
 }
 
-/// Extracts minimizers for the Forward strand
+/// Extracts minimizers for the Forward strand only
 /// (Used for Indexing - single strand only)
 fn extract_fwd_only(seq: &str) -> Vec<u64> {
     let bytes = seq.as_bytes();
@@ -82,15 +84,13 @@ fn extract_fwd_only(seq: &str) -> Vec<u64> {
     for i in 0..=(len - K) {
         let next_bit = base_to_bit(bytes[i + K - 1]);
         current_val = (current_val << 1) | next_bit;
-        
-        // Hash and push
         queue.push(i, current_val ^ SALT, &mut mins);
     }
     mins
 }
 
 /// Extracts minimizers for BOTH Forward and RC strands in ONE PASS.
-/// Returns (fwd_minimizers, rc_minimizers)
+/// Optimized for K=64 using bitwise negation and reversal.
 fn extract_dual_strand(seq: &str) -> (Vec<u64>, Vec<u64>) {
     let bytes = seq.as_bytes();
     let len = bytes.len();
@@ -110,25 +110,20 @@ fn extract_dual_strand(seq: &str) -> (Vec<u64>, Vec<u64>) {
         current_val = (current_val << 1) | base_to_bit(bytes[i]);
     }
 
-    // Single Slide Loop
+    // Slide
     for i in 0..=(len - K) {
         let next_bit = base_to_bit(bytes[i + K - 1]);
+        
+        // Update Forward
         current_val = (current_val << 1) | next_bit;
 
-        // 1. Forward Hash
+        // 1. Process Forward
         let h_fwd = current_val ^ SALT;
         fwd_queue.push(i, h_fwd, &mut fwd_mins);
 
-        // 2. RC Hash (Bitwise Magic)
-        // !current_val = Complement
-        // .reverse_bits() = Reverse order
-        // This generates the RC stream perfectly for K=64
+        // 2. Process RC (Bitwise Magic for K=64)
+        // RC(val) = reverse_bits(!val)
         let h_rc = (!current_val).reverse_bits() ^ SALT;
-        
-        // Note: We feed h_rc into its own queue. 
-        // Even though we generate these "backwards" relative to the RC physical string,
-        // the grouping of K-mers into windows remains contiguous, so the Set of Minimizers 
-        // generated is identical to scanning the RC string.
         rc_queue.push(i, h_rc, &mut rc_mins);
     }
 
@@ -148,48 +143,94 @@ impl RYEngine {
     }
 
     fn add_genome(&mut self, bucket_id: u32, sequence: &str) {
-        // Index only the provided strand
         let mins = extract_fwd_only(sequence);
         let bitmap = self.buckets.entry(bucket_id).or_insert_with(RoaringTreemap::new);
-        for m in mins { bitmap.insert(m); }
+        for m in mins { 
+            bitmap.insert(m); 
+        }
     }
 
+    /// Query a single long read (HiFi style)
     fn query(&self, sequence: &str, threshold: f64) -> Vec<(u32, f64)> {
-        // Single pass extraction
         let (mins_fwd, mins_rc) = extract_dual_strand(sequence);
-        
         if mins_fwd.is_empty() { return vec![]; }
 
-        // Build Bitmaps
-        let mut bitmap_fwd = RoaringTreemap::new();
-        for m in &mins_fwd { bitmap_fwd.insert(*m); }
-        let len_fwd = bitmap_fwd.len();
+        // Build bitmaps
+        let mut b_fwd = RoaringTreemap::new();
+        for m in &mins_fwd { b_fwd.insert(*m); }
+        let l_fwd = b_fwd.len();
 
-        let mut bitmap_rc = RoaringTreemap::new();
-        for m in &mins_rc { bitmap_rc.insert(*m); }
-        let len_rc = bitmap_rc.len();
+        let mut b_rc = RoaringTreemap::new();
+        for m in &mins_rc { b_rc.insert(*m); }
+        let l_rc = b_rc.len();
 
         let mut results = Vec::new();
 
         for (id, bucket) in &self.buckets {
-            let mut best_score = 0.0;
-            
-            // Score Forward
-            if len_fwd > 0 {
-                let intersect = bucket.intersection_len(&bitmap_fwd);
-                let score = intersect as f64 / len_fwd as f64;
-                if score > best_score { best_score = score; }
+            let mut best = 0.0;
+            if l_fwd > 0 {
+                let s = bucket.intersection_len(&b_fwd) as f64 / l_fwd as f64;
+                if s > best { best = s; }
             }
-            
-            // Score RC
-            if len_rc > 0 {
-                let intersect = bucket.intersection_len(&bitmap_rc);
-                let score = intersect as f64 / len_rc as f64;
-                if score > best_score { best_score = score; }
+            if l_rc > 0 {
+                let s = bucket.intersection_len(&b_rc) as f64 / l_rc as f64;
+                if s > best { best = s; }
+            }
+            if best >= threshold {
+                results.push((*id, best));
+            }
+        }
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(cmp::Ordering::Equal));
+        results
+    }
+
+    /// Query a Paired End Short Read (R1 + R2)
+    /// Combines signals from both reads to overcome K=64 brittleness.
+    /// Logic:
+    ///   Scenario A: Fragment is FWD relative to Ref
+    ///      -> R1 is Fwd, R2 is RC
+    ///   Scenario B: Fragment is RC relative to Ref
+    ///      -> R1 is RC, R2 is Fwd
+    fn query_paired(&self, r1: &str, r2: &str, threshold: f64) -> Vec<(u32, f64)> {
+        let (r1_f, r1_rc) = extract_dual_strand(r1);
+        let (r2_f, r2_rc) = extract_dual_strand(r2);
+
+        // If both reads fail length check, return empty
+        if r1_f.is_empty() && r2_f.is_empty() { return vec![]; }
+
+        // --- Build "Hypothesis A" Bitmap (Frag matches Ref FWD) ---
+        // Combine R1_Fwd + R2_RC
+        let mut b_hyp_a = RoaringTreemap::new();
+        for m in &r1_f { b_hyp_a.insert(*m); }
+        for m in &r2_rc { b_hyp_a.insert(*m); }
+        let len_a = b_hyp_a.len();
+
+        // --- Build "Hypothesis B" Bitmap (Frag matches Ref RC) ---
+        // Combine R1_RC + R2_Fwd
+        let mut b_hyp_b = RoaringTreemap::new();
+        for m in &r1_rc { b_hyp_b.insert(*m); }
+        for m in &r2_f { b_hyp_b.insert(*m); }
+        let len_b = b_hyp_b.len();
+
+        let mut results = Vec::new();
+
+        for (id, bucket) in &self.buckets {
+            let mut best = 0.0;
+
+            // Check Hypothesis A
+            if len_a > 0 {
+                let score = bucket.intersection_len(&b_hyp_a) as f64 / len_a as f64;
+                if score > best { best = score; }
             }
 
-            if best_score >= threshold {
-                results.push((*id, best_score));
+            // Check Hypothesis B
+            if len_b > 0 {
+                let score = bucket.intersection_len(&b_hyp_b) as f64 / len_b as f64;
+                if score > best { best = score; }
+            }
+
+            if best >= threshold {
+                results.push((*id, best));
             }
         }
         

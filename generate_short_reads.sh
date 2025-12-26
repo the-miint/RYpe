@@ -46,7 +46,7 @@ generate_one_genome_short() {
     # -i       : Input reference
     # -p       : Paired-end simulation
     # -l 150   : 150bp read length (NovaSeq X standard)
-    # -f 30    : 30x Coverage
+    # -f 1     : 1x Coverage
     # -m 450   : Mean fragment size (DNA insert size)
     # -s 50    : Fragment size standard deviation
     # -o       : Output prefix
@@ -56,7 +56,7 @@ generate_one_genome_short() {
         -i "$ref_path" \
         -p \
         -l 150 \
-        -f 30 \
+        -f 1 \
         -m 450 \
         -s 50 \
         -o "$out_prefix" \
