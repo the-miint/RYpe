@@ -8,8 +8,10 @@ name = "ry_partitioner"
 crate-type = ["cdylib"]
 
 [dependencies]
+needletail = "0.6.3"
 # The "abi3" feature is often recommended for stability, 
 # but strictly speaking just the base crate works.
 pyo3 = { version = "0.23.3", features = ["extension-module"] } 
+rayon = "1.11.0"
 roaring = "0.11.3"
 
