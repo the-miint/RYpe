@@ -6,7 +6,7 @@ use needletail::parse_fastx_file;
 use std::cmp;
 
 const K: usize = 64; 
-const WINDOW_SIZE: usize = 50;
+const WINDOW_SIZE: usize = 200;
 const SALT: u64 = 0x5555555555555555;
 const BATCH_SIZE: usize = 4096;
 
@@ -110,6 +110,76 @@ impl RYEngine {
     #[new]
     fn new() -> Self {
         RYEngine { buckets: HashMap::new() }
+    }
+    // ... inside #[pymethods] impl RYEngine ...
+
+    /// Save the entire index to a binary file
+    fn save(&self, path: &str) -> PyResult<()> {
+        use std::io::Write;
+        use std::fs::File;
+        use std::io::BufWriter;
+
+        let file = File::create(path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        let mut writer = BufWriter::new(file);
+
+        // 1. Write Number of Buckets (u32)
+        let num_buckets = self.buckets.len() as u32;
+        writer.write_all(&num_buckets.to_le_bytes()).unwrap();
+
+        // 2. Write Each Bucket
+        for (id, map) in &self.buckets {
+            // Write Bucket ID
+            writer.write_all(&id.to_le_bytes()).unwrap();
+
+            // Serialize Roaring Bitmap to a buffer first to know its size
+            let mut buf = Vec::new();
+            map.serialize_into(&mut buf).unwrap();
+
+            // Write Size (u64) then Data
+            let size = buf.len() as u64;
+            writer.write_all(&size.to_le_bytes()).unwrap();
+            writer.write_all(&buf).unwrap();
+        }
+        Ok(())
+    }
+
+    /// Load the index from a binary file
+    #[staticmethod]
+    fn load(path: &str) -> PyResult<Self> {
+        use std::io::Read;
+        use std::fs::File;
+        use std::io::BufReader;
+
+        let file = File::open(path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        let mut reader = BufReader::new(file);
+        let mut buffer = [0u8; 4];
+
+        // 1. Read Num Buckets
+        reader.read_exact(&mut buffer).unwrap();
+        let num_buckets = u32::from_le_bytes(buffer);
+
+        let mut buckets = HashMap::new();
+
+        for _ in 0..num_buckets {
+            // Read Bucket ID
+            reader.read_exact(&mut buffer).unwrap();
+            let id = u32::from_le_bytes(buffer);
+
+            // Read Size
+            let mut size_buf = [0u8; 8];
+            reader.read_exact(&mut size_buf).unwrap();
+            let _size = u64::from_le_bytes(size_buf);
+
+            // Read Roaring Data
+            // Roaring's deserialize consumes bytes from the reader.
+            // In a production format, we'd limit the reader, but here we trust the stream.
+            let map = RoaringTreemap::deserialize_from(&mut reader)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Roaring Error: {:?}", e)))?;
+
+            buckets.insert(id, map);
+        }
+
+        Ok(RYEngine { buckets })
     }
 
     fn add_genome(&mut self, bucket_id: u32, sequence: &str) {
