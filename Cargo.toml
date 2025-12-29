@@ -1,17 +1,15 @@
 [package]
-name = "ry_partitioner"
+name = "rype"
 version = "0.1.0"
-edition = "2021" # Rust 2024 is not yet stable in most toolchains; 2021 is safest.
-
-[lib]
-name = "ry_partitioner"
-crate-type = ["cdylib"]
+edition = "2021"
 
 [dependencies]
+clap = { version = "4.4", features = ["derive"] }
 needletail = "0.6.3"
-# The "abi3" feature is often recommended for stability, 
-# but strictly speaking just the base crate works.
-pyo3 = { version = "0.23.3", features = ["extension-module"] } 
-rayon = "1.11.0"
+rayon = "1.8"
 roaring = "0.11.3"
+anyhow = "1.0"
+
+[dev-dependencies]
+tempfile = "3.8"
 
