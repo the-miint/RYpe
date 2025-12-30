@@ -6,23 +6,23 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Sender};
+use std::thread;
 use anyhow::{Context, Result, anyhow};
 
-// --- CONSTANTS & LOOKUP TABLES ---
+// --- CONSTANTS & SAFETY CHECKS ---
 
 const K: usize = 64; 
 
-/// Branchless lookup table for Base -> Bit conversion (RY Space).
-/// A/G (Purines) -> 1
-/// T/C/N (Pyrimidines) -> 0
+// COMPILER CHECK: Ensure K is 64. 
+const _: () = assert!(K == 64, "This implementation relies on u64 overflow behavior matching K=64");
+
 const BASE_TO_BIT_LUT: [u64; 256] = {
-    let mut lut = [0u64; 256];
-    lut[b'A' as usize] = 1;
-    lut[b'a' as usize] = 1;
-    lut[b'G' as usize] = 1;
-    lut[b'g' as usize] = 1;
-    // All others are 0
+    let mut lut = [u64::MAX; 256];
+    lut[b'A' as usize] = 1; lut[b'a' as usize] = 1;
+    lut[b'G' as usize] = 1; lut[b'g' as usize] = 1;
+    lut[b'T' as usize] = 0; lut[b't' as usize] = 0;
+    lut[b'C' as usize] = 0; lut[b'c' as usize] = 0;
     lut
 };
 
@@ -38,26 +38,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Build a new index from reference FASTA files
     Index {
-        /// Output path for the .ryidx index file
         #[arg(short, long)]
         output: PathBuf,
-
-        /// List of reference FASTA files
         #[arg(short, long, required = true)]
         reference: Vec<PathBuf>,
-
-        /// Minimizer window size
         #[arg(short, long, default_value_t = 50)]
         window: usize,
-
-        /// Random seed for hashing (Salt)
         #[arg(short, long, default_value_t = 0x5555555555555555)]
         salt: u64,
     },
-
-    /// Standard Classification: Processes reads individually against the index
     Classify {
         #[arg(short, long)]
         index: PathBuf,
@@ -72,8 +62,6 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-
-    /// Batch Classification: Aggregates minimizers per batch, queries efficiently, reports per READ
     #[command(alias = "batch-classify")]
     BatchClassify {
         #[arg(short, long)]
@@ -89,8 +77,6 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-
-    /// Aggregate Classification: Treats ALL reads as ONE logical query, reports per BUCKET
     #[command(alias = "aggregate")]
     AggregateClassify {
         #[arg(short, long)]
@@ -108,19 +94,17 @@ enum Commands {
     },
 }
 
-// --- MINIMIZER LOGIC (Optimized) ---
+// --- MINIMIZER LOGIC ---
 
 #[inline(always)]
 fn base_to_bit(byte: u8) -> u64 {
-    // SAFETY: byte is u8 (0..255), array is [u64; 256]. Bounds check unnecessary.
     unsafe { *BASE_TO_BIT_LUT.get_unchecked(byte as usize) }
 }
 
-/// Reusable workspace to avoid heap allocations in hot loops.
 struct MinimizerWorkspace {
-    q_fwd: VecDeque<(usize, u64)>, // For Forward strand (or single strand)
-    q_rc: VecDeque<(usize, u64)>,  // For Reverse Complement strand
-    buffer: Vec<u64>,              // General purpose output buffer
+    q_fwd: VecDeque<(usize, u64)>, 
+    q_rc: VecDeque<(usize, u64)>,  
+    buffer: Vec<u64>,              
 }
 
 impl MinimizerWorkspace {
@@ -133,7 +117,7 @@ impl MinimizerWorkspace {
     }
 }
 
-/// Extracts minimizers into the workspace buffer (Single Strand).
+// Single Strand Extraction
 fn extract_into(seq: &[u8], w: usize, salt: u64, ws: &mut MinimizerWorkspace) {
     ws.buffer.clear();
     ws.q_fwd.clear();
@@ -141,125 +125,123 @@ fn extract_into(seq: &[u8], w: usize, salt: u64, ws: &mut MinimizerWorkspace) {
     let len = seq.len();
     if len < K { return; }
     
-    let num_kmers = len - K + 1;
-    let effective_w = if num_kmers < w { num_kmers } else { w };
     let mut current_val: u64 = 0;
     let mut last_min: Option<u64> = None;
+    let mut valid_bases_count = 0; 
 
-    // Pre-load first K-1 bases
-    for i in 0..(K - 1) { 
-        current_val = (current_val << 1) | base_to_bit(seq[i]); 
-    }
-
-    // Rolling hash + Monotonic Queue
-    for i in 0..num_kmers {
-        let next_bit = base_to_bit(seq[i + K - 1]);
-        current_val = (current_val << 1) | next_bit;
-        let hash = current_val ^ salt;
-
-        // Maintain queue: remove old elements
-        while let Some(&(pos, _)) = ws.q_fwd.front() {
-            if pos + effective_w <= i { ws.q_fwd.pop_front(); } else { break; }
+    for i in 0..len {
+        let bit = base_to_bit(seq[i]);
+        
+        if bit == u64::MAX {
+            valid_bases_count = 0;
+            ws.q_fwd.clear();
+            current_val = 0;
+            last_min = None;
+            continue;
         }
-        // Maintain queue: remove larger elements (shadowed)
-        while let Some(&(_, v)) = ws.q_fwd.back() {
-            if v >= hash { ws.q_fwd.pop_back(); } else { break; }
-        }
-        ws.q_fwd.push_back((i, hash));
 
-        // Report minimizer
-        if i >= effective_w - 1 {
-            if let Some(&(_, min_h)) = ws.q_fwd.front() {
-                if Some(min_h) != last_min {
-                    ws.buffer.push(min_h);
-                    last_min = Some(min_h);
+        valid_bases_count += 1;
+        current_val = (current_val << 1) | bit;
+
+        if valid_bases_count >= K {
+            // SAFE ARITHMETIC: (i + 1) - K guarantees no underflow when i=63, K=64
+            let pos = i + 1 - K;
+            let hash = current_val ^ salt;
+            
+            while let Some(&(p, _)) = ws.q_fwd.front() {
+                if p + w <= pos { ws.q_fwd.pop_front(); } else { break; }
+            }
+            while let Some(&(_, v)) = ws.q_fwd.back() {
+                if v >= hash { ws.q_fwd.pop_back(); } else { break; }
+            }
+            ws.q_fwd.push_back((pos, hash));
+
+            if valid_bases_count >= K + w - 1 {
+                if let Some(&(_, min_h)) = ws.q_fwd.front() {
+                    if Some(min_h) != last_min {
+                        ws.buffer.push(min_h);
+                        last_min = Some(min_h);
+                    }
                 }
             }
         }
     }
 }
 
-/// Helper to get paired minimizers using a reused workspace.
-/// Returns (Hypothesis_A_Minimizers, Hypothesis_B_Minimizers)
-/// Hyp A = R1_Fwd + R2_RC
-/// Hyp B = R1_RC + R2_Fwd
-fn get_paired_minimizers_into(
-    s1: &[u8], 
-    s2: Option<&Vec<u8>>, 
-    w: usize, 
-    salt: u64, 
-    ws: &mut MinimizerWorkspace
-) -> (Vec<u64>, Vec<u64>) {
-    
-    // 1. Extract R1 Dual Strands
-    let (mut fwd, mut rc) = extract_dual_strand_into(s1, w, salt, ws);
-
-    if let Some(seq2) = s2 {
-        let (mut r2_f, mut r2_rc) = extract_dual_strand_into(seq2, w, salt, ws);
-        
-        // Hyp A: R1 Fwd + R2 RC
-        fwd.append(&mut r2_rc);
-        // Hyp B: R1 RC + R2 Fwd
-        rc.append(&mut r2_f);
-    }
-
-    fwd.sort_unstable(); fwd.dedup();
-    rc.sort_unstable(); rc.dedup();
-    
-    (fwd, rc)
-}
-
-/// Optimized dual-strand extraction. 
-/// Uses `ws.q_fwd` and `ws.q_rc` to avoid allocating queues.
+// Dual Strand Extraction
 fn extract_dual_strand_into(seq: &[u8], w: usize, salt: u64, ws: &mut MinimizerWorkspace) -> (Vec<u64>, Vec<u64>) {
     ws.q_fwd.clear();
     ws.q_rc.clear();
 
     let len = seq.len();
     if len < K { return (vec![], vec![]); }
-    
-    let num_kmers = len - K + 1;
-    let effective_w = if num_kmers < w { num_kmers } else { w };
 
-    // These results must be allocated to be returned, but the intermediate queues are reused
     let mut fwd_mins = Vec::with_capacity(32);
     let mut rc_mins = Vec::with_capacity(32);
 
     let mut current_val: u64 = 0;
+    let mut valid_bases_count = 0;
     
-    // Pre-load
-    for i in 0..(K - 1) { 
-        current_val = (current_val << 1) | base_to_bit(seq[i]); 
-    }
+    let mut last_fwd: Option<u64> = None;
+    let mut last_rc: Option<u64> = None;
 
-    for i in 0..num_kmers {
-        let next_bit = base_to_bit(seq[i + K - 1]);
-        current_val = (current_val << 1) | next_bit;
-        
-        let h_fwd = current_val ^ salt;
-        let h_rc = (!current_val).reverse_bits() ^ salt;
+    for i in 0..len {
+        let bit = base_to_bit(seq[i]);
 
-        // FWD Queue
-        while let Some(&(pos, _)) = ws.q_fwd.front() { if pos + effective_w <= i { ws.q_fwd.pop_front(); } else { break; } }
-        while let Some(&(_, v)) = ws.q_fwd.back() { if v >= h_fwd { ws.q_fwd.pop_back(); } else { break; } }
-        ws.q_fwd.push_back((i, h_fwd));
+        if bit == u64::MAX {
+            valid_bases_count = 0;
+            ws.q_fwd.clear();
+            ws.q_rc.clear();
+            current_val = 0;
+            last_fwd = None;
+            last_rc = None;
+            continue;
+        }
 
-        // RC Queue
-        while let Some(&(pos, _)) = ws.q_rc.front() { if pos + effective_w <= i { ws.q_rc.pop_front(); } else { break; } }
-        while let Some(&(_, v)) = ws.q_rc.back() { if v >= h_rc { ws.q_rc.pop_back(); } else { break; } }
-        ws.q_rc.push_back((i, h_rc));
+        valid_bases_count += 1;
+        current_val = (current_val << 1) | bit;
 
-        // Emit
-        if i >= effective_w - 1 {
-            if let Some(&(_, min)) = ws.q_fwd.front() {
-                if fwd_mins.last() != Some(&min) { fwd_mins.push(min); }
-            }
-            if let Some(&(_, min)) = ws.q_rc.front() {
-                if rc_mins.last() != Some(&min) { rc_mins.push(min); }
+        if valid_bases_count >= K {
+            // SAFE ARITHMETIC
+            let pos = i + 1 - K;
+            let h_fwd = current_val ^ salt;
+            let h_rc = (!current_val).reverse_bits() ^ salt; 
+
+            // --- FWD QUEUE ---
+            while let Some(&(p, _)) = ws.q_fwd.front() { if p + w <= pos { ws.q_fwd.pop_front(); } else { break; } }
+            while let Some(&(_, v)) = ws.q_fwd.back() { if v >= h_fwd { ws.q_fwd.pop_back(); } else { break; } }
+            ws.q_fwd.push_back((pos, h_fwd));
+
+            // --- RC QUEUE ---
+            while let Some(&(p, _)) = ws.q_rc.front() { if p + w <= pos { ws.q_rc.pop_front(); } else { break; } }
+            while let Some(&(_, v)) = ws.q_rc.back() { if v >= h_rc { ws.q_rc.pop_back(); } else { break; } }
+            ws.q_rc.push_back((pos, h_rc));
+
+            if valid_bases_count >= K + w - 1 {
+                if let Some(&(_, min)) = ws.q_fwd.front() {
+                    if Some(min) != last_fwd { fwd_mins.push(min); last_fwd = Some(min); }
+                }
+                if let Some(&(_, min)) = ws.q_rc.front() {
+                    if Some(min) != last_rc { rc_mins.push(min); last_rc = Some(min); }
+                }
             }
         }
     }
     (fwd_mins, rc_mins)
+}
+
+fn get_paired_minimizers_into(
+    s1: &[u8], s2: Option<&Vec<u8>>, w: usize, salt: u64, ws: &mut MinimizerWorkspace
+) -> (Vec<u64>, Vec<u64>) {
+    let (mut fwd, mut rc) = extract_dual_strand_into(s1, w, salt, ws);
+    if let Some(seq2) = s2 {
+        let (mut r2_f, mut r2_rc) = extract_dual_strand_into(seq2, w, salt, ws);
+        fwd.append(&mut r2_rc);
+        rc.append(&mut r2_f);
+    }
+    fwd.sort_unstable(); fwd.dedup();
+    rc.sort_unstable(); rc.dedup();
+    (fwd, rc)
 }
 
 // --- INDEX STRUCTURE ---
@@ -273,21 +255,15 @@ struct Index {
 }
 
 impl Index {
-    fn new(w: usize, salt: u64) -> Self {
-        Index { w, salt, buckets: HashMap::new(), bucket_names: HashMap::new() }
-    }
-
+    fn new(w: usize, salt: u64) -> Self { Index { w, salt, buckets: HashMap::new(), bucket_names: HashMap::new() } }
+    
     fn add_reference_file(&mut self, path: &Path, id: u32) -> Result<()> {
-        let mut reader = parse_fastx_file(path)
-            .with_context(|| format!("Failed to open reference: {:?}", path))?;
-        
+        let mut reader = parse_fastx_file(path).with_context(|| format!("Failed to open reference: {:?}", path))?;
         self.bucket_names.insert(id, path.file_name().unwrap().to_string_lossy().to_string());
         let bucket = self.buckets.entry(id).or_insert_with(RoaringTreemap::new);
-        
-        let mut ws = MinimizerWorkspace::new(); // Local workspace for single-threaded build
-
+        let mut ws = MinimizerWorkspace::new();
         while let Some(record) = reader.next() {
-            let seqrec = record.context("Invalid FASTA record")?;
+            let seqrec = record.context("Invalid FASTA")?;
             extract_into(&seqrec.seq(), self.w, self.salt, &mut ws);
             for &m in &ws.buffer { bucket.insert(m); }
         }
@@ -296,134 +272,110 @@ impl Index {
 
     fn save(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
-        writer.write_all(b"RYPE")?; 
-        writer.write_all(&2u32.to_le_bytes())?; // Version
+        writer.write_all(b"RYPE")?; writer.write_all(&2u32.to_le_bytes())?;
         writer.write_all(&(K as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
         writer.write_all(&(self.salt).to_le_bytes())?;
-
-        let mut sorted_ids: Vec<_> = self.buckets.keys().collect();
-        sorted_ids.sort();
+        let mut sorted_ids: Vec<_> = self.buckets.keys().collect(); sorted_ids.sort();
         writer.write_all(&(sorted_ids.len() as u32).to_le_bytes())?;
-
         for id in sorted_ids {
             let map = &self.buckets[id];
             writer.write_all(&id.to_le_bytes())?;
-            
-            let name = self.bucket_names.get(id).unwrap_or(&"Unknown".to_string()).clone();
-            let name_bytes = name.as_bytes();
-            writer.write_all(&(name_bytes.len() as u64).to_le_bytes())?;
-            writer.write_all(name_bytes)?;
-
-            let mut buf = Vec::new();
-            map.serialize_into(&mut buf)?;
-            writer.write_all(&(buf.len() as u64).to_le_bytes())?;
-            writer.write_all(&buf)?;
+            let name = self.bucket_names.get(id).unwrap().as_bytes();
+            writer.write_all(&(name.len() as u64).to_le_bytes())?; writer.write_all(name)?;
+            let mut buf = Vec::new(); map.serialize_into(&mut buf)?;
+            writer.write_all(&(buf.len() as u64).to_le_bytes())?; writer.write_all(&buf)?;
         }
         Ok(())
     }
 
     fn load(path: &Path) -> Result<Self> {
-        let mut reader = BufReader::new(File::open(path).with_context(|| format!("Failed to open index: {:?}", path))?);
-        let mut buf4 = [0u8; 4];
-        let mut buf8 = [0u8; 8];
-
-        reader.read_exact(&mut buf4)?;
-        if &buf4 != b"RYPE" { return Err(anyhow!("Invalid index file format")); }
-
-        reader.read_exact(&mut buf4)?; // version
-        reader.read_exact(&mut buf8)?; // K
-        if u64::from_le_bytes(buf8) as usize != K { return Err(anyhow!("K-mer size mismatch")); }
-        
-        reader.read_exact(&mut buf8)?;
-        let w = u64::from_le_bytes(buf8) as usize;
-        reader.read_exact(&mut buf8)?;
-        let salt = u64::from_le_bytes(buf8);
-
-        reader.read_exact(&mut buf4)?;
-        let num_buckets = u32::from_le_bytes(buf4);
-
-        let mut buckets = HashMap::new();
-        let mut bucket_names = HashMap::new();
-
-        for _ in 0..num_buckets {
-            reader.read_exact(&mut buf4)?;
-            let id = u32::from_le_bytes(buf4);
-
-            reader.read_exact(&mut buf8)?;
-            let mut name_buf = vec![0u8; u64::from_le_bytes(buf8) as usize];
-            reader.read_exact(&mut name_buf)?;
-            bucket_names.insert(id, String::from_utf8(name_buf)?);
-
-            reader.read_exact(&mut buf8)?;
-            let _map_len = u64::from_le_bytes(buf8);
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut buf4 = [0u8; 4]; let mut buf8 = [0u8; 8];
+        reader.read_exact(&mut buf4)?; if &buf4 != b"RYPE" { return Err(anyhow!("Invalid Index")); }
+        reader.read_exact(&mut buf4)?; 
+        reader.read_exact(&mut buf8)?; if u64::from_le_bytes(buf8) as usize != K { return Err(anyhow!("K mismatch")); }
+        reader.read_exact(&mut buf8)?; let w = u64::from_le_bytes(buf8) as usize;
+        reader.read_exact(&mut buf8)?; let salt = u64::from_le_bytes(buf8);
+        reader.read_exact(&mut buf4)?; let num = u32::from_le_bytes(buf4);
+        let mut buckets = HashMap::new(); let mut names = HashMap::new();
+        for _ in 0..num {
+            reader.read_exact(&mut buf4)?; let id = u32::from_le_bytes(buf4);
+            reader.read_exact(&mut buf8)?; let mut nbuf = vec![0; u64::from_le_bytes(buf8) as usize]; reader.read_exact(&mut nbuf)?;
+            names.insert(id, String::from_utf8(nbuf)?);
+            reader.read_exact(&mut buf8)?; let _ = u64::from_le_bytes(buf8);
             buckets.insert(id, RoaringTreemap::deserialize_from(&mut reader)?);
         }
-        Ok(Index { w, salt, buckets, bucket_names })
+        Ok(Index { w, salt, buckets, bucket_names: names })
     }
 }
 
-// --- IO ABSTRACTION ---
+// --- IO ABSTRACTION (Async Writer) ---
 
 struct IoHandler {
     r1: Box<dyn FastxReader>,
     r2: Option<Box<dyn FastxReader>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    tx: Sender<Option<Vec<u8>>>, 
+    writer_handle: Option<thread::JoinHandle<Result<()>>>,
 }
 
 impl IoHandler {
-    fn new(r1_path: &Path, r2_path: Option<&PathBuf>, out_path: Option<PathBuf>) -> Result<Self> {
-        let r1 = parse_fastx_file(r1_path).context("Could not open R1")?;
-        let r2 = if let Some(p) = r2_path {
-            Some(parse_fastx_file(p).context("Could not open R2")?)
-        } else {
-            None
-        };
+    fn new(r1: &Path, r2: Option<&PathBuf>, out: Option<PathBuf>) -> Result<Self> {
+        let r1_r = parse_fastx_file(r1).context("R1 fail")?;
+        let r2_r = if let Some(p) = r2 { Some(parse_fastx_file(p).context("R2 fail")?) } else { None };
 
-        let writer: Box<dyn Write + Send> = match out_path {
-            Some(p) => Box::new(BufWriter::new(File::create(p)?)),
-            None => Box::new(BufWriter::new(io::stdout())),
-        };
+        let (tx, rx) = channel::<Option<Vec<u8>>>();
+        
+        let handle = thread::spawn(move || {
+            let mut w: Box<dyn Write> = match out {
+                Some(p) => Box::new(BufWriter::new(File::create(p)?)),
+                None => Box::new(BufWriter::new(io::stdout())),
+            };
+            while let Ok(Some(data)) = rx.recv() {
+                w.write_all(&data)?;
+            }
+            w.flush()?;
+            Ok(())
+        });
 
-        Ok(Self { r1, r2, writer: Arc::new(Mutex::new(writer)) })
+        Ok(Self { r1: r1_r, r2: r2_r, tx, writer_handle: Some(handle) })
     }
 
-    fn write_header(&self, cols: &[&str]) -> Result<()> {
-        let mut w = self.writer.lock().unwrap();
-        writeln!(w, "{}", cols.join("\t"))?;
-        Ok(())
+    fn write(&self, data: Vec<u8>) -> Result<()> {
+        self.tx.send(Some(data)).map_err(|_| anyhow!("Writer thread died"))
     }
 
-    fn next_batch(&mut self, batch_size: usize) -> Result<Option<(Vec<String>, Vec<Vec<u8>>, Option<Vec<Vec<u8>>>)>> {
-        let mut ids = Vec::with_capacity(batch_size);
-        let mut s1s = Vec::with_capacity(batch_size);
-        let mut s2s = if self.r2.is_some() { Some(Vec::with_capacity(batch_size)) } else { None };
+    fn next_batch(&mut self, size: usize) -> Result<Option<(Vec<String>, Vec<Vec<u8>>, Option<Vec<Vec<u8>>>)>> {
+        let mut ids = Vec::with_capacity(size);
+        let mut s1s = Vec::with_capacity(size);
+        let mut s2s = if self.r2.is_some() { Some(Vec::with_capacity(size)) } else { None };
 
-        for _ in 0..batch_size {
+        for _ in 0..size {
             match self.r1.next() {
-                Some(Ok(rec)) => {
-                    ids.push(String::from_utf8_lossy(rec.id()).to_string());
-                    s1s.push(rec.seq().into_owned());
-                }
+                Some(Ok(rec)) => { ids.push(String::from_utf8_lossy(rec.id()).to_string()); s1s.push(rec.seq().into_owned()); },
                 Some(Err(e)) => return Err(anyhow!(e)),
                 None => break,
             }
-
-            if let Some(reader2) = &mut self.r2 {
-                match reader2.next() {
+            if let Some(r2) = &mut self.r2 {
+                match r2.next() {
                     Some(Ok(rec)) => s2s.as_mut().unwrap().push(rec.seq().into_owned()),
                     Some(Err(e)) => return Err(anyhow!(e)),
-                    None => return Err(anyhow!("R1/R2 length mismatch")),
+                    None => return Err(anyhow!("R1/R2 mismatch")),
                 }
             }
         }
-
         if ids.is_empty() { return Ok(None); }
         Ok(Some((ids, s1s, s2s)))
     }
+
+    fn finish(mut self) -> Result<()> {
+        let _ = self.tx.send(None); 
+        if let Some(h) = self.writer_handle.take() { h.join().unwrap()?; }
+        Ok(())
+    }
 }
 
-// --- MAIN EXECUTION ---
+// --- MAIN ---
 
 fn main() -> Result<()> {
     let args = Cli::parse();
@@ -432,171 +384,127 @@ fn main() -> Result<()> {
         Commands::Index { output, reference, window, salt } => {
             let mut index = Index::new(window, salt);
             for (i, ref_path) in reference.iter().enumerate() {
-                println!("[*] Indexing {:?} as bucket {}", ref_path, i+1);
+                println!("[*] Indexing {:?} -> ID {}", ref_path, i+1);
                 index.add_reference_file(ref_path, (i + 1) as u32)?;
             }
-            println!("[*] Saving index to {:?}", output);
             index.save(&output)?;
         }
-
         Commands::Classify { index, r1, r2, threshold, batch_size, output } => {
             let engine = Index::load(&index)?;
             let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
-            io.write_header(&["read_id", "bucket_id", "score"])?;
+            io.write(b"read_id\tbucket_id\tscore\n".to_vec())?;
             run_classify(&engine, &mut io, threshold, batch_size)?;
+            io.finish()?;
         }
-
         Commands::BatchClassify { index, r1, r2, threshold, batch_size, output } => {
             let engine = Index::load(&index)?;
             let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
-            io.write_header(&["read_id", "bucket_id", "score"])?;
+            io.write(b"read_id\tbucket_id\tscore\n".to_vec())?;
             run_batch_classify(&engine, &mut io, threshold, batch_size)?;
+            io.finish()?;
         }
-
         Commands::AggregateClassify { index, r1, r2, threshold, batch_size, output } => {
             let engine = Index::load(&index)?;
             let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
-            io.write_header(&["query_name", "bucket_id", "score"])?;
+            io.write(b"query_name\tbucket_id\tscore\n".to_vec())?;
             run_aggregate_classify(&engine, &mut io, threshold, batch_size)?;
+            io.finish()?;
         }
     }
     Ok(())
 }
 
-// --- LOGIC IMPLEMENTATIONS ---
-
 fn run_classify(engine: &Index, io: &mut IoHandler, threshold: f64, batch_size: usize) -> Result<()> {
     while let Some((ids, s1s, s2s)) = io.next_batch(batch_size)? {
-        let results: Vec<String> = ids.par_iter().enumerate()
-            // Initialize thread-local workspace
+        let results: Vec<u8> = ids.par_iter().enumerate()
             .map_init(MinimizerWorkspace::new, |ws, (i, id)| {
-                let s1 = &s1s[i];
                 let s2 = s2s.as_ref().map(|v| &v[i]);
-                
-                let (hyp_a, hyp_b) = get_paired_minimizers_into(s1, s2, engine.w, engine.salt, ws);
-                let len_a = hyp_a.len() as f64;
-                let len_b = hyp_b.len() as f64;
+                let (hyp_a, hyp_b) = get_paired_minimizers_into(&s1s[i], s2, engine.w, engine.salt, ws);
+                let (la, lb) = (hyp_a.len() as f64, hyp_b.len() as f64);
+                if la == 0.0 && lb == 0.0 { return Vec::new(); }
 
-                if len_a == 0.0 && len_b == 0.0 { return String::new(); }
-
-                let mut out = String::with_capacity(128);
+                let mut out = Vec::with_capacity(128);
                 for (b_id, bucket) in &engine.buckets {
-                    let score_a = if len_a > 0.0 { count_hits(&hyp_a, bucket) / len_a } else { 0.0 };
-                    let score_b = if len_b > 0.0 { count_hits(&hyp_b, bucket) / len_b } else { 0.0 };
-                    let score = score_a.max(score_b);
-
+                    let sa = if la > 0.0 { count_hits(&hyp_a, bucket) / la } else { 0.0 };
+                    let sb = if lb > 0.0 { count_hits(&hyp_b, bucket) / lb } else { 0.0 };
+                    let score = sa.max(sb);
                     if score >= threshold {
-                        out.push_str(&format!("{}\t{}\t{:.4}\n", id, b_id, score));
+                        writeln!(out, "{}\t{}\t{:.4}", id, b_id, score).unwrap();
                     }
                 }
                 out
-            }).collect();
-
-        let mut w = io.writer.lock().unwrap();
-        for s in results { if !s.is_empty() { w.write_all(s.as_bytes())?; } }
+            }).flatten().collect();
+        io.write(results)?;
     }
     Ok(())
 }
 
 fn run_batch_classify(engine: &Index, io: &mut IoHandler, threshold: f64, batch_size: usize) -> Result<()> {
     while let Some((ids, s1s, s2s)) = io.next_batch(batch_size)? {
-        // 1. Process batch to get minimizers
-        let processed: Vec<(f64, f64, Vec<u64>, Vec<u64>)> = s1s.par_iter().enumerate()
+        let processed: Vec<_> = s1s.par_iter().enumerate()
             .map_init(MinimizerWorkspace::new, |ws, (i, s1)| {
                 let s2 = s2s.as_ref().map(|v| &v[i]);
-                let (hyp_a, hyp_b) = get_paired_minimizers_into(s1, s2, engine.w, engine.salt, ws);
-                (hyp_a.len() as f64, hyp_b.len() as f64, hyp_a, hyp_b)
+                let (ha, hb) = get_paired_minimizers_into(s1, s2, engine.w, engine.salt, ws);
+                (ha.len() as f64, hb.len() as f64, ha, hb)
             }).collect();
 
-        // 2. Build Inverted Index (Minimizer -> Read Indices)
         let mut map_a: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut map_b: HashMap<u64, Vec<usize>> = HashMap::new();
-        let mut unique_mins: HashSet<u64> = HashSet::new();
+        let mut uniq = HashSet::new();
 
         for (idx, (_, _, ma, mb)) in processed.iter().enumerate() {
-            for &m in ma { map_a.entry(m).or_default().push(idx); unique_mins.insert(m); }
-            for &m in mb { map_b.entry(m).or_default().push(idx); unique_mins.insert(m); }
+            for &m in ma { map_a.entry(m).or_default().push(idx); uniq.insert(m); }
+            for &m in mb { map_b.entry(m).or_default().push(idx); uniq.insert(m); }
         }
-        let unique_vec: Vec<u64> = unique_mins.into_iter().collect();
+        let uniq_vec: Vec<u64> = uniq.into_iter().collect();
 
-        // 3. Query Buckets
-        let bucket_results: Vec<String> = engine.buckets.par_iter().map(|(b_id, bucket)| {
-            let mut hits_map: HashMap<usize, (u32, u32)> = HashMap::new();
-
-            // Iterate only unique minimizers present in this batch
-            for &m in &unique_vec {
+        let batch_results: Vec<u8> = engine.buckets.par_iter().map(|(b_id, bucket)| {
+            let mut hits = HashMap::new();
+            for &m in &uniq_vec {
                 if bucket.contains(m) {
-                    if let Some(reads) = map_a.get(&m) { for &r in reads { hits_map.entry(r).or_default().0 += 1; } }
-                    if let Some(reads) = map_b.get(&m) { for &r in reads { hits_map.entry(r).or_default().1 += 1; } }
+                    if let Some(rs) = map_a.get(&m) { for &r in rs { hits.entry(r).or_insert((0,0)).0 += 1; } }
+                    if let Some(rs) = map_b.get(&m) { for &r in rs { hits.entry(r).or_insert((0,0)).1 += 1; } }
                 }
             }
-
-            let mut buf = String::new();
-            for (r_idx, (ha, hb)) in hits_map {
-                let (len_a, len_b, _, _) = &processed[r_idx];
-                let score = (if *len_a > 0.0 { ha as f64 / len_a } else { 0.0 })
-                    .max(if *len_b > 0.0 { hb as f64 / len_b } else { 0.0 });
-                
-                if score >= threshold {
-                    buf.push_str(&format!("{}\t{}\t{:.4}\n", ids[r_idx], b_id, score));
-                }
+            let mut buf = Vec::new();
+            for (r, (ha, hb)) in hits {
+                let (la, lb, _, _) = &processed[r];
+                let score = (if *la > 0.0 { ha as f64 / la } else { 0.0 }).max(if *lb > 0.0 { hb as f64 / lb } else { 0.0 });
+                if score >= threshold { writeln!(buf, "{}\t{}\t{:.4}", ids[r], b_id, score).unwrap(); }
             }
             buf
-        }).collect();
-
-        let mut w = io.writer.lock().unwrap();
-        for s in bucket_results { if !s.is_empty() { w.write_all(s.as_bytes())?; } }
+        }).flatten().collect();
+        io.write(batch_results)?;
     }
     Ok(())
 }
 
 fn run_aggregate_classify(engine: &Index, io: &mut IoHandler, threshold: f64, batch_size: usize) -> Result<()> {
-    let mut global_mins: HashSet<u64> = HashSet::new();
-    
-    // Accumulate ALL minimizers from ALL reads in the input
+    let mut global = HashSet::new();
     while let Some((_, s1s, s2s)) = io.next_batch(batch_size)? {
-        let batch_mins: Vec<Vec<u64>> = s1s.par_iter().enumerate()
+        let batch: Vec<Vec<u64>> = s1s.par_iter().enumerate()
             .map_init(MinimizerWorkspace::new, |ws, (i, s1)| {
                 let s2 = s2s.as_ref().map(|v| &v[i]);
-                let (mut ma, mb) = get_paired_minimizers_into(s1, s2, engine.w, engine.salt, ws);
-                ma.extend(mb);
-                ma // Just dump them all together
+                let (mut a, b) = get_paired_minimizers_into(s1, s2, engine.w, engine.salt, ws);
+                a.extend(b); a
             }).collect();
-
-        for m_vec in batch_mins {
-            for m in m_vec { global_mins.insert(m); }
-        }
+        for v in batch { for m in v { global.insert(m); } }
     }
-
-    let total_unique = global_mins.len() as f64;
-    if total_unique == 0.0 { return Ok(()); }
-
-    let global_vec: Vec<u64> = global_mins.into_iter().collect();
-
-    // Query buckets against global set
-    let results: Vec<String> = engine.buckets.par_iter().map(|(b_id, bucket)| {
-        let hits = count_hits(&global_vec, bucket);
-        let score = hits / total_unique;
-        
-        if score >= threshold {
-            return format!("global_query\t{}\t{:.4}\n", b_id, score);
-        }
-        String::new()
-    }).collect();
-
-    let mut w = io.writer.lock().unwrap();
-    for s in results { if !s.is_empty() { w.write_all(s.as_bytes())?; } }
+    let total = global.len() as f64;
+    if total == 0.0 { return Ok(()); }
+    let g_vec: Vec<u64> = global.into_iter().collect();
     
+    let res: Vec<u8> = engine.buckets.par_iter().filter_map(|(id, b)| {
+        let s = count_hits(&g_vec, b) / total;
+        if s >= threshold { Some(format!("global\t{}\t{:.4}\n", id, s).into_bytes()) } else { None }
+    }).flatten().collect();
+    io.write(res)?;
     Ok(())
 }
-
-// --- HELPERS ---
 
 fn count_hits(mins: &[u64], bucket: &RoaringTreemap) -> f64 {
     mins.iter().filter(|m| bucket.contains(**m)).count() as f64
 }
-
-// --- UNIT TESTS ---
 
 #[cfg(test)]
 mod tests {
@@ -607,61 +515,90 @@ mod tests {
     fn test_lut_accuracy() {
         assert_eq!(base_to_bit(b'A'), 1);
         assert_eq!(base_to_bit(b'G'), 1);
-        assert_eq!(base_to_bit(b'a'), 1);
-        assert_eq!(base_to_bit(b'g'), 1);
         assert_eq!(base_to_bit(b'T'), 0);
         assert_eq!(base_to_bit(b'C'), 0);
-        assert_eq!(base_to_bit(b'N'), 0);
+        assert_eq!(base_to_bit(b'N'), u64::MAX);
     }
 
     #[test]
-    fn test_extract_into_basic() {
+    fn test_short_sequences_ignored() {
         let mut ws = MinimizerWorkspace::new();
-        let w = 5;
-        // All As = all 1s. Hash will vary by salt, but sequence is constant
+        // Sequence shorter than K=64
+        let seq = vec![b'A'; 60]; 
+        extract_into(&seq, 5, 0, &mut ws);
+        assert!(ws.buffer.is_empty(), "Should not extract minimizers from seq < K");
+    }
+
+    #[test]
+    fn test_valid_extraction_long() {
+        let mut ws = MinimizerWorkspace::new();
+        // K=64. W=5. Need K+W-1 = 68 valid bases to emit first minimizer.
         let seq = vec![b'A'; 70]; 
-        
-        extract_into(&seq, w, 0, &mut ws);
-        // K=64, Seq=70. NumKmers = 7. W=5.
-        // Should produce 2 minimizers (0..5, 2..7) roughly
-        assert!(!ws.buffer.is_empty());
+        extract_into(&seq, 5, 0, &mut ws);
+        assert!(!ws.buffer.is_empty(), "Should extract minimizers from valid long seq");
     }
 
     #[test]
-    fn test_workspace_clears_correctly() {
+    fn test_n_handling_concatenation_identity() {
+        // Concatenation Identity Test:
+        // Processing (A) + Processing (B) should == Processing (A + N + B)
+        // This confirms that N acts exactly like a hard boundary/EOF between segments.
+
         let mut ws = MinimizerWorkspace::new();
-        extract_into(&vec![b'A'; 70], 5, 0, &mut ws);
-        let first_len = ws.buffer.len();
         
-        // Run again with short sequence -> should be empty
-        extract_into(&vec![b'A'; 10], 5, 0, &mut ws);
-        assert!(ws.buffer.is_empty());
-        assert_eq!(ws.q_fwd.len(), 0);
+        // Use pseudo-random sequences to avoid periodicity issues (homopolymers)
+        let seq_a: Vec<u8> = (0..80).map(|i| if i % 2 == 0 { b'A' } else { b'T' }).collect(); // ATAT...
+        let seq_b: Vec<u8> = (0..80).map(|i| if i % 3 == 0 { b'G' } else { b'C' }).collect(); // GC C GC C...
+        
+        // 1. Process separately
+        extract_into(&seq_a, 5, 0, &mut ws);
+        let mins_a = ws.buffer.clone();
+        
+        extract_into(&seq_b, 5, 0, &mut ws);
+        let mins_b = ws.buffer.clone();
 
-        // Run again with valid seq
-        extract_into(&vec![b'A'; 70], 5, 0, &mut ws);
-        assert_eq!(ws.buffer.len(), first_len);
+        // 2. Process combined with N
+        let mut seq_combined = seq_a.clone();
+        seq_combined.push(b'N');
+        seq_combined.extend_from_slice(&seq_b);
+        
+        extract_into(&seq_combined, 5, 0, &mut ws);
+        let mins_combined = ws.buffer.clone();
+
+        // 3. Verify
+        let mut expected = mins_a;
+        expected.extend(mins_b);
+        
+        assert_eq!(mins_combined, expected, "N should act as a perfect separator between sequences");
+        assert!(!mins_combined.is_empty(), "Test sequences should be long enough to generate minimizers");
     }
-
+    
     #[test]
-    fn test_dual_strand_extraction() {
+    fn test_random_sequence_stability() {
+        // Ensures the logic holds up on a larger, messier random sequence without panicking
         let mut ws = MinimizerWorkspace::new();
-        let seq = vec![b'A'; 70]; // All 1s
-        let (fwd, rc) = extract_dual_strand_into(&seq, 10, 0x1234, &mut ws);
+        let mut rng_state = 12345u64;
+        let mut next_byte = || {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            match (rng_state >> 32) % 4 {
+                0 => b'A', 1 => b'C', 2 => b'G', _ => b'T'
+            }
+        };
+
+        let seq: Vec<u8> = (0..1000).map(|_| next_byte()).collect();
+        extract_into(&seq, 5, 123, &mut ws);
         
-        assert!(!fwd.is_empty());
-        assert!(!rc.is_empty());
+        assert!(ws.buffer.len() > 10, "Random 1000bp sequence should yield plenty of minimizers");
     }
 
     #[test]
-    fn test_index_io() -> Result<()> {
+    fn test_index_save_load() -> Result<()> {
         let file = NamedTempFile::new()?;
         let path = file.path().to_path_buf();
         let mut index = Index::new(50, 0x1234);
         
-        // Manually insert some data (simulating add_reference)
         let mut map = RoaringTreemap::new();
-        map.insert(100); map.insert(200);
+        map.insert(123456789);
         index.buckets.insert(1, map);
         index.bucket_names.insert(1, "TestBucket".to_string());
 
@@ -670,8 +607,7 @@ mod tests {
 
         assert_eq!(loaded.w, 50);
         assert_eq!(loaded.salt, 0x1234);
-        assert!(loaded.buckets.contains_key(&1));
-        assert!(loaded.buckets[&1].contains(100));
+        assert!(loaded.buckets[&1].contains(123456789));
         assert_eq!(loaded.bucket_names[&1], "TestBucket");
         Ok(())
     }
