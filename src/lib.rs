@@ -5,6 +5,9 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+// Expose the C-API module
+pub mod c_api;
+
 // --- CONSTANTS ---
 
 pub const K: usize = 64;
@@ -21,10 +24,11 @@ const BASE_TO_BIT_LUT: [u64; 256] = {
 
 // --- DATA TYPES ---
 
-/// ID (i64), Sequence, Optional Pair Sequence
-pub type QueryRecord = (i64, Vec<u8>, Option<Vec<u8>>);
+/// ID (i64), Sequence Reference, Optional Pair Sequence Reference
+pub type QueryRecord<'a> = (i64, &'a [u8], Option<&'a [u8]>);
 
 /// Query ID, Bucket ID, Score
+#[derive(Debug, Clone, PartialEq)]
 pub struct HitResult {
     pub query_id: i64,
     pub bucket_id: u32,
@@ -365,23 +369,18 @@ impl Index {
 
 // --- LIBRARY LEVEL PROCESSING ---
 
-/// Batch Classify: Processes a vector of query records and returns individual hit scores.
-/// Threading: Uses `rayon::par_iter`. Caller controls threads via global pool config.
 pub fn classify_batch(
     engine: &Index, 
     records: &[QueryRecord], 
     threshold: f64
 ) -> Vec<HitResult> {
     
-    // Step 1: Extract Minimizers in Parallel
     let processed: Vec<_> = records.par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
-            let (ha, hb) = get_paired_minimizers_into(s1, s2.as_deref(), engine.w, engine.salt, ws);
+            let (ha, hb) = get_paired_minimizers_into(s1, *s2, engine.w, engine.salt, ws);
             (*id, ha, hb)
         }).collect();
 
-    // Step 2: Build Global Map of Minimizer -> Query Index
-    // This allows us to scan the Buckets (which are large) only once per unique minimizer.
     let mut map_a: HashMap<u64, Vec<usize>> = HashMap::new();
     let mut map_b: HashMap<u64, Vec<usize>> = HashMap::new();
     let mut uniq_mins = HashSet::new();
@@ -392,11 +391,9 @@ pub fn classify_batch(
     }
     let uniq_vec: Vec<u64> = uniq_mins.into_iter().collect();
 
-    // Step 3: Scan Buckets in Parallel
     let results: Vec<HitResult> = engine.buckets.par_iter().map(|(b_id, bucket)| {
-        let mut hits = HashMap::new(); // Query Index -> (HitsA, HitsB)
+        let mut hits = HashMap::new();
 
-        // Iterate unique minimizers in this batch
         for &m in &uniq_vec {
             if bucket.binary_search(&m).is_ok() {
                 if let Some(rs) = map_a.get(&m) { for &r in rs { hits.entry(r).or_insert((0,0)).0 += 1; } }
@@ -404,7 +401,6 @@ pub fn classify_batch(
             }
         }
 
-        // Calculate Scores
         let mut bucket_results = Vec::new();
         for (r_idx, (hits_a, hits_b)) in hits {
             let (qid, ha, hb) = &processed[r_idx];
@@ -424,7 +420,6 @@ pub fn classify_batch(
     results
 }
 
-/// Aggregate Classify: Treats the entire batch as one "Meta-Read" and scores it against buckets.
 pub fn aggregate_batch(
     engine: &Index,
     records: &[QueryRecord],
@@ -434,7 +429,7 @@ pub fn aggregate_batch(
     
     let batch_mins: Vec<Vec<u64>> = records.par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (_, s1, s2)| {
-            let (mut a, b) = get_paired_minimizers_into(s1, s2.as_deref(), engine.w, engine.salt, ws);
+            let (mut a, b) = get_paired_minimizers_into(s1, *s2, engine.w, engine.salt, ws);
             a.extend(b);
             a
         }).collect();
@@ -595,6 +590,68 @@ mod tests {
         assert_eq!(merged_sources.len(), 2);
 
         Ok(())
+    }
+
+    // --- LIBRARY BATCH PROCESSING TESTS ---
+
+    #[test]
+    fn test_classify_batch_logic() {
+        let mut index = Index::new(10, 0);
+        index.buckets.insert(1, vec![10, 20, 30, 40, 50]); 
+        index.buckets.insert(2, vec![60, 70, 80, 90, 100]); 
+        
+        let seq_a = vec![b'A'; 80]; 
+        let mut ws = MinimizerWorkspace::new();
+        
+        index.add_record(1, "ref_a", &seq_a, &mut ws);
+        index.finalize_bucket(1);
+
+        let query_seq = seq_a.clone();
+        let records: Vec<QueryRecord> = vec![
+            (101, &query_seq, None) 
+        ];
+
+        let results = classify_batch(&index, &records, 0.5);
+
+        assert!(!results.is_empty());
+        let hit = &results[0];
+        assert_eq!(hit.query_id, 101);
+        assert_eq!(hit.bucket_id, 1);
+        assert_eq!(hit.score, 1.0); 
+    }
+
+    #[test]
+    fn test_aggregate_batch_logic() {
+        let mut index = Index::new(10, 0);
+        let mut ws = MinimizerWorkspace::new();
+        
+        // Bucket 1: Poly-A (RY Space: All 1s)
+        let seq_a = vec![b'A'; 100];
+        index.add_record(1, "ref_a", &seq_a, &mut ws);
+        index.finalize_bucket(1);
+
+        // Bucket 2: Alternating AT (RY Space: Alternating 1/0)
+        // A=1, T=0 => 10101010...
+        // This generates distinct K-mers from Poly-A
+        let seq_at: Vec<u8> = (0..200).map(|i| if i % 2 == 0 { b'A' } else { b'T' }).collect();
+        index.add_record(2, "ref_at", &seq_at, &mut ws);
+        index.finalize_bucket(2);
+
+        // Query: Split the AT seq
+        let q1 = &seq_at[0..100];
+        let q2 = &seq_at[100..200];
+
+        let records: Vec<QueryRecord> = vec![
+            (1, q1, None),
+            (2, q2, None),
+        ];
+
+        let results = aggregate_batch(&index, &records, 0.5);
+        
+        // Should strictly match Bucket 2
+        assert_eq!(results.len(), 1, "Should only match bucket 2");
+        assert_eq!(results[0].bucket_id, 2);
+        assert!(results[0].score > 0.9);
     }
 }
 
