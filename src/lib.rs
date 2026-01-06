@@ -8,6 +8,9 @@ use std::path::Path;
 // Expose the C-API module
 pub mod c_api;
 
+// Expose the config module for testing and CLI usage
+pub mod config;
+
 // --- CONSTANTS ---
 
 pub const K: usize = 64;

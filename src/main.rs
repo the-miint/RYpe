@@ -1,11 +1,13 @@
 use clap::{Parser, Subcommand};
 use needletail::{parse_fastx_file, FastxReader};
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 
 use rype::{Index, MinimizerWorkspace, QueryRecord, classify_batch, aggregate_batch};
+use rype::config::{parse_config, validate_config, resolve_path};
 
 #[derive(Parser)]
 #[command(name = "rype")]
@@ -95,6 +97,10 @@ enum Commands {
         batch_size: usize,
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+    IndexFromConfig {
+        #[arg(short, long)]
+        config: PathBuf,
     },
 }
 
@@ -364,13 +370,13 @@ fn main() -> Result<()> {
             io.write(b"query_name\tbucket_id\tscore\n".to_vec())?;
 
             while let Some((owned_records, _)) = io.next_batch_records(batch_size)? {
-                
+
                 let batch_refs: Vec<QueryRecord> = owned_records.iter()
                     .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                     .collect();
 
                 let results = aggregate_batch(&engine, &batch_refs, threshold);
-                
+
                 let mut chunk_out = Vec::with_capacity(1024);
                 for res in results {
                     writeln!(chunk_out, "global\t{}\t{:.4}", res.bucket_id, res.score).unwrap();
@@ -379,7 +385,95 @@ fn main() -> Result<()> {
             }
             io.finish()?;
         }
+
+        Commands::IndexFromConfig { config } => {
+            build_index_from_config(&config)?;
+        }
     }
+
+    Ok(())
+}
+
+fn build_index_from_config(config_path: &Path) -> Result<()> {
+    println!("Building index from config: {}", config_path.display());
+
+    // 1. Parse and validate config
+    let cfg = parse_config(config_path)?;
+    let config_dir = config_path.parent()
+        .ok_or_else(|| anyhow!("Invalid config path"))?;
+
+    println!("Validating file paths...");
+    validate_config(&cfg, config_dir)?;
+    println!("Validation successful.");
+
+    // 2. Sort bucket names for deterministic ordering
+    let mut bucket_names: Vec<_> = cfg.buckets.keys().cloned().collect();
+    bucket_names.sort();
+
+    println!("Building {} buckets in parallel...", bucket_names.len());
+    for name in &bucket_names {
+        let file_count = cfg.buckets[name].files.len();
+        println!("  - {}: {} file{}", name, file_count, if file_count == 1 { "" } else { "s" });
+    }
+
+    // 3. Build indices in parallel (one per bucket)
+    let bucket_indices: Vec<_> = bucket_names.par_iter()
+        .map(|bucket_name| {
+            let mut idx = Index::new(cfg.index.window, cfg.index.salt);
+            let mut ws = MinimizerWorkspace::new();
+
+            // Process all files for this bucket
+            for file_path in &cfg.buckets[bucket_name].files {
+                let abs_path = resolve_path(config_dir, file_path);
+                let mut reader = parse_fastx_file(&abs_path)
+                    .context(format!("Failed to open file {} for bucket '{}'",
+                                   abs_path.display(), bucket_name))?;
+
+                let filename = file_path.file_name()
+                    .unwrap_or(file_path.as_ref())
+                    .to_string_lossy()
+                    .to_string();
+
+                while let Some(record) = reader.next() {
+                    let rec = record.context(format!("Invalid record in file {} (bucket '{}')",
+                                                    abs_path.display(), bucket_name))?;
+                    let seq_name = String::from_utf8_lossy(rec.id()).to_string();
+                    let source_label = format!("{}::{}", filename, seq_name);
+                    idx.add_record(1, &source_label, &rec.seq(), &mut ws);
+                }
+            }
+
+            idx.finalize_bucket(1);
+            Ok::<_, anyhow::Error>((bucket_name.clone(), idx))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    println!("Processing complete. Merging buckets...");
+
+    // 4. Merge all bucket indices into final index
+    let mut final_index = Index::new(cfg.index.window, cfg.index.salt);
+    for (bucket_id, (bucket_name, bucket_idx)) in bucket_indices.into_iter().enumerate() {
+        let new_id = (bucket_id + 1) as u32;
+        final_index.bucket_names.insert(new_id, bucket_name);
+
+        // Transfer bucket data
+        if let Some(minimizers) = bucket_idx.buckets.get(&1) {
+            final_index.buckets.insert(new_id, minimizers.clone());
+        }
+        if let Some(sources) = bucket_idx.bucket_sources.get(&1) {
+            final_index.bucket_sources.insert(new_id, sources.clone());
+        }
+    }
+
+    // 5. Save final index
+    println!("Saving index to {}...", cfg.index.output.display());
+    final_index.save(&cfg.index.output)?;
+
+    println!("Done! Index saved successfully.");
+    println!("\nFinal statistics:");
+    println!("  Buckets: {}", final_index.buckets.len());
+    let total_minimizers: usize = final_index.buckets.values().map(|v| v.len()).sum();
+    println!("  Total minimizers: {}", total_minimizers);
 
     Ok(())
 }
