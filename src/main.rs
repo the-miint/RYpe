@@ -262,7 +262,7 @@ fn main() -> Result<()> {
 
         Commands::IndexBucketAdd { index, reference } => {
             let mut idx = Index::load(&index)?;
-            let mut next_id = idx.next_id();
+            let mut next_id = idx.next_id()?;
             println!("Adding {:?} as new bucket ID {}", reference, next_id);
             add_reference_file_to_index(&mut idx, &reference, true, &mut next_id)?;
             idx.save(&index)?;
@@ -295,7 +295,7 @@ fn main() -> Result<()> {
                 // Naive merge strategy: Re-map IDs of 'other' to not collide, then insert
                 // Simple version: just append buckets with new IDs
                 for (old_id, vec) in other_idx.buckets {
-                    let new_id = base_idx.next_id();
+                    let new_id = base_idx.next_id()?;
                     base_idx.buckets.insert(new_id, vec);
                     
                     if let Some(name) = other_idx.bucket_names.get(&old_id) {
