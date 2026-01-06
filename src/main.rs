@@ -262,10 +262,30 @@ fn main() -> Result<()> {
 
         Commands::IndexBucketAdd { index, reference } => {
             let mut idx = Index::load(&index)?;
-            let mut next_id = idx.next_id()?;
+            let next_id = idx.next_id()?;
             println!("Adding {:?} as new bucket ID {}", reference, next_id);
-            add_reference_file_to_index(&mut idx, &reference, true, &mut next_id)?;
+
+            // Add all records from the file to a single new bucket
+            let mut reader = parse_fastx_file(&reference).context("Failed to open reference file")?;
+            let mut ws = MinimizerWorkspace::new();
+            let filename = reference.file_name().unwrap().to_string_lossy().to_string();
+
+            // Set the bucket name to the filename for consistency with 'index' command
+            idx.bucket_names.insert(next_id, filename.clone());
+
+            while let Some(record) = reader.next() {
+                let rec = record.context("Invalid record")?;
+                let seq = rec.seq();
+                let name = String::from_utf8_lossy(rec.id()).to_string();
+                let source_label = format!("{}::{}", filename, name);
+                idx.add_record(next_id, &source_label, &seq, &mut ws);
+            }
+
+            // Finalize the new bucket
+            idx.finalize_bucket(next_id);
             idx.save(&index)?;
+            println!("Done. Added {} minimizers to bucket {}.",
+                     idx.buckets.get(&next_id).map(|v| v.len()).unwrap_or(0), next_id);
         }
 
         Commands::IndexBucketMerge { index, src, dest } => {

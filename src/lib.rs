@@ -481,6 +481,7 @@ mod tests {
 
     // --- UTILS ---
 
+    #[allow(dead_code)]
     fn create_temp_fasta(content: &[u8]) -> NamedTempFile {
         let mut file = NamedTempFile::new().expect("Failed to create temp file");
         file.write_all(content).expect("Failed to write to temp file");
@@ -748,6 +749,91 @@ mod tests {
         let result = index.merge_buckets(999, 1);  // 999 doesn't exist
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_merge_buckets_updates_minimizer_count() -> Result<()> {
+        // Verify that merge_buckets correctly updates the minimizer count
+        let mut index = Index::new(50, 0);
+
+        // Create bucket 10 with 3 minimizers
+        index.buckets.insert(10, vec![1, 2, 3]);
+        index.bucket_names.insert(10, "Source".into());
+
+        // Create bucket 20 with 3 minimizers (one overlapping)
+        index.buckets.insert(20, vec![3, 4, 5]);
+        index.bucket_names.insert(20, "Dest".into());
+
+        // Before merge: bucket 20 has 3 minimizers
+        assert_eq!(index.buckets[&20].len(), 3);
+
+        // Merge 10 into 20
+        index.merge_buckets(10, 20)?;
+
+        // After merge: bucket 20 should have 5 unique minimizers (deduped)
+        assert_eq!(index.buckets[&20].len(), 5);
+        assert_eq!(index.buckets[&20], vec![1, 2, 3, 4, 5]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiple_records_single_bucket() {
+        // Verify that multiple records can be added to a single bucket
+        let mut index = Index::new(10, 0);
+        let mut ws = MinimizerWorkspace::new();
+
+        // Add multiple sequences to the same bucket
+        let seq1 = vec![b'A'; 80];
+        let seq2 = vec![b'T'; 80];
+        let seq3 = vec![b'G'; 80];
+
+        index.add_record(1, "file.fa::seq1", &seq1, &mut ws);
+        index.add_record(1, "file.fa::seq2", &seq2, &mut ws);
+        index.add_record(1, "file.fa::seq3", &seq3, &mut ws);
+        index.finalize_bucket(1);
+
+        // All three sequences should be in bucket 1
+        assert!(index.buckets.contains_key(&1));
+        assert_eq!(index.bucket_sources[&1].len(), 3);
+        assert_eq!(index.bucket_sources[&1][0], "file.fa::seq1");
+        assert_eq!(index.bucket_sources[&1][1], "file.fa::seq2");
+        assert_eq!(index.bucket_sources[&1][2], "file.fa::seq3");
+
+        // Bucket should have minimizers (exact count depends on sequences)
+        assert!(!index.buckets[&1].is_empty());
+    }
+
+    #[test]
+    fn test_bucket_naming_consistency() -> Result<()> {
+        // Verify that bucket names are consistent across operations
+        let mut index = Index::new(50, 0);
+        let mut ws = MinimizerWorkspace::new();
+
+        // Simulate adding a file with multiple records to a new bucket
+        let bucket_id = 1;
+        let filename = "reference.fasta";
+
+        // Set the bucket name to filename (consistent behavior)
+        index.bucket_names.insert(bucket_id, filename.to_string());
+
+        // Add multiple records to this bucket
+        let seq1 = vec![b'A'; 80];
+        let seq2 = vec![b'T'; 80];
+
+        index.add_record(bucket_id, &format!("{}::seq1", filename), &seq1, &mut ws);
+        index.add_record(bucket_id, &format!("{}::seq2", filename), &seq2, &mut ws);
+        index.finalize_bucket(bucket_id);
+
+        // Bucket name should be the filename
+        assert_eq!(index.bucket_names[&bucket_id], filename);
+
+        // Sources should include record names
+        assert_eq!(index.bucket_sources[&bucket_id].len(), 2);
+        assert!(index.bucket_sources[&bucket_id][0].contains("seq1"));
+        assert!(index.bucket_sources[&bucket_id][1].contains("seq2"));
+
+        Ok(())
     }
 }
 
