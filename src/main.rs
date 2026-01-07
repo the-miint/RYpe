@@ -260,31 +260,31 @@ fn main() -> Result<()> {
         }
         
         Commands::IndexStats { index } => {
-            let idx = Index::load(&index)?;
+            let metadata = Index::load_metadata(&index)?;
             println!("Index Stats for {:?}", index);
             println!("  K: 64 (fixed)");
-            println!("  Window (w): {}", idx.w);
-            println!("  Salt: {:x}", idx.salt);
-            println!("  Buckets: {}", idx.buckets.len());
+            println!("  Window (w): {}", metadata.w);
+            println!("  Salt: {:x}", metadata.salt);
+            println!("  Buckets: {}", metadata.bucket_names.len());
             println!("------------------------------------------------");
-            let mut sorted_ids: Vec<_> = idx.buckets.keys().collect();
+            let mut sorted_ids: Vec<_> = metadata.bucket_names.keys().collect();
             sorted_ids.sort();
             for id in sorted_ids {
-                let name = idx.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
-                let count = idx.buckets[id].len();
-                let sources = idx.bucket_sources.get(id).map(|v| v.len()).unwrap_or(0);
+                let name = metadata.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
+                let count = metadata.bucket_minimizer_counts.get(id).copied().unwrap_or(0);
+                let sources = metadata.bucket_sources.get(id).map(|v| v.len()).unwrap_or(0);
                 println!("  Bucket {}: '{}' ({} minimizers, {} sources)", id, name, count, sources);
             }
         }
 
         Commands::IndexBucketSourceDetail { index, bucket, paths, ids } => {
-            let idx = Index::load(&index)?;
-            let sources = idx.bucket_sources.get(&bucket).unwrap();
+            let metadata = Index::load_metadata(&index)?;
+            let sources = metadata.bucket_sources.get(&bucket).unwrap();
 
             if paths && ids {
                 return Err(anyhow!("Cannot have --paths and --ids"));
             }
-            
+
             if paths {
                 let mut all_paths: HashSet<String> = HashSet::new();
                 for source in sources {
@@ -297,7 +297,7 @@ fn main() -> Result<()> {
                     println!("{}", path);
                 }
             } else if ids {
-                let mut sorted_ids: Vec<_> = idx.buckets.keys().collect();
+                let mut sorted_ids: Vec<_> = metadata.bucket_names.keys().collect();
                 sorted_ids.sort();
                 for id in sorted_ids {
                     println!("{}", id);

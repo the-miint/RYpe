@@ -39,6 +39,16 @@ const BASE_TO_BIT_LUT: [u64; 256] = {
 /// ID (i64), Sequence Reference, Optional Pair Sequence Reference
 pub type QueryRecord<'a> = (i64, &'a [u8], Option<&'a [u8]>);
 
+/// Lightweight metadata-only view of an Index (without minimizer data)
+#[derive(Debug, Clone)]
+pub struct IndexMetadata {
+    pub w: usize,
+    pub salt: u64,
+    pub bucket_names: HashMap<u32, String>,
+    pub bucket_sources: HashMap<u32, Vec<String>>,
+    pub bucket_minimizer_counts: HashMap<u32, usize>,
+}
+
 /// Query ID, Bucket ID, Score
 #[derive(Debug, Clone, PartialEq)]
 pub struct HitResult {
@@ -287,7 +297,7 @@ impl Index {
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
         writer.write_all(b"RYP3")?;
-        writer.write_all(&2u32.to_le_bytes())?;
+        writer.write_all(&3u32.to_le_bytes())?; // Version 3
         writer.write_all(&(K as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
         writer.write_all(&(self.salt).to_le_bytes())?;
@@ -297,15 +307,23 @@ impl Index {
 
         writer.write_all(&(sorted_ids.len() as u32).to_le_bytes())?;
 
+        // V3 Format: MinimizerCount comes FIRST for each bucket (enables seeking)
         for id in sorted_ids {
             let vec = &self.buckets[id];
+
+            // Write minimizer count first
+            writer.write_all(&(vec.len() as u64).to_le_bytes())?;
+
+            // Write bucket ID
             writer.write_all(&id.to_le_bytes())?;
 
+            // Write name
             let name_str = self.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
             let name_bytes = name_str.as_bytes();
             writer.write_all(&(name_bytes.len() as u64).to_le_bytes())?;
             writer.write_all(name_bytes)?;
 
+            // Write sources
             let sources = self.bucket_sources.get(id);
             let empty = Vec::new();
             let src_vec = sources.unwrap_or(&empty);
@@ -317,7 +335,7 @@ impl Index {
                 writer.write_all(s_bytes)?;
             }
 
-            writer.write_all(&(vec.len() as u64).to_le_bytes())?;
+            // Write minimizers
             for val in vec {
                 writer.write_all(&val.to_le_bytes())?;
             }
@@ -335,10 +353,11 @@ impl Index {
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        const SUPPORTED_VERSION: u32 = 2;
+        const SUPPORTED_VERSION: u32 = 3;
         if version != SUPPORTED_VERSION {
             return Err(anyhow!("Unsupported index version: {} (expected {})", version, SUPPORTED_VERSION));
         }
+
         reader.read_exact(&mut buf8)?; if u64::from_le_bytes(buf8) as usize != K { return Err(anyhow!("K mismatch")); }
         reader.read_exact(&mut buf8)?; let w = u64::from_le_bytes(buf8) as usize;
         reader.read_exact(&mut buf8)?; let salt = u64::from_le_bytes(buf8);
@@ -351,7 +370,14 @@ impl Index {
         let mut names = HashMap::new();
         let mut sources = HashMap::new();
 
+        // V3 format: MinimizerCount comes first for each bucket
         for _ in 0..num {
+            reader.read_exact(&mut buf8)?;
+            let vec_len = u64::from_le_bytes(buf8) as usize;
+            if vec_len > MAX_BUCKET_SIZE {
+                return Err(anyhow!("Bucket size {} exceeds maximum {}", vec_len, MAX_BUCKET_SIZE));
+            }
+
             reader.read_exact(&mut buf4)?; let id = u32::from_le_bytes(buf4);
 
             reader.read_exact(&mut buf8)?; let name_len = u64::from_le_bytes(buf8) as usize;
@@ -375,12 +401,6 @@ impl Index {
             }
             sources.insert(id, src_list);
 
-            reader.read_exact(&mut buf8)?;
-            let vec_len = u64::from_le_bytes(buf8) as usize;
-            if vec_len > MAX_BUCKET_SIZE {
-                return Err(anyhow!("Bucket size {} exceeds maximum {}", vec_len, MAX_BUCKET_SIZE));
-            }
-
             let mut vec = Vec::with_capacity(vec_len);
             let mut buf8_inner = [0u8; 8];
             for _ in 0..vec_len {
@@ -390,7 +410,85 @@ impl Index {
 
             buckets.insert(id, vec);
         }
+
         Ok(Index { w, salt, buckets, bucket_names: names, bucket_sources: sources })
+    }
+
+    pub fn load_metadata(path: &Path) -> Result<IndexMetadata> {
+        use std::io::Seek;
+
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut buf4 = [0u8; 4];
+        let mut buf8 = [0u8; 8];
+
+        reader.read_exact(&mut buf4)?;
+        if &buf4 != b"RYP3" { return Err(anyhow!("Invalid Index Format (Expected RYP3)")); }
+
+        reader.read_exact(&mut buf4)?;
+        let version = u32::from_le_bytes(buf4);
+        const SUPPORTED_VERSION: u32 = 3;
+        if version != SUPPORTED_VERSION {
+            return Err(anyhow!("Unsupported index version: {} (expected {})", version, SUPPORTED_VERSION));
+        }
+
+        reader.read_exact(&mut buf8)?; if u64::from_le_bytes(buf8) as usize != K { return Err(anyhow!("K mismatch")); }
+        reader.read_exact(&mut buf8)?; let w = u64::from_le_bytes(buf8) as usize;
+        reader.read_exact(&mut buf8)?; let salt = u64::from_le_bytes(buf8);
+        reader.read_exact(&mut buf4)?; let num = u32::from_le_bytes(buf4);
+        if num > MAX_NUM_BUCKETS {
+            return Err(anyhow!("Number of buckets {} exceeds maximum {}", num, MAX_NUM_BUCKETS));
+        }
+
+        let mut names = HashMap::new();
+        let mut sources = HashMap::new();
+        let mut minimizer_counts = HashMap::new();
+
+        // V3 format allows seeking past minimizers for fast metadata-only loading
+        for _ in 0..num {
+            reader.read_exact(&mut buf8)?;
+            let vec_len = u64::from_le_bytes(buf8) as usize;
+            if vec_len > MAX_BUCKET_SIZE {
+                return Err(anyhow!("Bucket size {} exceeds maximum {}", vec_len, MAX_BUCKET_SIZE));
+            }
+
+            reader.read_exact(&mut buf4)?; let id = u32::from_le_bytes(buf4);
+
+            reader.read_exact(&mut buf8)?; let name_len = u64::from_le_bytes(buf8) as usize;
+            if name_len > MAX_STRING_LENGTH {
+                return Err(anyhow!("Bucket name length {} exceeds maximum {}", name_len, MAX_STRING_LENGTH));
+            }
+            let mut nbuf = vec![0u8; name_len];
+            reader.read_exact(&mut nbuf)?;
+            names.insert(id, String::from_utf8(nbuf)?);
+
+            reader.read_exact(&mut buf8)?; let src_count = u64::from_le_bytes(buf8) as usize;
+            let mut src_list = Vec::with_capacity(src_count);
+            for _ in 0..src_count {
+                reader.read_exact(&mut buf8)?; let slen = u64::from_le_bytes(buf8) as usize;
+                if slen > MAX_STRING_LENGTH {
+                    return Err(anyhow!("Source string length {} exceeds maximum {}", slen, MAX_STRING_LENGTH));
+                }
+                let mut sbuf = vec![0u8; slen];
+                reader.read_exact(&mut sbuf)?;
+                src_list.push(String::from_utf8(sbuf)?);
+            }
+            sources.insert(id, src_list);
+
+            // Store minimizer count without loading minimizers
+            minimizer_counts.insert(id, vec_len);
+
+            // Seek past minimizer data (vec_len × 8 bytes)
+            let bytes_to_skip = (vec_len as u64) * 8;
+            reader.seek(std::io::SeekFrom::Current(bytes_to_skip as i64))?;
+        }
+
+        Ok(IndexMetadata {
+            w,
+            salt,
+            bucket_names: names,
+            bucket_sources: sources,
+            bucket_minimizer_counts: minimizer_counts,
+        })
     }
 }
 
@@ -712,22 +810,23 @@ mod tests {
 
     #[test]
     fn test_index_load_oversized_bucket() {
-        // Create a malicious index file claiming a huge bucket
+        // Create a malicious index file claiming a huge bucket (V3 format)
         let file = NamedTempFile::new().unwrap();
         let path = file.path();
 
         let mut data = Vec::new();
         data.extend_from_slice(b"RYP3");
-        data.extend_from_slice(&2u32.to_le_bytes());  // Version
+        data.extend_from_slice(&3u32.to_le_bytes());  // Version 3
         data.extend_from_slice(&64u64.to_le_bytes()); // K
         data.extend_from_slice(&50u64.to_le_bytes()); // W
         data.extend_from_slice(&0u64.to_le_bytes());  // Salt
         data.extend_from_slice(&1u32.to_le_bytes());  // 1 bucket
+        // V3 Format: MinimizerCount comes FIRST
+        data.extend_from_slice(&(MAX_BUCKET_SIZE as u64 + 1).to_le_bytes()); // Oversized!
         data.extend_from_slice(&1u32.to_le_bytes());  // Bucket ID 1
         data.extend_from_slice(&4u64.to_le_bytes());  // Name length
         data.extend_from_slice(b"test");
         data.extend_from_slice(&0u64.to_le_bytes());  // No sources
-        data.extend_from_slice(&(MAX_BUCKET_SIZE as u64 + 1).to_le_bytes()); // Oversized!
 
         std::fs::write(path, data).unwrap();
 
@@ -837,6 +936,133 @@ mod tests {
         assert_eq!(index.bucket_sources[&bucket_id].len(), 2);
         assert!(index.bucket_sources[&bucket_id][0].contains("seq1"));
         assert!(index.bucket_sources[&bucket_id][1].contains("seq2"));
+
+        Ok(())
+    }
+
+    // --- METADATA LOADING TESTS (V3 FORMAT) ---
+
+    #[test]
+    fn test_load_metadata_fast() -> Result<()> {
+        // Verify that load_metadata() can read metadata without loading minimizers
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+        let mut index = Index::new(50, 0x1234);
+
+        // Create index with multiple buckets with varying minimizer counts
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.bucket_names.insert(1, "BucketA".into());
+        index.bucket_sources.insert(1, vec!["file1.fa::seq1".into(), "file1.fa::seq2".into()]);
+
+        index.buckets.insert(2, vec![400, 500]);
+        index.bucket_names.insert(2, "BucketB".into());
+        index.bucket_sources.insert(2, vec!["file2.fa::seq1".into()]);
+
+        index.buckets.insert(3, vec![600, 700, 800, 900]);
+        index.bucket_names.insert(3, "BucketC".into());
+        index.bucket_sources.insert(3, vec!["file3.fa::seq1".into(), "file3.fa::seq2".into(), "file3.fa::seq3".into()]);
+
+        index.save(&path)?;
+
+        // Load metadata only
+        let metadata = Index::load_metadata(&path)?;
+
+        // Verify basic parameters
+        assert_eq!(metadata.w, 50);
+        assert_eq!(metadata.salt, 0x1234);
+
+        // Verify bucket names
+        assert_eq!(metadata.bucket_names.len(), 3);
+        assert_eq!(metadata.bucket_names[&1], "BucketA");
+        assert_eq!(metadata.bucket_names[&2], "BucketB");
+        assert_eq!(metadata.bucket_names[&3], "BucketC");
+
+        // Verify bucket sources
+        assert_eq!(metadata.bucket_sources[&1].len(), 2);
+        assert_eq!(metadata.bucket_sources[&1][0], "file1.fa::seq1");
+        assert_eq!(metadata.bucket_sources[&2].len(), 1);
+        assert_eq!(metadata.bucket_sources[&3].len(), 3);
+
+        // Verify minimizer counts (without loading actual minimizers)
+        assert_eq!(metadata.bucket_minimizer_counts[&1], 3);
+        assert_eq!(metadata.bucket_minimizer_counts[&2], 2);
+        assert_eq!(metadata.bucket_minimizer_counts[&3], 4);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_metadata_matches_full_load() -> Result<()> {
+        // Verify that metadata from load_metadata() matches metadata from load()
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+        let mut index = Index::new(42, 0xABCD);
+
+        index.buckets.insert(10, vec![1, 2, 3, 4, 5]);
+        index.bucket_names.insert(10, "Test".into());
+        index.bucket_sources.insert(10, vec!["src1".into(), "src2".into()]);
+
+        index.save(&path)?;
+
+        let metadata = Index::load_metadata(&path)?;
+        let full_index = Index::load(&path)?;
+
+        // Verify metadata matches
+        assert_eq!(metadata.w, full_index.w);
+        assert_eq!(metadata.salt, full_index.salt);
+        assert_eq!(metadata.bucket_names, full_index.bucket_names);
+        assert_eq!(metadata.bucket_sources, full_index.bucket_sources);
+        assert_eq!(metadata.bucket_minimizer_counts[&10], full_index.buckets[&10].len());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_metadata_empty_index() -> Result<()> {
+        // Verify load_metadata works with index containing no buckets
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+        let index = Index::new(25, 0);
+
+        index.save(&path)?;
+        let metadata = Index::load_metadata(&path)?;
+
+        assert_eq!(metadata.w, 25);
+        assert_eq!(metadata.salt, 0);
+        assert!(metadata.bucket_names.is_empty());
+        assert!(metadata.bucket_sources.is_empty());
+        assert!(metadata.bucket_minimizer_counts.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_v3_format_roundtrip() -> Result<()> {
+        // Verify V3 format can save and load correctly
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+        let mut index = Index::new(50, 0x1234);
+
+        // Create realistic index
+        index.buckets.insert(1, vec![100, 200]);
+        index.buckets.insert(2, vec![300, 400, 500]);
+        index.bucket_names.insert(1, "BucketA".into());
+        index.bucket_names.insert(2, "BucketB".into());
+        index.bucket_sources.insert(1, vec!["file1.fa::seq1".into()]);
+        index.bucket_sources.insert(2, vec!["file2.fa::seq1".into(), "file2.fa::seq2".into()]);
+
+        index.save(&path)?;
+        let loaded = Index::load(&path)?;
+
+        // Verify complete roundtrip
+        assert_eq!(loaded.w, 50);
+        assert_eq!(loaded.salt, 0x1234);
+        assert_eq!(loaded.buckets.len(), 2);
+        assert_eq!(loaded.buckets[&1], vec![100, 200]);
+        assert_eq!(loaded.buckets[&2], vec![300, 400, 500]);
+        assert_eq!(loaded.bucket_names[&1], "BucketA");
+        assert_eq!(loaded.bucket_sources[&1][0], "file1.fa::seq1");
+        assert_eq!(loaded.bucket_sources[&2].len(), 2);
 
         Ok(())
     }
