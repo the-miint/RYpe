@@ -10,10 +10,16 @@ use anyhow::{Context, Result, anyhow};
 use rype::{Index, MinimizerWorkspace, QueryRecord, classify_batch, aggregate_batch};
 use rype::config::{parse_config, validate_config, resolve_path};
 
+mod logging;
+
 #[derive(Parser)]
 #[command(name = "rype")]
 #[command(about = "High-performance Read Partitioning Engine (RY-Space, K=64)", long_about = None)]
 struct Cli {
+    /// Enable verbose progress output with timestamps
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -123,9 +129,11 @@ fn add_reference_file_to_index(
     separate_buckets: bool,
     next_id: &mut u32
 ) -> Result<()> {
+    log::info!("Adding reference: {}", path.display());
     let mut reader = parse_fastx_file(path).context("Failed to open reference file")?;
     let mut ws = MinimizerWorkspace::new();
     let filename = path.canonicalize().unwrap().to_string_lossy().to_string();
+    let mut record_count = 0;
 
     while let Some(record) = reader.next() {
         let rec = record.context("Invalid record")?;
@@ -148,7 +156,14 @@ fn add_reference_file_to_index(
 
         let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
         index.add_record(bucket_id, &source_label, &seq, &mut ws);
+
+        record_count += 1;
+        if record_count % 100_000 == 0 {
+            log::info!("Processed {} records from {}", record_count, path.display());
+        }
     }
+
+    log::info!("Finalized bucket processing for {}: {} total records", path.display(), record_count);
     
     // Finalize relevant buckets
     if separate_buckets {
@@ -244,19 +259,21 @@ impl IoHandler {
 fn main() -> Result<()> {
     let args = Cli::parse();
 
+    // Initialize logging based on verbose flag
+    logging::init_logger(args.verbose);
+
     match args.command {
         Commands::Index { output, reference, window, salt, separate_buckets } => {
             let mut index = Index::new(window, salt);
             let mut next_id = 1;
 
             for ref_file in reference {
-                println!("Adding reference: {:?}", ref_file);
                 add_reference_file_to_index(&mut index, &ref_file, separate_buckets, &mut next_id)?;
             }
 
-            println!("Saving index to {:?}...", output);
+            log::info!("Saving index to {:?}...", output);
             index.save(&output)?;
-            println!("Done.");
+            log::info!("Done.");
         }
         
         Commands::IndexStats { index } => {
@@ -312,7 +329,7 @@ fn main() -> Result<()> {
         Commands::IndexBucketAdd { index, reference } => {
             let mut idx = Index::load(&index)?;
             let next_id = idx.next_id()?;
-            println!("Adding {:?} as new bucket ID {}", reference, next_id);
+            log::info!("Adding {:?} as new bucket ID {}", reference, next_id);
 
             // Add all records from the file to a single new bucket
             let mut reader = parse_fastx_file(&reference).context("Failed to open reference file")?;
@@ -333,30 +350,30 @@ fn main() -> Result<()> {
             // Finalize the new bucket
             idx.finalize_bucket(next_id);
             idx.save(&index)?;
-            println!("Done. Added {} minimizers to bucket {}.",
+            log::info!("Done. Added {} minimizers to bucket {}.",
                      idx.buckets.get(&next_id).map(|v| v.len()).unwrap_or(0), next_id);
         }
 
         Commands::IndexBucketMerge { index, src, dest } => {
             let mut idx = Index::load(&index)?;
-            println!("Merging Bucket {} -> Bucket {}...", src, dest);
+            log::info!("Merging Bucket {} -> Bucket {}...", src, dest);
             idx.merge_buckets(src, dest)?;
             idx.save(&index)?;
-            println!("Done.");
+            log::info!("Done.");
         }
 
         Commands::IndexMerge { output, inputs } => {
-            // Logic: Load first index, then merge others into it. 
+            // Logic: Load first index, then merge others into it.
             // Warning: Salt/W must match.
             if inputs.is_empty() { return Err(anyhow!("No input indexes provided")); }
-            
-            println!("Loading base index: {:?}", inputs[0]);
+
+            log::info!("Loading base index: {:?}", inputs[0]);
             let mut base_idx = Index::load(&inputs[0])?;
 
             for path in &inputs[1..] {
-                println!("Merging index: {:?}", path);
+                log::info!("Merging index: {:?}", path);
                 let other_idx = Index::load(path)?;
-                
+
                 if other_idx.w != base_idx.w || other_idx.salt != base_idx.salt {
                     return Err(anyhow!("Index parameters (w/salt) mismatch in {:?}", path));
                 }
@@ -366,7 +383,7 @@ fn main() -> Result<()> {
                 for (old_id, vec) in other_idx.buckets {
                     let new_id = base_idx.next_id()?;
                     base_idx.buckets.insert(new_id, vec);
-                    
+
                     if let Some(name) = other_idx.bucket_names.get(&old_id) {
                         base_idx.bucket_names.insert(new_id, name.clone());
                     }
@@ -376,18 +393,29 @@ fn main() -> Result<()> {
                 }
             }
             base_idx.save(&output)?;
-            println!("Merged index saved to {:?}", output);
+            log::info!("Merged index saved to {:?}", output);
         }
 
-        Commands::Classify { index, r1, r2, threshold, batch_size, output } | 
+        Commands::Classify { index, r1, r2, threshold, batch_size, output } |
         Commands::BatchClassify { index, r1, r2, threshold, batch_size, output } => {
+            log::info!("Loading index from {:?}", index);
             let engine = Index::load(&index)?;
+            log::info!("Index loaded: {} buckets", engine.buckets.len());
+
             let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
             io.write(b"read_id\tbucket_id\tscore\n".to_vec())?;
-            
+
+            let mut total_reads = 0;
+            let mut batch_num = 0;
+
+            log::info!("Starting classification (batch_size={})", batch_size);
+
             // 1. Get OWNED records from disk
             while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
-                
+                batch_num += 1;
+                let batch_read_count = owned_records.len();
+                total_reads += batch_read_count;
+
                 // 2. Create REFERENCES for the library
                 let batch_refs: Vec<QueryRecord> = owned_records.iter()
                     .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
@@ -395,7 +423,7 @@ fn main() -> Result<()> {
 
                 // 3. Process
                 let results = classify_batch(&engine, &batch_refs, threshold);
-                
+
                 // 4. Write Output
                 let mut chunk_out = Vec::with_capacity(1024);
                 for res in results {
@@ -403,16 +431,31 @@ fn main() -> Result<()> {
                     writeln!(chunk_out, "{}\t{}\t{:.4}", header, res.bucket_id, res.score).unwrap();
                 }
                 io.write(chunk_out)?;
+
+                log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
             }
+
+            log::info!("Classification complete: {} reads processed", total_reads);
             io.finish()?;
         }
 
         Commands::AggregateClassify { index, r1, r2, threshold, batch_size, output } => {
+            log::info!("Loading index from {:?}", index);
             let engine = Index::load(&index)?;
+            log::info!("Index loaded: {} buckets", engine.buckets.len());
+
             let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
             io.write(b"query_name\tbucket_id\tscore\n".to_vec())?;
 
+            let mut total_reads = 0;
+            let mut batch_num = 0;
+
+            log::info!("Starting aggregate classification (batch_size={})", batch_size);
+
             while let Some((owned_records, _)) = io.next_batch_records(batch_size)? {
+                batch_num += 1;
+                let batch_read_count = owned_records.len();
+                total_reads += batch_read_count;
 
                 let batch_refs: Vec<QueryRecord> = owned_records.iter()
                     .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
@@ -425,7 +468,11 @@ fn main() -> Result<()> {
                     writeln!(chunk_out, "global\t{}\t{:.4}", res.bucket_id, res.score).unwrap();
                 }
                 io.write(chunk_out)?;
+
+                log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
             }
+
+            log::info!("Aggregate classification complete: {} reads processed", total_reads);
             io.finish()?;
         }
 
@@ -438,30 +485,31 @@ fn main() -> Result<()> {
 }
 
 fn build_index_from_config(config_path: &Path) -> Result<()> {
-    println!("Building index from config: {}", config_path.display());
+    log::info!("Building index from config: {}", config_path.display());
 
     // 1. Parse and validate config
     let cfg = parse_config(config_path)?;
     let config_dir = config_path.parent()
         .ok_or_else(|| anyhow!("Invalid config path"))?;
 
-    println!("Validating file paths...");
+    log::info!("Validating file paths...");
     validate_config(&cfg, config_dir)?;
-    println!("Validation successful.");
+    log::info!("Validation successful.");
 
     // 2. Sort bucket names for deterministic ordering
     let mut bucket_names: Vec<_> = cfg.buckets.keys().cloned().collect();
     bucket_names.sort();
 
-    println!("Building {} buckets in parallel...", bucket_names.len());
+    log::info!("Building {} buckets in parallel...", bucket_names.len());
     for name in &bucket_names {
         let file_count = cfg.buckets[name].files.len();
-        println!("  - {}: {} file{}", name, file_count, if file_count == 1 { "" } else { "s" });
+        log::info!("  - {}: {} file{}", name, file_count, if file_count == 1 { "" } else { "s" });
     }
 
     // 3. Build indices in parallel (one per bucket)
     let bucket_indices: Vec<_> = bucket_names.par_iter()
         .map(|bucket_name| {
+            log::info!("Processing bucket '{}'...", bucket_name);
             let mut idx = Index::new(cfg.index.window, cfg.index.salt);
             let mut ws = MinimizerWorkspace::new();
 
@@ -487,11 +535,13 @@ fn build_index_from_config(config_path: &Path) -> Result<()> {
             }
 
             idx.finalize_bucket(1);
+            let minimizer_count = idx.buckets.get(&1).map(|v| v.len()).unwrap_or(0);
+            log::info!("Completed bucket '{}': {} minimizers", bucket_name, minimizer_count);
             Ok::<_, anyhow::Error>((bucket_name.clone(), idx))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    println!("Processing complete. Merging buckets...");
+    log::info!("Processing complete. Merging buckets...");
 
     // 4. Merge all bucket indices into final index
     let mut final_index = Index::new(cfg.index.window, cfg.index.salt);
@@ -509,14 +559,14 @@ fn build_index_from_config(config_path: &Path) -> Result<()> {
     }
 
     // 5. Save final index
-    println!("Saving index to {}...", cfg.index.output.display());
+    log::info!("Saving index to {}...", cfg.index.output.display());
     final_index.save(&cfg.index.output)?;
 
-    println!("Done! Index saved successfully.");
-    println!("\nFinal statistics:");
-    println!("  Buckets: {}", final_index.buckets.len());
+    log::info!("Done! Index saved successfully.");
+    log::info!("\nFinal statistics:");
+    log::info!("  Buckets: {}", final_index.buckets.len());
     let total_minimizers: usize = final_index.buckets.values().map(|v| v.len()).sum();
-    println!("  Total minimizers: {}", total_minimizers);
+    log::info!("  Total minimizers: {}", total_minimizers);
 
     Ok(())
 }

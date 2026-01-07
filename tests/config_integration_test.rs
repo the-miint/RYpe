@@ -1,10 +1,7 @@
 use anyhow::Result;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
 use tempfile::tempdir;
-
-use rype::Index;
 
 #[test]
 fn test_config_based_index_building() -> Result<()> {
@@ -51,7 +48,6 @@ files = ["ref3.fa"]
 
     // Run the index-from-config command via the CLI module
     // Since we can't easily call main(), we'll test the config module directly
-    use rype::Index as RypeIndex;
 
     // Parse config
     let cfg = rype::config::parse_config(&config_path)?;
