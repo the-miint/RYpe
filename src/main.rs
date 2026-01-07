@@ -35,6 +35,12 @@ enum Commands {
         #[arg(short, long)]
         index: PathBuf,
     },
+    IndexBucketSources {
+        #[arg(short, long)]
+        index: PathBuf,
+        #[arg(short, long, required = true)]
+        bucket: u32,
+    },
     IndexBucketAdd {
         #[arg(short, long)]
         index: PathBuf,
@@ -263,6 +269,14 @@ fn main() -> Result<()> {
                 let count = idx.buckets[id].len();
                 let sources = idx.bucket_sources.get(id).map(|v| v.len()).unwrap_or(0);
                 println!("  Bucket {}: '{}' ({} minimizers, {} sources)", id, name, count, sources);
+            }
+        }
+
+        Commands::IndexBucketSources { index, bucket } => {
+            let idx = Index::load(&index)?;
+            let sources = idx.bucket_sources.get(&bucket).unwrap();
+            for source in sources {
+                println!("{}", source);
             }
         }
 
