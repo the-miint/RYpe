@@ -4,6 +4,7 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::collections::HashSet;
 use anyhow::{Context, Result, anyhow};
 
 use rype::{Index, MinimizerWorkspace, QueryRecord, classify_batch, aggregate_batch};
@@ -35,11 +36,15 @@ enum Commands {
         #[arg(short, long)]
         index: PathBuf,
     },
-    IndexBucketSources {
+    IndexBucketSourceDetail {
         #[arg(short, long)]
         index: PathBuf,
         #[arg(short, long, required = true)]
         bucket: u32,
+        #[arg(long)]
+        paths: bool,
+        #[arg(long)]
+        ids: bool,
     },
     IndexBucketAdd {
         #[arg(short, long)]
@@ -120,7 +125,7 @@ fn add_reference_file_to_index(
 ) -> Result<()> {
     let mut reader = parse_fastx_file(path).context("Failed to open reference file")?;
     let mut ws = MinimizerWorkspace::new();
-    let filename = path.file_name().unwrap().to_string_lossy().to_string();
+    let filename = path.canonicalize().unwrap().to_string_lossy().to_string();
 
     while let Some(record) = reader.next() {
         let rec = record.context("Invalid record")?;
@@ -141,7 +146,7 @@ fn add_reference_file_to_index(
              index.bucket_names.entry(1).or_insert(filename.clone());
         }
 
-        let source_label = format!("{}::{}", filename, name);
+        let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
         index.add_record(bucket_id, &source_label, &seq, &mut ws);
     }
     
@@ -272,11 +277,35 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::IndexBucketSources { index, bucket } => {
+        Commands::IndexBucketSourceDetail { index, bucket, paths, ids } => {
             let idx = Index::load(&index)?;
             let sources = idx.bucket_sources.get(&bucket).unwrap();
-            for source in sources {
-                println!("{}", source);
+
+            if paths && ids {
+                return Err(anyhow!("Cannot have --paths and --ids"));
+            }
+            
+            if paths {
+                let mut all_paths: HashSet<String> = HashSet::new();
+                for source in sources {
+                    let parts: Vec<_> = source.split(Index::BUCKET_SOURCE_DELIM).collect();
+                    let path = parts.first().unwrap().to_string();
+                    all_paths.insert(path.clone());
+                }
+
+                for path in all_paths {
+                    println!("{}", path);
+                }
+            } else if ids {
+                let mut sorted_ids: Vec<_> = idx.buckets.keys().collect();
+                sorted_ids.sort();
+                for id in sorted_ids {
+                    println!("{}", id);
+                }
+            } else {
+                for source in sources {
+                    println!("{}", source);
+                }
             }
         }
 
@@ -288,7 +317,7 @@ fn main() -> Result<()> {
             // Add all records from the file to a single new bucket
             let mut reader = parse_fastx_file(&reference).context("Failed to open reference file")?;
             let mut ws = MinimizerWorkspace::new();
-            let filename = reference.file_name().unwrap().to_string_lossy().to_string();
+            let filename = reference.canonicalize().unwrap().to_string_lossy().to_string();
 
             // Set the bucket name to the filename for consistency with 'index' command
             idx.bucket_names.insert(next_id, filename.clone());
@@ -297,7 +326,7 @@ fn main() -> Result<()> {
                 let rec = record.context("Invalid record")?;
                 let seq = rec.seq();
                 let name = String::from_utf8_lossy(rec.id()).to_string();
-                let source_label = format!("{}::{}", filename, name);
+                let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
                 idx.add_record(next_id, &source_label, &seq, &mut ws);
             }
 
@@ -443,8 +472,8 @@ fn build_index_from_config(config_path: &Path) -> Result<()> {
                     .context(format!("Failed to open file {} for bucket '{}'",
                                    abs_path.display(), bucket_name))?;
 
-                let filename = file_path.file_name()
-                    .unwrap_or(file_path.as_ref())
+                let filename = file_path.canonicalize()
+                    .unwrap()
                     .to_string_lossy()
                     .to_string();
 
@@ -452,7 +481,7 @@ fn build_index_from_config(config_path: &Path) -> Result<()> {
                     let rec = record.context(format!("Invalid record in file {} (bucket '{}')",
                                                     abs_path.display(), bucket_name))?;
                     let seq_name = String::from_utf8_lossy(rec.id()).to_string();
-                    let source_label = format!("{}::{}", filename, seq_name);
+                    let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, seq_name);
                     idx.add_record(1, &source_label, &rec.seq(), &mut ws);
                 }
             }

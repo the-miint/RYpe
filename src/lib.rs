@@ -226,6 +226,8 @@ pub struct Index {
 }
 
 impl Index {
+    pub const BUCKET_SOURCE_DELIM: &'static str = "::";
+
     pub fn new(w: usize, salt: u64) -> Self {
         Index {
             w,
