@@ -12,6 +12,19 @@ use rype::config::{parse_config, validate_config, resolve_path};
 
 mod logging;
 
+// --- HELPER FUNCTIONS ---
+
+/// Sanitize bucket names by replacing nonprintable characters with "_"
+fn sanitize_bucket_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_control() || !c.is_ascii_graphic() && !c.is_whitespace() {
+            '_'
+        } else {
+            c
+        })
+        .collect()
+}
+
 #[derive(Parser)]
 #[command(name = "rype")]
 #[command(about = "High-performance Read Partitioning Engine (RY-Space, K=64)", long_about = None)]
@@ -121,8 +134,6 @@ enum Commands {
     },
 }
 
-// --- HELPER FUNCTIONS ---
-
 fn add_reference_file_to_index(
     index: &mut Index,
     path: &Path,
@@ -143,7 +154,7 @@ fn add_reference_file_to_index(
         let bucket_id = if separate_buckets {
             let id = *next_id;
             *next_id += 1;
-            index.bucket_names.insert(id, name.clone());
+            index.bucket_names.insert(id, sanitize_bucket_name(&name));
             id
         } else {
             1
@@ -151,7 +162,7 @@ fn add_reference_file_to_index(
 
         if !separate_buckets {
              // Just use bucket 1 and label it with the filename if not set
-             index.bucket_names.entry(1).or_insert(filename.clone());
+             index.bucket_names.entry(1).or_insert_with(|| sanitize_bucket_name(&filename));
         }
 
         let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
@@ -337,7 +348,7 @@ fn main() -> Result<()> {
             let filename = reference.canonicalize().unwrap().to_string_lossy().to_string();
 
             // Set the bucket name to the filename for consistency with 'index' command
-            idx.bucket_names.insert(next_id, filename.clone());
+            idx.bucket_names.insert(next_id, sanitize_bucket_name(&filename));
 
             while let Some(record) = reader.next() {
                 let rec = record.context("Invalid record")?;
@@ -385,7 +396,7 @@ fn main() -> Result<()> {
                     base_idx.buckets.insert(new_id, vec);
 
                     if let Some(name) = other_idx.bucket_names.get(&old_id) {
-                        base_idx.bucket_names.insert(new_id, name.clone());
+                        base_idx.bucket_names.insert(new_id, sanitize_bucket_name(name));
                     }
                     if let Some(srcs) = other_idx.bucket_sources.get(&old_id) {
                         base_idx.bucket_sources.insert(new_id, srcs.clone());
@@ -403,7 +414,7 @@ fn main() -> Result<()> {
             log::info!("Index loaded: {} buckets", engine.buckets.len());
 
             let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
-            io.write(b"read_id\tbucket_id\tscore\n".to_vec())?;
+            io.write(b"read_id\tbucket_name\tscore\n".to_vec())?;
 
             let mut total_reads = 0;
             let mut batch_num = 0;
@@ -428,7 +439,10 @@ fn main() -> Result<()> {
                 let mut chunk_out = Vec::with_capacity(1024);
                 for res in results {
                     let header = &headers[res.query_id as usize];
-                    writeln!(chunk_out, "{}\t{}\t{:.4}", header, res.bucket_id, res.score).unwrap();
+                    let bucket_name = engine.bucket_names.get(&res.bucket_id)
+                        .map(|s| s.as_str())
+                        .unwrap_or("unknown");
+                    writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
                 }
                 io.write(chunk_out)?;
 
@@ -445,7 +459,7 @@ fn main() -> Result<()> {
             log::info!("Index loaded: {} buckets", engine.buckets.len());
 
             let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
-            io.write(b"query_name\tbucket_id\tscore\n".to_vec())?;
+            io.write(b"query_name\tbucket_name\tscore\n".to_vec())?;
 
             let mut total_reads = 0;
             let mut batch_num = 0;
@@ -465,7 +479,10 @@ fn main() -> Result<()> {
 
                 let mut chunk_out = Vec::with_capacity(1024);
                 for res in results {
-                    writeln!(chunk_out, "global\t{}\t{:.4}", res.bucket_id, res.score).unwrap();
+                    let bucket_name = engine.bucket_names.get(&res.bucket_id)
+                        .map(|s| s.as_str())
+                        .unwrap_or("unknown");
+                    writeln!(chunk_out, "global\t{}\t{:.4}", bucket_name, res.score).unwrap();
                 }
                 io.write(chunk_out)?;
 
@@ -547,7 +564,7 @@ fn build_index_from_config(config_path: &Path) -> Result<()> {
     let mut final_index = Index::new(cfg.index.window, cfg.index.salt);
     for (bucket_id, (bucket_name, bucket_idx)) in bucket_indices.into_iter().enumerate() {
         let new_id = (bucket_id + 1) as u32;
-        final_index.bucket_names.insert(new_id, bucket_name);
+        final_index.bucket_names.insert(new_id, sanitize_bucket_name(&bucket_name));
 
         // Transfer bucket data
         if let Some(minimizers) = bucket_idx.buckets.get(&1) {
