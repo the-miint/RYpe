@@ -39,7 +39,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Index {
+    /// Index operations: create, modify, and inspect indices
+    #[command(subcommand)]
+    Index(IndexCommands),
+
+    /// Classification operations: classify reads against an index
+    #[command(subcommand)]
+    Classify(ClassifyCommands),
+}
+
+#[derive(Subcommand)]
+enum IndexCommands {
+    /// Create a new index from reference sequences
+    Create {
         #[arg(short, long)]
         output: PathBuf,
         #[arg(short, long, required = true)]
@@ -53,11 +65,15 @@ enum Commands {
         #[arg(long)]
         separate_buckets: bool,
     },
-    IndexStats {
+
+    /// Show index statistics
+    Stats {
         #[arg(short, long)]
         index: PathBuf,
     },
-    IndexBucketSourceDetail {
+
+    /// Show source details for a specific bucket
+    BucketSourceDetail {
         #[arg(short, long)]
         index: PathBuf,
         #[arg(short, long, required = true)]
@@ -67,13 +83,17 @@ enum Commands {
         #[arg(long)]
         ids: bool,
     },
-    IndexBucketAdd {
+
+    /// Add sequences to an existing index as a new bucket
+    BucketAdd {
         #[arg(short, long)]
         index: PathBuf,
         #[arg(short, long)]
         reference: PathBuf,
     },
-    IndexBucketMerge {
+
+    /// Merge two buckets within an index
+    BucketMerge {
         #[arg(short, long)]
         index: PathBuf,
         #[arg(long)]
@@ -81,13 +101,26 @@ enum Commands {
         #[arg(long)]
         dest: u32,
     },
-    IndexMerge {
+
+    /// Merge multiple indices into one
+    Merge {
         #[arg(short, long)]
         output: PathBuf,
         #[arg(short, long, required = true)]
         inputs: Vec<PathBuf>,
     },
-    Classify {
+
+    /// Build index from a TOML configuration file
+    FromConfig {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClassifyCommands {
+    /// Classify reads against an index (per-read output)
+    Run {
         #[arg(short, long)]
         index: PathBuf,
         #[arg(short = '1', long)]
@@ -101,7 +134,9 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    BatchClassify {
+
+    /// Batch classify reads (alias for 'run')
+    Batch {
         #[arg(short, long)]
         index: PathBuf,
         #[arg(short = '1', long)]
@@ -115,8 +150,10 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    #[command(alias = "aggregate")]
-    AggregateClassify {
+
+    /// Aggregate classification (higher sensitivity, aggregates paired-end reads)
+    #[command(alias = "agg")]
+    Aggregate {
         #[arg(short, long)]
         index: PathBuf,
         #[arg(short = '1', long)]
@@ -129,10 +166,6 @@ enum Commands {
         batch_size: usize,
         #[arg(short, long)]
         output: Option<PathBuf>,
-    },
-    IndexFromConfig {
-        #[arg(short, long)]
-        config: PathBuf,
     },
 }
 
@@ -276,235 +309,239 @@ fn main() -> Result<()> {
     logging::init_logger(args.verbose);
 
     match args.command {
-        Commands::Index { output, reference, kmer_size, window, salt, separate_buckets } => {
-            if !matches!(kmer_size, 16 | 32 | 64) {
-                return Err(anyhow!("K must be 16, 32, or 64 (got {})", kmer_size));
-            }
-            let mut index = Index::new(kmer_size, window, salt)?;
-            let mut next_id = 1;
+        Commands::Index(index_cmd) => match index_cmd {
+            IndexCommands::Create { output, reference, kmer_size, window, salt, separate_buckets } => {
+                if !matches!(kmer_size, 16 | 32 | 64) {
+                    return Err(anyhow!("K must be 16, 32, or 64 (got {})", kmer_size));
+                }
+                let mut index = Index::new(kmer_size, window, salt)?;
+                let mut next_id = 1;
 
-            for ref_file in reference {
-                add_reference_file_to_index(&mut index, &ref_file, separate_buckets, &mut next_id)?;
-            }
-
-            log::info!("Saving index to {:?}...", output);
-            index.save(&output)?;
-            log::info!("Done.");
-        }
-        
-        Commands::IndexStats { index } => {
-            let metadata = Index::load_metadata(&index)?;
-            println!("Index Stats for {:?}", index);
-            println!("  K: {}", metadata.k);
-            println!("  Window (w): {}", metadata.w);
-            println!("  Salt: {:x}", metadata.salt);
-            println!("  Buckets: {}", metadata.bucket_names.len());
-            println!("------------------------------------------------");
-            let mut sorted_ids: Vec<_> = metadata.bucket_names.keys().collect();
-            sorted_ids.sort();
-            for id in sorted_ids {
-                let name = metadata.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
-                let count = metadata.bucket_minimizer_counts.get(id).copied().unwrap_or(0);
-                let sources = metadata.bucket_sources.get(id).map(|v| v.len()).unwrap_or(0);
-                println!("  Bucket {}: '{}' ({} minimizers, {} sources)", id, name, count, sources);
-            }
-        }
-
-        Commands::IndexBucketSourceDetail { index, bucket, paths, ids } => {
-            let metadata = Index::load_metadata(&index)?;
-            let sources = metadata.bucket_sources.get(&bucket).unwrap();
-
-            if paths && ids {
-                return Err(anyhow!("Cannot have --paths and --ids"));
-            }
-
-            if paths {
-                let mut all_paths: HashSet<String> = HashSet::new();
-                for source in sources {
-                    let parts: Vec<_> = source.split(Index::BUCKET_SOURCE_DELIM).collect();
-                    let path = parts.first().unwrap().to_string();
-                    all_paths.insert(path.clone());
+                for ref_file in reference {
+                    add_reference_file_to_index(&mut index, &ref_file, separate_buckets, &mut next_id)?;
                 }
 
-                for path in all_paths {
-                    println!("{}", path);
-                }
-            } else if ids {
+                log::info!("Saving index to {:?}...", output);
+                index.save(&output)?;
+                log::info!("Done.");
+            }
+
+            IndexCommands::Stats { index } => {
+                let metadata = Index::load_metadata(&index)?;
+                println!("Index Stats for {:?}", index);
+                println!("  K: {}", metadata.k);
+                println!("  Window (w): {}", metadata.w);
+                println!("  Salt: {:x}", metadata.salt);
+                println!("  Buckets: {}", metadata.bucket_names.len());
+                println!("------------------------------------------------");
                 let mut sorted_ids: Vec<_> = metadata.bucket_names.keys().collect();
                 sorted_ids.sort();
                 for id in sorted_ids {
-                    println!("{}", id);
-                }
-            } else {
-                for source in sources {
-                    println!("{}", source);
+                    let name = metadata.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
+                    let count = metadata.bucket_minimizer_counts.get(id).copied().unwrap_or(0);
+                    let sources = metadata.bucket_sources.get(id).map(|v| v.len()).unwrap_or(0);
+                    println!("  Bucket {}: '{}' ({} minimizers, {} sources)", id, name, count, sources);
                 }
             }
-        }
 
-        Commands::IndexBucketAdd { index, reference } => {
-            let mut idx = Index::load(&index)?;
-            let next_id = idx.next_id()?;
-            log::info!("Adding {:?} as new bucket ID {}", reference, next_id);
+            IndexCommands::BucketSourceDetail { index, bucket, paths, ids } => {
+                let metadata = Index::load_metadata(&index)?;
+                let sources = metadata.bucket_sources.get(&bucket).unwrap();
 
-            // Add all records from the file to a single new bucket
-            let mut reader = parse_fastx_file(&reference).context("Failed to open reference file")?;
-            let mut ws = MinimizerWorkspace::new();
-            let filename = reference.canonicalize().unwrap().to_string_lossy().to_string();
-
-            // Set the bucket name to the filename for consistency with 'index' command
-            idx.bucket_names.insert(next_id, sanitize_bucket_name(&filename));
-
-            while let Some(record) = reader.next() {
-                let rec = record.context("Invalid record")?;
-                let seq = rec.seq();
-                let name = String::from_utf8_lossy(rec.id()).to_string();
-                let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
-                idx.add_record(next_id, &source_label, &seq, &mut ws);
-            }
-
-            // Finalize the new bucket
-            idx.finalize_bucket(next_id);
-            idx.save(&index)?;
-            log::info!("Done. Added {} minimizers to bucket {}.",
-                     idx.buckets.get(&next_id).map(|v| v.len()).unwrap_or(0), next_id);
-        }
-
-        Commands::IndexBucketMerge { index, src, dest } => {
-            let mut idx = Index::load(&index)?;
-            log::info!("Merging Bucket {} -> Bucket {}...", src, dest);
-            idx.merge_buckets(src, dest)?;
-            idx.save(&index)?;
-            log::info!("Done.");
-        }
-
-        Commands::IndexMerge { output, inputs } => {
-            // Logic: Load first index, then merge others into it.
-            // Warning: Salt/W must match.
-            if inputs.is_empty() { return Err(anyhow!("No input indexes provided")); }
-
-            log::info!("Loading base index: {:?}", inputs[0]);
-            let mut base_idx = Index::load(&inputs[0])?;
-
-            for path in &inputs[1..] {
-                log::info!("Merging index: {:?}", path);
-                let other_idx = Index::load(path)?;
-
-                if other_idx.k != base_idx.k || other_idx.w != base_idx.w || other_idx.salt != base_idx.salt {
-                    return Err(anyhow!(
-                        "Index parameters mismatch: expected K={}, W={}, Salt=0x{:x}, got K={}, W={}, Salt=0x{:x}",
-                        base_idx.k, base_idx.w, base_idx.salt,
-                        other_idx.k, other_idx.w, other_idx.salt
-                    ));
+                if paths && ids {
+                    return Err(anyhow!("Cannot have --paths and --ids"));
                 }
 
-                // Naive merge strategy: Re-map IDs of 'other' to not collide, then insert
-                // Simple version: just append buckets with new IDs
-                for (old_id, vec) in other_idx.buckets {
-                    let new_id = base_idx.next_id()?;
-                    base_idx.buckets.insert(new_id, vec);
-
-                    if let Some(name) = other_idx.bucket_names.get(&old_id) {
-                        base_idx.bucket_names.insert(new_id, sanitize_bucket_name(name));
+                if paths {
+                    let mut all_paths: HashSet<String> = HashSet::new();
+                    for source in sources {
+                        let parts: Vec<_> = source.split(Index::BUCKET_SOURCE_DELIM).collect();
+                        let path = parts.first().unwrap().to_string();
+                        all_paths.insert(path.clone());
                     }
-                    if let Some(srcs) = other_idx.bucket_sources.get(&old_id) {
-                        base_idx.bucket_sources.insert(new_id, srcs.clone());
+
+                    for path in all_paths {
+                        println!("{}", path);
+                    }
+                } else if ids {
+                    let mut sorted_ids: Vec<_> = metadata.bucket_names.keys().collect();
+                    sorted_ids.sort();
+                    for id in sorted_ids {
+                        println!("{}", id);
+                    }
+                } else {
+                    for source in sources {
+                        println!("{}", source);
                     }
                 }
             }
-            base_idx.save(&output)?;
-            log::info!("Merged index saved to {:?}", output);
-        }
 
-        Commands::Classify { index, r1, r2, threshold, batch_size, output } |
-        Commands::BatchClassify { index, r1, r2, threshold, batch_size, output } => {
-            log::info!("Loading index from {:?}", index);
-            let engine = Index::load(&index)?;
-            log::info!("Index loaded: {} buckets", engine.buckets.len());
+            IndexCommands::BucketAdd { index, reference } => {
+                let mut idx = Index::load(&index)?;
+                let next_id = idx.next_id()?;
+                log::info!("Adding {:?} as new bucket ID {}", reference, next_id);
 
-            let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
-            io.write(b"read_id\tbucket_name\tscore\n".to_vec())?;
+                // Add all records from the file to a single new bucket
+                let mut reader = parse_fastx_file(&reference).context("Failed to open reference file")?;
+                let mut ws = MinimizerWorkspace::new();
+                let filename = reference.canonicalize().unwrap().to_string_lossy().to_string();
 
-            let mut total_reads = 0;
-            let mut batch_num = 0;
+                // Set the bucket name to the filename for consistency with 'index' command
+                idx.bucket_names.insert(next_id, sanitize_bucket_name(&filename));
 
-            log::info!("Starting classification (batch_size={})", batch_size);
-
-            // 1. Get OWNED records from disk
-            while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
-                batch_num += 1;
-                let batch_read_count = owned_records.len();
-                total_reads += batch_read_count;
-
-                // 2. Create REFERENCES for the library
-                let batch_refs: Vec<QueryRecord> = owned_records.iter()
-                    .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
-                    .collect();
-
-                // 3. Process
-                let results = classify_batch(&engine, &batch_refs, threshold);
-
-                // 4. Write Output
-                let mut chunk_out = Vec::with_capacity(1024);
-                for res in results {
-                    let header = &headers[res.query_id as usize];
-                    let bucket_name = engine.bucket_names.get(&res.bucket_id)
-                        .map(|s| s.as_str())
-                        .unwrap_or("unknown");
-                    writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
+                while let Some(record) = reader.next() {
+                    let rec = record.context("Invalid record")?;
+                    let seq = rec.seq();
+                    let name = String::from_utf8_lossy(rec.id()).to_string();
+                    let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
+                    idx.add_record(next_id, &source_label, &seq, &mut ws);
                 }
-                io.write(chunk_out)?;
 
-                log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+                // Finalize the new bucket
+                idx.finalize_bucket(next_id);
+                idx.save(&index)?;
+                log::info!("Done. Added {} minimizers to bucket {}.",
+                         idx.buckets.get(&next_id).map(|v| v.len()).unwrap_or(0), next_id);
             }
 
-            log::info!("Classification complete: {} reads processed", total_reads);
-            io.finish()?;
-        }
-
-        Commands::AggregateClassify { index, r1, r2, threshold, batch_size, output } => {
-            log::info!("Loading index from {:?}", index);
-            let engine = Index::load(&index)?;
-            log::info!("Index loaded: {} buckets", engine.buckets.len());
-
-            let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
-            io.write(b"query_name\tbucket_name\tscore\n".to_vec())?;
-
-            let mut total_reads = 0;
-            let mut batch_num = 0;
-
-            log::info!("Starting aggregate classification (batch_size={})", batch_size);
-
-            while let Some((owned_records, _)) = io.next_batch_records(batch_size)? {
-                batch_num += 1;
-                let batch_read_count = owned_records.len();
-                total_reads += batch_read_count;
-
-                let batch_refs: Vec<QueryRecord> = owned_records.iter()
-                    .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
-                    .collect();
-
-                let results = aggregate_batch(&engine, &batch_refs, threshold);
-
-                let mut chunk_out = Vec::with_capacity(1024);
-                for res in results {
-                    let bucket_name = engine.bucket_names.get(&res.bucket_id)
-                        .map(|s| s.as_str())
-                        .unwrap_or("unknown");
-                    writeln!(chunk_out, "global\t{}\t{:.4}", bucket_name, res.score).unwrap();
-                }
-                io.write(chunk_out)?;
-
-                log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+            IndexCommands::BucketMerge { index, src, dest } => {
+                let mut idx = Index::load(&index)?;
+                log::info!("Merging Bucket {} -> Bucket {}...", src, dest);
+                idx.merge_buckets(src, dest)?;
+                idx.save(&index)?;
+                log::info!("Done.");
             }
 
-            log::info!("Aggregate classification complete: {} reads processed", total_reads);
-            io.finish()?;
-        }
+            IndexCommands::Merge { output, inputs } => {
+                // Logic: Load first index, then merge others into it.
+                // Warning: Salt/W must match.
+                if inputs.is_empty() { return Err(anyhow!("No input indexes provided")); }
 
-        Commands::IndexFromConfig { config } => {
-            build_index_from_config(&config)?;
-        }
+                log::info!("Loading base index: {:?}", inputs[0]);
+                let mut base_idx = Index::load(&inputs[0])?;
+
+                for path in &inputs[1..] {
+                    log::info!("Merging index: {:?}", path);
+                    let other_idx = Index::load(path)?;
+
+                    if other_idx.k != base_idx.k || other_idx.w != base_idx.w || other_idx.salt != base_idx.salt {
+                        return Err(anyhow!(
+                            "Index parameters mismatch: expected K={}, W={}, Salt=0x{:x}, got K={}, W={}, Salt=0x{:x}",
+                            base_idx.k, base_idx.w, base_idx.salt,
+                            other_idx.k, other_idx.w, other_idx.salt
+                        ));
+                    }
+
+                    // Naive merge strategy: Re-map IDs of 'other' to not collide, then insert
+                    // Simple version: just append buckets with new IDs
+                    for (old_id, vec) in other_idx.buckets {
+                        let new_id = base_idx.next_id()?;
+                        base_idx.buckets.insert(new_id, vec);
+
+                        if let Some(name) = other_idx.bucket_names.get(&old_id) {
+                            base_idx.bucket_names.insert(new_id, sanitize_bucket_name(name));
+                        }
+                        if let Some(srcs) = other_idx.bucket_sources.get(&old_id) {
+                            base_idx.bucket_sources.insert(new_id, srcs.clone());
+                        }
+                    }
+                }
+                base_idx.save(&output)?;
+                log::info!("Merged index saved to {:?}", output);
+            }
+
+            IndexCommands::FromConfig { config } => {
+                build_index_from_config(&config)?;
+            }
+        },
+
+        Commands::Classify(classify_cmd) => match classify_cmd {
+            ClassifyCommands::Run { index, r1, r2, threshold, batch_size, output } |
+            ClassifyCommands::Batch { index, r1, r2, threshold, batch_size, output } => {
+                log::info!("Loading index from {:?}", index);
+                let engine = Index::load(&index)?;
+                log::info!("Index loaded: {} buckets", engine.buckets.len());
+
+                let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
+                io.write(b"read_id\tbucket_name\tscore\n".to_vec())?;
+
+                let mut total_reads = 0;
+                let mut batch_num = 0;
+
+                log::info!("Starting classification (batch_size={})", batch_size);
+
+                // 1. Get OWNED records from disk
+                while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
+                    batch_num += 1;
+                    let batch_read_count = owned_records.len();
+                    total_reads += batch_read_count;
+
+                    // 2. Create REFERENCES for the library
+                    let batch_refs: Vec<QueryRecord> = owned_records.iter()
+                        .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                        .collect();
+
+                    // 3. Process
+                    let results = classify_batch(&engine, &batch_refs, threshold);
+
+                    // 4. Write Output
+                    let mut chunk_out = Vec::with_capacity(1024);
+                    for res in results {
+                        let header = &headers[res.query_id as usize];
+                        let bucket_name = engine.bucket_names.get(&res.bucket_id)
+                            .map(|s| s.as_str())
+                            .unwrap_or("unknown");
+                        writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
+                    }
+                    io.write(chunk_out)?;
+
+                    log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+                }
+
+                log::info!("Classification complete: {} reads processed", total_reads);
+                io.finish()?;
+            }
+
+            ClassifyCommands::Aggregate { index, r1, r2, threshold, batch_size, output } => {
+                log::info!("Loading index from {:?}", index);
+                let engine = Index::load(&index)?;
+                log::info!("Index loaded: {} buckets", engine.buckets.len());
+
+                let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
+                io.write(b"query_name\tbucket_name\tscore\n".to_vec())?;
+
+                let mut total_reads = 0;
+                let mut batch_num = 0;
+
+                log::info!("Starting aggregate classification (batch_size={})", batch_size);
+
+                while let Some((owned_records, _)) = io.next_batch_records(batch_size)? {
+                    batch_num += 1;
+                    let batch_read_count = owned_records.len();
+                    total_reads += batch_read_count;
+
+                    let batch_refs: Vec<QueryRecord> = owned_records.iter()
+                        .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                        .collect();
+
+                    let results = aggregate_batch(&engine, &batch_refs, threshold);
+
+                    let mut chunk_out = Vec::with_capacity(1024);
+                    for res in results {
+                        let bucket_name = engine.bucket_names.get(&res.bucket_id)
+                            .map(|s| s.as_str())
+                            .unwrap_or("unknown");
+                        writeln!(chunk_out, "global\t{}\t{:.4}", bucket_name, res.score).unwrap();
+                    }
+                    io.write(chunk_out)?;
+
+                    log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+                }
+
+                log::info!("Aggregate classification complete: {} reads processed", total_reads);
+                io.finish()?;
+            }
+        },
     }
 
     Ok(())

@@ -41,19 +41,31 @@ LD_LIBRARY_PATH=target/debug ./c_example
 ### CLI Usage
 ```bash
 # Create an index from reference sequences
-cargo run --release -- index -o output.ryidx -r ref1.fasta -r ref2.fasta -k 64 -w 50
-
-# Classify sequences (single-end)
-cargo run --release -- classify -i index.ryidx -1 reads.fastq -t 0.1
-
-# Classify sequences (paired-end)
-cargo run --release -- classify -i index.ryidx -1 reads_R1.fastq -2 reads_R2.fastq -t 0.1
-
-# Aggregate classification (for higher sensitivity)
-cargo run --release -- aggregate -i index.ryidx -1 reads.fastq -t 0.05
+cargo run --release -- index create -o output.ryidx -r ref1.fasta -r ref2.fasta -k 64 -w 50
 
 # Show index statistics
-cargo run --release -- index-stats -i index.ryidx
+cargo run --release -- index stats -i index.ryidx
+
+# Add sequences to an existing index as a new bucket
+cargo run --release -- index bucket-add -i index.ryidx -r new_ref.fasta
+
+# Merge two buckets within an index
+cargo run --release -- index bucket-merge -i index.ryidx --src 2 --dest 1
+
+# Merge multiple indices into one
+cargo run --release -- index merge -o merged.ryidx -i idx1.ryidx -i idx2.ryidx
+
+# Build index from a TOML configuration file
+cargo run --release -- index from-config -c config.toml
+
+# Classify sequences (single-end)
+cargo run --release -- classify run -i index.ryidx -1 reads.fastq -t 0.1
+
+# Classify sequences (paired-end)
+cargo run --release -- classify run -i index.ryidx -1 reads_R1.fastq -2 reads_R2.fastq -t 0.1
+
+# Aggregate classification (for higher sensitivity)
+cargo run --release -- classify aggregate -i index.ryidx -1 reads.fastq -t 0.05
 ```
 
 ## Architecture Overview
@@ -139,14 +151,21 @@ FFI layer exposing core functionality to C:
 
 ### CLI (src/main.rs)
 
-Subcommands using clap:
-- `index` - Build index from FASTA/FASTQ
-- `classify` - Per-read classification
-- `aggregate` - Aggregated classification for paired-end
-- `index-stats` - Show index statistics
-- `index-bucket-add` - Add sequences to existing bucket
-- `index-bucket-merge` - Merge two buckets
-- `index-merge` - Merge multiple indices
+Nested subcommands using clap:
+
+**`rype index`** - Index operations:
+- `create` - Build index from FASTA/FASTQ
+- `stats` - Show index statistics
+- `bucket-source-detail` - Show source details for a specific bucket
+- `bucket-add` - Add sequences to existing index as new bucket
+- `bucket-merge` - Merge two buckets within an index
+- `merge` - Merge multiple indices into one
+- `from-config` - Build index from TOML configuration file
+
+**`rype classify`** - Classification operations:
+- `run` - Per-read classification
+- `batch` - Batch classify (alias for run)
+- `aggregate` - Aggregated classification for paired-end (alias: `agg`)
 
 ## Important Constants
 
