@@ -27,7 +27,7 @@ fn sanitize_bucket_name(name: &str) -> String {
 
 #[derive(Parser)]
 #[command(name = "rype")]
-#[command(about = "High-performance Read Partitioning Engine (RY-Space, K=64)", long_about = None)]
+#[command(about = "High-performance Read Partitioning Engine (RY-Space, K=16/32/64)", long_about = None)]
 struct Cli {
     /// Enable verbose progress output with timestamps
     #[arg(short, long, global = true)]
@@ -44,6 +44,8 @@ enum Commands {
         output: PathBuf,
         #[arg(short, long, required = true)]
         reference: Vec<PathBuf>,
+        #[arg(short = 'k', long, default_value_t = 64)]
+        kmer_size: usize,
         #[arg(short, long, default_value_t = 50)]
         window: usize,
         #[arg(short, long, default_value_t = 0x5555555555555555)]
@@ -274,8 +276,11 @@ fn main() -> Result<()> {
     logging::init_logger(args.verbose);
 
     match args.command {
-        Commands::Index { output, reference, window, salt, separate_buckets } => {
-            let mut index = Index::new(window, salt);
+        Commands::Index { output, reference, kmer_size, window, salt, separate_buckets } => {
+            if !matches!(kmer_size, 16 | 32 | 64) {
+                return Err(anyhow!("K must be 16, 32, or 64 (got {})", kmer_size));
+            }
+            let mut index = Index::new(kmer_size, window, salt)?;
             let mut next_id = 1;
 
             for ref_file in reference {
@@ -290,7 +295,7 @@ fn main() -> Result<()> {
         Commands::IndexStats { index } => {
             let metadata = Index::load_metadata(&index)?;
             println!("Index Stats for {:?}", index);
-            println!("  K: 64 (fixed)");
+            println!("  K: {}", metadata.k);
             println!("  Window (w): {}", metadata.w);
             println!("  Salt: {:x}", metadata.salt);
             println!("  Buckets: {}", metadata.bucket_names.len());
@@ -385,8 +390,12 @@ fn main() -> Result<()> {
                 log::info!("Merging index: {:?}", path);
                 let other_idx = Index::load(path)?;
 
-                if other_idx.w != base_idx.w || other_idx.salt != base_idx.salt {
-                    return Err(anyhow!("Index parameters (w/salt) mismatch in {:?}", path));
+                if other_idx.k != base_idx.k || other_idx.w != base_idx.w || other_idx.salt != base_idx.salt {
+                    return Err(anyhow!(
+                        "Index parameters mismatch: expected K={}, W={}, Salt=0x{:x}, got K={}, W={}, Salt=0x{:x}",
+                        base_idx.k, base_idx.w, base_idx.salt,
+                        other_idx.k, other_idx.w, other_idx.salt
+                    ));
                 }
 
                 // Naive merge strategy: Re-map IDs of 'other' to not collide, then insert
@@ -527,7 +536,7 @@ fn build_index_from_config(config_path: &Path) -> Result<()> {
     let bucket_indices: Vec<_> = bucket_names.par_iter()
         .map(|bucket_name| {
             log::info!("Processing bucket '{}'...", bucket_name);
-            let mut idx = Index::new(cfg.index.window, cfg.index.salt);
+            let mut idx = Index::new(cfg.index.k, cfg.index.window, cfg.index.salt)?;
             let mut ws = MinimizerWorkspace::new();
 
             // Process all files for this bucket
@@ -561,7 +570,7 @@ fn build_index_from_config(config_path: &Path) -> Result<()> {
     log::info!("Processing complete. Merging buckets...");
 
     // 4. Merge all bucket indices into final index
-    let mut final_index = Index::new(cfg.index.window, cfg.index.salt);
+    let mut final_index = Index::new(cfg.index.k, cfg.index.window, cfg.index.salt)?;
     for (bucket_id, (bucket_name, bucket_idx)) in bucket_indices.into_iter().enumerate() {
         let new_id = (bucket_id + 1) as u32;
         final_index.bucket_names.insert(new_id, sanitize_bucket_name(&bucket_name));

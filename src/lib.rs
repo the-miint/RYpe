@@ -13,9 +13,6 @@ pub mod config;
 
 // --- CONSTANTS ---
 
-pub const K: usize = 64;
-const _: () = assert!(K == 64, "Implementation relies on u64 overflow behavior");
-
 // Maximum sizes for safety checks when loading files
 const MAX_BUCKET_SIZE: usize = 1_000_000_000; // 1B minimizers (~8GB)
 const MAX_STRING_LENGTH: usize = 10_000; // 10KB for names/sources
@@ -42,6 +39,7 @@ pub type QueryRecord<'a> = (i64, &'a [u8], Option<&'a [u8]>);
 /// Lightweight metadata-only view of an Index (without minimizer data)
 #[derive(Debug, Clone)]
 pub struct IndexMetadata {
+    pub k: usize,
     pub w: usize,
     pub salt: u64,
     pub bucket_names: HashMap<u32, String>,
@@ -62,6 +60,19 @@ pub struct HitResult {
 #[inline(always)]
 pub fn base_to_bit(byte: u8) -> u64 {
     unsafe { *BASE_TO_BIT_LUT.get_unchecked(byte as usize) }
+}
+
+/// Compute reverse complement of a k-mer in RY space
+/// Returns the reversed bits in the rightmost K positions
+#[inline]
+fn reverse_complement(kmer: u64, k: usize) -> u64 {
+    let complement = !kmer;
+    match k {
+        16 => complement.reverse_bits() >> 48,
+        32 => complement.reverse_bits() >> 32,
+        64 => complement.reverse_bits(),
+        _ => panic!("Unsupported K value: {}", k),
+    }
 }
 
 pub struct MinimizerWorkspace {
@@ -88,12 +99,12 @@ impl Default for MinimizerWorkspace {
 
 // --- ALGORITHMS ---
 
-pub fn extract_into(seq: &[u8], w: usize, salt: u64, ws: &mut MinimizerWorkspace) {
+pub fn extract_into(seq: &[u8], k: usize, w: usize, salt: u64, ws: &mut MinimizerWorkspace) {
     ws.buffer.clear();
     ws.q_fwd.clear();
 
     let len = seq.len();
-    if len < K { return; }
+    if len < k { return; }
 
     let mut current_val: u64 = 0;
     let mut last_min: Option<u64> = None;
@@ -113,8 +124,8 @@ pub fn extract_into(seq: &[u8], w: usize, salt: u64, ws: &mut MinimizerWorkspace
         valid_bases_count += 1;
         current_val = (current_val << 1) | bit;
 
-        if valid_bases_count >= K {
-            let pos = i + 1 - K;
+        if valid_bases_count >= k {
+            let pos = i + 1 - k;
             let hash = current_val ^ salt;
 
             while let Some(&(p, _)) = ws.q_fwd.front() {
@@ -125,7 +136,7 @@ pub fn extract_into(seq: &[u8], w: usize, salt: u64, ws: &mut MinimizerWorkspace
             }
             ws.q_fwd.push_back((pos, hash));
 
-            if valid_bases_count >= K + w - 1 {
+            if valid_bases_count >= k + w - 1 {
                 if let Some(&(_, min_h)) = ws.q_fwd.front() {
                     if Some(min_h) != last_min {
                         ws.buffer.push(min_h);
@@ -139,6 +150,7 @@ pub fn extract_into(seq: &[u8], w: usize, salt: u64, ws: &mut MinimizerWorkspace
 
 pub fn extract_dual_strand_into(
     seq: &[u8],
+    k: usize,
     w: usize,
     salt: u64,
     ws: &mut MinimizerWorkspace
@@ -147,7 +159,7 @@ pub fn extract_dual_strand_into(
     ws.q_rc.clear();
 
     let len = seq.len();
-    if len < K { return (vec![], vec![]); }
+    if len < k { return (vec![], vec![]); }
 
     let mut fwd_mins = Vec::with_capacity(ESTIMATED_MINIMIZERS_PER_SEQUENCE);
     let mut rc_mins = Vec::with_capacity(ESTIMATED_MINIMIZERS_PER_SEQUENCE);
@@ -174,10 +186,10 @@ pub fn extract_dual_strand_into(
         valid_bases_count += 1;
         current_val = (current_val << 1) | bit;
 
-        if valid_bases_count >= K {
-            let pos = i + 1 - K;
+        if valid_bases_count >= k {
+            let pos = i + 1 - k;
             let h_fwd = current_val ^ salt;
-            let h_rc = (!current_val).reverse_bits() ^ salt;
+            let h_rc = reverse_complement(current_val, k) ^ salt;
 
             while let Some(&(p, _)) = ws.q_fwd.front() { if p + w <= pos { ws.q_fwd.pop_front(); } else { break; } }
             while let Some(&(_, v)) = ws.q_fwd.back() { if v >= h_fwd { ws.q_fwd.pop_back(); } else { break; } }
@@ -187,7 +199,7 @@ pub fn extract_dual_strand_into(
             while let Some(&(_, v)) = ws.q_rc.back() { if v >= h_rc { ws.q_rc.pop_back(); } else { break; } }
             ws.q_rc.push_back((pos, h_rc));
 
-            if valid_bases_count >= K + w - 1 {
+            if valid_bases_count >= k + w - 1 {
                 if let Some(&(_, min)) = ws.q_fwd.front() {
                     if Some(min) != last_fwd { fwd_mins.push(min); last_fwd = Some(min); }
                 }
@@ -201,11 +213,11 @@ pub fn extract_dual_strand_into(
 }
 
 pub fn get_paired_minimizers_into(
-    s1: &[u8], s2: Option<&[u8]>, w: usize, salt: u64, ws: &mut MinimizerWorkspace
+    s1: &[u8], s2: Option<&[u8]>, k: usize, w: usize, salt: u64, ws: &mut MinimizerWorkspace
 ) -> (Vec<u64>, Vec<u64>) {
-    let (mut fwd, mut rc) = extract_dual_strand_into(s1, w, salt, ws);
+    let (mut fwd, mut rc) = extract_dual_strand_into(s1, k, w, salt, ws);
     if let Some(seq2) = s2 {
-        let (mut r2_f, mut r2_rc) = extract_dual_strand_into(seq2, w, salt, ws);
+        let (mut r2_f, mut r2_rc) = extract_dual_strand_into(seq2, k, w, salt, ws);
         fwd.append(&mut r2_rc);
         rc.append(&mut r2_f);
     }
@@ -228,6 +240,7 @@ pub fn count_hits(mins: &[u64], bucket: &[u64]) -> f64 {
 
 #[derive(Debug)]
 pub struct Index {
+    pub k: usize,
     pub w: usize,
     pub salt: u64,
     pub buckets: HashMap<u32, Vec<u64>>,
@@ -238,21 +251,25 @@ pub struct Index {
 impl Index {
     pub const BUCKET_SOURCE_DELIM: &'static str = "::";
 
-    pub fn new(w: usize, salt: u64) -> Self {
-        Index {
+    pub fn new(k: usize, w: usize, salt: u64) -> Result<Self> {
+        if !matches!(k, 16 | 32 | 64) {
+            return Err(anyhow!("K must be 16, 32, or 64 (got {})", k));
+        }
+        Ok(Index {
+            k,
             w,
             salt,
             buckets: HashMap::new(),
             bucket_names: HashMap::new(),
             bucket_sources: HashMap::new()
-        }
+        })
     }
 
     pub fn add_record(&mut self, id: u32, source_name: &str, sequence: &[u8], ws: &mut MinimizerWorkspace) {
         let sources = self.bucket_sources.entry(id).or_default();
         sources.push(source_name.to_string());
 
-        extract_into(sequence, self.w, self.salt, ws);
+        extract_into(sequence, self.k, self.w, self.salt, ws);
         let bucket = self.buckets.entry(id).or_default();
         bucket.extend_from_slice(&ws.buffer);
     }
@@ -298,7 +315,7 @@ impl Index {
         let mut writer = BufWriter::new(File::create(path)?);
         writer.write_all(b"RYP3")?;
         writer.write_all(&3u32.to_le_bytes())?; // Version 3
-        writer.write_all(&(K as u64).to_le_bytes())?;
+        writer.write_all(&(self.k as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
         writer.write_all(&(self.salt).to_le_bytes())?;
 
@@ -358,7 +375,11 @@ impl Index {
             return Err(anyhow!("Unsupported index version: {} (expected {})", version, SUPPORTED_VERSION));
         }
 
-        reader.read_exact(&mut buf8)?; if u64::from_le_bytes(buf8) as usize != K { return Err(anyhow!("K mismatch")); }
+        reader.read_exact(&mut buf8)?;
+        let k = u64::from_le_bytes(buf8) as usize;
+        if !matches!(k, 16 | 32 | 64) {
+            return Err(anyhow!("Invalid K value in index: {} (must be 16, 32, or 64)", k));
+        }
         reader.read_exact(&mut buf8)?; let w = u64::from_le_bytes(buf8) as usize;
         reader.read_exact(&mut buf8)?; let salt = u64::from_le_bytes(buf8);
         reader.read_exact(&mut buf4)?; let num = u32::from_le_bytes(buf4);
@@ -411,7 +432,7 @@ impl Index {
             buckets.insert(id, vec);
         }
 
-        Ok(Index { w, salt, buckets, bucket_names: names, bucket_sources: sources })
+        Ok(Index { k, w, salt, buckets, bucket_names: names, bucket_sources: sources })
     }
 
     pub fn load_metadata(path: &Path) -> Result<IndexMetadata> {
@@ -431,7 +452,11 @@ impl Index {
             return Err(anyhow!("Unsupported index version: {} (expected {})", version, SUPPORTED_VERSION));
         }
 
-        reader.read_exact(&mut buf8)?; if u64::from_le_bytes(buf8) as usize != K { return Err(anyhow!("K mismatch")); }
+        reader.read_exact(&mut buf8)?;
+        let k = u64::from_le_bytes(buf8) as usize;
+        if !matches!(k, 16 | 32 | 64) {
+            return Err(anyhow!("Invalid K value in index: {} (must be 16, 32, or 64)", k));
+        }
         reader.read_exact(&mut buf8)?; let w = u64::from_le_bytes(buf8) as usize;
         reader.read_exact(&mut buf8)?; let salt = u64::from_le_bytes(buf8);
         reader.read_exact(&mut buf4)?; let num = u32::from_le_bytes(buf4);
@@ -483,6 +508,7 @@ impl Index {
         }
 
         Ok(IndexMetadata {
+            k,
             w,
             salt,
             bucket_names: names,
@@ -495,14 +521,14 @@ impl Index {
 // --- LIBRARY LEVEL PROCESSING ---
 
 pub fn classify_batch(
-    engine: &Index, 
-    records: &[QueryRecord], 
+    engine: &Index,
+    records: &[QueryRecord],
     threshold: f64
 ) -> Vec<HitResult> {
-    
+
     let processed: Vec<_> = records.par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
-            let (ha, hb) = get_paired_minimizers_into(s1, *s2, engine.w, engine.salt, ws);
+            let (ha, hb) = get_paired_minimizers_into(s1, *s2, engine.k, engine.w, engine.salt, ws);
             (*id, ha, hb)
         }).collect();
 
@@ -551,10 +577,10 @@ pub fn aggregate_batch(
     threshold: f64
 ) -> Vec<HitResult> {
     let mut global = HashSet::new();
-    
+
     let batch_mins: Vec<Vec<u64>> = records.par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (_, s1, s2)| {
-            let (mut a, b) = get_paired_minimizers_into(s1, *s2, engine.w, engine.salt, ws);
+            let (mut a, b) = get_paired_minimizers_into(s1, *s2, engine.k, engine.w, engine.salt, ws);
             a.extend(b);
             a
         }).collect();
@@ -606,7 +632,7 @@ mod tests {
     fn test_valid_extraction_long() {
         let mut ws = MinimizerWorkspace::new();
         let seq = vec![b'A'; 70]; 
-        extract_into(&seq, 5, 0, &mut ws);
+        extract_into(&seq, 64, 5, 0, &mut ws);
         assert!(!ws.buffer.is_empty(), "Should extract minimizers from valid long seq");
     }
 
@@ -614,7 +640,7 @@ mod tests {
     fn test_short_sequences_ignored() {
         let mut ws = MinimizerWorkspace::new();
         let seq = vec![b'A'; 60]; 
-        extract_into(&seq, 5, 0, &mut ws);
+        extract_into(&seq, 64, 5, 0, &mut ws);
         assert!(ws.buffer.is_empty(), "Should not extract minimizers from seq < K");
     }
 
@@ -624,17 +650,17 @@ mod tests {
         let seq_a: Vec<u8> = (0..80).map(|i| if i % 2 == 0 { b'A' } else { b'T' }).collect(); 
         let seq_b: Vec<u8> = (0..80).map(|i| if i % 3 == 0 { b'G' } else { b'C' }).collect(); 
         
-        extract_into(&seq_a, 5, 0, &mut ws);
+        extract_into(&seq_a, 64, 5, 0, &mut ws);
         let mins_a = ws.buffer.clone();
-        
-        extract_into(&seq_b, 5, 0, &mut ws);
+
+        extract_into(&seq_b, 64, 5, 0, &mut ws);
         let mins_b = ws.buffer.clone();
 
         let mut seq_combined = seq_a.clone();
         seq_combined.push(b'N'); // N separator
         seq_combined.extend_from_slice(&seq_b);
-        
-        extract_into(&seq_combined, 5, 0, &mut ws);
+
+        extract_into(&seq_combined, 64, 5, 0, &mut ws);
         let mins_combined = ws.buffer.clone();
 
         let mut expected = mins_a;
@@ -647,7 +673,7 @@ mod tests {
     fn test_dual_strand_extraction() {
         let mut ws = MinimizerWorkspace::new();
         let seq = b"AAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCC"; // Long seq
-        let (fwd, rc) = extract_dual_strand_into(seq, 5, 0, &mut ws);
+        let (fwd, rc) = extract_dual_strand_into(seq, 64, 5, 0, &mut ws);
         assert!(!fwd.is_empty());
         assert!(!rc.is_empty());
         assert_ne!(fwd, rc); 
@@ -659,8 +685,8 @@ mod tests {
     fn test_index_save_load_roundtrip() -> Result<()> {
         let file = NamedTempFile::new()?;
         let path = file.path().to_path_buf();
-        let mut index = Index::new(50, 0x1234);
-        
+        let mut index = Index::new(64, 50, 0x1234).unwrap();
+
         index.buckets.insert(1, vec![100, 200]);
         index.buckets.insert(2, vec![300, 400]);
         index.bucket_names.insert(1, "BucketA".into());
@@ -680,7 +706,7 @@ mod tests {
 
     #[test]
     fn test_add_record_logic() {
-        let mut index = Index::new(5, 0);
+        let mut index = Index::new(64, 5, 0).unwrap();
         let mut ws = MinimizerWorkspace::new();
         let seq = vec![b'A'; 70];
         
@@ -694,7 +720,7 @@ mod tests {
 
     #[test]
     fn test_merge_buckets_logic() -> Result<()> {
-        let mut index = Index::new(50, 0);
+        let mut index = Index::new(64, 50, 0).unwrap();
         
         index.buckets.insert(10, vec![1, 2, 3]);
         index.bucket_names.insert(10, "Source".into());
@@ -722,7 +748,7 @@ mod tests {
 
     #[test]
     fn test_classify_batch_logic() {
-        let mut index = Index::new(10, 0);
+        let mut index = Index::new(64, 10, 0).unwrap();
         index.buckets.insert(1, vec![10, 20, 30, 40, 50]); 
         index.buckets.insert(2, vec![60, 70, 80, 90, 100]); 
         
@@ -748,7 +774,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_batch_logic() {
-        let mut index = Index::new(10, 0);
+        let mut index = Index::new(64, 10, 0).unwrap();
         let mut ws = MinimizerWorkspace::new();
         
         // Bucket 1: Poly-A (RY Space: All 1s)
@@ -837,7 +863,7 @@ mod tests {
 
     #[test]
     fn test_next_id_overflow() {
-        let mut index = Index::new(50, 0);
+        let mut index = Index::new(64, 50, 0).unwrap();
         index.buckets.insert(u32::MAX, vec![]);
 
         let result = index.next_id();
@@ -847,7 +873,7 @@ mod tests {
 
     #[test]
     fn test_merge_buckets_nonexistent_source() {
-        let mut index = Index::new(50, 0);
+        let mut index = Index::new(64, 50, 0).unwrap();
         index.buckets.insert(1, vec![1, 2, 3]);
 
         let result = index.merge_buckets(999, 1);  // 999 doesn't exist
@@ -858,7 +884,7 @@ mod tests {
     #[test]
     fn test_merge_buckets_updates_minimizer_count() -> Result<()> {
         // Verify that merge_buckets correctly updates the minimizer count
-        let mut index = Index::new(50, 0);
+        let mut index = Index::new(64, 50, 0).unwrap();
 
         // Create bucket 10 with 3 minimizers
         index.buckets.insert(10, vec![1, 2, 3]);
@@ -884,7 +910,7 @@ mod tests {
     #[test]
     fn test_multiple_records_single_bucket() {
         // Verify that multiple records can be added to a single bucket
-        let mut index = Index::new(10, 0);
+        let mut index = Index::new(64, 10, 0).unwrap();
         let mut ws = MinimizerWorkspace::new();
 
         // Add multiple sequences to the same bucket
@@ -911,7 +937,7 @@ mod tests {
     #[test]
     fn test_bucket_naming_consistency() -> Result<()> {
         // Verify that bucket names are consistent across operations
-        let mut index = Index::new(50, 0);
+        let mut index = Index::new(64, 50, 0).unwrap();
         let mut ws = MinimizerWorkspace::new();
 
         // Simulate adding a file with multiple records to a new bucket
@@ -947,7 +973,7 @@ mod tests {
         // Verify that load_metadata() can read metadata without loading minimizers
         let file = NamedTempFile::new()?;
         let path = file.path().to_path_buf();
-        let mut index = Index::new(50, 0x1234);
+        let mut index = Index::new(64, 50, 0x1234)?;
 
         // Create index with multiple buckets with varying minimizer counts
         index.buckets.insert(1, vec![100, 200, 300]);
@@ -968,6 +994,7 @@ mod tests {
         let metadata = Index::load_metadata(&path)?;
 
         // Verify basic parameters
+        assert_eq!(metadata.k, 64);
         assert_eq!(metadata.w, 50);
         assert_eq!(metadata.salt, 0x1234);
 
@@ -996,7 +1023,7 @@ mod tests {
         // Verify that metadata from load_metadata() matches metadata from load()
         let file = NamedTempFile::new()?;
         let path = file.path().to_path_buf();
-        let mut index = Index::new(42, 0xABCD);
+        let mut index = Index::new(64, 42, 0xABCD).unwrap();
 
         index.buckets.insert(10, vec![1, 2, 3, 4, 5]);
         index.bucket_names.insert(10, "Test".into());
@@ -1022,7 +1049,7 @@ mod tests {
         // Verify load_metadata works with index containing no buckets
         let file = NamedTempFile::new()?;
         let path = file.path().to_path_buf();
-        let index = Index::new(25, 0);
+        let index = Index::new(64, 25, 0).unwrap();
 
         index.save(&path)?;
         let metadata = Index::load_metadata(&path)?;
@@ -1041,7 +1068,7 @@ mod tests {
         // Verify V3 format can save and load correctly
         let file = NamedTempFile::new()?;
         let path = file.path().to_path_buf();
-        let mut index = Index::new(50, 0x1234);
+        let mut index = Index::new(64, 50, 0x1234)?;
 
         // Create realistic index
         index.buckets.insert(1, vec![100, 200]);
@@ -1055,6 +1082,7 @@ mod tests {
         let loaded = Index::load(&path)?;
 
         // Verify complete roundtrip
+        assert_eq!(loaded.k, 64);
         assert_eq!(loaded.w, 50);
         assert_eq!(loaded.salt, 0x1234);
         assert_eq!(loaded.buckets.len(), 2);
@@ -1063,6 +1091,172 @@ mod tests {
         assert_eq!(loaded.bucket_names[&1], "BucketA");
         assert_eq!(loaded.bucket_sources[&1][0], "file1.fa::seq1");
         assert_eq!(loaded.bucket_sources[&2].len(), 2);
+
+        Ok(())
+    }
+
+    // --- NEW TESTS FOR K PARAMETERIZATION ---
+
+    #[test]
+    fn test_reverse_complement() {
+        // K=16: Use non-palindromic pattern
+        // 0xF0AA = 1111000010101010
+        // Complement: 0000111101010101 = 0x0F55
+        // Reverse:    1010101011110000 = 0xAAF0
+        assert_eq!(reverse_complement(0xF0AA, 16), 0xAAF0);
+
+        // K=32: Use non-palindromic pattern
+        // 0xF0F0AAAA = 11110000111100001010101010101010
+        // Complement:  00001111000011110101010101010101 = 0x0F0F5555
+        // Reverse:     10101010101010101111000011110000 = 0xAAAAF0F0
+        assert_eq!(reverse_complement(0xF0F0AAAA, 32), 0xAAAAF0F0);
+
+        // K=64: Test with a simple pattern
+        // All 1s complement to all 0s, which reversed is still all 0s
+        assert_eq!(reverse_complement(0xFFFFFFFFFFFFFFFF, 64), 0x0000000000000000);
+
+        // All 0s complement to all 1s, which reversed is still all 1s
+        assert_eq!(reverse_complement(0x0000000000000000, 64), 0xFFFFFFFFFFFFFFFF);
+    }
+
+    #[test]
+    fn test_index_k16() -> Result<()> {
+        let mut index = Index::new(16, 50, 0)?;
+        assert_eq!(index.k, 16);
+
+        let mut ws = MinimizerWorkspace::new();
+        // Need K+W-1 = 16+50-1 = 65 bases to generate minimizers
+        let seq = vec![b'A'; 70];
+        index.add_record(1, "test", &seq, &mut ws);
+        index.finalize_bucket(1);
+
+        assert!(index.buckets.contains_key(&1));
+        assert!(!index.buckets[&1].is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_k32() -> Result<()> {
+        let mut index = Index::new(32, 50, 0)?;
+        assert_eq!(index.k, 32);
+
+        let mut ws = MinimizerWorkspace::new();
+        // Need K+W-1 = 32+50-1 = 81 bases to generate minimizers
+        let seq = vec![b'A'; 85];
+        index.add_record(1, "test", &seq, &mut ws);
+        index.finalize_bucket(1);
+
+        assert!(index.buckets.contains_key(&1));
+        assert!(!index.buckets[&1].is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_reject_invalid_k() {
+        // Test that invalid K values are rejected
+        assert!(Index::new(17, 50, 0).is_err());
+        assert!(Index::new(48, 50, 0).is_err());
+        assert!(Index::new(65, 50, 0).is_err());
+        assert!(Index::new(0, 50, 0).is_err());
+        assert!(Index::new(15, 50, 0).is_err());
+        assert!(Index::new(33, 50, 0).is_err());
+    }
+
+    #[test]
+    fn test_save_load_k32() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+        let mut index = Index::new(32, 50, 0x1234)?;
+
+        index.buckets.insert(1, vec![100, 200]);
+        index.bucket_names.insert(1, "TestBucket".into());
+
+        index.save(&path)?;
+        let loaded = Index::load(&path)?;
+
+        assert_eq!(loaded.k, 32);
+        assert_eq!(loaded.w, 50);
+        assert_eq!(loaded.salt, 0x1234);
+        assert_eq!(loaded.buckets[&1], vec![100, 200]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_save_load_k16() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+        let mut index = Index::new(16, 25, 0xABCD)?;
+
+        index.buckets.insert(1, vec![10, 20, 30]);
+        index.bucket_names.insert(1, "K16Bucket".into());
+
+        index.save(&path)?;
+        let loaded = Index::load(&path)?;
+
+        assert_eq!(loaded.k, 16);
+        assert_eq!(loaded.w, 25);
+        assert_eq!(loaded.salt, 0xABCD);
+        assert_eq!(loaded.buckets[&1], vec![10, 20, 30]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_minimizers_k16() {
+        let mut ws = MinimizerWorkspace::new();
+        // 20 bases - enough for K=16 + small window
+        let seq = b"AAAATTTTGGGGCCCCAAAA";
+        extract_into(seq, 16, 5, 0, &mut ws);
+        assert!(!ws.buffer.is_empty(), "Should extract minimizers with K=16");
+    }
+
+    #[test]
+    fn test_extract_minimizers_k32() {
+        let mut ws = MinimizerWorkspace::new();
+        // 40 bases - enough for K=32 + small window
+        let seq = b"AAAATTTTGGGGCCCCAAAATTTTGGGGCCCCAAAATTTT";
+        extract_into(seq, 32, 5, 0, &mut ws);
+        assert!(!ws.buffer.is_empty(), "Should extract minimizers with K=32");
+    }
+
+    #[test]
+    fn test_short_seq_k16() {
+        let mut ws = MinimizerWorkspace::new();
+        // Only 10 bases - too short for K=16
+        let seq = b"AAAATTTTGG";
+        extract_into(seq, 16, 5, 0, &mut ws);
+        assert!(ws.buffer.is_empty(), "Should not extract from seq < K");
+    }
+
+    #[test]
+    fn test_short_seq_k32() {
+        let mut ws = MinimizerWorkspace::new();
+        // Only 20 bases - too short for K=32
+        let seq = b"AAAATTTTGGGGCCCCAAAA";
+        extract_into(seq, 32, 5, 0, &mut ws);
+        assert!(ws.buffer.is_empty(), "Should not extract from seq < K");
+    }
+
+    #[test]
+    fn test_load_invalid_k_from_file() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path();
+
+        // Manually create an invalid index file with K=48
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RYP3");
+        data.extend_from_slice(&3u32.to_le_bytes());  // Version 3
+        data.extend_from_slice(&48u64.to_le_bytes()); // Invalid K=48
+        data.extend_from_slice(&50u64.to_le_bytes()); // W
+        data.extend_from_slice(&0u64.to_le_bytes());  // Salt
+        data.extend_from_slice(&0u32.to_le_bytes());  // 0 buckets
+
+        std::fs::write(path, data)?;
+
+        let result = Index::load(path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid K value"));
 
         Ok(())
     }

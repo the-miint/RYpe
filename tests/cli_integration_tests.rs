@@ -22,7 +22,7 @@ fn test_index_multi_record_single_bucket() -> Result<()> {
     let index_file = dir.path().join("test.ryidx");
 
     // Simulate: cargo run -- index -o test.ryidx -r reference.fa -w 50
-    let mut index = Index::new(50, 0x5555555555555555);
+    let mut index = Index::new(64, 50, 0x5555555555555555).unwrap();
     let mut ws = rype::MinimizerWorkspace::new();
     let filename = "reference.fa";
 
@@ -65,7 +65,7 @@ fn test_index_bucket_add_multi_record_single_bucket() -> Result<()> {
 
     // Create initial index with one bucket
     let index_file = dir.path().join("test.ryidx");
-    let mut index = Index::new(50, 0x5555555555555555);
+    let mut index = Index::new(64, 50, 0x5555555555555555).unwrap();
     let mut ws = rype::MinimizerWorkspace::new();
 
     index.bucket_names.insert(1, "initial.fa".to_string());
@@ -134,7 +134,7 @@ fn test_bucket_naming_consistency() -> Result<()> {
     let index_file = dir.path().join("test.ryidx");
 
     // Create index using 'index' command behavior
-    let mut index = Index::new(50, 0x5555555555555555);
+    let mut index = Index::new(64, 50, 0x5555555555555555).unwrap();
     let mut ws = rype::MinimizerWorkspace::new();
     let filename = "myfile.fasta";
 
@@ -173,7 +173,7 @@ fn test_merge_buckets_minimizer_count() -> Result<()> {
     let index_file = dir.path().join("test.ryidx");
 
     // Create index with two buckets
-    let mut index = Index::new(50, 0);
+    let mut index = Index::new(64, 50, 0).unwrap();
     let mut ws = rype::MinimizerWorkspace::new();
 
     // Bucket 1: Poly-A sequence

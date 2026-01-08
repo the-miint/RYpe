@@ -41,7 +41,7 @@ LD_LIBRARY_PATH=target/debug ./c_example
 ### CLI Usage
 ```bash
 # Create an index from reference sequences
-cargo run --release -- index -o output.ryidx -r ref1.fasta -r ref2.fasta -w 50
+cargo run --release -- index -o output.ryidx -r ref1.fasta -r ref2.fasta -k 64 -w 50
 
 # Classify sequences (single-end)
 cargo run --release -- classify -i index.ryidx -1 reads.fastq -t 0.1
@@ -150,7 +150,7 @@ Subcommands using clap:
 
 ## Important Constants
 
-- `K = 64` - K-mer size (fixed, implementation relies on u64 overflow)
+- `K ∈ {16, 32, 64}` - K-mer size (configurable per-index, always uses u64 representation)
 - `MAX_BUCKET_SIZE = 1_000_000_000` - DoS protection for index loading
 - `MAX_STRING_LENGTH = 10_000` - Max name/source string length
 - `MAX_NUM_BUCKETS = 100_000` - Max buckets per index
@@ -169,11 +169,11 @@ Uses `rayon` for data parallelism:
 - `classify_batch()` parallelizes minimizer extraction AND bucket scoring
 - `map_init()` pattern provides per-thread workspace to avoid allocations
 
-### Index File Format (version 2)
+### Index File Format (version 3)
 ```
 Magic: "RYP3" (4 bytes)
-Version: u32 (4 bytes) = 2
-K: u64 (8 bytes)
+Version: u32 (4 bytes) = 3
+K: u64 (8 bytes) - must be 16, 32, or 64
 W: u64 (8 bytes)
 Salt: u64 (8 bytes)
 Num Buckets: u32 (4 bytes)
@@ -229,7 +229,7 @@ When adding features:
 ## Common Pitfalls
 
 1. **Modifying buckets after finalization**: Must call `finalize_bucket()` after `add_record()` to ensure sorted/deduplicated minimizers
-2. **K-mer size assumptions**: Code assumes K=64 for u64 overflow behavior
+2. **K-mer size**: K must be 16, 32, or 64. K is set at index creation and stored in the index file. All merged indices must have matching K values.
 3. **C API thread safety**: Don't share RypeResultArray across threads
 4. **Index compatibility**: Version mismatch between save/load will fail
 5. **Short sequences**: Sequences < K bases produce no minimizers

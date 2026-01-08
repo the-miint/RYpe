@@ -40,7 +40,7 @@ int main() {
     }
 
     // 2. Prepare Query
-    // MUST BE >= K (64). Here we use 80 chars of "AT".
+    // MUST BE >= K (where K is the value used when creating the index). Here we use 80 chars of "AT".
     // This matches the reference "AT"*100 perfectly.
     const char* seq_str = "ATATATATATATATATATATATATATATATATATATATATATATATATATATATATATATATATATATATATATATATAT";
     

@@ -12,9 +12,15 @@ pub struct ConfigFile {
 
 #[derive(Debug, Deserialize)]
 pub struct IndexSettings {
+    #[serde(default = "default_k")]
+    pub k: usize,
     pub window: usize,
     pub salt: u64,
     pub output: PathBuf,
+}
+
+fn default_k() -> usize {
+    64
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +37,10 @@ pub fn parse_config(path: &Path) -> Result<ConfigFile> {
 
     if config.buckets.is_empty() {
         return Err(anyhow!("Config must define at least one bucket"));
+    }
+
+    if !matches!(config.index.k, 16 | 32 | 64) {
+        return Err(anyhow!("Config error: k must be 16, 32, or 64 (got {})", config.index.k));
     }
 
     Ok(config)
