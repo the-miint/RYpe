@@ -18,6 +18,10 @@ const MAX_BUCKET_SIZE: usize = 1_000_000_000; // 1B minimizers (~8GB)
 const MAX_STRING_LENGTH: usize = 10_000; // 10KB for names/sources
 const MAX_NUM_BUCKETS: u32 = 100_000; // Reasonable upper limit
 
+// Maximum sizes for inverted index
+const MAX_INVERTED_MINIMIZERS: usize = 2_000_000_000; // 2B unique minimizers
+const MAX_INVERTED_BUCKET_IDS: usize = 4_000_000_000; // 4B total bucket ID entries
+
 // Default capacities for workspace (document the reasoning)
 const DEFAULT_DEQUE_CAPACITY: usize = 128; // Typical window size range
 const ESTIMATED_MINIMIZERS_PER_SEQUENCE: usize = 32; // Conservative estimate
@@ -518,6 +522,380 @@ impl Index {
     }
 }
 
+// --- INVERTED INDEX ---
+
+/// CSR-format inverted index for fast minimizer → bucket lookups.
+///
+/// The inverted index maps each unique minimizer to the set of bucket IDs
+/// that contain it. Uses hybrid binary search for efficient batch lookups.
+///
+/// # Invariants
+/// - `minimizers` is sorted in ascending order with no duplicates
+/// - `offsets.len() == minimizers.len() + 1`
+/// - `offsets[0] == 0`
+/// - `offsets` is monotonically increasing
+/// - `offsets[minimizers.len()] == bucket_ids.len()`
+/// - For each minimizer at index i, the associated bucket IDs are `bucket_ids[offsets[i]..offsets[i+1]]`
+///
+/// # Thread Safety
+/// InvertedIndex can be shared across threads for concurrent classification (it only contains Vecs which are Sync).
+#[derive(Debug)]
+pub struct InvertedIndex {
+    pub k: usize,
+    pub w: usize,
+    pub salt: u64,
+    source_hash: u64,
+    minimizers: Vec<u64>,      // sorted unique minimizers (ascending, no duplicates)
+    offsets: Vec<u64>,         // CSR offsets (length = minimizers.len() + 1, monotonically increasing)
+    bucket_ids: Vec<u32>,      // flattened bucket IDs
+}
+
+impl InvertedIndex {
+    /// Compute a hash from index metadata for validation.
+    /// Hash is computed from sorted (bucket_id, minimizer_count) pairs.
+    pub fn compute_metadata_hash(metadata: &IndexMetadata) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut pairs: Vec<(u32, usize)> = metadata.bucket_minimizer_counts
+            .iter()
+            .map(|(&id, &count)| (id, count))
+            .collect();
+        pairs.sort_by_key(|(id, _)| *id);
+
+        let mut hasher = DefaultHasher::new();
+        for (id, count) in pairs {
+            id.hash(&mut hasher);
+            count.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Build an inverted index from a primary Index.
+    ///
+    /// # Requirements
+    /// All buckets in the index must be finalized (sorted and deduplicated).
+    /// Call `finalize_bucket()` on each bucket before calling this function.
+    ///
+    /// # Panics
+    /// Panics if any bucket is not sorted (indicates unfinalized bucket).
+    pub fn build_from_index(index: &Index) -> Self {
+        // Verify all buckets are finalized (sorted)
+        for (&id, minimizers) in &index.buckets {
+            debug_assert!(
+                minimizers.windows(2).all(|w| w[0] <= w[1]),
+                "Bucket {} is not sorted. Call finalize_bucket() first.", id
+            );
+            // In release builds, check and panic with a clear message
+            if !minimizers.windows(2).all(|w| w[0] <= w[1]) {
+                panic!("Bucket {} is not sorted. Call finalize_bucket() before building inverted index.", id);
+            }
+        }
+
+        // Count total entries for capacity reservation
+        let total_entries: usize = index.buckets.values().map(|v| v.len()).sum();
+
+        // Collect all (minimizer, bucket_id) pairs
+        let mut pairs: Vec<(u64, u32)> = Vec::with_capacity(total_entries);
+        for (&bucket_id, minimizers) in &index.buckets {
+            for &min in minimizers {
+                pairs.push((min, bucket_id));
+            }
+        }
+
+        // Sort by minimizer, then by bucket_id for determinism
+        pairs.sort_unstable();
+
+        // Build CSR structure with reserved capacity
+        // Upper bound: unique minimizers <= total_entries, bucket_ids <= total_entries
+        let mut minimizers: Vec<u64> = Vec::with_capacity(total_entries / 2); // heuristic
+        let mut offsets: Vec<u64> = Vec::with_capacity(total_entries / 2 + 1);
+        let mut bucket_ids: Vec<u32> = Vec::with_capacity(total_entries);
+
+        offsets.push(0);
+
+        let mut i = 0;
+        while i < pairs.len() {
+            let current_min = pairs[i].0;
+            minimizers.push(current_min);
+
+            // Collect all bucket_ids for this minimizer (already sorted due to pairs sort)
+            let mut last_bid: Option<u32> = None;
+            while i < pairs.len() && pairs[i].0 == current_min {
+                let bid = pairs[i].1;
+                // Deduplicate (shouldn't happen if buckets are already deduped, but be safe)
+                if last_bid != Some(bid) {
+                    bucket_ids.push(bid);
+                    last_bid = Some(bid);
+                }
+                i += 1;
+            }
+            offsets.push(bucket_ids.len() as u64);
+        }
+
+        // Shrink to fit to reclaim excess capacity
+        minimizers.shrink_to_fit();
+        offsets.shrink_to_fit();
+        bucket_ids.shrink_to_fit();
+
+        // Compute source hash from the index
+        let metadata = IndexMetadata {
+            k: index.k,
+            w: index.w,
+            salt: index.salt,
+            bucket_names: index.bucket_names.clone(),
+            bucket_sources: index.bucket_sources.clone(),
+            bucket_minimizer_counts: index.buckets.iter()
+                .map(|(&id, v)| (id, v.len()))
+                .collect(),
+        };
+        let source_hash = Self::compute_metadata_hash(&metadata);
+
+        InvertedIndex {
+            k: index.k,
+            w: index.w,
+            salt: index.salt,
+            source_hash,
+            minimizers,
+            offsets,
+            bucket_ids,
+        }
+    }
+
+    /// Validate that this inverted index matches the given metadata.
+    pub fn validate_against_metadata(&self, metadata: &IndexMetadata) -> Result<()> {
+        if self.k != metadata.k || self.w != metadata.w || self.salt != metadata.salt {
+            return Err(anyhow!(
+                "Inverted index parameters don't match source index.\n  \
+                 Inverted: K={}, W={}, salt=0x{:x}\n  \
+                 Source:   K={}, W={}, salt=0x{:x}",
+                self.k, self.w, self.salt,
+                metadata.k, metadata.w, metadata.salt
+            ));
+        }
+
+        let expected_hash = Self::compute_metadata_hash(metadata);
+        if self.source_hash != expected_hash {
+            return Err(anyhow!(
+                "Inverted index is stale (hash 0x{:016x} != expected 0x{:016x}). \
+                 The source index has been modified. Regenerate with 'rype index invert -i <index.ryidx>'",
+                self.source_hash, expected_hash
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Get bucket hit counts for a sorted query using hybrid binary search.
+    ///
+    /// Complexity: O(Q * log(U)) worst case, where Q = query length and U = unique minimizers.
+    /// When queries have good coverage of the minimizer space, the amortized complexity
+    /// approaches O(Q + Q * log(U/Q)) because the search range shrinks with each match.
+    ///
+    /// # Arguments
+    /// * `query` - A sorted, deduplicated slice of minimizer values
+    ///
+    /// # Returns
+    /// HashMap of bucket_id -> hit_count for all buckets that match at least one query minimizer.
+    pub fn get_bucket_hits(&self, query: &[u64]) -> HashMap<u32, usize> {
+        let mut hits: HashMap<u32, usize> = HashMap::new();
+
+        if query.is_empty() || self.minimizers.is_empty() {
+            return hits;
+        }
+
+        let mut search_start = 0;
+
+        for &q in query {
+            // Early exit if we've exhausted the index
+            if search_start >= self.minimizers.len() {
+                break;
+            }
+
+            // Binary search for q in minimizers[search_start..]
+            match self.minimizers[search_start..].binary_search(&q) {
+                Ok(relative_idx) => {
+                    let abs_idx = search_start + relative_idx;
+                    // Found! Get bucket IDs for this minimizer
+                    let start = self.offsets[abs_idx] as usize;
+                    let end = self.offsets[abs_idx + 1] as usize;
+                    for &bid in &self.bucket_ids[start..end] {
+                        *hits.entry(bid).or_insert(0) += 1;
+                    }
+                    // Move search_start past the found element
+                    search_start = abs_idx + 1;
+                }
+                Err(relative_idx) => {
+                    // Not found. relative_idx is the insertion point in the slice.
+                    // If relative_idx == 0, the query element is smaller than all remaining
+                    // index elements. Since query is sorted, ALL subsequent query elements
+                    // that are <= q will also not match, so we can update search_start.
+                    search_start += relative_idx;
+                    // Early exit optimization: if relative_idx == 0, this query element
+                    // is smaller than minimizers[search_start]. Since query is sorted,
+                    // we continue to the next query element (which may be larger).
+                    // No action needed here - the loop continues naturally.
+                }
+            }
+        }
+
+        hits
+    }
+
+    /// Save the inverted index to a file.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let mut writer = BufWriter::new(File::create(path)?);
+
+        // Magic and version
+        writer.write_all(b"RYXI")?;
+        writer.write_all(&1u32.to_le_bytes())?; // Version 1
+
+        // Metadata
+        writer.write_all(&(self.k as u64).to_le_bytes())?;
+        writer.write_all(&(self.w as u64).to_le_bytes())?;
+        writer.write_all(&self.salt.to_le_bytes())?;
+        writer.write_all(&self.source_hash.to_le_bytes())?;
+
+        // Sizes
+        writer.write_all(&(self.minimizers.len() as u64).to_le_bytes())?;
+        writer.write_all(&(self.bucket_ids.len() as u64).to_le_bytes())?;
+
+        // Offsets (minimizers.len() + 1 entries)
+        for &offset in &self.offsets {
+            writer.write_all(&offset.to_le_bytes())?;
+        }
+
+        // Minimizers
+        for &min in &self.minimizers {
+            writer.write_all(&min.to_le_bytes())?;
+        }
+
+        // Bucket IDs
+        for &bid in &self.bucket_ids {
+            writer.write_all(&bid.to_le_bytes())?;
+        }
+
+        Ok(())
+    }
+
+    /// Load an inverted index from a file.
+    pub fn load(path: &Path) -> Result<Self> {
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut buf4 = [0u8; 4];
+        let mut buf8 = [0u8; 8];
+
+        // Magic
+        reader.read_exact(&mut buf4)?;
+        if &buf4 != b"RYXI" {
+            return Err(anyhow!("Invalid inverted index format (expected RYXI)"));
+        }
+
+        // Version
+        reader.read_exact(&mut buf4)?;
+        let version = u32::from_le_bytes(buf4);
+        if version != 1 {
+            return Err(anyhow!("Unsupported inverted index version: {} (expected 1)", version));
+        }
+
+        // Metadata
+        reader.read_exact(&mut buf8)?;
+        let k = u64::from_le_bytes(buf8) as usize;
+        if !matches!(k, 16 | 32 | 64) {
+            return Err(anyhow!("Invalid K value in inverted index: {} (must be 16, 32, or 64)", k));
+        }
+
+        reader.read_exact(&mut buf8)?;
+        let w = u64::from_le_bytes(buf8) as usize;
+
+        reader.read_exact(&mut buf8)?;
+        let salt = u64::from_le_bytes(buf8);
+
+        reader.read_exact(&mut buf8)?;
+        let source_hash = u64::from_le_bytes(buf8);
+
+        // Sizes
+        reader.read_exact(&mut buf8)?;
+        let num_minimizers = u64::from_le_bytes(buf8) as usize;
+        if num_minimizers > MAX_INVERTED_MINIMIZERS {
+            return Err(anyhow!("Number of minimizers {} exceeds maximum {}",
+                num_minimizers, MAX_INVERTED_MINIMIZERS));
+        }
+
+        reader.read_exact(&mut buf8)?;
+        let num_bucket_ids = u64::from_le_bytes(buf8) as usize;
+        if num_bucket_ids > MAX_INVERTED_BUCKET_IDS {
+            return Err(anyhow!("Number of bucket IDs {} exceeds maximum {}",
+                num_bucket_ids, MAX_INVERTED_BUCKET_IDS));
+        }
+
+        // Offsets (num_minimizers + 1 entries)
+        let offsets_len = num_minimizers.checked_add(1)
+            .ok_or_else(|| anyhow!("Offset array length overflow"))?;
+        let mut offsets = Vec::with_capacity(offsets_len);
+        for _ in 0..offsets_len {
+            reader.read_exact(&mut buf8)?;
+            offsets.push(u64::from_le_bytes(buf8));
+        }
+
+        // Validate CSR invariants
+        if !offsets.is_empty() {
+            if offsets[0] != 0 {
+                return Err(anyhow!("Invalid CSR format: first offset must be 0, got {}", offsets[0]));
+            }
+            for i in 1..offsets.len() {
+                if offsets[i] < offsets[i - 1] {
+                    return Err(anyhow!(
+                        "Invalid CSR format: offsets must be monotonically increasing (offset[{}]={} < offset[{}]={})",
+                        i, offsets[i], i - 1, offsets[i - 1]
+                    ));
+                }
+            }
+            if let Some(&last_offset) = offsets.last() {
+                if last_offset as usize != num_bucket_ids {
+                    return Err(anyhow!(
+                        "Invalid CSR format: final offset {} doesn't match bucket_ids length {}",
+                        last_offset, num_bucket_ids
+                    ));
+                }
+            }
+        }
+
+        // Minimizers
+        let mut minimizers = Vec::with_capacity(num_minimizers);
+        for _ in 0..num_minimizers {
+            reader.read_exact(&mut buf8)?;
+            minimizers.push(u64::from_le_bytes(buf8));
+        }
+
+        // Bucket IDs
+        let mut bucket_ids = Vec::with_capacity(num_bucket_ids);
+        for _ in 0..num_bucket_ids {
+            reader.read_exact(&mut buf4)?;
+            bucket_ids.push(u32::from_le_bytes(buf4));
+        }
+
+        Ok(InvertedIndex {
+            k,
+            w,
+            salt,
+            source_hash,
+            minimizers,
+            offsets,
+            bucket_ids,
+        })
+    }
+
+    /// Returns the number of unique minimizers in the index.
+    pub fn num_minimizers(&self) -> usize {
+        self.minimizers.len()
+    }
+
+    /// Returns the total number of bucket ID entries.
+    pub fn num_bucket_entries(&self) -> usize {
+        self.bucket_ids.len()
+    }
+}
+
 // --- LIBRARY LEVEL PROCESSING ---
 
 pub fn classify_batch(
@@ -567,6 +945,73 @@ pub fn classify_batch(
         }
         bucket_results
     }).flatten().collect();
+
+    results
+}
+
+/// Classify a batch of query records using an inverted index.
+///
+/// This function uses the inverted index for O(Q * log(U/Q)) lookups per query
+/// instead of O(B * Q * log(M)) where B = buckets, Q = query minimizers, M = avg bucket size.
+///
+/// # Arguments
+/// * `inverted` - The inverted index for minimizer → bucket lookups
+/// * `records` - Batch of query records to classify
+/// * `threshold` - Minimum score threshold for reporting hits
+///
+/// # Returns
+/// Vector of HitResult for all (query, bucket) pairs meeting the threshold
+pub fn classify_batch_inverted(
+    inverted: &InvertedIndex,
+    records: &[QueryRecord],
+    threshold: f64
+) -> Vec<HitResult> {
+    // Extract minimizers for all queries in parallel
+    let processed: Vec<_> = records.par_iter()
+        .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
+            let (ha, hb) = get_paired_minimizers_into(s1, *s2, inverted.k, inverted.w, inverted.salt, ws);
+            (*id, ha, hb)
+        }).collect();
+
+    // Process each query and collect results
+    let results: Vec<HitResult> = processed.par_iter()
+        .flat_map(|(query_id, fwd_mins, rc_mins)| {
+            // Get bucket hits for forward strand
+            let fwd_hits = inverted.get_bucket_hits(fwd_mins);
+            let fwd_len = fwd_mins.len() as f64;
+
+            // Get bucket hits for reverse complement strand
+            let rc_hits = inverted.get_bucket_hits(rc_mins);
+            let rc_len = rc_mins.len() as f64;
+
+            // Merge hits into a single map (bucket_id -> (fwd_count, rc_count))
+            // Reserve capacity based on combined unique buckets (upper bound: sum of both)
+            let capacity = fwd_hits.len() + rc_hits.len();
+            let mut scores: HashMap<u32, (usize, usize)> = HashMap::with_capacity(capacity);
+            for (&bucket_id, &count) in &fwd_hits {
+                scores.entry(bucket_id).or_insert((0, 0)).0 = count;
+            }
+            for (&bucket_id, &count) in &rc_hits {
+                scores.entry(bucket_id).or_insert((0, 0)).1 = count;
+            }
+
+            // Compute scores and filter by threshold
+            let mut query_results = Vec::with_capacity(scores.len());
+            for (bucket_id, (fwd_count, rc_count)) in scores {
+                let score = (if fwd_len > 0.0 { fwd_count as f64 / fwd_len } else { 0.0 })
+                    .max(if rc_len > 0.0 { rc_count as f64 / rc_len } else { 0.0 });
+
+                if score >= threshold {
+                    query_results.push(HitResult {
+                        query_id: *query_id,
+                        bucket_id,
+                        score,
+                    });
+                }
+            }
+            query_results
+        })
+        .collect();
 
     results
 }
@@ -1259,6 +1704,339 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("Invalid K value"));
 
         Ok(())
+    }
+
+    // --- INVERTED INDEX TESTS ---
+
+    #[test]
+    fn test_inverted_index_build() {
+        let mut index = Index::new(64, 50, 0x1234).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.buckets.insert(2, vec![200, 300, 400]);
+        index.buckets.insert(3, vec![500, 600]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.bucket_names.insert(3, "C".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        assert_eq!(inverted.k, 64);
+        assert_eq!(inverted.w, 50);
+        assert_eq!(inverted.salt, 0x1234);
+        // Unique minimizers: 100, 200, 300, 400, 500, 600 = 6
+        assert_eq!(inverted.num_minimizers(), 6);
+        // Bucket entries: 1->100, 1->200, 1->300, 2->200, 2->300, 2->400, 3->500, 3->600 = 8
+        assert_eq!(inverted.num_bucket_entries(), 8);
+    }
+
+    #[test]
+    fn test_inverted_index_save_load_roundtrip() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        let mut index = Index::new(64, 50, 0xABCD).unwrap();
+        index.buckets.insert(1, vec![10, 20, 30]);
+        index.buckets.insert(2, vec![20, 30, 40]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save(&path)?;
+
+        let loaded = InvertedIndex::load(&path)?;
+
+        assert_eq!(loaded.k, 64);
+        assert_eq!(loaded.w, 50);
+        assert_eq!(loaded.salt, 0xABCD);
+        assert_eq!(loaded.num_minimizers(), inverted.num_minimizers());
+        assert_eq!(loaded.num_bucket_entries(), inverted.num_bucket_entries());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inverted_index_get_bucket_hits() {
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.buckets.insert(2, vec![200, 300, 400]);
+        index.buckets.insert(3, vec![500, 600]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.bucket_names.insert(3, "C".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Query with minimizers that match multiple buckets
+        let query = vec![200, 300, 500];
+        let hits = inverted.get_bucket_hits(&query);
+
+        // Bucket 1 has 200, 300 -> 2 hits
+        assert_eq!(hits.get(&1), Some(&2));
+        // Bucket 2 has 200, 300 -> 2 hits
+        assert_eq!(hits.get(&2), Some(&2));
+        // Bucket 3 has 500 -> 1 hit
+        assert_eq!(hits.get(&3), Some(&1));
+    }
+
+    #[test]
+    fn test_inverted_index_get_bucket_hits_no_matches() {
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Query with minimizers that don't match
+        let query = vec![999, 1000, 1001];
+        let hits = inverted.get_bucket_hits(&query);
+
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_inverted_index_validate_success() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        let mut index = Index::new(64, 50, 0x1234).unwrap();
+        index.buckets.insert(1, vec![100, 200]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_sources.insert(1, vec!["src".into()]);
+        index.save(&path)?;
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        let metadata = Index::load_metadata(&path)?;
+
+        // Should pass validation
+        inverted.validate_against_metadata(&metadata)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_inverted_index_validate_stale() -> Result<()> {
+        // Create original index
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        let mut index = Index::new(64, 50, 0x1234).unwrap();
+        index.buckets.insert(1, vec![100, 200]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_sources.insert(1, vec!["src".into()]);
+        index.save(&path)?;
+
+        // Build inverted index from original
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Modify the index (add a bucket)
+        index.buckets.insert(2, vec![300, 400]);
+        index.bucket_names.insert(2, "B".into());
+        index.bucket_sources.insert(2, vec!["src2".into()]);
+        index.save(&path)?;
+
+        // Load modified metadata
+        let metadata = Index::load_metadata(&path)?;
+
+        // Validation should fail because hash changed
+        let result = inverted.validate_against_metadata(&metadata);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("stale"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inverted_index_load_invalid_format() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(path, b"NOTRYXI").unwrap();
+
+        let result = InvertedIndex::load(path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid inverted index format"));
+    }
+
+    #[test]
+    fn test_inverted_index_load_wrong_version() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+
+        let mut data = b"RYXI".to_vec();
+        data.extend_from_slice(&999u32.to_le_bytes()); // Bad version
+        std::fs::write(path, data).unwrap();
+
+        let result = InvertedIndex::load(path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unsupported inverted index version"));
+    }
+
+    #[test]
+    fn test_classify_batch_inverted_matches_regular() -> Result<()> {
+        // Build a simple index
+        let mut index = Index::new(64, 10, 0).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq_a = vec![b'A'; 80];
+        index.add_record(1, "ref_a", &seq_a, &mut ws);
+        index.finalize_bucket(1);
+        index.bucket_names.insert(1, "BucketA".into());
+
+        let seq_b: Vec<u8> = (0..80).map(|i| if i % 2 == 0 { b'A' } else { b'T' }).collect();
+        index.add_record(2, "ref_b", &seq_b, &mut ws);
+        index.finalize_bucket(2);
+        index.bucket_names.insert(2, "BucketB".into());
+
+        // Build inverted index
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Query that should match bucket 1
+        let query_seq = seq_a.clone();
+        let records: Vec<QueryRecord> = vec![(101, &query_seq[..], None)];
+
+        // Run both classification methods
+        let results_regular = classify_batch(&index, &records, 0.5);
+        let results_inverted = classify_batch_inverted(&inverted, &records, 0.5);
+
+        // Both should return the same results
+        assert_eq!(results_regular.len(), results_inverted.len());
+        if !results_regular.is_empty() {
+            assert_eq!(results_regular[0].bucket_id, results_inverted[0].bucket_id);
+            assert!((results_regular[0].score - results_inverted[0].score).abs() < 0.001);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inverted_index_empty() {
+        let index = Index::new(64, 50, 0).unwrap();
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        assert_eq!(inverted.num_minimizers(), 0);
+        assert_eq!(inverted.num_bucket_entries(), 0);
+
+        // Query against empty index
+        let hits = inverted.get_bucket_hits(&[100, 200, 300]);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_inverted_index_hybrid_search_correctness() {
+        // Test that hybrid search correctly handles sorted queries
+        let mut index = Index::new(64, 50, 0).unwrap();
+        // Create buckets with a range of minimizers
+        index.buckets.insert(1, (0..1000).map(|i| i * 10).collect());
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Query with sorted minimizers spread across the range
+        let query: Vec<u64> = vec![50, 500, 5000, 9990];
+        let hits = inverted.get_bucket_hits(&query);
+
+        // 50, 500, 5000 are in range (0..10000 step 10), 9990 is also in range
+        // 50/10=5 ✓, 500/10=50 ✓, 5000/10=500 ✓, 9990/10=999 ✓
+        assert_eq!(hits.get(&1), Some(&4));
+    }
+
+    #[test]
+    fn test_inverted_index_k16() -> Result<()> {
+        // Test inverted index with K=16
+        let mut index = Index::new(16, 10, 0)?;
+
+        // Create some test data with minimizers in K=16 range (16 bits = max 65535)
+        index.buckets.insert(1, vec![100, 200, 300, 500]);
+        index.bucket_names.insert(1, "bucket_a".into());
+
+        index.buckets.insert(2, vec![200, 400, 600]);
+        index.bucket_names.insert(2, "bucket_b".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Verify K is preserved
+        assert_eq!(inverted.k, 16);
+
+        // Test save/load roundtrip
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+        inverted.save(&path)?;
+        let loaded = InvertedIndex::load(&path)?;
+
+        assert_eq!(loaded.k, 16);
+        assert_eq!(loaded.num_minimizers(), inverted.num_minimizers());
+
+        // Test lookups
+        let hits = loaded.get_bucket_hits(&[100, 200, 400]);
+        assert_eq!(hits.get(&1), Some(&2)); // 100, 200
+        assert_eq!(hits.get(&2), Some(&2)); // 200, 400
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inverted_index_k32() -> Result<()> {
+        // Test inverted index with K=32
+        let mut index = Index::new(32, 20, 0)?;
+
+        // Create some test data with minimizers in K=32 range
+        let large_min: u64 = 1 << 30; // Use larger values for K=32
+        index.buckets.insert(1, vec![large_min, large_min + 100, large_min + 200]);
+        index.bucket_names.insert(1, "bucket_a".into());
+
+        index.buckets.insert(2, vec![large_min + 100, large_min + 300]);
+        index.bucket_names.insert(2, "bucket_b".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Verify K is preserved
+        assert_eq!(inverted.k, 32);
+
+        // Test save/load roundtrip
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+        inverted.save(&path)?;
+        let loaded = InvertedIndex::load(&path)?;
+
+        assert_eq!(loaded.k, 32);
+        assert_eq!(loaded.num_minimizers(), inverted.num_minimizers());
+
+        // Test lookups
+        let hits = loaded.get_bucket_hits(&[large_min, large_min + 100, large_min + 300]);
+        assert_eq!(hits.get(&1), Some(&2)); // large_min, large_min+100
+        assert_eq!(hits.get(&2), Some(&2)); // large_min+100, large_min+300
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inverted_index_csr_validation() {
+        // Test that load() rejects invalid CSR data
+        use std::io::Write;
+
+        // Create a file with valid header but invalid CSR offsets
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+
+        {
+            let mut writer = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+            writer.write_all(b"RYXI").unwrap(); // Magic
+            writer.write_all(&1u32.to_le_bytes()).unwrap(); // Version
+            writer.write_all(&64u64.to_le_bytes()).unwrap(); // K
+            writer.write_all(&50u64.to_le_bytes()).unwrap(); // W
+            writer.write_all(&0u64.to_le_bytes()).unwrap(); // Salt
+            writer.write_all(&0u64.to_le_bytes()).unwrap(); // Source hash
+            writer.write_all(&2u64.to_le_bytes()).unwrap(); // num_minimizers = 2
+            writer.write_all(&3u64.to_le_bytes()).unwrap(); // num_bucket_ids = 3
+            // Offsets: should be [0, x, 3] but we'll write invalid [1, 2, 3]
+            writer.write_all(&1u64.to_le_bytes()).unwrap(); // Invalid: first offset != 0
+            writer.write_all(&2u64.to_le_bytes()).unwrap();
+            writer.write_all(&3u64.to_le_bytes()).unwrap();
+            // Rest doesn't matter, validation should fail first
+        }
+
+        let result = InvertedIndex::load(path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("first offset must be 0"), "Unexpected error: {}", err);
     }
 }
 

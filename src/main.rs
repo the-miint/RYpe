@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use anyhow::{Context, Result, anyhow};
 
-use rype::{Index, MinimizerWorkspace, QueryRecord, classify_batch, aggregate_batch};
+use rype::{Index, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, aggregate_batch};
 use rype::config::{parse_config, validate_config, resolve_path};
 
 mod logging;
@@ -70,6 +70,9 @@ enum IndexCommands {
     Stats {
         #[arg(short, long)]
         index: PathBuf,
+        /// Show inverted index stats (if .ryxdi exists)
+        #[arg(short = 'I', long)]
+        inverted: bool,
     },
 
     /// Show source details for a specific bucket
@@ -115,6 +118,12 @@ enum IndexCommands {
         #[arg(short, long)]
         config: PathBuf,
     },
+
+    /// Create inverted index for faster classification
+    Invert {
+        #[arg(short, long)]
+        index: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -133,6 +142,9 @@ enum ClassifyCommands {
         batch_size: usize,
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Use inverted index (.ryxdi) for faster classification
+        #[arg(short = 'I', long)]
+        use_inverted: bool,
     },
 
     /// Batch classify reads (alias for 'run')
@@ -149,6 +161,9 @@ enum ClassifyCommands {
         batch_size: usize,
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Use inverted index (.ryxdi) for faster classification
+        #[arg(short = 'I', long)]
+        use_inverted: bool,
     },
 
     /// Aggregate classification (higher sensitivity, aggregates paired-end reads)
@@ -326,21 +341,51 @@ fn main() -> Result<()> {
                 log::info!("Done.");
             }
 
-            IndexCommands::Stats { index } => {
-                let metadata = Index::load_metadata(&index)?;
-                println!("Index Stats for {:?}", index);
-                println!("  K: {}", metadata.k);
-                println!("  Window (w): {}", metadata.w);
-                println!("  Salt: {:x}", metadata.salt);
-                println!("  Buckets: {}", metadata.bucket_names.len());
-                println!("------------------------------------------------");
-                let mut sorted_ids: Vec<_> = metadata.bucket_names.keys().collect();
-                sorted_ids.sort();
-                for id in sorted_ids {
-                    let name = metadata.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
-                    let count = metadata.bucket_minimizer_counts.get(id).copied().unwrap_or(0);
-                    let sources = metadata.bucket_sources.get(id).map(|v| v.len()).unwrap_or(0);
-                    println!("  Bucket {}: '{}' ({} minimizers, {} sources)", id, name, count, sources);
+            IndexCommands::Stats { index, inverted } => {
+                if inverted {
+                    // Show inverted index stats
+                    let inverted_path = index.with_extension("ryxdi");
+                    if !inverted_path.exists() {
+                        return Err(anyhow!(
+                            "Inverted index not found: {:?}. Create it with 'rype index invert -i {:?}'",
+                            inverted_path, index
+                        ));
+                    }
+                    let inv = InvertedIndex::load(&inverted_path)?;
+                    println!("Inverted Index Stats for {:?}", inverted_path);
+                    println!("  K: {}", inv.k);
+                    println!("  Window (w): {}", inv.w);
+                    println!("  Salt: 0x{:x}", inv.salt);
+                    println!("  Unique minimizers: {}", inv.num_minimizers());
+                    println!("  Total bucket references: {}", inv.num_bucket_entries());
+                    if inv.num_minimizers() > 0 {
+                        println!("  Avg buckets per minimizer: {:.2}",
+                            inv.num_bucket_entries() as f64 / inv.num_minimizers() as f64);
+                    }
+                } else {
+                    // Show primary index stats
+                    let metadata = Index::load_metadata(&index)?;
+                    println!("Index Stats for {:?}", index);
+                    println!("  K: {}", metadata.k);
+                    println!("  Window (w): {}", metadata.w);
+                    println!("  Salt: 0x{:x}", metadata.salt);
+                    println!("  Buckets: {}", metadata.bucket_names.len());
+
+                    // Check if inverted index exists
+                    let inverted_path = index.with_extension("ryxdi");
+                    if inverted_path.exists() {
+                        println!("  Inverted index: {:?} (use -I to show stats)", inverted_path);
+                    }
+
+                    println!("------------------------------------------------");
+                    let mut sorted_ids: Vec<_> = metadata.bucket_names.keys().collect();
+                    sorted_ids.sort();
+                    for id in sorted_ids {
+                        let name = metadata.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
+                        let count = metadata.bucket_minimizer_counts.get(id).copied().unwrap_or(0);
+                        let sources = metadata.bucket_sources.get(id).map(|v| v.len()).unwrap_or(0);
+                        println!("  Bucket {}: '{}' ({} minimizers, {} sources)", id, name, count, sources);
+                    }
                 }
             }
 
@@ -453,53 +498,125 @@ fn main() -> Result<()> {
             IndexCommands::FromConfig { config } => {
                 build_index_from_config(&config)?;
             }
+
+            IndexCommands::Invert { index } => {
+                log::info!("Loading index from {:?}", index);
+                let idx = Index::load(&index)?;
+                log::info!("Index loaded: {} buckets", idx.buckets.len());
+
+                log::info!("Building inverted index...");
+                let inverted = InvertedIndex::build_from_index(&idx);
+                log::info!("Inverted index built: {} unique minimizers, {} bucket entries",
+                    inverted.num_minimizers(), inverted.num_bucket_entries());
+
+                // Save with .ryxdi extension
+                let output_path = index.with_extension("ryxdi");
+                log::info!("Saving inverted index to {:?}", output_path);
+                inverted.save(&output_path)?;
+                log::info!("Done.");
+            }
         },
 
         Commands::Classify(classify_cmd) => match classify_cmd {
-            ClassifyCommands::Run { index, r1, r2, threshold, batch_size, output } |
-            ClassifyCommands::Batch { index, r1, r2, threshold, batch_size, output } => {
-                log::info!("Loading index from {:?}", index);
-                let engine = Index::load(&index)?;
-                log::info!("Index loaded: {} buckets", engine.buckets.len());
-
-                let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
-                io.write(b"read_id\tbucket_name\tscore\n".to_vec())?;
-
-                let mut total_reads = 0;
-                let mut batch_num = 0;
-
-                log::info!("Starting classification (batch_size={})", batch_size);
-
-                // 1. Get OWNED records from disk
-                while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
-                    batch_num += 1;
-                    let batch_read_count = owned_records.len();
-                    total_reads += batch_read_count;
-
-                    // 2. Create REFERENCES for the library
-                    let batch_refs: Vec<QueryRecord> = owned_records.iter()
-                        .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
-                        .collect();
-
-                    // 3. Process
-                    let results = classify_batch(&engine, &batch_refs, threshold);
-
-                    // 4. Write Output
-                    let mut chunk_out = Vec::with_capacity(1024);
-                    for res in results {
-                        let header = &headers[res.query_id as usize];
-                        let bucket_name = engine.bucket_names.get(&res.bucket_id)
-                            .map(|s| s.as_str())
-                            .unwrap_or("unknown");
-                        writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
+            ClassifyCommands::Run { index, r1, r2, threshold, batch_size, output, use_inverted } |
+            ClassifyCommands::Batch { index, r1, r2, threshold, batch_size, output, use_inverted } => {
+                if use_inverted {
+                    // Use inverted index path - load .ryxdi and metadata only
+                    let inverted_path = index.with_extension("ryxdi");
+                    if !inverted_path.exists() {
+                        return Err(anyhow!(
+                            "Inverted index not found: {:?}. Create it with 'rype index invert -i {:?}'",
+                            inverted_path, index
+                        ));
                     }
-                    io.write(chunk_out)?;
 
-                    log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+                    log::info!("Loading inverted index from {:?}", inverted_path);
+                    let inverted = InvertedIndex::load(&inverted_path)?;
+                    log::info!("Inverted index loaded: {} unique minimizers", inverted.num_minimizers());
+
+                    log::info!("Loading index metadata from {:?}", index);
+                    let metadata = Index::load_metadata(&index)?;
+                    log::info!("Metadata loaded: {} buckets", metadata.bucket_names.len());
+
+                    // Validate inverted index matches source
+                    inverted.validate_against_metadata(&metadata)?;
+                    log::info!("Inverted index validated successfully");
+
+                    let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
+                    io.write(b"read_id\tbucket_name\tscore\n".to_vec())?;
+
+                    let mut total_reads = 0;
+                    let mut batch_num = 0;
+
+                    log::info!("Starting classification with inverted index (batch_size={})", batch_size);
+
+                    while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
+                        batch_num += 1;
+                        let batch_read_count = owned_records.len();
+                        total_reads += batch_read_count;
+
+                        let batch_refs: Vec<QueryRecord> = owned_records.iter()
+                            .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                            .collect();
+
+                        let results = classify_batch_inverted(&inverted, &batch_refs, threshold);
+
+                        let mut chunk_out = Vec::with_capacity(1024);
+                        for res in results {
+                            let header = &headers[res.query_id as usize];
+                            let bucket_name = metadata.bucket_names.get(&res.bucket_id)
+                                .map(|s| s.as_str())
+                                .unwrap_or("unknown");
+                            writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
+                        }
+                        io.write(chunk_out)?;
+
+                        log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+                    }
+
+                    log::info!("Classification complete: {} reads processed", total_reads);
+                    io.finish()?;
+                } else {
+                    // Standard path - load full index
+                    log::info!("Loading index from {:?}", index);
+                    let engine = Index::load(&index)?;
+                    log::info!("Index loaded: {} buckets", engine.buckets.len());
+
+                    let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
+                    io.write(b"read_id\tbucket_name\tscore\n".to_vec())?;
+
+                    let mut total_reads = 0;
+                    let mut batch_num = 0;
+
+                    log::info!("Starting classification (batch_size={})", batch_size);
+
+                    while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
+                        batch_num += 1;
+                        let batch_read_count = owned_records.len();
+                        total_reads += batch_read_count;
+
+                        let batch_refs: Vec<QueryRecord> = owned_records.iter()
+                            .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                            .collect();
+
+                        let results = classify_batch(&engine, &batch_refs, threshold);
+
+                        let mut chunk_out = Vec::with_capacity(1024);
+                        for res in results {
+                            let header = &headers[res.query_id as usize];
+                            let bucket_name = engine.bucket_names.get(&res.bucket_id)
+                                .map(|s| s.as_str())
+                                .unwrap_or("unknown");
+                            writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
+                        }
+                        io.write(chunk_out)?;
+
+                        log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+                    }
+
+                    log::info!("Classification complete: {} reads processed", total_reads);
+                    io.finish()?;
                 }
-
-                log::info!("Classification complete: {} reads processed", total_reads);
-                io.finish()?;
             }
 
             ClassifyCommands::Aggregate { index, r1, r2, threshold, batch_size, output } => {
