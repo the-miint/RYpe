@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -571,7 +572,11 @@ impl InvertedIndex {
         hasher.finish()
     }
 
-    /// Build an inverted index from a primary Index.
+    /// Build an inverted index from a primary Index using k-way merge.
+    ///
+    /// This implementation uses O(num_buckets) heap memory instead of O(total_entries)
+    /// by leveraging the fact that each bucket is already sorted. The k-way merge
+    /// is O(n log k) where k = number of buckets.
     ///
     /// # Requirements
     /// All buckets in the index must be finalized (sorted and deduplicated).
@@ -580,8 +585,9 @@ impl InvertedIndex {
     /// # Panics
     /// Panics if any bucket is not sorted (indicates unfinalized bucket).
     pub fn build_from_index(index: &Index) -> Self {
-        // Verify all buckets are finalized (sorted)
-        for (&id, minimizers) in &index.buckets {
+        // Verify all buckets are finalized (sorted) - can be done in parallel
+        let bucket_vec: Vec<_> = index.buckets.iter().collect();
+        bucket_vec.par_iter().for_each(|(&id, minimizers)| {
             debug_assert!(
                 minimizers.windows(2).all(|w| w[0] <= w[1]),
                 "Bucket {} is not sorted. Call finalize_bucket() first.", id
@@ -590,53 +596,108 @@ impl InvertedIndex {
             if !minimizers.windows(2).all(|w| w[0] <= w[1]) {
                 panic!("Bucket {} is not sorted. Call finalize_bucket() before building inverted index.", id);
             }
-        }
+        });
 
         // Count total entries for capacity reservation
         let total_entries: usize = index.buckets.values().map(|v| v.len()).sum();
 
-        // Collect all (minimizer, bucket_id) pairs
-        let mut pairs: Vec<(u64, u32)> = Vec::with_capacity(total_entries);
-        for (&bucket_id, minimizers) in &index.buckets {
-            for &min in minimizers {
-                pairs.push((min, bucket_id));
-            }
-        }
-
-        // Sort by minimizer, then by bucket_id for determinism
-        pairs.sort_unstable();
+        // Estimate unique minimizers (heuristic: assume 50% overlap on average)
+        let estimated_unique = total_entries / 2;
 
         // Build CSR structure with reserved capacity
-        // Upper bound: unique minimizers <= total_entries, bucket_ids <= total_entries
-        let mut minimizers: Vec<u64> = Vec::with_capacity(total_entries / 2); // heuristic
-        let mut offsets: Vec<u64> = Vec::with_capacity(total_entries / 2 + 1);
-        let mut bucket_ids: Vec<u32> = Vec::with_capacity(total_entries);
+        let mut minimizers: Vec<u64> = Vec::with_capacity(estimated_unique);
+        let mut offsets: Vec<u64> = Vec::with_capacity(estimated_unique + 1);
+        let mut bucket_ids_out: Vec<u32> = Vec::with_capacity(total_entries);
 
         offsets.push(0);
 
-        let mut i = 0;
-        while i < pairs.len() {
-            let current_min = pairs[i].0;
-            minimizers.push(current_min);
+        // Handle empty index case
+        if index.buckets.is_empty() || total_entries == 0 {
+            let metadata = IndexMetadata {
+                k: index.k,
+                w: index.w,
+                salt: index.salt,
+                bucket_names: index.bucket_names.clone(),
+                bucket_sources: index.bucket_sources.clone(),
+                bucket_minimizer_counts: HashMap::new(),
+            };
+            let source_hash = Self::compute_metadata_hash(&metadata);
 
-            // Collect all bucket_ids for this minimizer (already sorted due to pairs sort)
-            let mut last_bid: Option<u32> = None;
-            while i < pairs.len() && pairs[i].0 == current_min {
-                let bid = pairs[i].1;
-                // Deduplicate (shouldn't happen if buckets are already deduped, but be safe)
-                if last_bid != Some(bid) {
-                    bucket_ids.push(bid);
-                    last_bid = Some(bid);
+            return InvertedIndex {
+                k: index.k,
+                w: index.w,
+                salt: index.salt,
+                source_hash,
+                minimizers,
+                offsets,
+                bucket_ids: bucket_ids_out,
+            };
+        }
+
+        // K-way merge using a min-heap
+        // Heap entry: (Reverse(minimizer), Reverse(bucket_id), bucket_index_in_vec, position_in_bucket)
+        // Using Reverse because BinaryHeap is a max-heap
+        // bucket_index_in_vec is used to look up the bucket data
+
+        // Collect bucket data into a vec for indexed access
+        let bucket_data: Vec<(u32, &[u64])> = index.buckets
+            .iter()
+            .filter(|(_, mins)| !mins.is_empty())
+            .map(|(&id, mins)| (id, mins.as_slice()))
+            .collect();
+
+        // Initialize heap with first element from each non-empty bucket
+        // Entry: (Reverse((minimizer, bucket_id)), bucket_data_index, position)
+        let mut heap: BinaryHeap<(Reverse<(u64, u32)>, usize, usize)> = BinaryHeap::with_capacity(bucket_data.len());
+
+        for (idx, &(bucket_id, mins)) in bucket_data.iter().enumerate() {
+            heap.push((Reverse((mins[0], bucket_id)), idx, 0));
+        }
+
+        // Merge and build CSR
+        let mut current_min: Option<u64> = None;
+        let mut current_bucket_ids: Vec<u32> = Vec::new();
+
+        while let Some((Reverse((min_val, bucket_id)), data_idx, pos)) = heap.pop() {
+            // Check if this is a new minimizer
+            if current_min != Some(min_val) {
+                // Finalize previous minimizer if exists
+                if current_min.is_some() {
+                    // Sort bucket_ids for determinism and dedup
+                    current_bucket_ids.sort_unstable();
+                    current_bucket_ids.dedup();
+                    bucket_ids_out.extend_from_slice(&current_bucket_ids);
+                    offsets.push(bucket_ids_out.len() as u64);
+                    current_bucket_ids.clear();
                 }
-                i += 1;
+                minimizers.push(min_val);
+                current_min = Some(min_val);
             }
-            offsets.push(bucket_ids.len() as u64);
+
+            // Add this bucket_id to current minimizer's list
+            current_bucket_ids.push(bucket_id);
+
+            // Push next element from this bucket if available
+            let next_pos = pos + 1;
+            let (_, bucket_mins) = bucket_data[data_idx];
+            if next_pos < bucket_mins.len() {
+                let next_bucket_id = bucket_data[data_idx].0;
+                heap.push((Reverse((bucket_mins[next_pos], next_bucket_id)), data_idx, next_pos));
+            }
+        }
+
+        // Finalize last minimizer
+        if !current_bucket_ids.is_empty() {
+            current_bucket_ids.sort_unstable();
+            current_bucket_ids.dedup();
+            bucket_ids_out.extend_from_slice(&current_bucket_ids);
+            offsets.push(bucket_ids_out.len() as u64);
         }
 
         // Shrink to fit to reclaim excess capacity
         minimizers.shrink_to_fit();
         offsets.shrink_to_fit();
-        bucket_ids.shrink_to_fit();
+        bucket_ids_out.shrink_to_fit();
 
         // Compute source hash from the index
         let metadata = IndexMetadata {
@@ -658,7 +719,7 @@ impl InvertedIndex {
             source_hash,
             minimizers,
             offsets,
-            bucket_ids,
+            bucket_ids: bucket_ids_out,
         }
     }
 
