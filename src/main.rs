@@ -124,6 +124,12 @@ enum IndexCommands {
         #[arg(short, long)]
         index: PathBuf,
     },
+
+    /// Summarize index with detailed minimizer statistics
+    Summarize {
+        #[arg(short, long)]
+        index: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -514,6 +520,151 @@ fn main() -> Result<()> {
                 log::info!("Saving inverted index to {:?}", output_path);
                 inverted.save(&output_path)?;
                 log::info!("Done.");
+            }
+
+            IndexCommands::Summarize { index } => {
+                log::info!("Loading index from {:?}", index);
+                let idx = Index::load(&index)?;
+
+                // Basic info
+                println!("=== Index Summary ===");
+                println!("File: {:?}", index);
+                println!("K: {}", idx.k);
+                println!("Window (w): {}", idx.w);
+                println!("Salt: 0x{:x}", idx.salt);
+                println!("Buckets: {}", idx.buckets.len());
+
+                // Collect all minimizers from all buckets (they're already sorted within buckets)
+                let mut all_minimizers: Vec<u64> = Vec::new();
+                let mut per_bucket_counts: Vec<(u32, usize)> = Vec::new();
+
+                for (&id, mins) in &idx.buckets {
+                    per_bucket_counts.push((id, mins.len()));
+                    all_minimizers.extend(mins.iter().copied());
+                }
+
+                let total_minimizers = all_minimizers.len();
+                println!("Total minimizers (with duplicates across buckets): {}", total_minimizers);
+
+                if total_minimizers == 0 {
+                    println!("No minimizers to analyze.");
+                    return Ok(());
+                }
+
+                // Sort all minimizers for global analysis
+                all_minimizers.sort_unstable();
+
+                // Deduplicate to get unique minimizers
+                all_minimizers.dedup();
+                let unique_minimizers = all_minimizers.len();
+                println!("Unique minimizers: {}", unique_minimizers);
+                println!("Duplication ratio: {:.2}x", total_minimizers as f64 / unique_minimizers as f64);
+
+                // Value range
+                let min_val = *all_minimizers.first().unwrap();
+                let max_val = *all_minimizers.last().unwrap();
+                println!("\n=== Minimizer Value Statistics ===");
+                println!("Min value: {}", min_val);
+                println!("Max value: {}", max_val);
+                println!("Value range: {}", max_val - min_val);
+
+                // Bits needed for raw values
+                let bits_for_max = if max_val == 0 { 1 } else { 64 - max_val.leading_zeros() };
+                println!("Bits needed for max value: {}", bits_for_max);
+
+                // Compute deltas
+                if unique_minimizers > 1 {
+                    println!("\n=== Delta Statistics (for compression analysis) ===");
+
+                    let mut deltas: Vec<u64> = Vec::with_capacity(unique_minimizers - 1);
+                    for i in 1..unique_minimizers {
+                        deltas.push(all_minimizers[i] - all_minimizers[i - 1]);
+                    }
+
+                    let min_delta = *deltas.iter().min().unwrap();
+                    let max_delta = *deltas.iter().max().unwrap();
+                    let sum_delta: u128 = deltas.iter().map(|&d| d as u128).sum();
+                    let mean_delta = sum_delta as f64 / deltas.len() as f64;
+
+                    // Median delta
+                    let mut sorted_deltas = deltas.clone();
+                    sorted_deltas.sort_unstable();
+                    let median_delta = sorted_deltas[sorted_deltas.len() / 2];
+
+                    println!("Min delta: {}", min_delta);
+                    println!("Max delta: {}", max_delta);
+                    println!("Mean delta: {:.2}", mean_delta);
+                    println!("Median delta: {}", median_delta);
+
+                    // Bits needed for deltas
+                    let bits_for_max_delta = if max_delta == 0 { 1 } else { 64 - max_delta.leading_zeros() };
+                    println!("Bits needed for max delta: {}", bits_for_max_delta);
+
+                    // Distribution of bits needed per delta
+                    let mut bit_distribution = [0usize; 65]; // 0-64 bits
+                    for &d in &deltas {
+                        let bits = if d == 0 { 1 } else { 64 - d.leading_zeros() } as usize;
+                        bit_distribution[bits] += 1;
+                    }
+
+                    println!("\nDelta bit-width distribution:");
+                    let mut cumulative = 0usize;
+                    for bits in 1..=64 {
+                        if bit_distribution[bits] > 0 {
+                            cumulative += bit_distribution[bits];
+                            let pct = 100.0 * cumulative as f64 / deltas.len() as f64;
+                            println!("  <= {} bits: {} deltas ({:.1}% cumulative)",
+                                bits, bit_distribution[bits], pct);
+                        }
+                    }
+
+                    // Estimate compression potential
+                    println!("\n=== Compression Estimates ===");
+                    let raw_bytes = unique_minimizers * 8;
+                    println!("Raw storage (8 bytes/minimizer): {} bytes ({:.2} GB)",
+                        raw_bytes, raw_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+
+                    // Estimate varint-encoded delta size
+                    // Varint uses 1 byte per 7 bits, roughly
+                    let mut estimated_varint_bytes: usize = 8; // First value stored raw
+                    for &d in &deltas {
+                        let bits = if d == 0 { 1 } else { 64 - d.leading_zeros() } as usize;
+                        estimated_varint_bytes += (bits + 6) / 7; // ceil(bits/7)
+                    }
+                    let varint_ratio = estimated_varint_bytes as f64 / raw_bytes as f64;
+                    println!("Estimated delta+varint: {} bytes ({:.1}% of raw)",
+                        estimated_varint_bytes, varint_ratio * 100.0);
+
+                    // With zstd on top (rough estimate: 50-70% of varint size for sorted data)
+                    let estimated_zstd = (estimated_varint_bytes as f64 * 0.6) as usize;
+                    let zstd_ratio = estimated_zstd as f64 / raw_bytes as f64;
+                    println!("Estimated delta+varint+zstd: ~{} bytes (~{:.1}% of raw)",
+                        estimated_zstd, zstd_ratio * 100.0);
+                }
+
+                // Per-bucket summary
+                println!("\n=== Per-Bucket Statistics ===");
+                per_bucket_counts.sort_by_key(|(id, _)| *id);
+                let total_in_buckets: usize = per_bucket_counts.iter().map(|(_, c)| c).sum();
+                println!("Total minimizers across all buckets: {}", total_in_buckets);
+
+                if per_bucket_counts.len() <= 20 {
+                    for (id, count) in &per_bucket_counts {
+                        let name = idx.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
+                        println!("  Bucket {}: {} minimizers ({})", id, count, name);
+                    }
+                } else {
+                    println!("  (showing first 10 and last 10 of {} buckets)", per_bucket_counts.len());
+                    for (id, count) in per_bucket_counts.iter().take(10) {
+                        let name = idx.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
+                        println!("  Bucket {}: {} minimizers ({})", id, count, name);
+                    }
+                    println!("  ...");
+                    for (id, count) in per_bucket_counts.iter().rev().take(10).collect::<Vec<_>>().into_iter().rev() {
+                        let name = idx.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
+                        println!("  Bucket {}: {} minimizers ({})", id, count, name);
+                    }
+                }
             }
         },
 
