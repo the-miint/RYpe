@@ -188,22 +188,28 @@ Uses `rayon` for data parallelism:
 - `classify_batch()` parallelizes minimizer extraction AND bucket scoring
 - `map_init()` pattern provides per-thread workspace to avoid allocations
 
-### Index File Format (version 3)
+### Index File Format (version 4)
 ```
-Magic: "RYP3" (4 bytes)
-Version: u32 (4 bytes) = 3
+HEADER (uncompressed):
+Magic: "RYP4" (4 bytes)
+Version: u32 (4 bytes) = 4
 K: u64 (8 bytes) - must be 16, 32, or 64
 W: u64 (8 bytes)
 Salt: u64 (8 bytes)
 Num Buckets: u32 (4 bytes)
-For each bucket:
+
+METADATA (uncompressed, for each bucket in sorted ID order):
+  - Minimizer count: u64
   - Bucket ID: u32
   - Name length: u64, then UTF-8 bytes
   - Source count: u64
     - For each source: length (u64), UTF-8 bytes
-  - Minimizer count: u64
-    - For each minimizer: u64 (little-endian)
+
+MINIMIZERS (zstd compressed stream):
+  - All minimizers for all buckets, in bucket order (u64 little-endian each)
 ```
+
+This format keeps metadata uncompressed for fast `load_metadata()` while compressing the bulk of the data (minimizers).
 
 ### Error Handling
 - Rust API: Uses `anyhow::Result<T>` for all fallible operations

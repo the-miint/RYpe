@@ -316,10 +316,19 @@ impl Index {
             .ok_or_else(|| anyhow!("Bucket ID overflow: maximum ID {} reached", max_id))
     }
 
+    /// Save the index to a file (v4 format with zstd-compressed minimizers).
+    ///
+    /// Format v4:
+    /// - Header (uncompressed): magic "RYP4", version 4, k, w, salt, num_buckets
+    /// - Bucket metadata (uncompressed): for each bucket: minimizer_count, bucket_id, name, sources
+    /// - Minimizers (zstd compressed stream): all minimizers for all buckets in order
+    ///
+    /// This format keeps metadata uncompressed for fast seeking (load_metadata) while
+    /// compressing the bulk of the data (minimizers).
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
-        writer.write_all(b"RYP3")?;
-        writer.write_all(&3u32.to_le_bytes())?; // Version 3
+        writer.write_all(b"RYP4")?;
+        writer.write_all(&4u32.to_le_bytes())?; // Version 4
         writer.write_all(&(self.k as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
         writer.write_all(&(self.salt).to_le_bytes())?;
@@ -329,11 +338,11 @@ impl Index {
 
         writer.write_all(&(sorted_ids.len() as u32).to_le_bytes())?;
 
-        // V3 Format: MinimizerCount comes FIRST for each bucket (enables seeking)
-        for id in sorted_ids {
+        // Write all bucket metadata (uncompressed) - enables fast load_metadata()
+        for id in &sorted_ids {
             let vec = &self.buckets[id];
 
-            // Write minimizer count first
+            // Write minimizer count first (for seeking past in load_metadata)
             writer.write_all(&(vec.len() as u64).to_le_bytes())?;
 
             // Write bucket ID
@@ -356,26 +365,49 @@ impl Index {
                 writer.write_all(&(s_bytes.len() as u64).to_le_bytes())?;
                 writer.write_all(s_bytes)?;
             }
+        }
 
-            // Write minimizers
+        // Write all minimizers (zstd compressed stream)
+        let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
+
+        const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024;
+        let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
+
+        let flush_buf = |buf: &mut Vec<u8>, encoder: &mut zstd::stream::write::Encoder<BufWriter<File>>| -> Result<()> {
+            if !buf.is_empty() {
+                encoder.write_all(buf)?;
+                buf.clear();
+            }
+            Ok(())
+        };
+
+        for id in &sorted_ids {
+            let vec = &self.buckets[id];
             for val in vec {
-                writer.write_all(&val.to_le_bytes())?;
+                write_buf.extend_from_slice(&val.to_le_bytes());
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
             }
         }
+        flush_buf(&mut write_buf, &mut encoder)?;
+
+        encoder.finish()?;
         Ok(())
     }
 
+    /// Load an index from a file (v4 format with zstd-compressed minimizers).
     pub fn load(path: &Path) -> Result<Self> {
         let mut reader = BufReader::new(File::open(path)?);
         let mut buf4 = [0u8; 4];
         let mut buf8 = [0u8; 8];
 
         reader.read_exact(&mut buf4)?;
-        if &buf4 != b"RYP3" { return Err(anyhow!("Invalid Index Format (Expected RYP3)")); }
+        if &buf4 != b"RYP4" { return Err(anyhow!("Invalid Index Format (Expected RYP4)")); }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        const SUPPORTED_VERSION: u32 = 3;
+        const SUPPORTED_VERSION: u32 = 4;
         if version != SUPPORTED_VERSION {
             return Err(anyhow!("Unsupported index version: {} (expected {})", version, SUPPORTED_VERSION));
         }
@@ -395,8 +427,9 @@ impl Index {
         let mut buckets = HashMap::new();
         let mut names = HashMap::new();
         let mut sources = HashMap::new();
+        let mut bucket_order: Vec<(u32, usize)> = Vec::with_capacity(num as usize);
 
-        // V3 format: MinimizerCount comes first for each bucket
+        // Read all bucket metadata (uncompressed)
         for _ in 0..num {
             reader.read_exact(&mut buf8)?;
             let vec_len = u64::from_le_bytes(buf8) as usize;
@@ -427,11 +460,31 @@ impl Index {
             }
             sources.insert(id, src_list);
 
+            // Remember bucket ID and size for reading minimizers later
+            bucket_order.push((id, vec_len));
+        }
+
+        // Read all minimizers (zstd compressed stream)
+        let mut decoder = zstd::stream::read::Decoder::new(reader)
+            .map_err(|e| anyhow!("Failed to create zstd decoder: {}", e))?;
+
+        const READ_BUF_SIZE: usize = 8 * 1024 * 1024;
+
+        for (id, vec_len) in bucket_order {
             let mut vec = Vec::with_capacity(vec_len);
-            let mut buf8_inner = [0u8; 8];
-            for _ in 0..vec_len {
-                reader.read_exact(&mut buf8_inner)?;
-                vec.push(u64::from_le_bytes(buf8_inner));
+            let bytes_needed = vec_len * 8;
+            let mut read_buf = vec![0u8; bytes_needed.min(READ_BUF_SIZE)];
+            let mut total_read = 0;
+
+            while total_read < bytes_needed {
+                let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
+                decoder.read_exact(&mut read_buf[..chunk_size])
+                    .map_err(|e| anyhow!("Failed to read minimizers for bucket {}: {}", id, e))?;
+
+                for chunk in read_buf[..chunk_size].chunks_exact(8) {
+                    vec.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+                }
+                total_read += chunk_size;
             }
 
             buckets.insert(id, vec);
@@ -440,19 +493,22 @@ impl Index {
         Ok(Index { k, w, salt, buckets, bucket_names: names, bucket_sources: sources })
     }
 
+    /// Load only metadata from an index file (v4 format).
+    ///
+    /// This is much faster than load() because in v4 format all metadata is stored
+    /// uncompressed before the compressed minimizers, so we can read just the metadata
+    /// section and stop without touching the compressed data.
     pub fn load_metadata(path: &Path) -> Result<IndexMetadata> {
-        use std::io::Seek;
-
         let mut reader = BufReader::new(File::open(path)?);
         let mut buf4 = [0u8; 4];
         let mut buf8 = [0u8; 8];
 
         reader.read_exact(&mut buf4)?;
-        if &buf4 != b"RYP3" { return Err(anyhow!("Invalid Index Format (Expected RYP3)")); }
+        if &buf4 != b"RYP4" { return Err(anyhow!("Invalid Index Format (Expected RYP4)")); }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        const SUPPORTED_VERSION: u32 = 3;
+        const SUPPORTED_VERSION: u32 = 4;
         if version != SUPPORTED_VERSION {
             return Err(anyhow!("Unsupported index version: {} (expected {})", version, SUPPORTED_VERSION));
         }
@@ -473,7 +529,8 @@ impl Index {
         let mut sources = HashMap::new();
         let mut minimizer_counts = HashMap::new();
 
-        // V3 format allows seeking past minimizers for fast metadata-only loading
+        // V4 format: all metadata is before the compressed minimizer section
+        // No seeking needed - we just read the metadata and stop
         for _ in 0..num {
             reader.read_exact(&mut buf8)?;
             let vec_len = u64::from_le_bytes(buf8) as usize;
@@ -504,12 +561,8 @@ impl Index {
             }
             sources.insert(id, src_list);
 
-            // Store minimizer count without loading minimizers
+            // Store minimizer count (no need to seek - minimizers are after all metadata)
             minimizer_counts.insert(id, vec_len);
-
-            // Seek past minimizer data (vec_len × 8 bytes)
-            let bytes_to_skip = (vec_len as u64) * 8;
-            reader.seek(std::io::SeekFrom::Current(bytes_to_skip as i64))?;
         }
 
         Ok(IndexMetadata {
@@ -1521,7 +1574,7 @@ mod tests {
     fn test_index_load_invalid_format() {
         let file = NamedTempFile::new().unwrap();
         let path = file.path();
-        std::fs::write(path, b"NOTRYP3").unwrap();
+        std::fs::write(path, b"NOTRYP4").unwrap();
 
         let result = Index::load(path);
         assert!(result.is_err());
@@ -1534,7 +1587,7 @@ mod tests {
         let path = file.path();
 
         // Write valid header with wrong version
-        let mut data = b"RYP3".to_vec();
+        let mut data = b"RYP4".to_vec();
         data.extend_from_slice(&999u32.to_le_bytes());  // Bad version
         std::fs::write(path, data).unwrap();
 
@@ -1545,18 +1598,18 @@ mod tests {
 
     #[test]
     fn test_index_load_oversized_bucket() {
-        // Create a malicious index file claiming a huge bucket (V3 format)
+        // Create a malicious index file claiming a huge bucket (V4 format)
         let file = NamedTempFile::new().unwrap();
         let path = file.path();
 
         let mut data = Vec::new();
-        data.extend_from_slice(b"RYP3");
-        data.extend_from_slice(&3u32.to_le_bytes());  // Version 3
+        data.extend_from_slice(b"RYP4");
+        data.extend_from_slice(&4u32.to_le_bytes());  // Version 4
         data.extend_from_slice(&64u64.to_le_bytes()); // K
         data.extend_from_slice(&50u64.to_le_bytes()); // W
         data.extend_from_slice(&0u64.to_le_bytes());  // Salt
         data.extend_from_slice(&1u32.to_le_bytes());  // 1 bucket
-        // V3 Format: MinimizerCount comes FIRST
+        // V4 Format: MinimizerCount comes FIRST (in metadata section)
         data.extend_from_slice(&(MAX_BUCKET_SIZE as u64 + 1).to_le_bytes()); // Oversized!
         data.extend_from_slice(&1u32.to_le_bytes());  // Bucket ID 1
         data.extend_from_slice(&4u64.to_le_bytes());  // Name length
@@ -1773,8 +1826,8 @@ mod tests {
     }
 
     #[test]
-    fn test_v3_format_roundtrip() -> Result<()> {
-        // Verify V3 format can save and load correctly
+    fn test_v4_format_roundtrip() -> Result<()> {
+        // Verify V4 format (zstd-compressed minimizers) can save and load correctly
         let file = NamedTempFile::new()?;
         let path = file.path().to_path_buf();
         let mut index = Index::new(64, 50, 0x1234)?;
@@ -1954,8 +2007,8 @@ mod tests {
 
         // Manually create an invalid index file with K=48
         let mut data = Vec::new();
-        data.extend_from_slice(b"RYP3");
-        data.extend_from_slice(&3u32.to_le_bytes());  // Version 3
+        data.extend_from_slice(b"RYP4");
+        data.extend_from_slice(&4u32.to_le_bytes());  // Version 4
         data.extend_from_slice(&48u64.to_le_bytes()); // Invalid K=48
         data.extend_from_slice(&50u64.to_le_bytes()); // W
         data.extend_from_slice(&0u64.to_le_bytes());  // Salt
