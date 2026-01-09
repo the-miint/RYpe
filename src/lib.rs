@@ -806,14 +806,14 @@ impl InvertedIndex {
         hits
     }
 
-    /// Save the inverted index to a file (zstd compressed, u32 offsets, adaptive bucket IDs).
+    /// Save the inverted index to a file (zstd streaming compressed, u32 offsets, adaptive bucket IDs).
     ///
     /// Format v2:
-    /// - Header (uncompressed): magic "RYXI", version 2, k, w, salt, source_hash, max_bucket_id, num_minimizers, num_bucket_ids, compressed_size
-    /// - Payload (zstd compressed): offsets (u32), minimizers (u64), bucket_ids (u8/u16/u32 based on max_bucket_id)
+    /// - Header (uncompressed, 60 bytes): magic "RYXI", version 2, k, w, salt, source_hash, max_bucket_id, num_minimizers, num_bucket_ids
+    /// - Payload (zstd compressed stream to EOF): offsets (u32), minimizers (u64), bucket_ids (u8/u16/u32 based on max_bucket_id)
+    ///
+    /// Uses streaming compression with chunked writes for efficiency.
     pub fn save(&self, path: &Path) -> Result<()> {
-        use std::io::Cursor;
-
         // Validate sizes before saving
         if self.bucket_ids.len() > MAX_INVERTED_BUCKET_IDS {
             return Err(anyhow!("Cannot save: bucket_ids length {} exceeds maximum {}",
@@ -828,14 +828,6 @@ impl InvertedIndex {
 
         // Determine max bucket ID for adaptive sizing
         let max_bucket_id = self.bucket_ids.iter().copied().max().unwrap_or(0);
-        let bucket_id_width = Self::bucket_id_bytes(max_bucket_id);
-
-        // Calculate payload size with checked arithmetic
-        let payload_size = (self.offsets.len() as u64)
-            .checked_mul(4)
-            .and_then(|s| s.checked_add((self.minimizers.len() as u64).checked_mul(8)?))
-            .and_then(|s| s.checked_add((self.bucket_ids.len() as u64).checked_mul(bucket_id_width as u64)?))
-            .ok_or_else(|| anyhow!("Payload size calculation overflow"))?;
 
         // Magic and version
         writer.write_all(b"RYXI")?;
@@ -852,56 +844,74 @@ impl InvertedIndex {
         writer.write_all(&(self.minimizers.len() as u64).to_le_bytes())?;
         writer.write_all(&(self.bucket_ids.len() as u64).to_le_bytes())?;
 
-        // Build uncompressed payload
-        let mut payload = Vec::with_capacity(payload_size as usize);
+        // Create streaming zstd encoder (level 3 is a good balance of speed/compression)
+        let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
 
-        // Offsets (u32)
+        // Write buffer for batching small writes (8MB chunks)
+        const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024;
+        let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
+
+        // Helper closure to flush buffer when full
+        let flush_buf = |buf: &mut Vec<u8>, encoder: &mut zstd::stream::write::Encoder<BufWriter<File>>| -> Result<()> {
+            if !buf.is_empty() {
+                encoder.write_all(buf)?;
+                buf.clear();
+            }
+            Ok(())
+        };
+
+        // Stream offsets (u32) in chunks
         for &offset in &self.offsets {
-            payload.extend_from_slice(&offset.to_le_bytes());
+            write_buf.extend_from_slice(&offset.to_le_bytes());
+            if write_buf.len() >= WRITE_BUF_SIZE {
+                flush_buf(&mut write_buf, &mut encoder)?;
+            }
         }
+        flush_buf(&mut write_buf, &mut encoder)?;
 
-        // Minimizers (u64)
+        // Stream minimizers (u64) in chunks
         for &min in &self.minimizers {
-            payload.extend_from_slice(&min.to_le_bytes());
+            write_buf.extend_from_slice(&min.to_le_bytes());
+            if write_buf.len() >= WRITE_BUF_SIZE {
+                flush_buf(&mut write_buf, &mut encoder)?;
+            }
         }
+        flush_buf(&mut write_buf, &mut encoder)?;
 
-        // Bucket IDs (adaptive sizing)
+        // Stream bucket IDs (adaptive sizing) in chunks
         if max_bucket_id <= u8::MAX as u32 {
             for &bid in &self.bucket_ids {
-                payload.push(bid as u8);
+                write_buf.push(bid as u8);
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
             }
         } else if max_bucket_id <= u16::MAX as u32 {
             for &bid in &self.bucket_ids {
-                payload.extend_from_slice(&(bid as u16).to_le_bytes());
+                write_buf.extend_from_slice(&(bid as u16).to_le_bytes());
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
             }
         } else {
             for &bid in &self.bucket_ids {
-                payload.extend_from_slice(&bid.to_le_bytes());
+                write_buf.extend_from_slice(&bid.to_le_bytes());
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
             }
         }
+        flush_buf(&mut write_buf, &mut encoder)?;
 
-        // Compress payload with zstd (level 3 is a good balance of speed/compression)
-        let compressed = zstd::encode_all(Cursor::new(&payload), 3)?;
-
-        // Write compressed size and data
-        writer.write_all(&(compressed.len() as u64).to_le_bytes())?;
-        writer.write_all(&compressed)?;
+        // Finish compression and flush
+        encoder.finish()?;
 
         Ok(())
     }
 
-    /// Returns the number of bytes per bucket ID for adaptive sizing.
-    fn bucket_id_bytes(max_bucket_id: u32) -> usize {
-        if max_bucket_id <= u8::MAX as u32 {
-            1
-        } else if max_bucket_id <= u16::MAX as u32 {
-            2
-        } else {
-            4
-        }
-    }
-
-    /// Load an inverted index from a file.
+    /// Load an inverted index from a file using streaming decompression.
+    ///
+    /// Uses streaming decompression to avoid buffering the entire payload in memory.
     pub fn load(path: &Path) -> Result<Self> {
         let mut reader = BufReader::new(File::open(path)?);
         let mut buf4 = [0u8; 4];
@@ -954,59 +964,47 @@ impl InvertedIndex {
                 num_bucket_ids, MAX_INVERTED_BUCKET_IDS));
         }
 
-        // Calculate expected sizes BEFORE decompression to validate and prevent compression bombs
+        // Calculate expected allocation sizes for validation
         let offsets_len = num_minimizers.checked_add(1)
             .ok_or_else(|| anyhow!("Offset array length overflow"))?;
-        let bucket_id_width = Self::bucket_id_bytes(max_bucket_id);
 
-        // Use checked arithmetic to prevent overflow
-        let expected_size = (offsets_len as u64)
-            .checked_mul(4)
-            .and_then(|s| s.checked_add((num_minimizers as u64).checked_mul(8)?))
-            .and_then(|s| s.checked_add((num_bucket_ids as u64).checked_mul(bucket_id_width as u64)?))
-            .ok_or_else(|| anyhow!("Expected payload size calculation overflow"))?;
-
-        // Sanity limit on decompressed size (64GB) to prevent compression bombs
-        const MAX_DECOMPRESSED_SIZE: u64 = 64 * 1024 * 1024 * 1024;
-        if expected_size > MAX_DECOMPRESSED_SIZE {
+        // Sanity check on total allocation size (prevent DoS via huge allocations)
+        let total_elements = (offsets_len as u64)
+            .checked_add(num_minimizers as u64)
+            .and_then(|s| s.checked_add(num_bucket_ids as u64))
+            .ok_or_else(|| anyhow!("Total element count overflow"))?;
+        const MAX_TOTAL_ELEMENTS: u64 = 8_000_000_000; // ~8B elements
+        if total_elements > MAX_TOTAL_ELEMENTS {
             return Err(anyhow!(
-                "Expected decompressed payload size {} exceeds maximum {}",
-                expected_size, MAX_DECOMPRESSED_SIZE
-            ));
-        }
-        let expected_size = expected_size as usize;
-
-        // Compressed payload size
-        reader.read_exact(&mut buf8)?;
-        let compressed_size = u64::from_le_bytes(buf8) as usize;
-        if compressed_size > 64 * 1024 * 1024 * 1024 { // 64GB sanity limit on compressed data
-            return Err(anyhow!("Compressed payload size {} exceeds sanity limit", compressed_size));
-        }
-
-        // Read and decompress payload
-        let mut compressed = vec![0u8; compressed_size];
-        reader.read_exact(&mut compressed)?;
-
-        let payload = zstd::decode_all(std::io::Cursor::new(&compressed))
-            .map_err(|e| anyhow!("Failed to decompress inverted index payload: {}", e))?;
-        drop(compressed); // Free compressed data
-
-        if payload.len() != expected_size {
-            return Err(anyhow!(
-                "Decompressed payload size {} doesn't match expected {}",
-                payload.len(), expected_size
+                "Total element count {} exceeds maximum {}",
+                total_elements, MAX_TOTAL_ELEMENTS
             ));
         }
 
-        let mut cursor = 0;
+        // Create streaming zstd decoder for the rest of the file
+        let mut decoder = zstd::stream::read::Decoder::new(reader)
+            .map_err(|e| anyhow!("Failed to create zstd decoder: {}", e))?;
 
-        // Offsets (u32)
+        // Read buffer for batching small reads (8MB chunks)
+        const READ_BUF_SIZE: usize = 8 * 1024 * 1024;
+
+        // Read offsets (u32) in chunks
         let mut offsets = Vec::with_capacity(offsets_len);
-        for _ in 0..offsets_len {
-            let bytes: [u8; 4] = payload[cursor..cursor + 4].try_into()
-                .map_err(|_| anyhow!("Payload truncated at offset {}", cursor))?;
-            offsets.push(u32::from_le_bytes(bytes));
-            cursor += 4;
+        {
+            let bytes_needed = offsets_len * 4;
+            let mut read_buf = vec![0u8; bytes_needed.min(READ_BUF_SIZE)];
+            let mut total_read = 0;
+
+            while total_read < bytes_needed {
+                let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
+                decoder.read_exact(&mut read_buf[..chunk_size])
+                    .map_err(|e| anyhow!("Failed to read offsets: {}", e))?;
+
+                for chunk in read_buf[..chunk_size].chunks_exact(4) {
+                    offsets.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+                }
+                total_read += chunk_size;
+            }
         }
 
         // Validate CSR invariants
@@ -1032,55 +1030,111 @@ impl InvertedIndex {
             }
         }
 
-        // Minimizers (u64)
+        // Read minimizers (u64) in chunks
         let mut minimizers = Vec::with_capacity(num_minimizers);
-        for _ in 0..num_minimizers {
-            let bytes: [u8; 8] = payload[cursor..cursor + 8].try_into()
-                .map_err(|_| anyhow!("Payload truncated at offset {}", cursor))?;
-            minimizers.push(u64::from_le_bytes(bytes));
-            cursor += 8;
-        }
+        {
+            let bytes_needed = num_minimizers * 8;
+            let mut read_buf = vec![0u8; bytes_needed.min(READ_BUF_SIZE)];
+            let mut total_read = 0;
+            let mut prev_min: Option<u64> = None;
+            let mut idx = 0;
 
-        // Validate minimizers are sorted (required for binary search in get_bucket_hits)
-        for i in 1..minimizers.len() {
-            if minimizers[i] < minimizers[i - 1] {
-                return Err(anyhow!(
-                    "Invalid inverted index: minimizers not sorted (minimizers[{}]={} < minimizers[{}]={})",
-                    i, minimizers[i], i - 1, minimizers[i - 1]
-                ));
+            while total_read < bytes_needed {
+                let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
+                decoder.read_exact(&mut read_buf[..chunk_size])
+                    .map_err(|e| anyhow!("Failed to read minimizers: {}", e))?;
+
+                for chunk in read_buf[..chunk_size].chunks_exact(8) {
+                    let min = u64::from_le_bytes(chunk.try_into().unwrap());
+
+                    // Validate minimizers are sorted (required for binary search)
+                    if let Some(prev) = prev_min {
+                        if min < prev {
+                            return Err(anyhow!(
+                                "Invalid inverted index: minimizers not sorted (minimizers[{}]={} < minimizers[{}]={})",
+                                idx, min, idx - 1, prev
+                            ));
+                        }
+                    }
+                    prev_min = Some(min);
+                    minimizers.push(min);
+                    idx += 1;
+                }
+                total_read += chunk_size;
             }
         }
 
-        // Bucket IDs (adaptive sizing)
+        // Read bucket IDs (adaptive sizing) in chunks
         let mut bucket_ids = Vec::with_capacity(num_bucket_ids);
         if max_bucket_id <= u8::MAX as u32 {
-            for _ in 0..num_bucket_ids {
-                bucket_ids.push(payload[cursor] as u32);
-                cursor += 1;
+            // u8 bucket IDs
+            let bytes_needed = num_bucket_ids;
+            let mut read_buf = vec![0u8; bytes_needed.min(READ_BUF_SIZE)];
+            let mut total_read = 0;
+
+            while total_read < bytes_needed {
+                let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
+                decoder.read_exact(&mut read_buf[..chunk_size])
+                    .map_err(|e| anyhow!("Failed to read bucket_ids: {}", e))?;
+
+                for &b in &read_buf[..chunk_size] {
+                    bucket_ids.push(b as u32);
+                }
+                total_read += chunk_size;
             }
         } else if max_bucket_id <= u16::MAX as u32 {
-            for _ in 0..num_bucket_ids {
-                let bytes: [u8; 2] = payload[cursor..cursor + 2].try_into()
-                    .map_err(|_| anyhow!("Payload truncated at offset {}", cursor))?;
-                bucket_ids.push(u16::from_le_bytes(bytes) as u32);
-                cursor += 2;
+            // u16 bucket IDs
+            let bytes_needed = num_bucket_ids * 2;
+            let mut read_buf = vec![0u8; bytes_needed.min(READ_BUF_SIZE)];
+            let mut total_read = 0;
+            let mut idx = 0;
+
+            while total_read < bytes_needed {
+                let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
+                // Ensure we read aligned to 2 bytes
+                let chunk_size = chunk_size - (chunk_size % 2);
+                if chunk_size == 0 { break; }
+
+                decoder.read_exact(&mut read_buf[..chunk_size])
+                    .map_err(|e| anyhow!("Failed to read bucket_ids: {}", e))?;
+
+                for chunk in read_buf[..chunk_size].chunks_exact(2) {
+                    let bid = u16::from_le_bytes(chunk.try_into().unwrap()) as u32;
+                    if bid > max_bucket_id {
+                        return Err(anyhow!(
+                            "Invalid inverted index: bucket_id[{}]={} exceeds declared max_bucket_id={}",
+                            idx, bid, max_bucket_id
+                        ));
+                    }
+                    bucket_ids.push(bid);
+                    idx += 1;
+                }
+                total_read += chunk_size;
             }
         } else {
-            for _ in 0..num_bucket_ids {
-                let bytes: [u8; 4] = payload[cursor..cursor + 4].try_into()
-                    .map_err(|_| anyhow!("Payload truncated at offset {}", cursor))?;
-                bucket_ids.push(u32::from_le_bytes(bytes));
-                cursor += 4;
-            }
-        }
+            // u32 bucket IDs
+            let bytes_needed = num_bucket_ids * 4;
+            let mut read_buf = vec![0u8; bytes_needed.min(READ_BUF_SIZE)];
+            let mut total_read = 0;
+            let mut idx = 0;
 
-        // Validate bucket IDs don't exceed declared max_bucket_id
-        for (i, &bid) in bucket_ids.iter().enumerate() {
-            if bid > max_bucket_id {
-                return Err(anyhow!(
-                    "Invalid inverted index: bucket_id[{}]={} exceeds declared max_bucket_id={}",
-                    i, bid, max_bucket_id
-                ));
+            while total_read < bytes_needed {
+                let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
+                decoder.read_exact(&mut read_buf[..chunk_size])
+                    .map_err(|e| anyhow!("Failed to read bucket_ids: {}", e))?;
+
+                for chunk in read_buf[..chunk_size].chunks_exact(4) {
+                    let bid = u32::from_le_bytes(chunk.try_into().unwrap());
+                    if bid > max_bucket_id {
+                        return Err(anyhow!(
+                            "Invalid inverted index: bucket_id[{}]={} exceeds declared max_bucket_id={}",
+                            idx, bid, max_bucket_id
+                        ));
+                    }
+                    bucket_ids.push(bid);
+                    idx += 1;
+                }
+                total_read += chunk_size;
             }
         }
 
@@ -2238,24 +2292,22 @@ mod tests {
             writer.write_all(&2u64.to_le_bytes()).unwrap(); // num_minimizers = 2
             writer.write_all(&3u64.to_le_bytes()).unwrap(); // num_bucket_ids = 3
 
-            // Build invalid payload: offsets should be [0, x, 3] but we'll write [1, 2, 3]
-            let mut payload = Vec::new();
-            // Offsets (u32): invalid - first offset != 0
-            payload.extend_from_slice(&1u32.to_le_bytes()); // Invalid: first offset != 0
-            payload.extend_from_slice(&2u32.to_le_bytes());
-            payload.extend_from_slice(&3u32.to_le_bytes());
-            // Minimizers (u64)
-            payload.extend_from_slice(&100u64.to_le_bytes());
-            payload.extend_from_slice(&200u64.to_le_bytes());
-            // Bucket IDs (u8 since max_bucket_id = 0)
-            payload.push(0);
-            payload.push(0);
-            payload.push(0);
+            // Create streaming encoder for payload
+            let mut encoder = zstd::stream::write::Encoder::new(writer, 3).unwrap();
 
-            // Compress with zstd
-            let compressed = zstd::encode_all(std::io::Cursor::new(&payload), 3).unwrap();
-            writer.write_all(&(compressed.len() as u64).to_le_bytes()).unwrap();
-            writer.write_all(&compressed).unwrap();
+            // Offsets (u32): invalid - first offset != 0
+            encoder.write_all(&1u32.to_le_bytes()).unwrap(); // Invalid: first offset != 0
+            encoder.write_all(&2u32.to_le_bytes()).unwrap();
+            encoder.write_all(&3u32.to_le_bytes()).unwrap();
+            // Minimizers (u64)
+            encoder.write_all(&100u64.to_le_bytes()).unwrap();
+            encoder.write_all(&200u64.to_le_bytes()).unwrap();
+            // Bucket IDs (u8 since max_bucket_id = 0)
+            encoder.write_all(&[0u8]).unwrap();
+            encoder.write_all(&[0u8]).unwrap();
+            encoder.write_all(&[0u8]).unwrap();
+
+            encoder.finish().unwrap();
         }
 
         let result = InvertedIndex::load(path);
