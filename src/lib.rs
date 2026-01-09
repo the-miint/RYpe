@@ -547,7 +547,7 @@ pub struct InvertedIndex {
     pub salt: u64,
     source_hash: u64,
     minimizers: Vec<u64>,      // sorted unique minimizers (ascending, no duplicates)
-    offsets: Vec<u64>,         // CSR offsets (length = minimizers.len() + 1, monotonically increasing)
+    offsets: Vec<u32>,         // CSR offsets (length = minimizers.len() + 1, monotonically increasing, max 4B entries)
     bucket_ids: Vec<u32>,      // flattened bucket IDs
 }
 
@@ -606,7 +606,7 @@ impl InvertedIndex {
 
         // Build CSR structure with reserved capacity
         let mut minimizers: Vec<u64> = Vec::with_capacity(estimated_unique);
-        let mut offsets: Vec<u64> = Vec::with_capacity(estimated_unique + 1);
+        let mut offsets: Vec<u32> = Vec::with_capacity(estimated_unique + 1);
         let mut bucket_ids_out: Vec<u32> = Vec::with_capacity(total_entries);
 
         offsets.push(0);
@@ -667,7 +667,9 @@ impl InvertedIndex {
                     current_bucket_ids.sort_unstable();
                     current_bucket_ids.dedup();
                     bucket_ids_out.extend_from_slice(&current_bucket_ids);
-                    offsets.push(bucket_ids_out.len() as u64);
+                    // Safe conversion: panic if bucket_ids exceeds u32::MAX (indicates corrupted/too large data)
+                    offsets.push(u32::try_from(bucket_ids_out.len())
+                        .expect("CSR offset overflow: bucket_ids exceeded u32::MAX"));
                     current_bucket_ids.clear();
                 }
                 minimizers.push(min_val);
@@ -691,7 +693,8 @@ impl InvertedIndex {
             current_bucket_ids.sort_unstable();
             current_bucket_ids.dedup();
             bucket_ids_out.extend_from_slice(&current_bucket_ids);
-            offsets.push(bucket_ids_out.len() as u64);
+            offsets.push(u32::try_from(bucket_ids_out.len())
+                .expect("CSR offset overflow: bucket_ids exceeded u32::MAX"));
         }
 
         // Shrink to fit to reclaim excess capacity
@@ -803,40 +806,99 @@ impl InvertedIndex {
         hits
     }
 
-    /// Save the inverted index to a file.
+    /// Save the inverted index to a file (zstd compressed, u32 offsets, adaptive bucket IDs).
+    ///
+    /// Format v2:
+    /// - Header (uncompressed): magic "RYXI", version 2, k, w, salt, source_hash, max_bucket_id, num_minimizers, num_bucket_ids, compressed_size
+    /// - Payload (zstd compressed): offsets (u32), minimizers (u64), bucket_ids (u8/u16/u32 based on max_bucket_id)
     pub fn save(&self, path: &Path) -> Result<()> {
+        use std::io::Cursor;
+
+        // Validate sizes before saving
+        if self.bucket_ids.len() > MAX_INVERTED_BUCKET_IDS {
+            return Err(anyhow!("Cannot save: bucket_ids length {} exceeds maximum {}",
+                self.bucket_ids.len(), MAX_INVERTED_BUCKET_IDS));
+        }
+        if self.minimizers.len() > MAX_INVERTED_MINIMIZERS {
+            return Err(anyhow!("Cannot save: minimizers length {} exceeds maximum {}",
+                self.minimizers.len(), MAX_INVERTED_MINIMIZERS));
+        }
+
         let mut writer = BufWriter::new(File::create(path)?);
+
+        // Determine max bucket ID for adaptive sizing
+        let max_bucket_id = self.bucket_ids.iter().copied().max().unwrap_or(0);
+        let bucket_id_width = Self::bucket_id_bytes(max_bucket_id);
+
+        // Calculate payload size with checked arithmetic
+        let payload_size = (self.offsets.len() as u64)
+            .checked_mul(4)
+            .and_then(|s| s.checked_add((self.minimizers.len() as u64).checked_mul(8)?))
+            .and_then(|s| s.checked_add((self.bucket_ids.len() as u64).checked_mul(bucket_id_width as u64)?))
+            .ok_or_else(|| anyhow!("Payload size calculation overflow"))?;
 
         // Magic and version
         writer.write_all(b"RYXI")?;
-        writer.write_all(&1u32.to_le_bytes())?; // Version 1
+        writer.write_all(&2u32.to_le_bytes())?;
 
-        // Metadata
+        // Metadata (uncompressed header)
         writer.write_all(&(self.k as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
         writer.write_all(&self.salt.to_le_bytes())?;
         writer.write_all(&self.source_hash.to_le_bytes())?;
 
-        // Sizes
+        // Sizes and adaptive bucket ID info
+        writer.write_all(&max_bucket_id.to_le_bytes())?;
         writer.write_all(&(self.minimizers.len() as u64).to_le_bytes())?;
         writer.write_all(&(self.bucket_ids.len() as u64).to_le_bytes())?;
 
-        // Offsets (minimizers.len() + 1 entries)
+        // Build uncompressed payload
+        let mut payload = Vec::with_capacity(payload_size as usize);
+
+        // Offsets (u32)
         for &offset in &self.offsets {
-            writer.write_all(&offset.to_le_bytes())?;
+            payload.extend_from_slice(&offset.to_le_bytes());
         }
 
-        // Minimizers
+        // Minimizers (u64)
         for &min in &self.minimizers {
-            writer.write_all(&min.to_le_bytes())?;
+            payload.extend_from_slice(&min.to_le_bytes());
         }
 
-        // Bucket IDs
-        for &bid in &self.bucket_ids {
-            writer.write_all(&bid.to_le_bytes())?;
+        // Bucket IDs (adaptive sizing)
+        if max_bucket_id <= u8::MAX as u32 {
+            for &bid in &self.bucket_ids {
+                payload.push(bid as u8);
+            }
+        } else if max_bucket_id <= u16::MAX as u32 {
+            for &bid in &self.bucket_ids {
+                payload.extend_from_slice(&(bid as u16).to_le_bytes());
+            }
+        } else {
+            for &bid in &self.bucket_ids {
+                payload.extend_from_slice(&bid.to_le_bytes());
+            }
         }
+
+        // Compress payload with zstd (level 3 is a good balance of speed/compression)
+        let compressed = zstd::encode_all(Cursor::new(&payload), 3)?;
+
+        // Write compressed size and data
+        writer.write_all(&(compressed.len() as u64).to_le_bytes())?;
+        writer.write_all(&compressed)?;
 
         Ok(())
+    }
+
+    /// Returns the number of bytes per bucket ID for adaptive sizing.
+    fn bucket_id_bytes(max_bucket_id: u32) -> usize {
+        if max_bucket_id <= u8::MAX as u32 {
+            1
+        } else if max_bucket_id <= u16::MAX as u32 {
+            2
+        } else {
+            4
+        }
     }
 
     /// Load an inverted index from a file.
@@ -854,8 +916,8 @@ impl InvertedIndex {
         // Version
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != 1 {
-            return Err(anyhow!("Unsupported inverted index version: {} (expected 1)", version));
+        if version != 2 {
+            return Err(anyhow!("Unsupported inverted index version: {} (expected 2)", version));
         }
 
         // Metadata
@@ -874,7 +936,10 @@ impl InvertedIndex {
         reader.read_exact(&mut buf8)?;
         let source_hash = u64::from_le_bytes(buf8);
 
-        // Sizes
+        // Sizes and adaptive bucket ID info
+        reader.read_exact(&mut buf4)?;
+        let max_bucket_id = u32::from_le_bytes(buf4);
+
         reader.read_exact(&mut buf8)?;
         let num_minimizers = u64::from_le_bytes(buf8) as usize;
         if num_minimizers > MAX_INVERTED_MINIMIZERS {
@@ -889,13 +954,59 @@ impl InvertedIndex {
                 num_bucket_ids, MAX_INVERTED_BUCKET_IDS));
         }
 
-        // Offsets (num_minimizers + 1 entries)
+        // Calculate expected sizes BEFORE decompression to validate and prevent compression bombs
         let offsets_len = num_minimizers.checked_add(1)
             .ok_or_else(|| anyhow!("Offset array length overflow"))?;
+        let bucket_id_width = Self::bucket_id_bytes(max_bucket_id);
+
+        // Use checked arithmetic to prevent overflow
+        let expected_size = (offsets_len as u64)
+            .checked_mul(4)
+            .and_then(|s| s.checked_add((num_minimizers as u64).checked_mul(8)?))
+            .and_then(|s| s.checked_add((num_bucket_ids as u64).checked_mul(bucket_id_width as u64)?))
+            .ok_or_else(|| anyhow!("Expected payload size calculation overflow"))?;
+
+        // Sanity limit on decompressed size (64GB) to prevent compression bombs
+        const MAX_DECOMPRESSED_SIZE: u64 = 64 * 1024 * 1024 * 1024;
+        if expected_size > MAX_DECOMPRESSED_SIZE {
+            return Err(anyhow!(
+                "Expected decompressed payload size {} exceeds maximum {}",
+                expected_size, MAX_DECOMPRESSED_SIZE
+            ));
+        }
+        let expected_size = expected_size as usize;
+
+        // Compressed payload size
+        reader.read_exact(&mut buf8)?;
+        let compressed_size = u64::from_le_bytes(buf8) as usize;
+        if compressed_size > 64 * 1024 * 1024 * 1024 { // 64GB sanity limit on compressed data
+            return Err(anyhow!("Compressed payload size {} exceeds sanity limit", compressed_size));
+        }
+
+        // Read and decompress payload
+        let mut compressed = vec![0u8; compressed_size];
+        reader.read_exact(&mut compressed)?;
+
+        let payload = zstd::decode_all(std::io::Cursor::new(&compressed))
+            .map_err(|e| anyhow!("Failed to decompress inverted index payload: {}", e))?;
+        drop(compressed); // Free compressed data
+
+        if payload.len() != expected_size {
+            return Err(anyhow!(
+                "Decompressed payload size {} doesn't match expected {}",
+                payload.len(), expected_size
+            ));
+        }
+
+        let mut cursor = 0;
+
+        // Offsets (u32)
         let mut offsets = Vec::with_capacity(offsets_len);
         for _ in 0..offsets_len {
-            reader.read_exact(&mut buf8)?;
-            offsets.push(u64::from_le_bytes(buf8));
+            let bytes: [u8; 4] = payload[cursor..cursor + 4].try_into()
+                .map_err(|_| anyhow!("Payload truncated at offset {}", cursor))?;
+            offsets.push(u32::from_le_bytes(bytes));
+            cursor += 4;
         }
 
         // Validate CSR invariants
@@ -921,18 +1032,56 @@ impl InvertedIndex {
             }
         }
 
-        // Minimizers
+        // Minimizers (u64)
         let mut minimizers = Vec::with_capacity(num_minimizers);
         for _ in 0..num_minimizers {
-            reader.read_exact(&mut buf8)?;
-            minimizers.push(u64::from_le_bytes(buf8));
+            let bytes: [u8; 8] = payload[cursor..cursor + 8].try_into()
+                .map_err(|_| anyhow!("Payload truncated at offset {}", cursor))?;
+            minimizers.push(u64::from_le_bytes(bytes));
+            cursor += 8;
         }
 
-        // Bucket IDs
+        // Validate minimizers are sorted (required for binary search in get_bucket_hits)
+        for i in 1..minimizers.len() {
+            if minimizers[i] < minimizers[i - 1] {
+                return Err(anyhow!(
+                    "Invalid inverted index: minimizers not sorted (minimizers[{}]={} < minimizers[{}]={})",
+                    i, minimizers[i], i - 1, minimizers[i - 1]
+                ));
+            }
+        }
+
+        // Bucket IDs (adaptive sizing)
         let mut bucket_ids = Vec::with_capacity(num_bucket_ids);
-        for _ in 0..num_bucket_ids {
-            reader.read_exact(&mut buf4)?;
-            bucket_ids.push(u32::from_le_bytes(buf4));
+        if max_bucket_id <= u8::MAX as u32 {
+            for _ in 0..num_bucket_ids {
+                bucket_ids.push(payload[cursor] as u32);
+                cursor += 1;
+            }
+        } else if max_bucket_id <= u16::MAX as u32 {
+            for _ in 0..num_bucket_ids {
+                let bytes: [u8; 2] = payload[cursor..cursor + 2].try_into()
+                    .map_err(|_| anyhow!("Payload truncated at offset {}", cursor))?;
+                bucket_ids.push(u16::from_le_bytes(bytes) as u32);
+                cursor += 2;
+            }
+        } else {
+            for _ in 0..num_bucket_ids {
+                let bytes: [u8; 4] = payload[cursor..cursor + 4].try_into()
+                    .map_err(|_| anyhow!("Payload truncated at offset {}", cursor))?;
+                bucket_ids.push(u32::from_le_bytes(bytes));
+                cursor += 4;
+            }
+        }
+
+        // Validate bucket IDs don't exceed declared max_bucket_id
+        for (i, &bid) in bucket_ids.iter().enumerate() {
+            if bid > max_bucket_id {
+                return Err(anyhow!(
+                    "Invalid inverted index: bucket_id[{}]={} exceeds declared max_bucket_id={}",
+                    i, bid, max_bucket_id
+                ));
+            }
         }
 
         Ok(InvertedIndex {
@@ -2073,25 +2222,40 @@ mod tests {
         // Test that load() rejects invalid CSR data
         use std::io::Write;
 
-        // Create a file with valid header but invalid CSR offsets
+        // Create a file with valid v2 header but invalid CSR offsets in compressed payload
         let file = NamedTempFile::new().unwrap();
         let path = file.path();
 
         {
             let mut writer = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
             writer.write_all(b"RYXI").unwrap(); // Magic
-            writer.write_all(&1u32.to_le_bytes()).unwrap(); // Version
+            writer.write_all(&2u32.to_le_bytes()).unwrap(); // Version 2
             writer.write_all(&64u64.to_le_bytes()).unwrap(); // K
             writer.write_all(&50u64.to_le_bytes()).unwrap(); // W
             writer.write_all(&0u64.to_le_bytes()).unwrap(); // Salt
             writer.write_all(&0u64.to_le_bytes()).unwrap(); // Source hash
+            writer.write_all(&0u32.to_le_bytes()).unwrap(); // max_bucket_id (u8 mode)
             writer.write_all(&2u64.to_le_bytes()).unwrap(); // num_minimizers = 2
             writer.write_all(&3u64.to_le_bytes()).unwrap(); // num_bucket_ids = 3
-            // Offsets: should be [0, x, 3] but we'll write invalid [1, 2, 3]
-            writer.write_all(&1u64.to_le_bytes()).unwrap(); // Invalid: first offset != 0
-            writer.write_all(&2u64.to_le_bytes()).unwrap();
-            writer.write_all(&3u64.to_le_bytes()).unwrap();
-            // Rest doesn't matter, validation should fail first
+
+            // Build invalid payload: offsets should be [0, x, 3] but we'll write [1, 2, 3]
+            let mut payload = Vec::new();
+            // Offsets (u32): invalid - first offset != 0
+            payload.extend_from_slice(&1u32.to_le_bytes()); // Invalid: first offset != 0
+            payload.extend_from_slice(&2u32.to_le_bytes());
+            payload.extend_from_slice(&3u32.to_le_bytes());
+            // Minimizers (u64)
+            payload.extend_from_slice(&100u64.to_le_bytes());
+            payload.extend_from_slice(&200u64.to_le_bytes());
+            // Bucket IDs (u8 since max_bucket_id = 0)
+            payload.push(0);
+            payload.push(0);
+            payload.push(0);
+
+            // Compress with zstd
+            let compressed = zstd::encode_all(std::io::Cursor::new(&payload), 3).unwrap();
+            writer.write_all(&(compressed.len() as u64).to_le_bytes()).unwrap();
+            writer.write_all(&compressed).unwrap();
         }
 
         let result = InvertedIndex::load(path);
