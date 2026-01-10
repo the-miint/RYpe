@@ -1235,9 +1235,10 @@ impl InvertedIndex {
         // Read minimizers using delta+varint decoding
         // First minimizer is stored as full u64, rest are delta-encoded varints
         let mut minimizers = Vec::with_capacity(num_minimizers);
-        // Stack-allocated buffer for leftover bytes from varint decoding (max 9 bytes)
-        let mut leftover_buf: [u8; 16] = [0; 16];
-        let mut leftover_len: usize = 0;
+        // Buffer for reading varints - kept alive for leftover bytes needed by bucket ID reading
+        let mut varint_read_buf = vec![0u8; READ_BUF_SIZE];
+        let mut leftover_start: usize = 0;
+        let mut leftover_end: usize = 0;
 
         if num_minimizers > 0 {
             // Read first minimizer as full u64
@@ -1248,7 +1249,6 @@ impl InvertedIndex {
 
             // Read remaining minimizers as delta-encoded varints
             if num_minimizers > 1 {
-                let mut read_buf = vec![0u8; READ_BUF_SIZE];
                 let mut buf_pos: usize = 0;
                 let mut buf_len: usize = 0;
                 let mut prev = first_min;
@@ -1260,18 +1260,18 @@ impl InvertedIndex {
                         if remaining < 10 && buf_len > 0 {
                             // Move remaining bytes to the front
                             if remaining > 0 && buf_pos > 0 {
-                                read_buf.copy_within(buf_pos..buf_len, 0);
+                                varint_read_buf.copy_within(buf_pos..buf_len, 0);
                             }
                             buf_len = remaining;
                             buf_pos = 0;
                             // Try to read more data (EOF returns Ok(0), Err is a real error)
-                            match decoder.read(&mut read_buf[buf_len..]) {
+                            match decoder.read(&mut varint_read_buf[buf_len..]) {
                                 Ok(n) => buf_len += n,
                                 Err(e) => return Err(anyhow!("I/O error reading minimizers: {}", e)),
                             }
                         } else if buf_len == 0 {
                             // Initial fill
-                            match decoder.read(&mut read_buf) {
+                            match decoder.read(&mut varint_read_buf) {
                                 Ok(n) => buf_len = n,
                                 Err(e) => return Err(anyhow!("Failed to read minimizers: {}", e)),
                             }
@@ -1285,7 +1285,7 @@ impl InvertedIndex {
                         return Err(anyhow!("Unexpected end of data at minimizer {}", i));
                     }
 
-                    let (delta, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
+                    let (delta, consumed) = decode_varint(&varint_read_buf[buf_pos..buf_len]);
                     buf_pos += consumed;
 
                     // Use checked_add to detect overflow (corrupted data)
@@ -1306,26 +1306,26 @@ impl InvertedIndex {
                     prev = min;
                 }
 
-                // Save remaining bytes for bucket ID reading (stack allocated)
-                leftover_len = buf_len - buf_pos;
-                leftover_buf[..leftover_len].copy_from_slice(&read_buf[buf_pos..buf_len]);
+                // Track remaining bytes for bucket ID reading (no copy needed)
+                leftover_start = buf_pos;
+                leftover_end = buf_len;
             }
         }
 
         // Read bucket IDs (adaptive sizing)
         // First consume any leftover bytes from varint decoding, then read from decoder
         let mut bucket_ids = Vec::with_capacity(num_bucket_ids);
-        let mut leftover_pos = 0; // Position in leftover_buf
+        let mut leftover_pos = leftover_start; // Current position in varint_read_buf
 
         // Helper macro to read exact bytes, consuming leftover first then decoder
         macro_rules! read_exact_with_leftover {
             ($buf:expr) => {{
                 let buf: &mut [u8] = $buf;
                 let mut filled = 0;
-                // First, consume from leftover buffer
-                if leftover_pos < leftover_len {
-                    let from_leftover = (leftover_len - leftover_pos).min(buf.len());
-                    buf[..from_leftover].copy_from_slice(&leftover_buf[leftover_pos..leftover_pos + from_leftover]);
+                // First, consume from leftover in varint_read_buf
+                if leftover_pos < leftover_end {
+                    let from_leftover = (leftover_end - leftover_pos).min(buf.len());
+                    buf[..from_leftover].copy_from_slice(&varint_read_buf[leftover_pos..leftover_pos + from_leftover]);
                     leftover_pos += from_leftover;
                     filled = from_leftover;
                 }
