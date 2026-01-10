@@ -1175,7 +1175,7 @@ impl InvertedIndex {
             .checked_add(num_minimizers as u64)
             .and_then(|s| s.checked_add(num_bucket_ids as u64))
             .ok_or_else(|| anyhow!("Total element count overflow"))?;
-        const MAX_TOTAL_ELEMENTS: u64 = 8_000_000_000; // ~8B elements
+        const MAX_TOTAL_ELEMENTS: u64 = 100_000_000_000; // ~100B elements
         if total_elements > MAX_TOTAL_ELEMENTS {
             return Err(anyhow!(
                 "Total element count {} exceeds maximum {}",
