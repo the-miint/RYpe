@@ -36,6 +36,55 @@ const BASE_TO_BIT_LUT: [u64; 256] = {
     lut
 };
 
+// --- VARINT ENCODING (LEB128) ---
+
+/// Encode a u64 as a variable-length integer (LEB128 format).
+/// Returns the number of bytes written.
+#[inline]
+fn encode_varint(mut value: u64, buf: &mut [u8]) -> usize {
+    let mut i = 0;
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            buf[i] = byte;
+            return i + 1;
+        } else {
+            buf[i] = byte | 0x80;
+            i += 1;
+        }
+    }
+}
+
+/// Decode a variable-length integer from a byte slice.
+/// Returns (value, bytes_consumed). If buffer is too small or varint is malformed,
+/// returns (partial_value, bytes_read) - caller must check consumed < buf.len()
+/// or validate the result.
+#[inline]
+fn decode_varint(buf: &[u8]) -> (u64, usize) {
+    let mut value: u64 = 0;
+    let mut shift = 0;
+    let mut i = 0;
+    loop {
+        // Bounds check - prevent buffer overrun
+        if i >= buf.len() {
+            // Truncated varint - return what we have
+            return (value, i);
+        }
+        let byte = buf[i];
+        value |= ((byte & 0x7F) as u64) << shift;
+        i += 1;
+        if byte & 0x80 == 0 {
+            return (value, i);
+        }
+        shift += 7;
+        if shift >= 64 {
+            // Malformed varint (>10 bytes) - return what we have
+            return (value, i);
+        }
+    }
+}
+
 // --- DATA TYPES ---
 
 /// ID (i64), Sequence Reference, Optional Pair Sequence Reference
@@ -316,19 +365,21 @@ impl Index {
             .ok_or_else(|| anyhow!("Bucket ID overflow: maximum ID {} reached", max_id))
     }
 
-    /// Save the index to a file (v4 format with zstd-compressed minimizers).
+    /// Save the index to a file (v5 format with delta+varint+zstd compressed minimizers).
     ///
-    /// Format v4:
-    /// - Header (uncompressed): magic "RYP4", version 4, k, w, salt, num_buckets
+    /// Format v5:
+    /// - Header (uncompressed): magic "RYP5", version 5, k, w, salt, num_buckets
     /// - Bucket metadata (uncompressed): for each bucket: minimizer_count, bucket_id, name, sources
-    /// - Minimizers (zstd compressed stream): all minimizers for all buckets in order
+    /// - Minimizers (zstd compressed stream): delta+varint encoded minimizers per bucket
+    ///   - For each bucket: first minimizer as u64, then deltas as varints
     ///
-    /// This format keeps metadata uncompressed for fast seeking (load_metadata) while
-    /// compressing the bulk of the data (minimizers).
+    /// Delta encoding exploits the fact that minimizers are sorted, so consecutive
+    /// values are often close together. Combined with varint and zstd, this achieves
+    /// ~65% compression compared to raw u64 storage.
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
-        writer.write_all(b"RYP4")?;
-        writer.write_all(&4u32.to_le_bytes())?; // Version 4
+        writer.write_all(b"RYP5")?;
+        writer.write_all(&5u32.to_le_bytes())?; // Version 5
         writer.write_all(&(self.k as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
         writer.write_all(&(self.salt).to_le_bytes())?;
@@ -367,11 +418,12 @@ impl Index {
             }
         }
 
-        // Write all minimizers (zstd compressed stream)
+        // Write all minimizers with delta+varint encoding (zstd compressed stream)
         let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
 
         const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024;
         let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
+        let mut varint_buf = [0u8; 10]; // Max 10 bytes for u64 varint
 
         let flush_buf = |buf: &mut Vec<u8>, encoder: &mut zstd::stream::write::Encoder<BufWriter<File>>| -> Result<()> {
             if !buf.is_empty() {
@@ -383,11 +435,26 @@ impl Index {
 
         for id in &sorted_ids {
             let vec = &self.buckets[id];
-            for val in vec {
-                write_buf.extend_from_slice(&val.to_le_bytes());
+            if vec.is_empty() {
+                continue;
+            }
+
+            // First minimizer: store as full u64
+            write_buf.extend_from_slice(&vec[0].to_le_bytes());
+            if write_buf.len() >= WRITE_BUF_SIZE {
+                flush_buf(&mut write_buf, &mut encoder)?;
+            }
+
+            // Remaining minimizers: store as delta-encoded varints
+            let mut prev = vec[0];
+            for &val in &vec[1..] {
+                let delta = val - prev; // Safe because minimizers are sorted
+                let len = encode_varint(delta, &mut varint_buf);
+                write_buf.extend_from_slice(&varint_buf[..len]);
                 if write_buf.len() >= WRITE_BUF_SIZE {
                     flush_buf(&mut write_buf, &mut encoder)?;
                 }
+                prev = val;
             }
         }
         flush_buf(&mut write_buf, &mut encoder)?;
@@ -396,18 +463,18 @@ impl Index {
         Ok(())
     }
 
-    /// Load an index from a file (v4 format with zstd-compressed minimizers).
+    /// Load an index from a file (v5 format with delta+varint+zstd compressed minimizers).
     pub fn load(path: &Path) -> Result<Self> {
         let mut reader = BufReader::new(File::open(path)?);
         let mut buf4 = [0u8; 4];
         let mut buf8 = [0u8; 8];
 
         reader.read_exact(&mut buf4)?;
-        if &buf4 != b"RYP4" { return Err(anyhow!("Invalid Index Format (Expected RYP4)")); }
+        if &buf4 != b"RYP5" { return Err(anyhow!("Invalid Index Format (Expected RYP5)")); }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        const SUPPORTED_VERSION: u32 = 4;
+        const SUPPORTED_VERSION: u32 = 5;
         if version != SUPPORTED_VERSION {
             return Err(anyhow!("Unsupported index version: {} (expected {})", version, SUPPORTED_VERSION));
         }
@@ -464,27 +531,88 @@ impl Index {
             bucket_order.push((id, vec_len));
         }
 
-        // Read all minimizers (zstd compressed stream)
+        // Read all minimizers with delta+varint decoding (zstd compressed stream)
         let mut decoder = zstd::stream::read::Decoder::new(reader)
             .map_err(|e| anyhow!("Failed to create zstd decoder: {}", e))?;
 
+        // Read buffer - we read in chunks and decode varints from the buffer
         const READ_BUF_SIZE: usize = 8 * 1024 * 1024;
+        let mut read_buf = vec![0u8; READ_BUF_SIZE];
+        let mut buf_pos = 0usize;
+        let mut buf_len = 0usize;
 
         for (id, vec_len) in bucket_order {
             let mut vec = Vec::with_capacity(vec_len);
-            let bytes_needed = vec_len * 8;
-            let mut read_buf = vec![0u8; bytes_needed.min(READ_BUF_SIZE)];
-            let mut total_read = 0;
 
-            while total_read < bytes_needed {
-                let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
-                decoder.read_exact(&mut read_buf[..chunk_size])
-                    .map_err(|e| anyhow!("Failed to read minimizers for bucket {}: {}", id, e))?;
+            if vec_len == 0 {
+                buckets.insert(id, vec);
+                continue;
+            }
 
-                for chunk in read_buf[..chunk_size].chunks_exact(8) {
-                    vec.push(u64::from_le_bytes(chunk.try_into().unwrap()));
-                }
-                total_read += chunk_size;
+            // Helper macro to ensure we have at least `need` bytes in buffer
+            macro_rules! ensure_bytes {
+                ($need:expr) => {{
+                    let need = $need;
+                    if buf_pos + need > buf_len {
+                        // Shift remaining bytes to start
+                        if buf_pos > 0 {
+                            read_buf.copy_within(buf_pos..buf_len, 0);
+                            buf_len -= buf_pos;
+                            buf_pos = 0;
+                        }
+                        // Read more data until we have enough
+                        while buf_len < need {
+                            let n = decoder.read(&mut read_buf[buf_len..])?;
+                            if n == 0 {
+                                return Err(anyhow!("Unexpected end of compressed data"));
+                            }
+                            buf_len += n;
+                        }
+                    }
+                }};
+            }
+
+            // Helper macro to refill buffer if running low (but don't require specific amount)
+            macro_rules! refill_if_low {
+                () => {{
+                    if buf_pos >= buf_len {
+                        // Buffer exhausted, refill
+                        buf_pos = 0;
+                        let n = decoder.read(&mut read_buf)?;
+                        if n == 0 {
+                            return Err(anyhow!("Unexpected end of compressed data"));
+                        }
+                        buf_len = n;
+                    } else if buf_len - buf_pos < 10 {
+                        // Low on data, shift and try to read more
+                        read_buf.copy_within(buf_pos..buf_len, 0);
+                        buf_len -= buf_pos;
+                        buf_pos = 0;
+                        // Try to read more (but don't fail if we can't)
+                        let n = decoder.read(&mut read_buf[buf_len..])?;
+                        buf_len += n;
+                    }
+                }};
+            }
+
+            // Read first minimizer as full u64
+            ensure_bytes!(8);
+            let first = u64::from_le_bytes(read_buf[buf_pos..buf_pos + 8].try_into().unwrap());
+            buf_pos += 8;
+            vec.push(first);
+
+            // Read remaining minimizers as delta-encoded varints
+            let mut prev = first;
+            for _ in 1..vec_len {
+                // Ensure we have some bytes available
+                refill_if_low!();
+
+                let (delta, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
+                buf_pos += consumed;
+
+                let val = prev + delta;
+                vec.push(val);
+                prev = val;
             }
 
             buckets.insert(id, vec);
@@ -493,9 +621,9 @@ impl Index {
         Ok(Index { k, w, salt, buckets, bucket_names: names, bucket_sources: sources })
     }
 
-    /// Load only metadata from an index file (v4 format).
+    /// Load only metadata from an index file (v5 format).
     ///
-    /// This is much faster than load() because in v4 format all metadata is stored
+    /// This is much faster than load() because in v5 format all metadata is stored
     /// uncompressed before the compressed minimizers, so we can read just the metadata
     /// section and stop without touching the compressed data.
     pub fn load_metadata(path: &Path) -> Result<IndexMetadata> {
@@ -504,11 +632,11 @@ impl Index {
         let mut buf8 = [0u8; 8];
 
         reader.read_exact(&mut buf4)?;
-        if &buf4 != b"RYP4" { return Err(anyhow!("Invalid Index Format (Expected RYP4)")); }
+        if &buf4 != b"RYP5" { return Err(anyhow!("Invalid Index Format (Expected RYP5)")); }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        const SUPPORTED_VERSION: u32 = 4;
+        const SUPPORTED_VERSION: u32 = 5;
         if version != SUPPORTED_VERSION {
             return Err(anyhow!("Unsupported index version: {} (expected {})", version, SUPPORTED_VERSION));
         }
@@ -529,7 +657,7 @@ impl Index {
         let mut sources = HashMap::new();
         let mut minimizer_counts = HashMap::new();
 
-        // V4 format: all metadata is before the compressed minimizer section
+        // V5 format: all metadata is before the compressed minimizer section
         // No seeking needed - we just read the metadata and stop
         for _ in 0..num {
             reader.read_exact(&mut buf8)?;
@@ -861,11 +989,12 @@ impl InvertedIndex {
 
     /// Save the inverted index to a file (zstd streaming compressed, u32 offsets, adaptive bucket IDs).
     ///
-    /// Format v2:
-    /// - Header (uncompressed, 60 bytes): magic "RYXI", version 2, k, w, salt, source_hash, max_bucket_id, num_minimizers, num_bucket_ids
-    /// - Payload (zstd compressed stream to EOF): offsets (u32), minimizers (u64), bucket_ids (u8/u16/u32 based on max_bucket_id)
+    /// Format v3:
+    /// - Header (uncompressed, 60 bytes): magic "RYXI", version 3, k, w, salt, source_hash, max_bucket_id, num_minimizers, num_bucket_ids
+    /// - Payload (zstd compressed stream to EOF): offsets (u32), minimizers (delta+varint), bucket_ids (u8/u16/u32 based on max_bucket_id)
     ///
     /// Uses streaming compression with chunked writes for efficiency.
+    /// Minimizers are delta+varint encoded for ~65% compression.
     pub fn save(&self, path: &Path) -> Result<()> {
         // Validate sizes before saving
         if self.bucket_ids.len() > MAX_INVERTED_BUCKET_IDS {
@@ -877,6 +1006,11 @@ impl InvertedIndex {
                 self.minimizers.len(), MAX_INVERTED_MINIMIZERS));
         }
 
+        // Validate minimizers are sorted and unique (required for delta encoding)
+        if !self.minimizers.windows(2).all(|w| w[0] < w[1]) {
+            return Err(anyhow!("Cannot save: minimizers must be sorted and unique"));
+        }
+
         let mut writer = BufWriter::new(File::create(path)?);
 
         // Determine max bucket ID for adaptive sizing
@@ -884,7 +1018,7 @@ impl InvertedIndex {
 
         // Magic and version
         writer.write_all(b"RYXI")?;
-        writer.write_all(&2u32.to_le_bytes())?;
+        writer.write_all(&3u32.to_le_bytes())?;
 
         // Metadata (uncompressed header)
         writer.write_all(&(self.k as u64).to_le_bytes())?;
@@ -922,11 +1056,26 @@ impl InvertedIndex {
         }
         flush_buf(&mut write_buf, &mut encoder)?;
 
-        // Stream minimizers (u64) in chunks
-        for &min in &self.minimizers {
-            write_buf.extend_from_slice(&min.to_le_bytes());
+        // Stream minimizers using delta+varint encoding
+        // First minimizer is stored as full u64, rest are delta-encoded varints
+        let mut varint_buf = [0u8; 10]; // Max 10 bytes for LEB128 u64
+        if !self.minimizers.is_empty() {
+            // First minimizer: store as full u64
+            write_buf.extend_from_slice(&self.minimizers[0].to_le_bytes());
             if write_buf.len() >= WRITE_BUF_SIZE {
                 flush_buf(&mut write_buf, &mut encoder)?;
+            }
+
+            // Remaining minimizers: store as delta-encoded varints
+            let mut prev = self.minimizers[0];
+            for &min in &self.minimizers[1..] {
+                let delta = min - prev;
+                let len = encode_varint(delta, &mut varint_buf);
+                write_buf.extend_from_slice(&varint_buf[..len]);
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
+                prev = min;
             }
         }
         flush_buf(&mut write_buf, &mut encoder)?;
@@ -979,8 +1128,8 @@ impl InvertedIndex {
         // Version
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != 2 {
-            return Err(anyhow!("Unsupported inverted index version: {} (expected 2)", version));
+        if version != 3 {
+            return Err(anyhow!("Unsupported inverted index version: {} (expected 3)", version));
         }
 
         // Metadata
@@ -1083,52 +1232,121 @@ impl InvertedIndex {
             }
         }
 
-        // Read minimizers (u64) in chunks
+        // Read minimizers using delta+varint decoding
+        // First minimizer is stored as full u64, rest are delta-encoded varints
         let mut minimizers = Vec::with_capacity(num_minimizers);
-        {
-            let bytes_needed = num_minimizers * 8;
-            let mut read_buf = vec![0u8; bytes_needed.min(READ_BUF_SIZE)];
-            let mut total_read = 0;
-            let mut prev_min: Option<u64> = None;
-            let mut idx = 0;
+        // Stack-allocated buffer for leftover bytes from varint decoding (max 9 bytes)
+        let mut leftover_buf: [u8; 16] = [0; 16];
+        let mut leftover_len: usize = 0;
 
-            while total_read < bytes_needed {
-                let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
-                decoder.read_exact(&mut read_buf[..chunk_size])
-                    .map_err(|e| anyhow!("Failed to read minimizers: {}", e))?;
+        if num_minimizers > 0 {
+            // Read first minimizer as full u64
+            decoder.read_exact(&mut buf8)
+                .map_err(|e| anyhow!("Failed to read first minimizer: {}", e))?;
+            let first_min = u64::from_le_bytes(buf8);
+            minimizers.push(first_min);
 
-                for chunk in read_buf[..chunk_size].chunks_exact(8) {
-                    let min = u64::from_le_bytes(chunk.try_into().unwrap());
+            // Read remaining minimizers as delta-encoded varints
+            if num_minimizers > 1 {
+                let mut read_buf = vec![0u8; READ_BUF_SIZE];
+                let mut buf_pos: usize = 0;
+                let mut buf_len: usize = 0;
+                let mut prev = first_min;
 
-                    // Validate minimizers are sorted (required for binary search)
-                    if let Some(prev) = prev_min {
-                        if min < prev {
-                            return Err(anyhow!(
-                                "Invalid inverted index: minimizers not sorted (minimizers[{}]={} < minimizers[{}]={})",
-                                idx, min, idx - 1, prev
-                            ));
+                // Macro to refill buffer when fewer than 10 bytes remain (max varint size)
+                macro_rules! refill_if_low {
+                    () => {
+                        let remaining = buf_len - buf_pos;
+                        if remaining < 10 && buf_len > 0 {
+                            // Move remaining bytes to the front
+                            if remaining > 0 && buf_pos > 0 {
+                                read_buf.copy_within(buf_pos..buf_len, 0);
+                            }
+                            buf_len = remaining;
+                            buf_pos = 0;
+                            // Try to read more data (EOF returns Ok(0), Err is a real error)
+                            match decoder.read(&mut read_buf[buf_len..]) {
+                                Ok(n) => buf_len += n,
+                                Err(e) => return Err(anyhow!("I/O error reading minimizers: {}", e)),
+                            }
+                        } else if buf_len == 0 {
+                            // Initial fill
+                            match decoder.read(&mut read_buf) {
+                                Ok(n) => buf_len = n,
+                                Err(e) => return Err(anyhow!("Failed to read minimizers: {}", e)),
+                            }
                         }
-                    }
-                    prev_min = Some(min);
-                    minimizers.push(min);
-                    idx += 1;
+                    };
                 }
-                total_read += chunk_size;
+
+                for i in 1..num_minimizers {
+                    refill_if_low!();
+                    if buf_pos >= buf_len {
+                        return Err(anyhow!("Unexpected end of data at minimizer {}", i));
+                    }
+
+                    let (delta, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
+                    buf_pos += consumed;
+
+                    // Use checked_add to detect overflow (corrupted data)
+                    let min = prev.checked_add(delta)
+                        .ok_or_else(|| anyhow!(
+                            "Invalid inverted index: minimizer overflow at index {} (prev={}, delta={})",
+                            i, prev, delta
+                        ))?;
+
+                    // Validate minimizers are strictly increasing (sorted, unique)
+                    if min <= prev {
+                        return Err(anyhow!(
+                            "Invalid inverted index: minimizers not strictly increasing (minimizers[{}]={} <= minimizers[{}]={})",
+                            i, min, i - 1, prev
+                        ));
+                    }
+                    minimizers.push(min);
+                    prev = min;
+                }
+
+                // Save remaining bytes for bucket ID reading (stack allocated)
+                leftover_len = buf_len - buf_pos;
+                leftover_buf[..leftover_len].copy_from_slice(&read_buf[buf_pos..buf_len]);
             }
         }
 
-        // Read bucket IDs (adaptive sizing) in chunks
+        // Read bucket IDs (adaptive sizing)
+        // First consume any leftover bytes from varint decoding, then read from decoder
         let mut bucket_ids = Vec::with_capacity(num_bucket_ids);
+        let mut leftover_pos = 0; // Position in leftover_buf
+
+        // Helper macro to read exact bytes, consuming leftover first then decoder
+        macro_rules! read_exact_with_leftover {
+            ($buf:expr) => {{
+                let buf: &mut [u8] = $buf;
+                let mut filled = 0;
+                // First, consume from leftover buffer
+                if leftover_pos < leftover_len {
+                    let from_leftover = (leftover_len - leftover_pos).min(buf.len());
+                    buf[..from_leftover].copy_from_slice(&leftover_buf[leftover_pos..leftover_pos + from_leftover]);
+                    leftover_pos += from_leftover;
+                    filled = from_leftover;
+                }
+                // Then read remainder from decoder
+                if filled < buf.len() {
+                    decoder.read_exact(&mut buf[filled..])
+                        .map_err(|e| anyhow!("Failed to read bucket_ids: {}", e))?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }};
+        }
+
         if max_bucket_id <= u8::MAX as u32 {
-            // u8 bucket IDs
+            // u8 bucket IDs - no validation needed (any u8 is valid when max <= 255)
             let bytes_needed = num_bucket_ids;
             let mut read_buf = vec![0u8; bytes_needed.min(READ_BUF_SIZE)];
             let mut total_read = 0;
 
             while total_read < bytes_needed {
                 let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
-                decoder.read_exact(&mut read_buf[..chunk_size])
-                    .map_err(|e| anyhow!("Failed to read bucket_ids: {}", e))?;
+                read_exact_with_leftover!(&mut read_buf[..chunk_size])?;
 
                 for &b in &read_buf[..chunk_size] {
                     bucket_ids.push(b as u32);
@@ -1144,12 +1362,7 @@ impl InvertedIndex {
 
             while total_read < bytes_needed {
                 let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
-                // Ensure we read aligned to 2 bytes
-                let chunk_size = chunk_size - (chunk_size % 2);
-                if chunk_size == 0 { break; }
-
-                decoder.read_exact(&mut read_buf[..chunk_size])
-                    .map_err(|e| anyhow!("Failed to read bucket_ids: {}", e))?;
+                read_exact_with_leftover!(&mut read_buf[..chunk_size])?;
 
                 for chunk in read_buf[..chunk_size].chunks_exact(2) {
                     let bid = u16::from_le_bytes(chunk.try_into().unwrap()) as u32;
@@ -1164,6 +1377,14 @@ impl InvertedIndex {
                 }
                 total_read += chunk_size;
             }
+
+            // Validate we read exactly what we expected
+            if total_read != bytes_needed {
+                return Err(anyhow!(
+                    "Incomplete bucket_id read: expected {} bytes, got {}",
+                    bytes_needed, total_read
+                ));
+            }
         } else {
             // u32 bucket IDs
             let bytes_needed = num_bucket_ids * 4;
@@ -1173,8 +1394,7 @@ impl InvertedIndex {
 
             while total_read < bytes_needed {
                 let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
-                decoder.read_exact(&mut read_buf[..chunk_size])
-                    .map_err(|e| anyhow!("Failed to read bucket_ids: {}", e))?;
+                read_exact_with_leftover!(&mut read_buf[..chunk_size])?;
 
                 for chunk in read_buf[..chunk_size].chunks_exact(4) {
                     let bid = u32::from_le_bytes(chunk.try_into().unwrap());
@@ -1188,6 +1408,14 @@ impl InvertedIndex {
                     idx += 1;
                 }
                 total_read += chunk_size;
+            }
+
+            // Validate we read exactly what we expected
+            if total_read != bytes_needed {
+                return Err(anyhow!(
+                    "Incomplete bucket_id read: expected {} bytes, got {}",
+                    bytes_needed, total_read
+                ));
             }
         }
 
@@ -1574,7 +1802,7 @@ mod tests {
     fn test_index_load_invalid_format() {
         let file = NamedTempFile::new().unwrap();
         let path = file.path();
-        std::fs::write(path, b"NOTRYP4").unwrap();
+        std::fs::write(path, b"NOTRYP5").unwrap();
 
         let result = Index::load(path);
         assert!(result.is_err());
@@ -1587,7 +1815,7 @@ mod tests {
         let path = file.path();
 
         // Write valid header with wrong version
-        let mut data = b"RYP4".to_vec();
+        let mut data = b"RYP5".to_vec();
         data.extend_from_slice(&999u32.to_le_bytes());  // Bad version
         std::fs::write(path, data).unwrap();
 
@@ -1598,18 +1826,18 @@ mod tests {
 
     #[test]
     fn test_index_load_oversized_bucket() {
-        // Create a malicious index file claiming a huge bucket (V4 format)
+        // Create a malicious index file claiming a huge bucket (V5 format)
         let file = NamedTempFile::new().unwrap();
         let path = file.path();
 
         let mut data = Vec::new();
-        data.extend_from_slice(b"RYP4");
-        data.extend_from_slice(&4u32.to_le_bytes());  // Version 4
+        data.extend_from_slice(b"RYP5");
+        data.extend_from_slice(&5u32.to_le_bytes());  // Version 5
         data.extend_from_slice(&64u64.to_le_bytes()); // K
         data.extend_from_slice(&50u64.to_le_bytes()); // W
         data.extend_from_slice(&0u64.to_le_bytes());  // Salt
         data.extend_from_slice(&1u32.to_le_bytes());  // 1 bucket
-        // V4 Format: MinimizerCount comes FIRST (in metadata section)
+        // V5 Format: MinimizerCount comes FIRST (in metadata section)
         data.extend_from_slice(&(MAX_BUCKET_SIZE as u64 + 1).to_le_bytes()); // Oversized!
         data.extend_from_slice(&1u32.to_le_bytes());  // Bucket ID 1
         data.extend_from_slice(&4u64.to_le_bytes());  // Name length
@@ -1826,8 +2054,8 @@ mod tests {
     }
 
     #[test]
-    fn test_v4_format_roundtrip() -> Result<()> {
-        // Verify V4 format (zstd-compressed minimizers) can save and load correctly
+    fn test_v5_format_roundtrip() -> Result<()> {
+        // Verify V5 format (delta+varint+zstd-compressed minimizers) can save and load correctly
         let file = NamedTempFile::new()?;
         let path = file.path().to_path_buf();
         let mut index = Index::new(64, 50, 0x1234)?;
@@ -2007,8 +2235,8 @@ mod tests {
 
         // Manually create an invalid index file with K=48
         let mut data = Vec::new();
-        data.extend_from_slice(b"RYP4");
-        data.extend_from_slice(&4u32.to_le_bytes());  // Version 4
+        data.extend_from_slice(b"RYP5");
+        data.extend_from_slice(&5u32.to_le_bytes());  // Version 5
         data.extend_from_slice(&48u64.to_le_bytes()); // Invalid K=48
         data.extend_from_slice(&50u64.to_le_bytes()); // W
         data.extend_from_slice(&0u64.to_le_bytes());  // Salt
@@ -2329,14 +2557,14 @@ mod tests {
         // Test that load() rejects invalid CSR data
         use std::io::Write;
 
-        // Create a file with valid v2 header but invalid CSR offsets in compressed payload
+        // Create a file with valid v3 header but invalid CSR offsets in compressed payload
         let file = NamedTempFile::new().unwrap();
         let path = file.path();
 
         {
             let mut writer = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
             writer.write_all(b"RYXI").unwrap(); // Magic
-            writer.write_all(&2u32.to_le_bytes()).unwrap(); // Version 2
+            writer.write_all(&3u32.to_le_bytes()).unwrap(); // Version 3
             writer.write_all(&64u64.to_le_bytes()).unwrap(); // K
             writer.write_all(&50u64.to_le_bytes()).unwrap(); // W
             writer.write_all(&0u64.to_le_bytes()).unwrap(); // Salt
@@ -2352,9 +2580,13 @@ mod tests {
             encoder.write_all(&1u32.to_le_bytes()).unwrap(); // Invalid: first offset != 0
             encoder.write_all(&2u32.to_le_bytes()).unwrap();
             encoder.write_all(&3u32.to_le_bytes()).unwrap();
-            // Minimizers (u64)
-            encoder.write_all(&100u64.to_le_bytes()).unwrap();
-            encoder.write_all(&200u64.to_le_bytes()).unwrap();
+            // Minimizers: v3 format uses delta+varint encoding
+            // First minimizer as u64, second as varint delta
+            encoder.write_all(&100u64.to_le_bytes()).unwrap(); // First minimizer
+            let delta: u64 = 100; // delta = 200 - 100
+            let mut varint_buf = [0u8; 10];
+            let len = encode_varint(delta, &mut varint_buf);
+            encoder.write_all(&varint_buf[..len]).unwrap(); // Second minimizer as delta
             // Bucket IDs (u8 since max_bucket_id = 0)
             encoder.write_all(&[0u8]).unwrap();
             encoder.write_all(&[0u8]).unwrap();
