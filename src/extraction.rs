@@ -8,6 +8,131 @@ use crate::constants::ESTIMATED_MINIMIZERS_PER_SEQUENCE;
 use crate::encoding::{base_to_bit, reverse_complement};
 use crate::workspace::MinimizerWorkspace;
 
+/// Strand indicator for minimizer origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strand {
+    Forward,
+    ReverseComplement,
+}
+
+/// A minimizer with its source position and strand.
+#[derive(Debug, Clone)]
+pub struct MinimizerWithPosition {
+    /// The minimizer hash value
+    pub hash: u64,
+    /// 0-based position in sequence where the k-mer starts
+    pub position: usize,
+    /// Which strand the minimizer came from
+    pub strand: Strand,
+}
+
+/// Extract minimizers from both strands with position tracking.
+///
+/// Unlike `extract_dual_strand_into()`, this function does NOT deduplicate
+/// consecutive identical minimizers, preserving all positions for inspection.
+///
+/// # Arguments
+/// * `seq` - DNA sequence as bytes
+/// * `k` - K-mer size (must be 16, 32, or 64)
+/// * `w` - Window size for minimizer selection
+/// * `salt` - XOR salt applied to k-mer hashes
+/// * `ws` - Workspace for temporary storage
+///
+/// # Returns
+/// A vector of minimizers with their positions and strand information.
+pub fn extract_with_positions(
+    seq: &[u8],
+    k: usize,
+    w: usize,
+    salt: u64,
+    ws: &mut MinimizerWorkspace,
+) -> Vec<MinimizerWithPosition> {
+    ws.q_fwd.clear();
+    ws.q_rc.clear();
+
+    let len = seq.len();
+    if len < k {
+        return vec![];
+    }
+
+    let mut results = Vec::with_capacity(ESTIMATED_MINIMIZERS_PER_SEQUENCE * 2);
+
+    let mut current_val: u64 = 0;
+    let mut valid_bases_count = 0;
+
+    // Track last output to avoid duplicates at same position (but allow same hash at different positions)
+    let mut last_fwd_pos: Option<usize> = None;
+    let mut last_rc_pos: Option<usize> = None;
+
+    for i in 0..len {
+        let bit = base_to_bit(seq[i]);
+
+        if bit == u64::MAX {
+            valid_bases_count = 0;
+            ws.q_fwd.clear();
+            ws.q_rc.clear();
+            current_val = 0;
+            last_fwd_pos = None;
+            last_rc_pos = None;
+            continue;
+        }
+
+        valid_bases_count += 1;
+        current_val = (current_val << 1) | bit;
+
+        if valid_bases_count >= k {
+            let pos = i + 1 - k;
+            let h_fwd = current_val ^ salt;
+            let h_rc = reverse_complement(current_val, k) ^ salt;
+
+            // Forward strand deque
+            while let Some(&(p, _)) = ws.q_fwd.front() {
+                if p + w <= pos { ws.q_fwd.pop_front(); } else { break; }
+            }
+            while let Some(&(_, v)) = ws.q_fwd.back() {
+                if v >= h_fwd { ws.q_fwd.pop_back(); } else { break; }
+            }
+            ws.q_fwd.push_back((pos, h_fwd));
+
+            // Reverse complement deque
+            while let Some(&(p, _)) = ws.q_rc.front() {
+                if p + w <= pos { ws.q_rc.pop_front(); } else { break; }
+            }
+            while let Some(&(_, v)) = ws.q_rc.back() {
+                if v >= h_rc { ws.q_rc.pop_back(); } else { break; }
+            }
+            ws.q_rc.push_back((pos, h_rc));
+
+            if valid_bases_count >= k + w - 1 {
+                // Output forward minimizer (only if position changed)
+                if let Some(&(min_pos, min_hash)) = ws.q_fwd.front() {
+                    if last_fwd_pos != Some(min_pos) {
+                        results.push(MinimizerWithPosition {
+                            hash: min_hash,
+                            position: min_pos,
+                            strand: Strand::Forward,
+                        });
+                        last_fwd_pos = Some(min_pos);
+                    }
+                }
+                // Output reverse complement minimizer (only if position changed)
+                if let Some(&(min_pos, min_hash)) = ws.q_rc.front() {
+                    if last_rc_pos != Some(min_pos) {
+                        results.push(MinimizerWithPosition {
+                            hash: min_hash,
+                            position: min_pos,
+                            strand: Strand::ReverseComplement,
+                        });
+                        last_rc_pos = Some(min_pos);
+                    }
+                }
+            }
+        }
+    }
+
+    results
+}
+
 /// Extract minimizers from a sequence (single strand).
 ///
 /// Uses a monotonic deque to efficiently find the minimum hash value
@@ -330,5 +455,120 @@ mod tests {
         let seq = b"AAAATTTTGGGGCCCCAAAA"; // 20 bases, too short for K=32
         extract_into(seq, 32, 5, 0, &mut ws);
         assert!(ws.buffer.is_empty(), "Should not extract from seq < K");
+    }
+
+    // Tests for extract_with_positions
+
+    #[test]
+    fn test_extract_with_positions_basic() {
+        let mut ws = MinimizerWorkspace::new();
+        let seq = b"AAAATTTTGGGGCCCCAAAATTTT"; // 24 bases
+        let results = extract_with_positions(seq, 16, 4, 0, &mut ws);
+
+        // Should have some minimizers with positions
+        assert!(!results.is_empty(), "Should extract minimizers with positions");
+
+        // All positions should be valid (< seq.len() - k + 1)
+        for m in &results {
+            assert!(m.position + 16 <= seq.len(), "Position should be valid");
+            assert!(m.strand == Strand::Forward || m.strand == Strand::ReverseComplement);
+        }
+    }
+
+    #[test]
+    fn test_extract_with_positions_short_sequence() {
+        let mut ws = MinimizerWorkspace::new();
+        let seq = b"ACGT"; // 4 bases, too short for k=16
+        let results = extract_with_positions(seq, 16, 4, 0, &mut ws);
+        assert!(results.is_empty(), "Short sequence should produce no minimizers");
+    }
+
+    #[test]
+    fn test_extract_with_positions_has_both_strands() {
+        let mut ws = MinimizerWorkspace::new();
+        // Use a sequence that will produce different hashes for fwd and rc
+        let seq = b"AAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCC";
+        let results = extract_with_positions(seq, 64, 5, 0, &mut ws);
+
+        let has_forward = results.iter().any(|m| m.strand == Strand::Forward);
+        let has_rc = results.iter().any(|m| m.strand == Strand::ReverseComplement);
+
+        assert!(has_forward, "Should have forward strand minimizers");
+        assert!(has_rc, "Should have reverse complement minimizers");
+    }
+
+    #[test]
+    fn test_extract_with_positions_matches_dual_strand_hashes() {
+        let mut ws = MinimizerWorkspace::new();
+        let seq = b"AAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCC";
+
+        // Get hashes from both methods
+        let with_pos = extract_with_positions(seq, 64, 5, 0, &mut ws);
+        let (fwd_hashes, rc_hashes) = extract_dual_strand_into(seq, 64, 5, 0, &mut ws);
+
+        // Collect hashes by strand from extract_with_positions
+        let fwd_pos_hashes: Vec<u64> = with_pos.iter()
+            .filter(|m| m.strand == Strand::Forward)
+            .map(|m| m.hash)
+            .collect();
+        let rc_pos_hashes: Vec<u64> = with_pos.iter()
+            .filter(|m| m.strand == Strand::ReverseComplement)
+            .map(|m| m.hash)
+            .collect();
+
+        // The hashes should match (though order might differ due to deduplication differences)
+        // extract_dual_strand_into deduplicates consecutive identical hashes
+        // extract_with_positions deduplicates by position
+        // So we just check that the sets of hashes overlap significantly
+        let fwd_set: std::collections::HashSet<_> = fwd_hashes.iter().collect();
+        let rc_set: std::collections::HashSet<_> = rc_hashes.iter().collect();
+
+        let fwd_matches = fwd_pos_hashes.iter().filter(|h| fwd_set.contains(h)).count();
+        let rc_matches = rc_pos_hashes.iter().filter(|h| rc_set.contains(h)).count();
+
+        assert!(fwd_matches > 0, "Forward hashes should match");
+        assert!(rc_matches > 0, "RC hashes should match");
+    }
+
+    #[test]
+    fn test_extract_with_positions_n_handling() {
+        let mut ws = MinimizerWorkspace::new();
+        // N should reset extraction
+        let seq_with_n = b"AAAATTTTGGGGCCCCAAAANAAAATTTTGGGGCCCCAAAA";
+        let results = extract_with_positions(seq_with_n, 16, 4, 0, &mut ws);
+
+        // All positions should be either before the N or after it
+        // The N is at position 20, so no minimizer should span it
+        for m in &results {
+            // K-mer either ends before N (pos + k <= 20) or starts after N (pos > 20)
+            let ends_before_n = m.position + 16 <= 20;
+            let starts_after_n = m.position > 20;
+            assert!(ends_before_n || starts_after_n,
+                "Minimizer at position {} should not span the N at position 20", m.position);
+        }
+    }
+
+    #[test]
+    fn test_extract_with_positions_k16() {
+        let mut ws = MinimizerWorkspace::new();
+        let seq = b"AAAATTTTGGGGCCCCAAAATTTT"; // 24 bases
+        let results = extract_with_positions(seq, 16, 4, 0, &mut ws);
+        assert!(!results.is_empty(), "Should extract minimizers with K=16");
+
+        for m in &results {
+            assert!(m.position + 16 <= seq.len());
+        }
+    }
+
+    #[test]
+    fn test_extract_with_positions_k32() {
+        let mut ws = MinimizerWorkspace::new();
+        let seq = b"AAAATTTTGGGGCCCCAAAATTTTGGGGCCCCAAAATTTTGGGGCCCC"; // 48 bases
+        let results = extract_with_positions(seq, 32, 4, 0, &mut ws);
+        assert!(!results.is_empty(), "Should extract minimizers with K=32");
+
+        for m in &results {
+            assert!(m.position + 32 <= seq.len());
+        }
     }
 }

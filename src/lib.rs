@@ -47,12 +47,15 @@ pub use workspace::MinimizerWorkspace;
 // Re-export encoding utilities (only public function)
 pub use encoding::base_to_bit;
 
-// Re-export extraction functions
+// Re-export extraction functions and types
 pub use extraction::{
     extract_into,
     extract_dual_strand_into,
     get_paired_minimizers_into,
+    extract_with_positions,
     count_hits,
+    Strand,
+    MinimizerWithPosition,
 };
 
 // Re-export index

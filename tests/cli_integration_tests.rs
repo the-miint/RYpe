@@ -1,4 +1,4 @@
-use rype::Index;
+use rype::{Index, MinimizerWorkspace, extract_with_positions, Strand};
 use std::fs;
 use tempfile::tempdir;
 use anyhow::Result;
@@ -208,6 +208,96 @@ fn test_merge_buckets_minimizer_count() -> Result<()> {
 
     // Verify sources were merged
     assert_eq!(loaded.bucket_sources[&2].len(), 2, "Should have 2 sources");
+
+    Ok(())
+}
+
+/// Test extract_with_positions returns correct positions and strands
+#[test]
+fn test_extract_with_positions_correctness() -> Result<()> {
+    let mut ws = MinimizerWorkspace::new();
+
+    // Create a simple sequence
+    let seq = b"AAAATTTTGGGGCCCCAAAATTTTGGGGCCCC"; // 32 bases
+
+    let results = extract_with_positions(seq, 16, 4, 0, &mut ws);
+
+    // Should have some minimizers
+    assert!(!results.is_empty(), "Should extract minimizers");
+
+    // All positions should be valid
+    for m in &results {
+        assert!(m.position + 16 <= seq.len(),
+            "Position {} invalid for seq len {}", m.position, seq.len());
+
+        // Strand should be either Forward or ReverseComplement
+        match m.strand {
+            Strand::Forward | Strand::ReverseComplement => {}
+        }
+    }
+
+    // Should have both forward and reverse complement minimizers
+    let has_fwd = results.iter().any(|m| m.strand == Strand::Forward);
+    let has_rc = results.iter().any(|m| m.strand == Strand::ReverseComplement);
+
+    assert!(has_fwd, "Should have forward strand minimizers");
+    assert!(has_rc, "Should have reverse complement minimizers");
+
+    Ok(())
+}
+
+/// Test that minimizers from a query match minimizers in an index
+#[test]
+fn test_minimizer_matching_with_positions() -> Result<()> {
+    let dir = tempdir()?;
+
+    // Create reference sequence (long enough for minimizers)
+    let ref_seq = b"AAAATTTTGGGGCCCCAAAATTTTGGGGCCCCAAAATTTTGGGGCCCCAAAATTTTGGGGCCCC";
+    let ref_file = dir.path().join("reference.fa");
+    fs::write(&ref_file, format!(">ref1\n{}\n", String::from_utf8_lossy(ref_seq)))?;
+
+    // Create index
+    let index_file = dir.path().join("test.ryidx");
+    let mut index = Index::new(16, 4, 0)?;
+    let mut ws = MinimizerWorkspace::new();
+
+    use needletail::parse_fastx_file;
+    let abs_path = ref_file.canonicalize()?;
+    let filename = abs_path.to_string_lossy().to_string();
+
+    index.bucket_names.insert(1, "reference".to_string());
+
+    let mut reader = parse_fastx_file(&ref_file)?;
+    while let Some(record) = reader.next() {
+        let rec = record?;
+        let seq = rec.seq();
+        let name = String::from_utf8_lossy(rec.id()).to_string();
+        let source_label = format!("{}::{}", filename, name);
+        index.add_record(1, &source_label, &seq, &mut ws);
+    }
+
+    index.finalize_bucket(1);
+    index.save(&index_file)?;
+
+    // Now extract minimizers from a query that shares sequence with reference
+    let query_seq = b"AAAATTTTGGGGCCCCAAAATTTTGGGGCCCC"; // substring of reference
+    let query_mins = extract_with_positions(query_seq, 16, 4, 0, &mut ws);
+
+    // Load index and check for matches
+    let loaded = Index::load(&index_file)?;
+    let bucket = &loaded.buckets[&1];
+
+    // At least some query minimizers should match the bucket
+    let matches: Vec<_> = query_mins.iter()
+        .filter(|m| bucket.binary_search(&m.hash).is_ok())
+        .collect();
+
+    assert!(!matches.is_empty(), "Query should have minimizers matching the reference");
+
+    // All matched positions should be valid
+    for m in &matches {
+        assert!(m.position + 16 <= query_seq.len());
+    }
 
     Ok(())
 }
