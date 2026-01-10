@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use anyhow::{Context, Result, anyhow};
 
-use rype::{Index, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, classify_batch_sharded, aggregate_batch, ShardManifest, ShardedInvertedIndex};
+use rype::{Index, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, classify_batch_sharded_sequential, aggregate_batch, ShardManifest, ShardedInvertedIndex};
 use rype::config::{parse_config, validate_config, resolve_path};
 
 mod logging;
@@ -702,21 +702,16 @@ fn main() -> Result<()> {
                     let mut batch_num = 0;
 
                     if manifest_path.exists() {
-                        // Sharded inverted index
-                        log::info!("Loading sharded inverted index from {:?}", inverted_path);
-                        let mut sharded = ShardedInvertedIndex::open(&inverted_path)?;
+                        // Sharded inverted index - use sequential loading to minimize memory
+                        log::info!("Loading sharded inverted index manifest from {:?}", inverted_path);
+                        let sharded = ShardedInvertedIndex::open(&inverted_path)?;
                         log::info!("Sharded index: {} shards, {} total minimizers",
                             sharded.num_shards(), sharded.total_minimizers());
 
-                        // Validate and load all shards
                         sharded.validate_against_metadata(&metadata)?;
                         log::info!("Sharded index validated successfully");
 
-                        log::info!("Loading all {} shards...", sharded.num_shards());
-                        sharded.load_all()?;
-                        log::info!("All shards loaded");
-
-                        log::info!("Starting classification with sharded inverted index (batch_size={})", batch_size);
+                        log::info!("Starting classification with sequential shard loading (batch_size={})", batch_size);
 
                         while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
                             batch_num += 1;
@@ -727,7 +722,7 @@ fn main() -> Result<()> {
                                 .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                                 .collect();
 
-                            let results = classify_batch_sharded(&sharded, &batch_refs, threshold);
+                            let results = classify_batch_sharded_sequential(&sharded, &batch_refs, threshold)?;
 
                             let mut chunk_out = Vec::with_capacity(1024);
                             for res in results {

@@ -245,7 +245,7 @@ Each shard is a complete inverted index containing a contiguous range of minimiz
 **Key Data Structures**:
 - `ShardManifest` - Describes shard layout and totals
 - `ShardInfo` - Per-shard metadata (ID, range, counts)
-- `ShardedInvertedIndex` - Lazy-loading wrapper that loads shards on demand
+- `ShardedInvertedIndex` - Handle that holds the manifest; shards loaded on-demand during classification
 
 **Usage**:
 ```bash
@@ -258,8 +258,9 @@ cargo run --release -- classify run -i index.ryidx --use-inverted -1 reads.fq
 
 **Memory Benefits**:
 - Manifest loads instantly (no minimizer data)
-- Shards can be loaded/unloaded independently
-- Classification loads all shards but can be extended for partial loading
+- Classification loads one shard at a time via `classify_batch_sharded_sequential`
+- Memory usage: O(batch_size × minimizers_per_read) + O(single_shard_size)
+- Enables classification when total index exceeds available RAM
 
 ### Error Handling
 - Rust API: Uses `anyhow::Result<T>` for all fallible operations

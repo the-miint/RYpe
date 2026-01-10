@@ -2073,21 +2073,21 @@ impl ShardManifest {
     }
 }
 
-/// A sharded inverted index that loads shards on demand.
+/// Handle for a sharded inverted index.
 ///
-/// This struct holds a manifest describing the shards and lazily loads
-/// individual shards into memory as needed.
+/// This struct holds a manifest describing the shards. Shards are loaded
+/// on-demand during classification via `classify_batch_sharded_sequential`,
+/// which processes one shard at a time to minimize memory usage.
 #[derive(Debug)]
 pub struct ShardedInvertedIndex {
     manifest: ShardManifest,
     base_path: std::path::PathBuf,
-    loaded: HashMap<u32, InvertedIndex>,
 }
 
 impl ShardedInvertedIndex {
     /// Open a sharded inverted index by loading just the manifest.
     ///
-    /// No shards are loaded into memory until `load_shard()` or `load_all()` is called.
+    /// Shards are loaded on-demand during classification.
     pub fn open(base_path: &Path) -> Result<Self> {
         let manifest_path = ShardManifest::manifest_path(base_path);
         let manifest = ShardManifest::load(&manifest_path)?;
@@ -2095,186 +2095,7 @@ impl ShardedInvertedIndex {
         Ok(ShardedInvertedIndex {
             manifest,
             base_path: base_path.to_path_buf(),
-            loaded: HashMap::new(),
         })
-    }
-
-    /// Load a specific shard into memory.
-    ///
-    /// If the shard is already loaded, this is a no-op.
-    /// Validates that the shard's k/w/salt/source_hash match the manifest.
-    pub fn load_shard(&mut self, shard_id: u32) -> Result<()> {
-        if self.loaded.contains_key(&shard_id) {
-            return Ok(()); // Already loaded
-        }
-
-        if shard_id as usize >= self.manifest.shards.len() {
-            return Err(anyhow!("Invalid shard ID: {} (only {} shards)", shard_id, self.manifest.shards.len()));
-        }
-
-        let shard_path = ShardManifest::shard_path(&self.base_path, shard_id);
-        let shard = InvertedIndex::load_shard(&shard_path)?;
-
-        // Validate shard parameters match manifest (Fix #3)
-        if shard.k != self.manifest.k {
-            return Err(anyhow!(
-                "Shard {} K mismatch: shard has K={}, manifest has K={}",
-                shard_id, shard.k, self.manifest.k
-            ));
-        }
-        if shard.w != self.manifest.w {
-            return Err(anyhow!(
-                "Shard {} W mismatch: shard has W={}, manifest has W={}",
-                shard_id, shard.w, self.manifest.w
-            ));
-        }
-        if shard.salt != self.manifest.salt {
-            return Err(anyhow!(
-                "Shard {} salt mismatch: shard has salt={:#x}, manifest has salt={:#x}",
-                shard_id, shard.salt, self.manifest.salt
-            ));
-        }
-        if shard.source_hash != self.manifest.source_hash {
-            return Err(anyhow!(
-                "Shard {} source_hash mismatch: shard has {:#x}, manifest has {:#x}",
-                shard_id, shard.source_hash, self.manifest.source_hash
-            ));
-        }
-
-        // Validate shard size matches manifest
-        let expected = &self.manifest.shards[shard_id as usize];
-        if shard.minimizers.len() != expected.num_minimizers {
-            return Err(anyhow!(
-                "Shard {} minimizer count mismatch: file has {}, manifest expects {}",
-                shard_id, shard.minimizers.len(), expected.num_minimizers
-            ));
-        }
-        if shard.bucket_ids.len() != expected.num_bucket_ids {
-            return Err(anyhow!(
-                "Shard {} bucket_ids count mismatch: file has {}, manifest expects {}",
-                shard_id, shard.bucket_ids.len(), expected.num_bucket_ids
-            ));
-        }
-
-        self.loaded.insert(shard_id, shard);
-        Ok(())
-    }
-
-    /// Load all shards into memory in parallel (Fix #6).
-    pub fn load_all(&mut self) -> Result<()> {
-        use rayon::prelude::*;
-
-        // Collect shard info for parallel loading
-        let shard_infos: Vec<_> = self.manifest.shards.iter()
-            .map(|s| (s.shard_id, ShardManifest::shard_path(&self.base_path, s.shard_id)))
-            .collect();
-
-        // Load shards in parallel
-        let results: Vec<Result<(u32, InvertedIndex)>> = shard_infos.par_iter()
-            .map(|(shard_id, shard_path)| {
-                let shard = InvertedIndex::load_shard(shard_path)?;
-                Ok((*shard_id, shard))
-            })
-            .collect();
-
-        // Insert and validate each shard
-        for result in results {
-            let (shard_id, shard) = result?;
-
-            // Validate shard parameters match manifest
-            if shard.k != self.manifest.k {
-                return Err(anyhow!(
-                    "Shard {} K mismatch: shard has K={}, manifest has K={}",
-                    shard_id, shard.k, self.manifest.k
-                ));
-            }
-            if shard.w != self.manifest.w {
-                return Err(anyhow!(
-                    "Shard {} W mismatch: shard has W={}, manifest has W={}",
-                    shard_id, shard.w, self.manifest.w
-                ));
-            }
-            if shard.salt != self.manifest.salt {
-                return Err(anyhow!(
-                    "Shard {} salt mismatch: shard has salt={:#x}, manifest has salt={:#x}",
-                    shard_id, shard.salt, self.manifest.salt
-                ));
-            }
-            if shard.source_hash != self.manifest.source_hash {
-                return Err(anyhow!(
-                    "Shard {} source_hash mismatch: shard has {:#x}, manifest has {:#x}",
-                    shard_id, shard.source_hash, self.manifest.source_hash
-                ));
-            }
-
-            // Validate shard size matches manifest
-            let expected = &self.manifest.shards[shard_id as usize];
-            if shard.minimizers.len() != expected.num_minimizers {
-                return Err(anyhow!(
-                    "Shard {} minimizer count mismatch: file has {}, manifest expects {}",
-                    shard_id, shard.minimizers.len(), expected.num_minimizers
-                ));
-            }
-            if shard.bucket_ids.len() != expected.num_bucket_ids {
-                return Err(anyhow!(
-                    "Shard {} bucket_ids count mismatch: file has {}, manifest expects {}",
-                    shard_id, shard.bucket_ids.len(), expected.num_bucket_ids
-                ));
-            }
-
-            self.loaded.insert(shard_id, shard);
-        }
-        Ok(())
-    }
-
-    /// Unload a shard to free memory.
-    pub fn unload_shard(&mut self, shard_id: u32) {
-        self.loaded.remove(&shard_id);
-    }
-
-    /// Check if a query minimizer range overlaps with a shard's range.
-    fn query_overlaps_shard(min_query: u64, max_query: u64, shard_info: &ShardInfo) -> bool {
-        if shard_info.is_last_shard {
-            // Last shard covers all values >= min_start
-            max_query >= shard_info.min_start
-        } else {
-            // Normal range check: [min_start, min_end)
-            max_query >= shard_info.min_start && min_query < shard_info.min_end
-        }
-    }
-
-    /// Get bucket hits across all loaded shards.
-    ///
-    /// Returns aggregated hit counts from all currently loaded shards.
-    /// Skips shards whose ranges don't overlap with the query minimizers (Fix #7).
-    /// Unloaded shards are ignored.
-    pub fn get_bucket_hits(&self, query: &[u64]) -> HashMap<u32, usize> {
-        if query.is_empty() {
-            return HashMap::new();
-        }
-
-        // Compute query range for shard pruning
-        let min_query = *query.iter().min().unwrap();
-        let max_query = *query.iter().max().unwrap();
-
-        let mut total_hits: HashMap<u32, usize> = HashMap::new();
-
-        for (shard_id, shard) in &self.loaded {
-            // Get shard info for range check
-            let shard_info = &self.manifest.shards[*shard_id as usize];
-
-            // Skip shards outside query range (Fix #7)
-            if !Self::query_overlaps_shard(min_query, max_query, shard_info) {
-                continue;
-            }
-
-            let shard_hits = shard.get_bucket_hits(query);
-            for (bucket_id, count) in shard_hits {
-                *total_hits.entry(bucket_id).or_insert(0) += count;
-            }
-        }
-
-        total_hits
     }
 
     /// Returns the K value (k-mer size).
@@ -2302,11 +2123,6 @@ impl ShardedInvertedIndex {
         self.manifest.shards.len()
     }
 
-    /// Returns the number of currently loaded shards.
-    pub fn num_loaded(&self) -> usize {
-        self.loaded.len()
-    }
-
     /// Returns the total number of minimizers across all shards.
     pub fn total_minimizers(&self) -> usize {
         self.manifest.total_minimizers
@@ -2320,6 +2136,11 @@ impl ShardedInvertedIndex {
     /// Returns a reference to the manifest.
     pub fn manifest(&self) -> &ShardManifest {
         &self.manifest
+    }
+
+    /// Returns a reference to the base path.
+    pub fn base_path(&self) -> &Path {
+        &self.base_path
     }
 
     /// Validate against Index metadata.
@@ -2466,62 +2287,78 @@ pub fn classify_batch_inverted(
     results
 }
 
-/// Classify reads against a sharded inverted index.
+/// Classify a batch of records against a sharded inverted index, loading one shard at a time.
 ///
-/// This is equivalent to `classify_batch_inverted` but uses a `ShardedInvertedIndex`.
-/// All shards must be loaded before calling this function.
-pub fn classify_batch_sharded(
+/// This approach uses O(batch_size * minimizers_per_read) + O(single_shard_size) memory,
+/// compared to O(all_shards) for the standard approach. This is useful when the total
+/// index size exceeds available memory.
+///
+/// The trade-off is that each shard must be loaded from disk sequentially, which may
+/// be slower than having all shards in memory.
+pub fn classify_batch_sharded_sequential(
     sharded: &ShardedInvertedIndex,
     records: &[QueryRecord],
     threshold: f64
-) -> Vec<HitResult> {
+) -> Result<Vec<HitResult>> {
+    use std::sync::Mutex;
+
+    let manifest = sharded.manifest();
+    let base_path = sharded.base_path();
+
     // Extract minimizers for all queries in parallel
     let processed: Vec<_> = records.par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
-            let (ha, hb) = get_paired_minimizers_into(s1, *s2, sharded.k(), sharded.w(), sharded.salt(), ws);
+            let (ha, hb) = get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
             (*id, ha, hb)
         }).collect();
 
-    // Process each query and collect results
-    let results: Vec<HitResult> = processed.par_iter()
-        .flat_map(|(query_id, fwd_mins, rc_mins)| {
-            // Get bucket hits for forward strand
-            let fwd_hits = sharded.get_bucket_hits(fwd_mins);
+    // Accumulate hits: query_idx -> bucket_id -> (fwd_count, rc_count)
+    // Wrap in Mutex for safe parallel access within each shard iteration
+    let all_hits: Vec<Mutex<HashMap<u32, (usize, usize)>>> =
+        (0..processed.len()).map(|_| Mutex::new(HashMap::new())).collect();
+
+    // Process shards sequentially
+    for shard_info in &manifest.shards {
+        let shard_path = ShardManifest::shard_path(base_path, shard_info.shard_id);
+        let shard = InvertedIndex::load_shard(&shard_path)?;
+
+        // Query records in parallel against this shard
+        processed.par_iter().enumerate().for_each(|(idx, (_, fwd_mins, rc_mins))| {
+            let fwd_hits = shard.get_bucket_hits(fwd_mins);
+            let rc_hits = shard.get_bucket_hits(rc_mins);
+
+            let mut hits = all_hits[idx].lock().unwrap();
+            for (bucket_id, count) in fwd_hits {
+                hits.entry(bucket_id).or_insert((0, 0)).0 += count;
+            }
+            for (bucket_id, count) in rc_hits {
+                hits.entry(bucket_id).or_insert((0, 0)).1 += count;
+            }
+        });
+        // shard dropped here, freeing memory before loading next
+    }
+
+    // Collect results with threshold applied
+    let results: Vec<HitResult> = processed.iter().enumerate()
+        .flat_map(|(idx, (query_id, fwd_mins, rc_mins))| {
             let fwd_len = fwd_mins.len() as f64;
-
-            // Get bucket hits for reverse complement strand
-            let rc_hits = sharded.get_bucket_hits(rc_mins);
             let rc_len = rc_mins.len() as f64;
+            let hits = all_hits[idx].lock().unwrap();
 
-            // Merge hits into a single map (bucket_id -> (fwd_count, rc_count))
-            let capacity = fwd_hits.len() + rc_hits.len();
-            let mut scores: HashMap<u32, (usize, usize)> = HashMap::with_capacity(capacity);
-            for (&bucket_id, &count) in &fwd_hits {
-                scores.entry(bucket_id).or_insert((0, 0)).0 = count;
-            }
-            for (&bucket_id, &count) in &rc_hits {
-                scores.entry(bucket_id).or_insert((0, 0)).1 = count;
-            }
-
-            // Compute scores and filter by threshold
-            let mut query_results = Vec::with_capacity(scores.len());
-            for (bucket_id, (fwd_count, rc_count)) in scores {
+            hits.iter().filter_map(|(&bucket_id, &(fwd_count, rc_count))| {
                 let score = (if fwd_len > 0.0 { fwd_count as f64 / fwd_len } else { 0.0 })
                     .max(if rc_len > 0.0 { rc_count as f64 / rc_len } else { 0.0 });
 
                 if score >= threshold {
-                    query_results.push(HitResult {
-                        query_id: *query_id,
-                        bucket_id,
-                        score,
-                    });
+                    Some(HitResult { query_id: *query_id, bucket_id, score })
+                } else {
+                    None
                 }
-            }
-            query_results
+            }).collect::<Vec<_>>()
         })
         .collect();
 
-    results
+    Ok(results)
 }
 
 pub fn aggregate_batch(
@@ -3865,138 +3702,6 @@ mod tests {
         assert_eq!(sharded.w(), 50);
         assert_eq!(sharded.salt(), 0x1234);
         assert_eq!(sharded.num_shards(), 2);
-        assert_eq!(sharded.num_loaded(), 0); // No shards loaded yet
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_sharded_inverted_index_load_shard() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let base_path = dir.path().join("test.ryxdi");
-
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300, 400]);
-        index.bucket_names.insert(1, "A".into());
-        let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_sharded(&base_path, 2)?;
-
-        let mut sharded = ShardedInvertedIndex::open(&base_path)?;
-
-        // Load first shard
-        sharded.load_shard(0)?;
-        assert_eq!(sharded.num_loaded(), 1);
-
-        // Load second shard
-        sharded.load_shard(1)?;
-        assert_eq!(sharded.num_loaded(), 2);
-
-        // Loading same shard again should be no-op
-        sharded.load_shard(0)?;
-        assert_eq!(sharded.num_loaded(), 2);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_sharded_inverted_index_load_all() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let base_path = dir.path().join("test.ryxdi");
-
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300, 400]);
-        index.bucket_names.insert(1, "A".into());
-        let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_sharded(&base_path, 4)?;
-
-        let mut sharded = ShardedInvertedIndex::open(&base_path)?;
-        sharded.load_all()?;
-
-        assert_eq!(sharded.num_loaded(), sharded.num_shards());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_sharded_inverted_index_unload_shard() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let base_path = dir.path().join("test.ryxdi");
-
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300, 400]);
-        index.bucket_names.insert(1, "A".into());
-        let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_sharded(&base_path, 2)?;
-
-        let mut sharded = ShardedInvertedIndex::open(&base_path)?;
-        sharded.load_all()?;
-        assert_eq!(sharded.num_loaded(), 2);
-
-        sharded.unload_shard(0);
-        assert_eq!(sharded.num_loaded(), 1);
-
-        sharded.unload_shard(1);
-        assert_eq!(sharded.num_loaded(), 0);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_sharded_inverted_index_get_bucket_hits() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let base_path = dir.path().join("test.ryxdi");
-
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300]);
-        index.buckets.insert(2, vec![200, 300, 400]);
-        index.bucket_names.insert(1, "A".into());
-        index.bucket_names.insert(2, "B".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_sharded(&base_path, 2)?;
-
-        let mut sharded = ShardedInvertedIndex::open(&base_path)?;
-        sharded.load_all()?;
-
-        // Query spanning both shards
-        let hits = sharded.get_bucket_hits(&[200, 300]);
-
-        assert_eq!(hits.get(&1), Some(&2)); // Bucket 1: 200, 300
-        assert_eq!(hits.get(&2), Some(&2)); // Bucket 2: 200, 300
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_sharded_inverted_index_partial_load_hits() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let base_path = dir.path().join("test.ryxdi");
-
-        // Create index where first shard has 100,200 and second has 300,400
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300, 400]);
-        index.bucket_names.insert(1, "A".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_sharded(&base_path, 2)?;
-
-        let mut sharded = ShardedInvertedIndex::open(&base_path)?;
-
-        // Load only first shard
-        sharded.load_shard(0)?;
-
-        // Query should only find hits from loaded shard
-        let hits = sharded.get_bucket_hits(&[100, 200, 300, 400]);
-
-        // Only hits from first shard (100, 200)
-        assert_eq!(hits.get(&1), Some(&2));
-
-        // Load second shard
-        sharded.load_shard(1)?;
-        let hits = sharded.get_bucket_hits(&[100, 200, 300, 400]);
-
-        // Now all 4 hits
-        assert_eq!(hits.get(&1), Some(&4));
 
         Ok(())
     }
@@ -4004,11 +3709,11 @@ mod tests {
     // --- CLASSIFICATION TESTS ---
 
     #[test]
-    fn test_classify_batch_sharded_matches_inverted() -> Result<()> {
+    fn test_classify_batch_sharded_sequential_matches_inverted() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let base_path = dir.path().join("test.ryxdi");
 
-        // Build a reasonably sized index with K=32 (smaller K for shorter sequences)
+        // Build a reasonably sized index with K=32
         let mut index = Index::new(32, 10, 0x1234).unwrap();
         let mut ws = MinimizerWorkspace::new();
 
@@ -4027,12 +3732,12 @@ mod tests {
         let inverted = InvertedIndex::build_from_index(&index);
         assert!(inverted.num_minimizers() > 0, "Inverted index should not be empty");
 
-        // Build sharded inverted index
+        // Build sharded inverted index with 4 shards
         inverted.save_sharded(&base_path, 4)?;
-        let mut sharded = ShardedInvertedIndex::open(&base_path)?;
-        sharded.load_all()?;
+        let sharded = ShardedInvertedIndex::open(&base_path)?;
+        // Shards are loaded on-demand by classify_batch_sharded_sequential
 
-        // Create test queries (same length as reference sequences)
+        // Create test queries
         let query1: &[u8] = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
         let query2: &[u8] = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
         let records: Vec<QueryRecord> = vec![
@@ -4042,28 +3747,29 @@ mod tests {
 
         let threshold = 0.1;
 
-        // Classify with single-file inverted index
+        // Classify with single-file inverted index (ground truth)
         let results_inverted = classify_batch_inverted(&inverted, &records, threshold);
 
-        // Classify with sharded index
-        let results_sharded = classify_batch_sharded(&sharded, &records, threshold);
+        // Classify with sequential sharded approach
+        let results_sequential = classify_batch_sharded_sequential(&sharded, &records, threshold)?;
 
         // Results should match
-        assert_eq!(results_inverted.len(), results_sharded.len(),
-            "Result counts should match");
+        assert_eq!(results_inverted.len(), results_sequential.len(),
+            "Result counts should match: inverted={}, sequential={}",
+            results_inverted.len(), results_sequential.len());
 
         // Sort by query_id and bucket_id for comparison
         let mut sorted_inverted = results_inverted.clone();
         sorted_inverted.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
 
-        let mut sorted_sharded = results_sharded.clone();
-        sorted_sharded.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
+        let mut sorted_sequential = results_sequential.clone();
+        sorted_sequential.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
 
-        for (inv, shd) in sorted_inverted.iter().zip(sorted_sharded.iter()) {
-            assert_eq!(inv.query_id, shd.query_id, "Query IDs should match");
-            assert_eq!(inv.bucket_id, shd.bucket_id, "Bucket IDs should match");
-            assert!((inv.score - shd.score).abs() < 0.001,
-                "Scores should match: {} vs {}", inv.score, shd.score);
+        for (inv, seq) in sorted_inverted.iter().zip(sorted_sequential.iter()) {
+            assert_eq!(inv.query_id, seq.query_id, "Query IDs should match");
+            assert_eq!(inv.bucket_id, seq.bucket_id, "Bucket IDs should match");
+            assert!((inv.score - seq.score).abs() < 0.001,
+                "Scores should match: {} vs {}", inv.score, seq.score);
         }
 
         Ok(())
