@@ -1439,6 +1439,911 @@ impl InvertedIndex {
     pub fn num_bucket_entries(&self) -> usize {
         self.bucket_ids.len()
     }
+
+    /// Save a subset of this inverted index as a shard file.
+    ///
+    /// Format v1 (RYXS):
+    /// - Header (uncompressed, 84 bytes): magic "RYXS", version 1, k, w, salt, source_hash,
+    ///   shard_id, min_start, min_end, max_bucket_id, num_minimizers, num_bucket_ids
+    /// - Payload (zstd compressed): offsets (u32), minimizers (delta+varint), bucket_ids (adaptive)
+    ///
+    /// # Arguments
+    /// * `path` - Output file path
+    /// * `shard_id` - Shard identifier
+    /// * `start_idx` - Start index in minimizers array (inclusive)
+    /// * `end_idx` - End index in minimizers array (exclusive)
+    /// * `is_last_shard` - Whether this is the last shard (covers all values >= min_start)
+    ///
+    /// # Returns
+    /// ShardInfo describing the saved shard
+    pub fn save_shard(&self, path: &Path, shard_id: u32, start_idx: usize, end_idx: usize, is_last_shard: bool) -> Result<ShardInfo> {
+        let end_idx = end_idx.min(self.minimizers.len());
+        if start_idx >= end_idx {
+            return Err(anyhow!("Invalid shard range: start {} >= end {}", start_idx, end_idx));
+        }
+
+        let shard_minimizers = &self.minimizers[start_idx..end_idx];
+        let min_start = shard_minimizers[0];
+        let min_end = if is_last_shard {
+            // For last shard, min_end is 0 (sentinel value, not used for range checks)
+            0
+        } else {
+            // Use the next shard's start value
+            self.minimizers[end_idx]
+        };
+
+        // Calculate bucket_ids range from offsets
+        let bucket_start = self.offsets[start_idx] as usize;
+        let bucket_end = self.offsets[end_idx] as usize;
+        let shard_bucket_ids = &self.bucket_ids[bucket_start..bucket_end];
+
+        // Recompute offsets relative to shard start
+        let base_offset = self.offsets[start_idx];
+        let shard_offsets: Vec<u32> = self.offsets[start_idx..=end_idx]
+            .iter()
+            .map(|&o| o - base_offset)
+            .collect();
+
+        let mut writer = BufWriter::new(File::create(path)?);
+
+        // Determine max bucket ID for adaptive sizing
+        let max_bucket_id = shard_bucket_ids.iter().copied().max().unwrap_or(0);
+
+        // Header (uncompressed)
+        writer.write_all(b"RYXS")?;
+        writer.write_all(&1u32.to_le_bytes())?;  // Version 1
+        writer.write_all(&(self.k as u64).to_le_bytes())?;
+        writer.write_all(&(self.w as u64).to_le_bytes())?;
+        writer.write_all(&self.salt.to_le_bytes())?;
+        writer.write_all(&self.source_hash.to_le_bytes())?;
+        writer.write_all(&shard_id.to_le_bytes())?;
+        writer.write_all(&min_start.to_le_bytes())?;
+        writer.write_all(&min_end.to_le_bytes())?;
+        writer.write_all(&max_bucket_id.to_le_bytes())?;
+        writer.write_all(&(shard_minimizers.len() as u64).to_le_bytes())?;
+        writer.write_all(&(shard_bucket_ids.len() as u64).to_le_bytes())?;
+
+        // Compressed payload
+        let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
+
+        const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024;
+        let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
+
+        let flush_buf = |buf: &mut Vec<u8>, encoder: &mut zstd::stream::write::Encoder<BufWriter<File>>| -> Result<()> {
+            if !buf.is_empty() {
+                encoder.write_all(buf)?;
+                buf.clear();
+            }
+            Ok(())
+        };
+
+        // Write offsets
+        for &offset in &shard_offsets {
+            write_buf.extend_from_slice(&offset.to_le_bytes());
+            if write_buf.len() >= WRITE_BUF_SIZE {
+                flush_buf(&mut write_buf, &mut encoder)?;
+            }
+        }
+        flush_buf(&mut write_buf, &mut encoder)?;
+
+        // Write minimizers (delta + varint)
+        let mut varint_buf = [0u8; 10];
+        if !shard_minimizers.is_empty() {
+            write_buf.extend_from_slice(&shard_minimizers[0].to_le_bytes());
+            if write_buf.len() >= WRITE_BUF_SIZE {
+                flush_buf(&mut write_buf, &mut encoder)?;
+            }
+
+            let mut prev = shard_minimizers[0];
+            for &min in &shard_minimizers[1..] {
+                let delta = min - prev;
+                let len = encode_varint(delta, &mut varint_buf);
+                write_buf.extend_from_slice(&varint_buf[..len]);
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
+                prev = min;
+            }
+        }
+        flush_buf(&mut write_buf, &mut encoder)?;
+
+        // Write bucket IDs (adaptive sizing)
+        if max_bucket_id <= u8::MAX as u32 {
+            for &bid in shard_bucket_ids {
+                write_buf.push(bid as u8);
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
+            }
+        } else if max_bucket_id <= u16::MAX as u32 {
+            for &bid in shard_bucket_ids {
+                write_buf.extend_from_slice(&(bid as u16).to_le_bytes());
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
+            }
+        } else {
+            for &bid in shard_bucket_ids {
+                write_buf.extend_from_slice(&bid.to_le_bytes());
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
+            }
+        }
+        flush_buf(&mut write_buf, &mut encoder)?;
+
+        encoder.finish()?;
+
+        Ok(ShardInfo {
+            shard_id,
+            min_start,
+            min_end,
+            is_last_shard,
+            num_minimizers: shard_minimizers.len(),
+            num_bucket_ids: shard_bucket_ids.len(),
+        })
+    }
+
+    /// Load a shard file into an InvertedIndex.
+    ///
+    /// The loaded index can be used for classification just like a regular InvertedIndex,
+    /// but only contains a subset of the minimizers.
+    pub fn load_shard(path: &Path) -> Result<Self> {
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut buf4 = [0u8; 4];
+        let mut buf8 = [0u8; 8];
+
+        // Magic
+        reader.read_exact(&mut buf4)?;
+        if &buf4 != b"RYXS" {
+            return Err(anyhow!("Invalid shard format (expected RYXS)"));
+        }
+
+        // Version
+        reader.read_exact(&mut buf4)?;
+        let version = u32::from_le_bytes(buf4);
+        if version != 1 {
+            return Err(anyhow!("Unsupported shard version: {} (expected 1)", version));
+        }
+
+        // Metadata
+        reader.read_exact(&mut buf8)?;
+        let k = u64::from_le_bytes(buf8) as usize;
+        if !matches!(k, 16 | 32 | 64) {
+            return Err(anyhow!("Invalid K value in shard: {} (must be 16, 32, or 64)", k));
+        }
+
+        reader.read_exact(&mut buf8)?;
+        let w = u64::from_le_bytes(buf8) as usize;
+
+        reader.read_exact(&mut buf8)?;
+        let salt = u64::from_le_bytes(buf8);
+
+        reader.read_exact(&mut buf8)?;
+        let source_hash = u64::from_le_bytes(buf8);
+
+        // Shard metadata (skip shard_id, min_start, min_end for now)
+        reader.read_exact(&mut buf4)?; // shard_id
+        reader.read_exact(&mut buf8)?; // min_start
+        reader.read_exact(&mut buf8)?; // min_end
+
+        reader.read_exact(&mut buf4)?;
+        let max_bucket_id = u32::from_le_bytes(buf4);
+
+        reader.read_exact(&mut buf8)?;
+        let num_minimizers = u64::from_le_bytes(buf8) as usize;
+
+        reader.read_exact(&mut buf8)?;
+        let num_bucket_ids = u64::from_le_bytes(buf8) as usize;
+
+        // Sanity checks
+        if num_minimizers > MAX_INVERTED_MINIMIZERS {
+            return Err(anyhow!("Shard has too many minimizers: {}", num_minimizers));
+        }
+        if num_bucket_ids > MAX_INVERTED_BUCKET_IDS {
+            return Err(anyhow!("Shard has too many bucket IDs: {}", num_bucket_ids));
+        }
+
+        // Decompress payload
+        let mut decoder = zstd::stream::read::Decoder::new(reader)?;
+
+        const READ_BUF_SIZE: usize = 8 * 1024 * 1024;
+        let mut read_buf = vec![0u8; READ_BUF_SIZE];
+        let mut buf_pos = 0;
+        let mut buf_len = 0;
+
+        macro_rules! ensure_bytes {
+            ($n:expr) => {{
+                while buf_len - buf_pos < $n {
+                    if buf_pos > 0 {
+                        read_buf.copy_within(buf_pos..buf_len, 0);
+                        buf_len -= buf_pos;
+                        buf_pos = 0;
+                    }
+                    let space = read_buf.len() - buf_len;
+                    if space == 0 {
+                        read_buf.resize(read_buf.len() * 2, 0);
+                    }
+                    let n = decoder.read(&mut read_buf[buf_len..])?;
+                    if n == 0 {
+                        return Err(anyhow!("Unexpected end of shard data"));
+                    }
+                    buf_len += n;
+                }
+            }};
+        }
+
+        // Read offsets
+        let offsets_count = num_minimizers + 1;
+        let mut offsets = Vec::with_capacity(offsets_count);
+        for _ in 0..offsets_count {
+            ensure_bytes!(4);
+            let offset = u32::from_le_bytes(read_buf[buf_pos..buf_pos + 4].try_into().unwrap());
+            offsets.push(offset);
+            buf_pos += 4;
+        }
+
+        // Validate offsets
+        if !offsets.is_empty() && offsets[0] != 0 {
+            return Err(anyhow!("Invalid shard: first offset must be 0"));
+        }
+        if offsets.windows(2).any(|w| w[0] > w[1]) {
+            return Err(anyhow!("Invalid shard: offsets not monotonically increasing"));
+        }
+        if !offsets.is_empty() && *offsets.last().unwrap() as usize != num_bucket_ids {
+            return Err(anyhow!("Invalid shard: final offset doesn't match bucket_ids count"));
+        }
+
+        // Read minimizers (delta + varint)
+        let mut minimizers = Vec::with_capacity(num_minimizers);
+        if num_minimizers > 0 {
+            ensure_bytes!(8);
+            let first = u64::from_le_bytes(read_buf[buf_pos..buf_pos + 8].try_into().unwrap());
+            minimizers.push(first);
+            buf_pos += 8;
+
+            let mut prev = first;
+            for _ in 1..num_minimizers {
+                ensure_bytes!(1);
+                let (delta, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
+                if consumed == 0 {
+                    return Err(anyhow!("Invalid varint in shard"));
+                }
+                let val = prev + delta;
+                minimizers.push(val);
+                prev = val;
+                buf_pos += consumed;
+            }
+        }
+
+        // Read bucket IDs
+        let mut bucket_ids = Vec::with_capacity(num_bucket_ids);
+        if max_bucket_id <= u8::MAX as u32 {
+            for _ in 0..num_bucket_ids {
+                ensure_bytes!(1);
+                bucket_ids.push(read_buf[buf_pos] as u32);
+                buf_pos += 1;
+            }
+        } else if max_bucket_id <= u16::MAX as u32 {
+            for _ in 0..num_bucket_ids {
+                ensure_bytes!(2);
+                let val = u16::from_le_bytes(read_buf[buf_pos..buf_pos + 2].try_into().unwrap());
+                bucket_ids.push(val as u32);
+                buf_pos += 2;
+            }
+        } else {
+            for _ in 0..num_bucket_ids {
+                ensure_bytes!(4);
+                let val = u32::from_le_bytes(read_buf[buf_pos..buf_pos + 4].try_into().unwrap());
+                bucket_ids.push(val);
+                buf_pos += 4;
+            }
+        }
+
+        Ok(InvertedIndex {
+            k,
+            w,
+            salt,
+            source_hash,
+            minimizers,
+            offsets,
+            bucket_ids,
+        })
+    }
+
+    /// Save this inverted index as a sharded index with multiple files.
+    ///
+    /// Creates:
+    /// - `{base_path}.manifest` - Manifest file describing all shards
+    /// - `{base_path}.shard.0`, `{base_path}.shard.1`, ... - Individual shard files
+    ///
+    /// # Arguments
+    /// * `base_path` - Base path for output files (e.g., "index.ryxdi")
+    /// * `num_shards` - Number of shards to create (will be reduced if fewer minimizers)
+    ///
+    /// # Returns
+    /// The manifest describing the created shards
+    pub fn save_sharded(&self, base_path: &Path, num_shards: u32) -> Result<ShardManifest> {
+        if self.minimizers.is_empty() {
+            return Err(anyhow!("Cannot shard empty inverted index"));
+        }
+
+        // Adjust num_shards if we have fewer minimizers
+        let actual_shards = (num_shards as usize).min(self.minimizers.len()) as u32;
+
+        // Compute shard boundaries (split by count for even distribution)
+        let per_shard = self.minimizers.len().div_ceil(actual_shards as usize);
+        let boundaries: Vec<(usize, usize)> = (0..actual_shards as usize)
+            .map(|i| {
+                let start = i * per_shard;
+                let end = ((i + 1) * per_shard).min(self.minimizers.len());
+                (start, end)
+            })
+            .filter(|(s, e)| s < e)
+            .collect();
+
+        // Save each shard and collect shard info
+        let mut shards = Vec::with_capacity(boundaries.len());
+        let num_boundaries = boundaries.len();
+        for (shard_id, (start, end)) in boundaries.iter().enumerate() {
+            let shard_path = ShardManifest::shard_path(base_path, shard_id as u32);
+            let is_last = shard_id == num_boundaries - 1;
+            let shard_info = self.save_shard(&shard_path, shard_id as u32, *start, *end, is_last)?;
+            shards.push(shard_info);
+        }
+
+        // Create and save manifest
+        let manifest = ShardManifest {
+            k: self.k,
+            w: self.w,
+            salt: self.salt,
+            source_hash: self.source_hash,
+            total_minimizers: self.minimizers.len(),
+            total_bucket_ids: self.bucket_ids.len(),
+            shards,
+        };
+
+        let manifest_path = ShardManifest::manifest_path(base_path);
+        manifest.save(&manifest_path)?;
+
+        Ok(manifest)
+    }
+}
+
+// --- SHARDED INVERTED INDEX STRUCTURES ---
+
+/// Information about a single shard in a sharded inverted index.
+#[derive(Debug, Clone)]
+pub struct ShardInfo {
+    /// Shard identifier (0-indexed)
+    pub shard_id: u32,
+    /// First minimizer value in this shard (inclusive)
+    pub min_start: u64,
+    /// Last minimizer value in this shard (exclusive), or 0 if this is the last shard
+    pub min_end: u64,
+    /// Whether this is the last shard (covers all values >= min_start)
+    pub is_last_shard: bool,
+    /// Number of minimizers in this shard
+    pub num_minimizers: usize,
+    /// Number of bucket ID entries in this shard
+    pub num_bucket_ids: usize,
+}
+
+/// Manifest describing a sharded inverted index.
+///
+/// Format v2:
+/// - Magic: "RYXM" (4 bytes)
+/// - Version: 2 (u32)
+/// - k (u64), w (u64), salt (u64), source_hash (u64)
+/// - total_minimizers (u64), total_bucket_ids (u64)
+/// - num_shards (u32)
+/// - For each shard: shard_id (u32), min_start (u64), min_end (u64), is_last_shard (u8), num_minimizers (u64), num_bucket_ids (u64)
+#[derive(Debug, Clone)]
+pub struct ShardManifest {
+    pub k: usize,
+    pub w: usize,
+    pub salt: u64,
+    pub source_hash: u64,
+    pub total_minimizers: usize,
+    pub total_bucket_ids: usize,
+    pub shards: Vec<ShardInfo>,
+}
+
+impl ShardManifest {
+    /// Maximum allowed shards in a manifest (prevents DoS via huge allocations)
+    const MAX_SHARDS: u32 = 10_000;
+
+    /// Save the manifest to a file.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let mut writer = BufWriter::new(File::create(path)?);
+
+        // Magic and version
+        writer.write_all(b"RYXM")?;
+        writer.write_all(&2u32.to_le_bytes())?;
+
+        // Metadata
+        writer.write_all(&(self.k as u64).to_le_bytes())?;
+        writer.write_all(&(self.w as u64).to_le_bytes())?;
+        writer.write_all(&self.salt.to_le_bytes())?;
+        writer.write_all(&self.source_hash.to_le_bytes())?;
+
+        // Totals
+        writer.write_all(&(self.total_minimizers as u64).to_le_bytes())?;
+        writer.write_all(&(self.total_bucket_ids as u64).to_le_bytes())?;
+
+        // Shard count
+        writer.write_all(&(self.shards.len() as u32).to_le_bytes())?;
+
+        // Shard info
+        for shard in &self.shards {
+            writer.write_all(&shard.shard_id.to_le_bytes())?;
+            writer.write_all(&shard.min_start.to_le_bytes())?;
+            writer.write_all(&shard.min_end.to_le_bytes())?;
+            writer.write_all(&[if shard.is_last_shard { 1u8 } else { 0u8 }])?;
+            writer.write_all(&(shard.num_minimizers as u64).to_le_bytes())?;
+            writer.write_all(&(shard.num_bucket_ids as u64).to_le_bytes())?;
+        }
+
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Load a manifest from a file.
+    pub fn load(path: &Path) -> Result<Self> {
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut buf1 = [0u8; 1];
+        let mut buf4 = [0u8; 4];
+        let mut buf8 = [0u8; 8];
+
+        // Magic
+        reader.read_exact(&mut buf4)?;
+        if &buf4 != b"RYXM" {
+            return Err(anyhow!("Invalid shard manifest format (expected RYXM)"));
+        }
+
+        // Version
+        reader.read_exact(&mut buf4)?;
+        let version = u32::from_le_bytes(buf4);
+        if version != 2 {
+            return Err(anyhow!("Unsupported shard manifest version: {} (expected 2)", version));
+        }
+
+        // Metadata
+        reader.read_exact(&mut buf8)?;
+        let k = u64::from_le_bytes(buf8) as usize;
+        if !matches!(k, 16 | 32 | 64) {
+            return Err(anyhow!("Invalid K value in manifest: {} (must be 16, 32, or 64)", k));
+        }
+
+        reader.read_exact(&mut buf8)?;
+        let w = u64::from_le_bytes(buf8) as usize;
+
+        reader.read_exact(&mut buf8)?;
+        let salt = u64::from_le_bytes(buf8);
+
+        reader.read_exact(&mut buf8)?;
+        let source_hash = u64::from_le_bytes(buf8);
+
+        // Totals with sanity checks (Fix #5)
+        reader.read_exact(&mut buf8)?;
+        let total_minimizers = u64::from_le_bytes(buf8) as usize;
+        if total_minimizers > MAX_INVERTED_MINIMIZERS {
+            return Err(anyhow!(
+                "Invalid total_minimizers in manifest: {} (max {})",
+                total_minimizers, MAX_INVERTED_MINIMIZERS
+            ));
+        }
+
+        reader.read_exact(&mut buf8)?;
+        let total_bucket_ids = u64::from_le_bytes(buf8) as usize;
+        if total_bucket_ids > MAX_INVERTED_BUCKET_IDS {
+            return Err(anyhow!(
+                "Invalid total_bucket_ids in manifest: {} (max {})",
+                total_bucket_ids, MAX_INVERTED_BUCKET_IDS
+            ));
+        }
+
+        // Shard count
+        reader.read_exact(&mut buf4)?;
+        let num_shards = u32::from_le_bytes(buf4);
+
+        // Sanity check
+        if num_shards > Self::MAX_SHARDS {
+            return Err(anyhow!("Too many shards: {} (max {})", num_shards, Self::MAX_SHARDS));
+        }
+
+        // Shard info
+        let mut shards = Vec::with_capacity(num_shards as usize);
+        for _ in 0..num_shards {
+            reader.read_exact(&mut buf4)?;
+            let shard_id = u32::from_le_bytes(buf4);
+
+            reader.read_exact(&mut buf8)?;
+            let min_start = u64::from_le_bytes(buf8);
+
+            reader.read_exact(&mut buf8)?;
+            let min_end = u64::from_le_bytes(buf8);
+
+            reader.read_exact(&mut buf1)?;
+            let is_last_shard = buf1[0] != 0;
+
+            reader.read_exact(&mut buf8)?;
+            let num_minimizers = u64::from_le_bytes(buf8) as usize;
+
+            reader.read_exact(&mut buf8)?;
+            let num_bucket_ids = u64::from_le_bytes(buf8) as usize;
+
+            shards.push(ShardInfo {
+                shard_id,
+                min_start,
+                min_end,
+                is_last_shard,
+                num_minimizers,
+                num_bucket_ids,
+            });
+        }
+
+        // Validate shard ranges (Fix #1): sorted by min_start, non-overlapping, contiguous
+        if !shards.is_empty() {
+            // Check shards are sorted by shard_id and min_start
+            for i in 1..shards.len() {
+                if shards[i].shard_id != shards[i - 1].shard_id + 1 {
+                    return Err(anyhow!(
+                        "Invalid manifest: shard IDs not sequential (shard {} followed by {})",
+                        shards[i - 1].shard_id, shards[i].shard_id
+                    ));
+                }
+                if shards[i].min_start < shards[i - 1].min_start {
+                    return Err(anyhow!(
+                        "Invalid manifest: shards not sorted by min_start (shard {} has min_start {} < shard {} min_start {})",
+                        shards[i].shard_id, shards[i].min_start, shards[i - 1].shard_id, shards[i - 1].min_start
+                    ));
+                }
+            }
+
+            // Check non-overlapping and contiguous ranges
+            for i in 0..shards.len() - 1 {
+                if shards[i].is_last_shard {
+                    return Err(anyhow!(
+                        "Invalid manifest: shard {} marked as last but not final shard",
+                        shards[i].shard_id
+                    ));
+                }
+                // Check contiguity: this shard's min_end should equal next shard's min_start
+                if shards[i].min_end != shards[i + 1].min_start {
+                    return Err(anyhow!(
+                        "Invalid manifest: shard ranges not contiguous (shard {} ends at {}, shard {} starts at {})",
+                        shards[i].shard_id, shards[i].min_end, shards[i + 1].shard_id, shards[i + 1].min_start
+                    ));
+                }
+            }
+
+            // Last shard must have is_last_shard = true
+            if let Some(last) = shards.last() {
+                if !last.is_last_shard {
+                    return Err(anyhow!(
+                        "Invalid manifest: final shard {} not marked as is_last_shard",
+                        last.shard_id
+                    ));
+                }
+            }
+
+            // Validate total counts match sum of shard counts
+            let sum_minimizers: usize = shards.iter().map(|s| s.num_minimizers).sum();
+            let sum_bucket_ids: usize = shards.iter().map(|s| s.num_bucket_ids).sum();
+            if sum_minimizers != total_minimizers {
+                return Err(anyhow!(
+                    "Invalid manifest: shard minimizer counts sum to {}, expected {}",
+                    sum_minimizers, total_minimizers
+                ));
+            }
+            if sum_bucket_ids != total_bucket_ids {
+                return Err(anyhow!(
+                    "Invalid manifest: shard bucket_id counts sum to {}, expected {}",
+                    sum_bucket_ids, total_bucket_ids
+                ));
+            }
+        }
+
+        Ok(ShardManifest {
+            k,
+            w,
+            salt,
+            source_hash,
+            total_minimizers,
+            total_bucket_ids,
+            shards,
+        })
+    }
+
+    /// Get the path for the manifest file given a base path.
+    pub fn manifest_path(base: &Path) -> std::path::PathBuf {
+        let mut path = base.to_path_buf();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        path.set_file_name(format!("{}.manifest", name));
+        path
+    }
+
+    /// Get the path for a shard file given a base path and shard ID.
+    pub fn shard_path(base: &Path, shard_id: u32) -> std::path::PathBuf {
+        let mut path = base.to_path_buf();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        path.set_file_name(format!("{}.shard.{}", name, shard_id));
+        path
+    }
+}
+
+/// A sharded inverted index that loads shards on demand.
+///
+/// This struct holds a manifest describing the shards and lazily loads
+/// individual shards into memory as needed.
+#[derive(Debug)]
+pub struct ShardedInvertedIndex {
+    manifest: ShardManifest,
+    base_path: std::path::PathBuf,
+    loaded: HashMap<u32, InvertedIndex>,
+}
+
+impl ShardedInvertedIndex {
+    /// Open a sharded inverted index by loading just the manifest.
+    ///
+    /// No shards are loaded into memory until `load_shard()` or `load_all()` is called.
+    pub fn open(base_path: &Path) -> Result<Self> {
+        let manifest_path = ShardManifest::manifest_path(base_path);
+        let manifest = ShardManifest::load(&manifest_path)?;
+
+        Ok(ShardedInvertedIndex {
+            manifest,
+            base_path: base_path.to_path_buf(),
+            loaded: HashMap::new(),
+        })
+    }
+
+    /// Load a specific shard into memory.
+    ///
+    /// If the shard is already loaded, this is a no-op.
+    /// Validates that the shard's k/w/salt/source_hash match the manifest.
+    pub fn load_shard(&mut self, shard_id: u32) -> Result<()> {
+        if self.loaded.contains_key(&shard_id) {
+            return Ok(()); // Already loaded
+        }
+
+        if shard_id as usize >= self.manifest.shards.len() {
+            return Err(anyhow!("Invalid shard ID: {} (only {} shards)", shard_id, self.manifest.shards.len()));
+        }
+
+        let shard_path = ShardManifest::shard_path(&self.base_path, shard_id);
+        let shard = InvertedIndex::load_shard(&shard_path)?;
+
+        // Validate shard parameters match manifest (Fix #3)
+        if shard.k != self.manifest.k {
+            return Err(anyhow!(
+                "Shard {} K mismatch: shard has K={}, manifest has K={}",
+                shard_id, shard.k, self.manifest.k
+            ));
+        }
+        if shard.w != self.manifest.w {
+            return Err(anyhow!(
+                "Shard {} W mismatch: shard has W={}, manifest has W={}",
+                shard_id, shard.w, self.manifest.w
+            ));
+        }
+        if shard.salt != self.manifest.salt {
+            return Err(anyhow!(
+                "Shard {} salt mismatch: shard has salt={:#x}, manifest has salt={:#x}",
+                shard_id, shard.salt, self.manifest.salt
+            ));
+        }
+        if shard.source_hash != self.manifest.source_hash {
+            return Err(anyhow!(
+                "Shard {} source_hash mismatch: shard has {:#x}, manifest has {:#x}",
+                shard_id, shard.source_hash, self.manifest.source_hash
+            ));
+        }
+
+        // Validate shard size matches manifest
+        let expected = &self.manifest.shards[shard_id as usize];
+        if shard.minimizers.len() != expected.num_minimizers {
+            return Err(anyhow!(
+                "Shard {} minimizer count mismatch: file has {}, manifest expects {}",
+                shard_id, shard.minimizers.len(), expected.num_minimizers
+            ));
+        }
+        if shard.bucket_ids.len() != expected.num_bucket_ids {
+            return Err(anyhow!(
+                "Shard {} bucket_ids count mismatch: file has {}, manifest expects {}",
+                shard_id, shard.bucket_ids.len(), expected.num_bucket_ids
+            ));
+        }
+
+        self.loaded.insert(shard_id, shard);
+        Ok(())
+    }
+
+    /// Load all shards into memory in parallel (Fix #6).
+    pub fn load_all(&mut self) -> Result<()> {
+        use rayon::prelude::*;
+
+        // Collect shard info for parallel loading
+        let shard_infos: Vec<_> = self.manifest.shards.iter()
+            .map(|s| (s.shard_id, ShardManifest::shard_path(&self.base_path, s.shard_id)))
+            .collect();
+
+        // Load shards in parallel
+        let results: Vec<Result<(u32, InvertedIndex)>> = shard_infos.par_iter()
+            .map(|(shard_id, shard_path)| {
+                let shard = InvertedIndex::load_shard(shard_path)?;
+                Ok((*shard_id, shard))
+            })
+            .collect();
+
+        // Insert and validate each shard
+        for result in results {
+            let (shard_id, shard) = result?;
+
+            // Validate shard parameters match manifest
+            if shard.k != self.manifest.k {
+                return Err(anyhow!(
+                    "Shard {} K mismatch: shard has K={}, manifest has K={}",
+                    shard_id, shard.k, self.manifest.k
+                ));
+            }
+            if shard.w != self.manifest.w {
+                return Err(anyhow!(
+                    "Shard {} W mismatch: shard has W={}, manifest has W={}",
+                    shard_id, shard.w, self.manifest.w
+                ));
+            }
+            if shard.salt != self.manifest.salt {
+                return Err(anyhow!(
+                    "Shard {} salt mismatch: shard has salt={:#x}, manifest has salt={:#x}",
+                    shard_id, shard.salt, self.manifest.salt
+                ));
+            }
+            if shard.source_hash != self.manifest.source_hash {
+                return Err(anyhow!(
+                    "Shard {} source_hash mismatch: shard has {:#x}, manifest has {:#x}",
+                    shard_id, shard.source_hash, self.manifest.source_hash
+                ));
+            }
+
+            // Validate shard size matches manifest
+            let expected = &self.manifest.shards[shard_id as usize];
+            if shard.minimizers.len() != expected.num_minimizers {
+                return Err(anyhow!(
+                    "Shard {} minimizer count mismatch: file has {}, manifest expects {}",
+                    shard_id, shard.minimizers.len(), expected.num_minimizers
+                ));
+            }
+            if shard.bucket_ids.len() != expected.num_bucket_ids {
+                return Err(anyhow!(
+                    "Shard {} bucket_ids count mismatch: file has {}, manifest expects {}",
+                    shard_id, shard.bucket_ids.len(), expected.num_bucket_ids
+                ));
+            }
+
+            self.loaded.insert(shard_id, shard);
+        }
+        Ok(())
+    }
+
+    /// Unload a shard to free memory.
+    pub fn unload_shard(&mut self, shard_id: u32) {
+        self.loaded.remove(&shard_id);
+    }
+
+    /// Check if a query minimizer range overlaps with a shard's range.
+    fn query_overlaps_shard(min_query: u64, max_query: u64, shard_info: &ShardInfo) -> bool {
+        if shard_info.is_last_shard {
+            // Last shard covers all values >= min_start
+            max_query >= shard_info.min_start
+        } else {
+            // Normal range check: [min_start, min_end)
+            max_query >= shard_info.min_start && min_query < shard_info.min_end
+        }
+    }
+
+    /// Get bucket hits across all loaded shards.
+    ///
+    /// Returns aggregated hit counts from all currently loaded shards.
+    /// Skips shards whose ranges don't overlap with the query minimizers (Fix #7).
+    /// Unloaded shards are ignored.
+    pub fn get_bucket_hits(&self, query: &[u64]) -> HashMap<u32, usize> {
+        if query.is_empty() {
+            return HashMap::new();
+        }
+
+        // Compute query range for shard pruning
+        let min_query = *query.iter().min().unwrap();
+        let max_query = *query.iter().max().unwrap();
+
+        let mut total_hits: HashMap<u32, usize> = HashMap::new();
+
+        for (shard_id, shard) in &self.loaded {
+            // Get shard info for range check
+            let shard_info = &self.manifest.shards[*shard_id as usize];
+
+            // Skip shards outside query range (Fix #7)
+            if !Self::query_overlaps_shard(min_query, max_query, shard_info) {
+                continue;
+            }
+
+            let shard_hits = shard.get_bucket_hits(query);
+            for (bucket_id, count) in shard_hits {
+                *total_hits.entry(bucket_id).or_insert(0) += count;
+            }
+        }
+
+        total_hits
+    }
+
+    /// Returns the K value (k-mer size).
+    pub fn k(&self) -> usize {
+        self.manifest.k
+    }
+
+    /// Returns the window size.
+    pub fn w(&self) -> usize {
+        self.manifest.w
+    }
+
+    /// Returns the salt value.
+    pub fn salt(&self) -> u64 {
+        self.manifest.salt
+    }
+
+    /// Returns the source hash for validation.
+    pub fn source_hash(&self) -> u64 {
+        self.manifest.source_hash
+    }
+
+    /// Returns the total number of shards.
+    pub fn num_shards(&self) -> usize {
+        self.manifest.shards.len()
+    }
+
+    /// Returns the number of currently loaded shards.
+    pub fn num_loaded(&self) -> usize {
+        self.loaded.len()
+    }
+
+    /// Returns the total number of minimizers across all shards.
+    pub fn total_minimizers(&self) -> usize {
+        self.manifest.total_minimizers
+    }
+
+    /// Returns the total number of bucket ID entries across all shards.
+    pub fn total_bucket_ids(&self) -> usize {
+        self.manifest.total_bucket_ids
+    }
+
+    /// Returns a reference to the manifest.
+    pub fn manifest(&self) -> &ShardManifest {
+        &self.manifest
+    }
+
+    /// Validate against Index metadata.
+    pub fn validate_against_metadata(&self, metadata: &IndexMetadata) -> Result<()> {
+        if self.manifest.k != metadata.k {
+            return Err(anyhow!("K mismatch: sharded index has K={}, metadata has K={}",
+                self.manifest.k, metadata.k));
+        }
+        if self.manifest.w != metadata.w {
+            return Err(anyhow!("W mismatch: sharded index has W={}, metadata has W={}",
+                self.manifest.w, metadata.w));
+        }
+        if self.manifest.salt != metadata.salt {
+            return Err(anyhow!("Salt mismatch: sharded index has salt={:#x}, metadata has salt={:#x}",
+                self.manifest.salt, metadata.salt));
+        }
+
+        let expected_hash = InvertedIndex::compute_metadata_hash(metadata);
+        if self.manifest.source_hash != expected_hash {
+            return Err(anyhow!("Source hash mismatch: sharded index is stale or was built from different source"));
+        }
+
+        Ok(())
+    }
 }
 
 // --- LIBRARY LEVEL PROCESSING ---
@@ -1531,6 +2436,64 @@ pub fn classify_batch_inverted(
 
             // Merge hits into a single map (bucket_id -> (fwd_count, rc_count))
             // Reserve capacity based on combined unique buckets (upper bound: sum of both)
+            let capacity = fwd_hits.len() + rc_hits.len();
+            let mut scores: HashMap<u32, (usize, usize)> = HashMap::with_capacity(capacity);
+            for (&bucket_id, &count) in &fwd_hits {
+                scores.entry(bucket_id).or_insert((0, 0)).0 = count;
+            }
+            for (&bucket_id, &count) in &rc_hits {
+                scores.entry(bucket_id).or_insert((0, 0)).1 = count;
+            }
+
+            // Compute scores and filter by threshold
+            let mut query_results = Vec::with_capacity(scores.len());
+            for (bucket_id, (fwd_count, rc_count)) in scores {
+                let score = (if fwd_len > 0.0 { fwd_count as f64 / fwd_len } else { 0.0 })
+                    .max(if rc_len > 0.0 { rc_count as f64 / rc_len } else { 0.0 });
+
+                if score >= threshold {
+                    query_results.push(HitResult {
+                        query_id: *query_id,
+                        bucket_id,
+                        score,
+                    });
+                }
+            }
+            query_results
+        })
+        .collect();
+
+    results
+}
+
+/// Classify reads against a sharded inverted index.
+///
+/// This is equivalent to `classify_batch_inverted` but uses a `ShardedInvertedIndex`.
+/// All shards must be loaded before calling this function.
+pub fn classify_batch_sharded(
+    sharded: &ShardedInvertedIndex,
+    records: &[QueryRecord],
+    threshold: f64
+) -> Vec<HitResult> {
+    // Extract minimizers for all queries in parallel
+    let processed: Vec<_> = records.par_iter()
+        .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
+            let (ha, hb) = get_paired_minimizers_into(s1, *s2, sharded.k(), sharded.w(), sharded.salt(), ws);
+            (*id, ha, hb)
+        }).collect();
+
+    // Process each query and collect results
+    let results: Vec<HitResult> = processed.par_iter()
+        .flat_map(|(query_id, fwd_mins, rc_mins)| {
+            // Get bucket hits for forward strand
+            let fwd_hits = sharded.get_bucket_hits(fwd_mins);
+            let fwd_len = fwd_mins.len() as f64;
+
+            // Get bucket hits for reverse complement strand
+            let rc_hits = sharded.get_bucket_hits(rc_mins);
+            let rc_len = rc_mins.len() as f64;
+
+            // Merge hits into a single map (bucket_id -> (fwd_count, rc_count))
             let capacity = fwd_hits.len() + rc_hits.len();
             let mut scores: HashMap<u32, (usize, usize)> = HashMap::with_capacity(capacity);
             for (&bucket_id, &count) in &fwd_hits {
@@ -2599,6 +3562,511 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("first offset must be 0"), "Unexpected error: {}", err);
+    }
+
+    // --- SHARDED INDEX TESTS ---
+
+    #[test]
+    fn test_shard_manifest_save_load_roundtrip() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        let manifest = ShardManifest {
+            k: 64,
+            w: 50,
+            salt: 0xDEADBEEF,
+            source_hash: 0x12345678,
+            total_minimizers: 1000,
+            total_bucket_ids: 5000,
+            shards: vec![
+                ShardInfo {
+                    shard_id: 0,
+                    min_start: 0,
+                    min_end: 500,
+                    is_last_shard: false,
+                    num_minimizers: 400,
+                    num_bucket_ids: 2000,
+                },
+                ShardInfo {
+                    shard_id: 1,
+                    min_start: 500,
+                    min_end: 0,  // min_end is 0 for last shard (sentinel value)
+                    is_last_shard: true,
+                    num_minimizers: 600,
+                    num_bucket_ids: 3000,
+                },
+            ],
+        };
+
+        manifest.save(&path)?;
+        let loaded = ShardManifest::load(&path)?;
+
+        assert_eq!(loaded.k, 64);
+        assert_eq!(loaded.w, 50);
+        assert_eq!(loaded.salt, 0xDEADBEEF);
+        assert_eq!(loaded.source_hash, 0x12345678);
+        assert_eq!(loaded.total_minimizers, 1000);
+        assert_eq!(loaded.total_bucket_ids, 5000);
+        assert_eq!(loaded.shards.len(), 2);
+
+        assert_eq!(loaded.shards[0].shard_id, 0);
+        assert_eq!(loaded.shards[0].min_start, 0);
+        assert_eq!(loaded.shards[0].min_end, 500);
+        assert!(!loaded.shards[0].is_last_shard);
+        assert_eq!(loaded.shards[0].num_minimizers, 400);
+        assert_eq!(loaded.shards[0].num_bucket_ids, 2000);
+
+        assert_eq!(loaded.shards[1].shard_id, 1);
+        assert_eq!(loaded.shards[1].min_start, 500);
+        assert_eq!(loaded.shards[1].min_end, 0);  // 0 for last shard
+        assert!(loaded.shards[1].is_last_shard);
+        assert_eq!(loaded.shards[1].num_minimizers, 600);
+        assert_eq!(loaded.shards[1].num_bucket_ids, 3000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_shard_manifest_invalid_magic() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(path, b"NOTM").unwrap();
+
+        let result = ShardManifest::load(path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid shard manifest format"));
+    }
+
+    #[test]
+    fn test_shard_manifest_invalid_version() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RYXM");
+        data.extend_from_slice(&99u32.to_le_bytes()); // Bad version
+        std::fs::write(path, data).unwrap();
+
+        let result = ShardManifest::load(path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unsupported shard manifest version"));
+    }
+
+    #[test]
+    fn test_shard_manifest_path_helpers() {
+        let base = std::path::Path::new("/tmp/test.ryxdi");
+
+        let manifest_path = ShardManifest::manifest_path(base);
+        assert_eq!(manifest_path.to_str().unwrap(), "/tmp/test.ryxdi.manifest");
+
+        let shard_path = ShardManifest::shard_path(base, 3);
+        assert_eq!(shard_path.to_str().unwrap(), "/tmp/test.ryxdi.shard.3");
+    }
+
+    #[test]
+    fn test_shard_save_load_roundtrip() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        // Build a simple inverted index
+        let mut index = Index::new(64, 50, 0xABCD).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.buckets.insert(2, vec![200, 300, 400]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Save as a shard (full index as single shard)
+        let shard_info = inverted.save_shard(&path, 0, 0, inverted.num_minimizers(), true)?;
+
+        assert_eq!(shard_info.shard_id, 0);
+        assert_eq!(shard_info.num_minimizers, inverted.num_minimizers());
+        assert_eq!(shard_info.num_bucket_ids, inverted.num_bucket_entries());
+
+        // Load the shard
+        let loaded = InvertedIndex::load_shard(&path)?;
+
+        assert_eq!(loaded.k, 64);
+        assert_eq!(loaded.w, 50);
+        assert_eq!(loaded.salt, 0xABCD);
+        assert_eq!(loaded.num_minimizers(), inverted.num_minimizers());
+        assert_eq!(loaded.num_bucket_entries(), inverted.num_bucket_entries());
+
+        // Verify lookups work
+        let hits = loaded.get_bucket_hits(&[200, 300]);
+        assert_eq!(hits.get(&1), Some(&2)); // Bucket 1 has 200, 300
+        assert_eq!(hits.get(&2), Some(&2)); // Bucket 2 has 200, 300
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_shard_partial_range() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        // Build an inverted index with more minimizers
+        let mut index = Index::new(64, 50, 0x1234).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300, 400, 500]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        assert_eq!(inverted.num_minimizers(), 5);
+
+        // Save only first 3 minimizers as a shard (not the last shard)
+        let shard_info = inverted.save_shard(&path, 0, 0, 3, false)?;
+
+        assert_eq!(shard_info.shard_id, 0);
+        assert_eq!(shard_info.num_minimizers, 3);
+        assert!(!shard_info.is_last_shard);
+        assert_eq!(shard_info.min_start, 100);
+        assert_eq!(shard_info.min_end, 400); // Exclusive: next would be 400
+
+        // Load and verify
+        let loaded = InvertedIndex::load_shard(&path)?;
+        assert_eq!(loaded.num_minimizers(), 3);
+
+        // Should find 100, 200, 300 but not 400, 500
+        let hits = loaded.get_bucket_hits(&[100, 200, 300, 400, 500]);
+        assert_eq!(hits.get(&1), Some(&3)); // Only 3 hits
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_shard_invalid_magic() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(path, b"NOTS").unwrap();
+
+        let result = InvertedIndex::load_shard(path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid shard format"));
+    }
+
+    #[test]
+    fn test_save_sharded_creates_files() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        // Build a larger inverted index
+        let mut index = Index::new(64, 50, 0xCAFE).unwrap();
+        for i in 0..100u64 {
+            index.buckets.entry(1).or_default().push(i * 10);
+            index.buckets.entry(2).or_default().push(i * 10 + 5);
+        }
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.finalize_bucket(1);
+        index.finalize_bucket(2);
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        let total_minimizers = inverted.num_minimizers();
+        let total_bucket_ids = inverted.num_bucket_entries();
+
+        // Save as 4 shards
+        let manifest = inverted.save_sharded(&base_path, 4)?;
+
+        // Verify manifest
+        assert_eq!(manifest.k, 64);
+        assert_eq!(manifest.w, 50);
+        assert_eq!(manifest.salt, 0xCAFE);
+        assert_eq!(manifest.shards.len(), 4);
+        assert_eq!(manifest.total_minimizers, total_minimizers);
+        assert_eq!(manifest.total_bucket_ids, total_bucket_ids);
+
+        // Verify shard files exist
+        let manifest_path = ShardManifest::manifest_path(&base_path);
+        assert!(manifest_path.exists(), "Manifest file should exist");
+
+        for i in 0..4 {
+            let shard_path = ShardManifest::shard_path(&base_path, i);
+            assert!(shard_path.exists(), "Shard {} file should exist", i);
+        }
+
+        // Verify shards contain all minimizers
+        let shard_mins: usize = manifest.shards.iter().map(|s| s.num_minimizers).sum();
+        assert_eq!(shard_mins, total_minimizers);
+
+        let shard_bids: usize = manifest.shards.iter().map(|s| s.num_bucket_ids).sum();
+        assert_eq!(shard_bids, total_bucket_ids);
+
+        // Verify shard ranges are contiguous
+        for i in 1..manifest.shards.len() {
+            assert_eq!(
+                manifest.shards[i - 1].min_end,
+                manifest.shards[i].min_start,
+                "Shard ranges should be contiguous"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_save_sharded_single_shard() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        let manifest = inverted.save_sharded(&base_path, 1)?;
+
+        assert_eq!(manifest.shards.len(), 1);
+        assert_eq!(manifest.shards[0].num_minimizers, 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_save_sharded_more_shards_than_minimizers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Request 10 shards but only have 2 minimizers
+        let manifest = inverted.save_sharded(&base_path, 10)?;
+
+        // Should create at most 2 shards (one per minimizer)
+        assert!(manifest.shards.len() <= 2);
+        let total: usize = manifest.shards.iter().map(|s| s.num_minimizers).sum();
+        assert_eq!(total, 2);
+
+        Ok(())
+    }
+
+    // --- SHARDED INVERTED INDEX TESTS ---
+
+    #[test]
+    fn test_sharded_inverted_index_open() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        // Create sharded index
+        let mut index = Index::new(64, 50, 0x1234).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300, 400]);
+        index.bucket_names.insert(1, "A".into());
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_sharded(&base_path, 2)?;
+
+        // Open sharded index (manifest only)
+        let sharded = ShardedInvertedIndex::open(&base_path)?;
+
+        assert_eq!(sharded.k(), 64);
+        assert_eq!(sharded.w(), 50);
+        assert_eq!(sharded.salt(), 0x1234);
+        assert_eq!(sharded.num_shards(), 2);
+        assert_eq!(sharded.num_loaded(), 0); // No shards loaded yet
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sharded_inverted_index_load_shard() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300, 400]);
+        index.bucket_names.insert(1, "A".into());
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_sharded(&base_path, 2)?;
+
+        let mut sharded = ShardedInvertedIndex::open(&base_path)?;
+
+        // Load first shard
+        sharded.load_shard(0)?;
+        assert_eq!(sharded.num_loaded(), 1);
+
+        // Load second shard
+        sharded.load_shard(1)?;
+        assert_eq!(sharded.num_loaded(), 2);
+
+        // Loading same shard again should be no-op
+        sharded.load_shard(0)?;
+        assert_eq!(sharded.num_loaded(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sharded_inverted_index_load_all() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300, 400]);
+        index.bucket_names.insert(1, "A".into());
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_sharded(&base_path, 4)?;
+
+        let mut sharded = ShardedInvertedIndex::open(&base_path)?;
+        sharded.load_all()?;
+
+        assert_eq!(sharded.num_loaded(), sharded.num_shards());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sharded_inverted_index_unload_shard() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300, 400]);
+        index.bucket_names.insert(1, "A".into());
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_sharded(&base_path, 2)?;
+
+        let mut sharded = ShardedInvertedIndex::open(&base_path)?;
+        sharded.load_all()?;
+        assert_eq!(sharded.num_loaded(), 2);
+
+        sharded.unload_shard(0);
+        assert_eq!(sharded.num_loaded(), 1);
+
+        sharded.unload_shard(1);
+        assert_eq!(sharded.num_loaded(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sharded_inverted_index_get_bucket_hits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.buckets.insert(2, vec![200, 300, 400]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_sharded(&base_path, 2)?;
+
+        let mut sharded = ShardedInvertedIndex::open(&base_path)?;
+        sharded.load_all()?;
+
+        // Query spanning both shards
+        let hits = sharded.get_bucket_hits(&[200, 300]);
+
+        assert_eq!(hits.get(&1), Some(&2)); // Bucket 1: 200, 300
+        assert_eq!(hits.get(&2), Some(&2)); // Bucket 2: 200, 300
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sharded_inverted_index_partial_load_hits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        // Create index where first shard has 100,200 and second has 300,400
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300, 400]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_sharded(&base_path, 2)?;
+
+        let mut sharded = ShardedInvertedIndex::open(&base_path)?;
+
+        // Load only first shard
+        sharded.load_shard(0)?;
+
+        // Query should only find hits from loaded shard
+        let hits = sharded.get_bucket_hits(&[100, 200, 300, 400]);
+
+        // Only hits from first shard (100, 200)
+        assert_eq!(hits.get(&1), Some(&2));
+
+        // Load second shard
+        sharded.load_shard(1)?;
+        let hits = sharded.get_bucket_hits(&[100, 200, 300, 400]);
+
+        // Now all 4 hits
+        assert_eq!(hits.get(&1), Some(&4));
+
+        Ok(())
+    }
+
+    // --- CLASSIFICATION TESTS ---
+
+    #[test]
+    fn test_classify_batch_sharded_matches_inverted() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        // Build a reasonably sized index with K=32 (smaller K for shorter sequences)
+        let mut index = Index::new(32, 10, 0x1234).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        // Add sequences that are long enough for K=32, w=10
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq2 = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+
+        index.add_record(1, "ref1", seq1, &mut ws);
+        index.add_record(2, "ref2", seq2, &mut ws);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.finalize_bucket(1);
+        index.finalize_bucket(2);
+
+        // Build single-file inverted index
+        let inverted = InvertedIndex::build_from_index(&index);
+        assert!(inverted.num_minimizers() > 0, "Inverted index should not be empty");
+
+        // Build sharded inverted index
+        inverted.save_sharded(&base_path, 4)?;
+        let mut sharded = ShardedInvertedIndex::open(&base_path)?;
+        sharded.load_all()?;
+
+        // Create test queries (same length as reference sequences)
+        let query1: &[u8] = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let query2: &[u8] = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+        let records: Vec<QueryRecord> = vec![
+            (0, query1, None),
+            (1, query2, None),
+        ];
+
+        let threshold = 0.1;
+
+        // Classify with single-file inverted index
+        let results_inverted = classify_batch_inverted(&inverted, &records, threshold);
+
+        // Classify with sharded index
+        let results_sharded = classify_batch_sharded(&sharded, &records, threshold);
+
+        // Results should match
+        assert_eq!(results_inverted.len(), results_sharded.len(),
+            "Result counts should match");
+
+        // Sort by query_id and bucket_id for comparison
+        let mut sorted_inverted = results_inverted.clone();
+        sorted_inverted.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
+
+        let mut sorted_sharded = results_sharded.clone();
+        sorted_sharded.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
+
+        for (inv, shd) in sorted_inverted.iter().zip(sorted_sharded.iter()) {
+            assert_eq!(inv.query_id, shd.query_id, "Query IDs should match");
+            assert_eq!(inv.bucket_id, shd.bucket_id, "Bucket IDs should match");
+            assert!((inv.score - shd.score).abs() < 0.001,
+                "Scores should match: {} vs {}", inv.score, shd.score);
+        }
+
+        Ok(())
     }
 }
 

@@ -161,9 +161,10 @@ Nested subcommands using clap:
 - `bucket-merge` - Merge two buckets within an index
 - `merge` - Merge multiple indices into one
 - `from-config` - Build index from TOML configuration file
+- `invert` - Create inverted index for faster classification (supports `--shards N` for sharding)
 
 **`rype classify`** - Classification operations:
-- `run` - Per-read classification
+- `run` - Per-read classification (auto-detects sharded vs single-file inverted index)
 - `batch` - Batch classify (alias for run)
 - `aggregate` - Aggregated classification for paired-end (alias: `agg`)
 
@@ -216,6 +217,49 @@ This format achieves ~65% compression compared to raw storage by:
 2. Delta encoding minimizers (exploits sorted order - consecutive values are close)
 3. Varint encoding deltas (most deltas fit in 4 bytes instead of 8)
 4. zstd compression on top of the delta+varint stream
+
+### Sharded Inverted Index
+
+For very large inverted indexes that exceed available memory, the index can be split into multiple shard files:
+
+```
+index.ryxdi.manifest     # Manifest describing all shards
+index.ryxdi.shard.0      # Shard 0
+index.ryxdi.shard.1      # Shard 1
+...
+```
+
+**Manifest Format (RYXM v1)**:
+```
+Magic: "RYXM" (4 bytes)
+Version: 1 (u32)
+k, w, salt, source_hash (u64 each)
+total_minimizers, total_bucket_ids (u64 each)
+num_shards (u32)
+For each shard: shard_id (u32), min_start (u64), min_end (u64), num_minimizers (u64), num_bucket_ids (u64)
+```
+
+**Shard Format (RYXS v1)**:
+Each shard is a complete inverted index containing a contiguous range of minimizers. Uses same encoding as RYXI (delta+varint+zstd) with additional shard metadata in header.
+
+**Key Data Structures**:
+- `ShardManifest` - Describes shard layout and totals
+- `ShardInfo` - Per-shard metadata (ID, range, counts)
+- `ShardedInvertedIndex` - Lazy-loading wrapper that loads shards on demand
+
+**Usage**:
+```bash
+# Create sharded inverted index (4 shards)
+cargo run --release -- index invert -i index.ryidx --shards 4
+
+# Classification auto-detects sharded format
+cargo run --release -- classify run -i index.ryidx --use-inverted -1 reads.fq
+```
+
+**Memory Benefits**:
+- Manifest loads instantly (no minimizer data)
+- Shards can be loaded/unloaded independently
+- Classification loads all shards but can be extended for partial loading
 
 ### Error Handling
 - Rust API: Uses `anyhow::Result<T>` for all fallible operations

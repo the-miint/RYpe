@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use anyhow::{Context, Result, anyhow};
 
-use rype::{Index, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, aggregate_batch};
+use rype::{Index, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, classify_batch_sharded, aggregate_batch, ShardManifest, ShardedInvertedIndex};
 use rype::config::{parse_config, validate_config, resolve_path};
 
 mod logging;
@@ -123,6 +123,10 @@ enum IndexCommands {
     Invert {
         #[arg(short, long)]
         index: PathBuf,
+
+        /// Number of shards to split the inverted index into (default: 1 = single file)
+        #[arg(long, default_value_t = 1)]
+        shards: u32,
     },
 
     /// Summarize index with detailed minimizer statistics
@@ -505,7 +509,7 @@ fn main() -> Result<()> {
                 build_index_from_config(&config)?;
             }
 
-            IndexCommands::Invert { index } => {
+            IndexCommands::Invert { index, shards } => {
                 log::info!("Loading index from {:?}", index);
                 let idx = Index::load(&index)?;
                 log::info!("Index loaded: {} buckets", idx.buckets.len());
@@ -515,10 +519,20 @@ fn main() -> Result<()> {
                 log::info!("Inverted index built: {} unique minimizers, {} bucket entries",
                     inverted.num_minimizers(), inverted.num_bucket_entries());
 
-                // Save with .ryxdi extension
                 let output_path = index.with_extension("ryxdi");
-                log::info!("Saving inverted index to {:?}", output_path);
-                inverted.save(&output_path)?;
+
+                if shards > 1 {
+                    log::info!("Saving sharded inverted index ({} shards) to {:?}", shards, output_path);
+                    let manifest = inverted.save_sharded(&output_path, shards)?;
+                    log::info!("Created {} shards:", manifest.shards.len());
+                    for shard in &manifest.shards {
+                        log::info!("  Shard {}: {} minimizers, {} bucket entries",
+                            shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
+                    }
+                } else {
+                    log::info!("Saving inverted index to {:?}", output_path);
+                    inverted.save(&output_path)?;
+                }
                 log::info!("Done.");
             }
 
@@ -672,26 +686,14 @@ fn main() -> Result<()> {
             ClassifyCommands::Run { index, r1, r2, threshold, batch_size, output, use_inverted } |
             ClassifyCommands::Batch { index, r1, r2, threshold, batch_size, output, use_inverted } => {
                 if use_inverted {
-                    // Use inverted index path - load .ryxdi and metadata only
+                    // Use inverted index path - detect sharded vs single-file format
                     let inverted_path = index.with_extension("ryxdi");
-                    if !inverted_path.exists() {
-                        return Err(anyhow!(
-                            "Inverted index not found: {:?}. Create it with 'rype index invert -i {:?}'",
-                            inverted_path, index
-                        ));
-                    }
+                    let manifest_path = ShardManifest::manifest_path(&inverted_path);
 
-                    log::info!("Loading inverted index from {:?}", inverted_path);
-                    let inverted = InvertedIndex::load(&inverted_path)?;
-                    log::info!("Inverted index loaded: {} unique minimizers", inverted.num_minimizers());
-
+                    // Load index metadata first (needed for both paths)
                     log::info!("Loading index metadata from {:?}", index);
                     let metadata = Index::load_metadata(&index)?;
                     log::info!("Metadata loaded: {} buckets", metadata.bucket_names.len());
-
-                    // Validate inverted index matches source
-                    inverted.validate_against_metadata(&metadata)?;
-                    log::info!("Inverted index validated successfully");
 
                     let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
                     io.write(b"read_id\tbucket_name\tscore\n".to_vec())?;
@@ -699,30 +701,85 @@ fn main() -> Result<()> {
                     let mut total_reads = 0;
                     let mut batch_num = 0;
 
-                    log::info!("Starting classification with inverted index (batch_size={})", batch_size);
+                    if manifest_path.exists() {
+                        // Sharded inverted index
+                        log::info!("Loading sharded inverted index from {:?}", inverted_path);
+                        let mut sharded = ShardedInvertedIndex::open(&inverted_path)?;
+                        log::info!("Sharded index: {} shards, {} total minimizers",
+                            sharded.num_shards(), sharded.total_minimizers());
 
-                    while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
-                        batch_num += 1;
-                        let batch_read_count = owned_records.len();
-                        total_reads += batch_read_count;
+                        // Validate and load all shards
+                        sharded.validate_against_metadata(&metadata)?;
+                        log::info!("Sharded index validated successfully");
 
-                        let batch_refs: Vec<QueryRecord> = owned_records.iter()
-                            .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
-                            .collect();
+                        log::info!("Loading all {} shards...", sharded.num_shards());
+                        sharded.load_all()?;
+                        log::info!("All shards loaded");
 
-                        let results = classify_batch_inverted(&inverted, &batch_refs, threshold);
+                        log::info!("Starting classification with sharded inverted index (batch_size={})", batch_size);
 
-                        let mut chunk_out = Vec::with_capacity(1024);
-                        for res in results {
-                            let header = &headers[res.query_id as usize];
-                            let bucket_name = metadata.bucket_names.get(&res.bucket_id)
-                                .map(|s| s.as_str())
-                                .unwrap_or("unknown");
-                            writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
+                        while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
+                            batch_num += 1;
+                            let batch_read_count = owned_records.len();
+                            total_reads += batch_read_count;
+
+                            let batch_refs: Vec<QueryRecord> = owned_records.iter()
+                                .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                                .collect();
+
+                            let results = classify_batch_sharded(&sharded, &batch_refs, threshold);
+
+                            let mut chunk_out = Vec::with_capacity(1024);
+                            for res in results {
+                                let header = &headers[res.query_id as usize];
+                                let bucket_name = metadata.bucket_names.get(&res.bucket_id)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("unknown");
+                                writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
+                            }
+                            io.write(chunk_out)?;
+
+                            log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
                         }
-                        io.write(chunk_out)?;
+                    } else if inverted_path.exists() {
+                        // Single-file inverted index
+                        log::info!("Loading inverted index from {:?}", inverted_path);
+                        let inverted = InvertedIndex::load(&inverted_path)?;
+                        log::info!("Inverted index loaded: {} unique minimizers", inverted.num_minimizers());
 
-                        log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+                        inverted.validate_against_metadata(&metadata)?;
+                        log::info!("Inverted index validated successfully");
+
+                        log::info!("Starting classification with inverted index (batch_size={})", batch_size);
+
+                        while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
+                            batch_num += 1;
+                            let batch_read_count = owned_records.len();
+                            total_reads += batch_read_count;
+
+                            let batch_refs: Vec<QueryRecord> = owned_records.iter()
+                                .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                                .collect();
+
+                            let results = classify_batch_inverted(&inverted, &batch_refs, threshold);
+
+                            let mut chunk_out = Vec::with_capacity(1024);
+                            for res in results {
+                                let header = &headers[res.query_id as usize];
+                                let bucket_name = metadata.bucket_names.get(&res.bucket_id)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("unknown");
+                                writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
+                            }
+                            io.write(chunk_out)?;
+
+                            log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+                        }
+                    } else {
+                        return Err(anyhow!(
+                            "Inverted index not found: {:?}. Create it with 'rype index invert -i {:?}'",
+                            inverted_path, index
+                        ));
                     }
 
                     log::info!("Classification complete: {} reads processed", total_reads);
