@@ -1,0 +1,1405 @@
+//! Inverted index for fast minimizer → bucket lookups.
+//!
+//! The inverted index maps each unique minimizer to the set of bucket IDs
+//! that contain it, using a CSR (Compressed Sparse Row) format. This enables
+//! O(Q * log(U)) lookups where Q = query minimizers and U = unique minimizers.
+
+use anyhow::{Result, anyhow};
+use rayon::prelude::*;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::Path;
+
+use crate::constants::{MAX_INVERTED_MINIMIZERS, MAX_INVERTED_BUCKET_IDS};
+use crate::encoding::{encode_varint, decode_varint};
+use crate::index::Index;
+use crate::sharded::{ShardInfo, ShardManifest};
+use crate::types::IndexMetadata;
+
+/// CSR-format inverted index for fast minimizer → bucket lookups.
+///
+/// # Invariants
+/// - `minimizers` is sorted in ascending order with no duplicates
+/// - `offsets.len() == minimizers.len() + 1`
+/// - `offsets[0] == 0`
+/// - `offsets` is monotonically increasing
+/// - `offsets[minimizers.len()] == bucket_ids.len()`
+/// - For each minimizer at index i, the associated bucket IDs are `bucket_ids[offsets[i]..offsets[i+1]]`
+///
+/// # Thread Safety
+/// InvertedIndex can be shared across threads for concurrent classification.
+#[derive(Debug)]
+pub struct InvertedIndex {
+    pub k: usize,
+    pub w: usize,
+    pub salt: u64,
+    pub(crate) source_hash: u64,
+    pub(crate) minimizers: Vec<u64>,
+    pub(crate) offsets: Vec<u32>,
+    pub(crate) bucket_ids: Vec<u32>,
+}
+
+impl InvertedIndex {
+    /// Compute a hash from index metadata for validation.
+    /// Hash is computed from sorted (bucket_id, minimizer_count) pairs.
+    pub fn compute_metadata_hash(metadata: &IndexMetadata) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut pairs: Vec<(u32, usize)> = metadata.bucket_minimizer_counts
+            .iter()
+            .map(|(&id, &count)| (id, count))
+            .collect();
+        pairs.sort_by_key(|(id, _)| *id);
+
+        let mut hasher = DefaultHasher::new();
+        for (id, count) in pairs {
+            id.hash(&mut hasher);
+            count.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Build an inverted index from a primary Index using k-way merge.
+    ///
+    /// This implementation uses O(num_buckets) heap memory instead of O(total_entries)
+    /// by leveraging the fact that each bucket is already sorted.
+    ///
+    /// # Requirements
+    /// All buckets in the index must be finalized (sorted and deduplicated).
+    ///
+    /// # Panics
+    /// Panics if any bucket is not sorted.
+    pub fn build_from_index(index: &Index) -> Self {
+        // Verify all buckets are finalized
+        let bucket_vec: Vec<_> = index.buckets.iter().collect();
+        bucket_vec.par_iter().for_each(|(&id, minimizers)| {
+            debug_assert!(
+                minimizers.windows(2).all(|w| w[0] <= w[1]),
+                "Bucket {} is not sorted. Call finalize_bucket() first.", id
+            );
+            if !minimizers.windows(2).all(|w| w[0] <= w[1]) {
+                panic!("Bucket {} is not sorted. Call finalize_bucket() before building inverted index.", id);
+            }
+        });
+
+        let total_entries: usize = index.buckets.values().map(|v| v.len()).sum();
+        let estimated_unique = total_entries / 2;
+
+        let mut minimizers: Vec<u64> = Vec::with_capacity(estimated_unique);
+        let mut offsets: Vec<u32> = Vec::with_capacity(estimated_unique + 1);
+        let mut bucket_ids_out: Vec<u32> = Vec::with_capacity(total_entries);
+
+        offsets.push(0);
+
+        if index.buckets.is_empty() || total_entries == 0 {
+            let metadata = IndexMetadata {
+                k: index.k,
+                w: index.w,
+                salt: index.salt,
+                bucket_names: index.bucket_names.clone(),
+                bucket_sources: index.bucket_sources.clone(),
+                bucket_minimizer_counts: HashMap::new(),
+            };
+            let source_hash = Self::compute_metadata_hash(&metadata);
+
+            return InvertedIndex {
+                k: index.k,
+                w: index.w,
+                salt: index.salt,
+                source_hash,
+                minimizers,
+                offsets,
+                bucket_ids: bucket_ids_out,
+            };
+        }
+
+        // K-way merge using a min-heap
+        let bucket_data: Vec<(u32, &[u64])> = index.buckets
+            .iter()
+            .filter(|(_, mins)| !mins.is_empty())
+            .map(|(&id, mins)| (id, mins.as_slice()))
+            .collect();
+
+        let mut heap: BinaryHeap<(Reverse<(u64, u32)>, usize, usize)> = BinaryHeap::with_capacity(bucket_data.len());
+
+        for (idx, &(bucket_id, mins)) in bucket_data.iter().enumerate() {
+            heap.push((Reverse((mins[0], bucket_id)), idx, 0));
+        }
+
+        let mut current_min: Option<u64> = None;
+        let mut current_bucket_ids: Vec<u32> = Vec::new();
+
+        while let Some((Reverse((min_val, bucket_id)), data_idx, pos)) = heap.pop() {
+            if current_min != Some(min_val) {
+                if current_min.is_some() {
+                    current_bucket_ids.sort_unstable();
+                    current_bucket_ids.dedup();
+                    bucket_ids_out.extend_from_slice(&current_bucket_ids);
+                    offsets.push(u32::try_from(bucket_ids_out.len())
+                        .expect("CSR offset overflow: bucket_ids exceeded u32::MAX"));
+                    current_bucket_ids.clear();
+                }
+                minimizers.push(min_val);
+                current_min = Some(min_val);
+            }
+
+            current_bucket_ids.push(bucket_id);
+
+            let next_pos = pos + 1;
+            let (_, bucket_mins) = bucket_data[data_idx];
+            if next_pos < bucket_mins.len() {
+                let next_bucket_id = bucket_data[data_idx].0;
+                heap.push((Reverse((bucket_mins[next_pos], next_bucket_id)), data_idx, next_pos));
+            }
+        }
+
+        if !current_bucket_ids.is_empty() {
+            current_bucket_ids.sort_unstable();
+            current_bucket_ids.dedup();
+            bucket_ids_out.extend_from_slice(&current_bucket_ids);
+            offsets.push(u32::try_from(bucket_ids_out.len())
+                .expect("CSR offset overflow: bucket_ids exceeded u32::MAX"));
+        }
+
+        minimizers.shrink_to_fit();
+        offsets.shrink_to_fit();
+        bucket_ids_out.shrink_to_fit();
+
+        let metadata = IndexMetadata {
+            k: index.k,
+            w: index.w,
+            salt: index.salt,
+            bucket_names: index.bucket_names.clone(),
+            bucket_sources: index.bucket_sources.clone(),
+            bucket_minimizer_counts: index.buckets.iter()
+                .map(|(&id, v)| (id, v.len()))
+                .collect(),
+        };
+        let source_hash = Self::compute_metadata_hash(&metadata);
+
+        InvertedIndex {
+            k: index.k,
+            w: index.w,
+            salt: index.salt,
+            source_hash,
+            minimizers,
+            offsets,
+            bucket_ids: bucket_ids_out,
+        }
+    }
+
+    /// Validate that this inverted index matches the given metadata.
+    pub fn validate_against_metadata(&self, metadata: &IndexMetadata) -> Result<()> {
+        if self.k != metadata.k || self.w != metadata.w || self.salt != metadata.salt {
+            return Err(anyhow!(
+                "Inverted index parameters don't match source index.\n  \
+                 Inverted: K={}, W={}, salt=0x{:x}\n  \
+                 Source:   K={}, W={}, salt=0x{:x}",
+                self.k, self.w, self.salt,
+                metadata.k, metadata.w, metadata.salt
+            ));
+        }
+
+        let expected_hash = Self::compute_metadata_hash(metadata);
+        if self.source_hash != expected_hash {
+            return Err(anyhow!(
+                "Inverted index is stale (hash 0x{:016x} != expected 0x{:016x}). \
+                 The source index has been modified. Regenerate with 'rype index invert -i <index.ryidx>'",
+                self.source_hash, expected_hash
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Get bucket hit counts for a sorted query using hybrid binary search.
+    ///
+    /// # Arguments
+    /// * `query` - A sorted, deduplicated slice of minimizer values
+    ///
+    /// # Returns
+    /// HashMap of bucket_id -> hit_count for all buckets matching at least one query minimizer.
+    pub fn get_bucket_hits(&self, query: &[u64]) -> HashMap<u32, usize> {
+        let mut hits: HashMap<u32, usize> = HashMap::new();
+
+        if query.is_empty() || self.minimizers.is_empty() {
+            return hits;
+        }
+
+        let mut search_start = 0;
+
+        for &q in query {
+            if search_start >= self.minimizers.len() {
+                break;
+            }
+
+            match self.minimizers[search_start..].binary_search(&q) {
+                Ok(relative_idx) => {
+                    let abs_idx = search_start + relative_idx;
+                    let start = self.offsets[abs_idx] as usize;
+                    let end = self.offsets[abs_idx + 1] as usize;
+                    for &bid in &self.bucket_ids[start..end] {
+                        *hits.entry(bid).or_insert(0) += 1;
+                    }
+                    search_start = abs_idx + 1;
+                }
+                Err(relative_idx) => {
+                    search_start += relative_idx;
+                }
+            }
+        }
+
+        hits
+    }
+
+    /// Save the inverted index to a file (v3 format).
+    ///
+    /// Format v3:
+    /// - Header (uncompressed, 60 bytes): magic "RYXI", version 3, k, w, salt, source_hash, max_bucket_id, num_minimizers, num_bucket_ids
+    /// - Payload (zstd compressed): offsets (u32), minimizers (delta+varint), bucket_ids (adaptive)
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if self.bucket_ids.len() > MAX_INVERTED_BUCKET_IDS {
+            return Err(anyhow!("Cannot save: bucket_ids length {} exceeds maximum {}",
+                self.bucket_ids.len(), MAX_INVERTED_BUCKET_IDS));
+        }
+        if self.minimizers.len() > MAX_INVERTED_MINIMIZERS {
+            return Err(anyhow!("Cannot save: minimizers length {} exceeds maximum {}",
+                self.minimizers.len(), MAX_INVERTED_MINIMIZERS));
+        }
+
+        if !self.minimizers.windows(2).all(|w| w[0] < w[1]) {
+            return Err(anyhow!("Cannot save: minimizers must be sorted and unique"));
+        }
+
+        let mut writer = BufWriter::new(File::create(path)?);
+
+        let max_bucket_id = self.bucket_ids.iter().copied().max().unwrap_or(0);
+
+        writer.write_all(b"RYXI")?;
+        writer.write_all(&3u32.to_le_bytes())?;
+        writer.write_all(&(self.k as u64).to_le_bytes())?;
+        writer.write_all(&(self.w as u64).to_le_bytes())?;
+        writer.write_all(&self.salt.to_le_bytes())?;
+        writer.write_all(&self.source_hash.to_le_bytes())?;
+        writer.write_all(&max_bucket_id.to_le_bytes())?;
+        writer.write_all(&(self.minimizers.len() as u64).to_le_bytes())?;
+        writer.write_all(&(self.bucket_ids.len() as u64).to_le_bytes())?;
+
+        let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
+
+        const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024;
+        let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
+
+        let flush_buf = |buf: &mut Vec<u8>, encoder: &mut zstd::stream::write::Encoder<BufWriter<File>>| -> Result<()> {
+            if !buf.is_empty() {
+                encoder.write_all(buf)?;
+                buf.clear();
+            }
+            Ok(())
+        };
+
+        for &offset in &self.offsets {
+            write_buf.extend_from_slice(&offset.to_le_bytes());
+            if write_buf.len() >= WRITE_BUF_SIZE {
+                flush_buf(&mut write_buf, &mut encoder)?;
+            }
+        }
+        flush_buf(&mut write_buf, &mut encoder)?;
+
+        let mut varint_buf = [0u8; 10];
+        if !self.minimizers.is_empty() {
+            write_buf.extend_from_slice(&self.minimizers[0].to_le_bytes());
+            if write_buf.len() >= WRITE_BUF_SIZE {
+                flush_buf(&mut write_buf, &mut encoder)?;
+            }
+
+            let mut prev = self.minimizers[0];
+            for &min in &self.minimizers[1..] {
+                let delta = min - prev;
+                let len = encode_varint(delta, &mut varint_buf);
+                write_buf.extend_from_slice(&varint_buf[..len]);
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
+                prev = min;
+            }
+        }
+        flush_buf(&mut write_buf, &mut encoder)?;
+
+        if max_bucket_id <= u8::MAX as u32 {
+            for &bid in &self.bucket_ids {
+                write_buf.push(bid as u8);
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
+            }
+        } else if max_bucket_id <= u16::MAX as u32 {
+            for &bid in &self.bucket_ids {
+                write_buf.extend_from_slice(&(bid as u16).to_le_bytes());
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
+            }
+        } else {
+            for &bid in &self.bucket_ids {
+                write_buf.extend_from_slice(&bid.to_le_bytes());
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
+            }
+        }
+        flush_buf(&mut write_buf, &mut encoder)?;
+
+        encoder.finish()?;
+        Ok(())
+    }
+
+    /// Load an inverted index from a file (v3 format).
+    pub fn load(path: &Path) -> Result<Self> {
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut buf4 = [0u8; 4];
+        let mut buf8 = [0u8; 8];
+
+        reader.read_exact(&mut buf4)?;
+        if &buf4 != b"RYXI" {
+            return Err(anyhow!("Invalid inverted index format (expected RYXI)"));
+        }
+
+        reader.read_exact(&mut buf4)?;
+        let version = u32::from_le_bytes(buf4);
+        if version != 3 {
+            return Err(anyhow!("Unsupported inverted index version: {} (expected 3)", version));
+        }
+
+        reader.read_exact(&mut buf8)?;
+        let k = u64::from_le_bytes(buf8) as usize;
+        if !matches!(k, 16 | 32 | 64) {
+            return Err(anyhow!("Invalid K value in inverted index: {} (must be 16, 32, or 64)", k));
+        }
+
+        reader.read_exact(&mut buf8)?;
+        let w = u64::from_le_bytes(buf8) as usize;
+
+        reader.read_exact(&mut buf8)?;
+        let salt = u64::from_le_bytes(buf8);
+
+        reader.read_exact(&mut buf8)?;
+        let source_hash = u64::from_le_bytes(buf8);
+
+        reader.read_exact(&mut buf4)?;
+        let max_bucket_id = u32::from_le_bytes(buf4);
+
+        reader.read_exact(&mut buf8)?;
+        let num_minimizers = u64::from_le_bytes(buf8) as usize;
+        if num_minimizers > MAX_INVERTED_MINIMIZERS {
+            return Err(anyhow!("Number of minimizers {} exceeds maximum {}",
+                num_minimizers, MAX_INVERTED_MINIMIZERS));
+        }
+
+        reader.read_exact(&mut buf8)?;
+        let num_bucket_ids = u64::from_le_bytes(buf8) as usize;
+        if num_bucket_ids > MAX_INVERTED_BUCKET_IDS {
+            return Err(anyhow!("Number of bucket IDs {} exceeds maximum {}",
+                num_bucket_ids, MAX_INVERTED_BUCKET_IDS));
+        }
+
+        let offsets_len = num_minimizers.checked_add(1)
+            .ok_or_else(|| anyhow!("Offset array length overflow"))?;
+
+        let total_elements = (offsets_len as u64)
+            .checked_add(num_minimizers as u64)
+            .and_then(|s| s.checked_add(num_bucket_ids as u64))
+            .ok_or_else(|| anyhow!("Total element count overflow"))?;
+        const MAX_TOTAL_ELEMENTS: u64 = 100_000_000_000;
+        if total_elements > MAX_TOTAL_ELEMENTS {
+            return Err(anyhow!(
+                "Total element count {} exceeds maximum {}",
+                total_elements, MAX_TOTAL_ELEMENTS
+            ));
+        }
+
+        let mut decoder = zstd::stream::read::Decoder::new(reader)
+            .map_err(|e| anyhow!("Failed to create zstd decoder: {}", e))?;
+
+        const READ_BUF_SIZE: usize = 8 * 1024 * 1024;
+
+        // Read offsets
+        let mut offsets = Vec::with_capacity(offsets_len);
+        {
+            let bytes_needed = offsets_len * 4;
+            let mut read_buf = vec![0u8; bytes_needed.min(READ_BUF_SIZE)];
+            let mut total_read = 0;
+
+            while total_read < bytes_needed {
+                let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
+                decoder.read_exact(&mut read_buf[..chunk_size])
+                    .map_err(|e| anyhow!("Failed to read offsets: {}", e))?;
+
+                for chunk in read_buf[..chunk_size].chunks_exact(4) {
+                    offsets.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+                }
+                total_read += chunk_size;
+            }
+        }
+
+        // Validate CSR invariants
+        if !offsets.is_empty() {
+            if offsets[0] != 0 {
+                return Err(anyhow!("Invalid CSR format: first offset must be 0, got {}", offsets[0]));
+            }
+            for i in 1..offsets.len() {
+                if offsets[i] < offsets[i - 1] {
+                    return Err(anyhow!(
+                        "Invalid CSR format: offsets must be monotonically increasing (offset[{}]={} < offset[{}]={})",
+                        i, offsets[i], i - 1, offsets[i - 1]
+                    ));
+                }
+            }
+            if let Some(&last_offset) = offsets.last() {
+                if last_offset as usize != num_bucket_ids {
+                    return Err(anyhow!(
+                        "Invalid CSR format: final offset {} doesn't match bucket_ids length {}",
+                        last_offset, num_bucket_ids
+                    ));
+                }
+            }
+        }
+
+        // Read minimizers
+        let mut minimizers = Vec::with_capacity(num_minimizers);
+        let mut varint_read_buf = vec![0u8; READ_BUF_SIZE];
+        let mut leftover_start: usize = 0;
+        let mut leftover_end: usize = 0;
+
+        if num_minimizers > 0 {
+            decoder.read_exact(&mut buf8)
+                .map_err(|e| anyhow!("Failed to read first minimizer: {}", e))?;
+            let first_min = u64::from_le_bytes(buf8);
+            minimizers.push(first_min);
+
+            if num_minimizers > 1 {
+                let mut buf_pos: usize = 0;
+                let mut buf_len: usize = 0;
+                let mut prev = first_min;
+
+                macro_rules! refill_if_low {
+                    () => {
+                        let remaining = buf_len - buf_pos;
+                        if remaining < 10 && buf_len > 0 {
+                            if remaining > 0 && buf_pos > 0 {
+                                varint_read_buf.copy_within(buf_pos..buf_len, 0);
+                            }
+                            buf_len = remaining;
+                            buf_pos = 0;
+                            match decoder.read(&mut varint_read_buf[buf_len..]) {
+                                Ok(n) => buf_len += n,
+                                Err(e) => return Err(anyhow!("I/O error reading minimizers: {}", e)),
+                            }
+                        } else if buf_len == 0 {
+                            match decoder.read(&mut varint_read_buf) {
+                                Ok(n) => buf_len = n,
+                                Err(e) => return Err(anyhow!("Failed to read minimizers: {}", e)),
+                            }
+                        }
+                    };
+                }
+
+                for i in 1..num_minimizers {
+                    refill_if_low!();
+                    if buf_pos >= buf_len {
+                        return Err(anyhow!("Unexpected end of data at minimizer {}", i));
+                    }
+
+                    let (delta, consumed) = decode_varint(&varint_read_buf[buf_pos..buf_len]);
+                    buf_pos += consumed;
+
+                    let min = prev.checked_add(delta)
+                        .ok_or_else(|| anyhow!(
+                            "Invalid inverted index: minimizer overflow at index {} (prev={}, delta={})",
+                            i, prev, delta
+                        ))?;
+
+                    if min <= prev {
+                        return Err(anyhow!(
+                            "Invalid inverted index: minimizers not strictly increasing (minimizers[{}]={} <= minimizers[{}]={})",
+                            i, min, i - 1, prev
+                        ));
+                    }
+                    minimizers.push(min);
+                    prev = min;
+                }
+
+                leftover_start = buf_pos;
+                leftover_end = buf_len;
+            }
+        }
+
+        // Read bucket IDs
+        let mut bucket_ids = Vec::with_capacity(num_bucket_ids);
+        let mut leftover_pos = leftover_start;
+
+        macro_rules! read_exact_with_leftover {
+            ($buf:expr) => {{
+                let buf: &mut [u8] = $buf;
+                let mut filled = 0;
+                if leftover_pos < leftover_end {
+                    let from_leftover = (leftover_end - leftover_pos).min(buf.len());
+                    buf[..from_leftover].copy_from_slice(&varint_read_buf[leftover_pos..leftover_pos + from_leftover]);
+                    leftover_pos += from_leftover;
+                    filled = from_leftover;
+                }
+                if filled < buf.len() {
+                    decoder.read_exact(&mut buf[filled..])
+                        .map_err(|e| anyhow!("Failed to read bucket_ids: {}", e))?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }};
+        }
+
+        if max_bucket_id <= u8::MAX as u32 {
+            let bytes_needed = num_bucket_ids;
+            let mut read_buf = vec![0u8; bytes_needed.min(READ_BUF_SIZE)];
+            let mut total_read = 0;
+
+            while total_read < bytes_needed {
+                let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
+                read_exact_with_leftover!(&mut read_buf[..chunk_size])?;
+
+                for &b in &read_buf[..chunk_size] {
+                    bucket_ids.push(b as u32);
+                }
+                total_read += chunk_size;
+            }
+        } else if max_bucket_id <= u16::MAX as u32 {
+            let bytes_needed = num_bucket_ids * 2;
+            let mut read_buf = vec![0u8; bytes_needed.min(READ_BUF_SIZE)];
+            let mut total_read = 0;
+            let mut idx = 0;
+
+            while total_read < bytes_needed {
+                let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
+                read_exact_with_leftover!(&mut read_buf[..chunk_size])?;
+
+                for chunk in read_buf[..chunk_size].chunks_exact(2) {
+                    let bid = u16::from_le_bytes(chunk.try_into().unwrap()) as u32;
+                    if bid > max_bucket_id {
+                        return Err(anyhow!(
+                            "Invalid inverted index: bucket_id[{}]={} exceeds declared max_bucket_id={}",
+                            idx, bid, max_bucket_id
+                        ));
+                    }
+                    bucket_ids.push(bid);
+                    idx += 1;
+                }
+                total_read += chunk_size;
+            }
+        } else {
+            let bytes_needed = num_bucket_ids * 4;
+            let mut read_buf = vec![0u8; bytes_needed.min(READ_BUF_SIZE)];
+            let mut total_read = 0;
+            let mut idx = 0;
+
+            while total_read < bytes_needed {
+                let chunk_size = (bytes_needed - total_read).min(READ_BUF_SIZE);
+                read_exact_with_leftover!(&mut read_buf[..chunk_size])?;
+
+                for chunk in read_buf[..chunk_size].chunks_exact(4) {
+                    let bid = u32::from_le_bytes(chunk.try_into().unwrap());
+                    if bid > max_bucket_id {
+                        return Err(anyhow!(
+                            "Invalid inverted index: bucket_id[{}]={} exceeds declared max_bucket_id={}",
+                            idx, bid, max_bucket_id
+                        ));
+                    }
+                    bucket_ids.push(bid);
+                    idx += 1;
+                }
+                total_read += chunk_size;
+            }
+        }
+
+        Ok(InvertedIndex {
+            k,
+            w,
+            salt,
+            source_hash,
+            minimizers,
+            offsets,
+            bucket_ids,
+        })
+    }
+
+    /// Returns the number of unique minimizers in the index.
+    pub fn num_minimizers(&self) -> usize {
+        self.minimizers.len()
+    }
+
+    /// Returns the total number of bucket ID entries.
+    pub fn num_bucket_entries(&self) -> usize {
+        self.bucket_ids.len()
+    }
+
+    /// Save a subset of this inverted index as a shard file (RYXS format v1).
+    pub fn save_shard(&self, path: &Path, shard_id: u32, start_idx: usize, end_idx: usize, is_last_shard: bool) -> Result<ShardInfo> {
+        let end_idx = end_idx.min(self.minimizers.len());
+        if start_idx >= end_idx {
+            return Err(anyhow!("Invalid shard range: start {} >= end {}", start_idx, end_idx));
+        }
+
+        let shard_minimizers = &self.minimizers[start_idx..end_idx];
+        let min_start = shard_minimizers[0];
+        let min_end = if is_last_shard {
+            0
+        } else {
+            self.minimizers[end_idx]
+        };
+
+        let bucket_start = self.offsets[start_idx] as usize;
+        let bucket_end = self.offsets[end_idx] as usize;
+        let shard_bucket_ids = &self.bucket_ids[bucket_start..bucket_end];
+
+        let base_offset = self.offsets[start_idx];
+        let shard_offsets: Vec<u32> = self.offsets[start_idx..=end_idx]
+            .iter()
+            .map(|&o| o - base_offset)
+            .collect();
+
+        let mut writer = BufWriter::new(File::create(path)?);
+        let max_bucket_id = shard_bucket_ids.iter().copied().max().unwrap_or(0);
+
+        writer.write_all(b"RYXS")?;
+        writer.write_all(&1u32.to_le_bytes())?;
+        writer.write_all(&(self.k as u64).to_le_bytes())?;
+        writer.write_all(&(self.w as u64).to_le_bytes())?;
+        writer.write_all(&self.salt.to_le_bytes())?;
+        writer.write_all(&self.source_hash.to_le_bytes())?;
+        writer.write_all(&shard_id.to_le_bytes())?;
+        writer.write_all(&min_start.to_le_bytes())?;
+        writer.write_all(&min_end.to_le_bytes())?;
+        writer.write_all(&max_bucket_id.to_le_bytes())?;
+        writer.write_all(&(shard_minimizers.len() as u64).to_le_bytes())?;
+        writer.write_all(&(shard_bucket_ids.len() as u64).to_le_bytes())?;
+
+        let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
+
+        const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024;
+        let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
+
+        let flush_buf = |buf: &mut Vec<u8>, encoder: &mut zstd::stream::write::Encoder<BufWriter<File>>| -> Result<()> {
+            if !buf.is_empty() {
+                encoder.write_all(buf)?;
+                buf.clear();
+            }
+            Ok(())
+        };
+
+        for &offset in &shard_offsets {
+            write_buf.extend_from_slice(&offset.to_le_bytes());
+            if write_buf.len() >= WRITE_BUF_SIZE {
+                flush_buf(&mut write_buf, &mut encoder)?;
+            }
+        }
+        flush_buf(&mut write_buf, &mut encoder)?;
+
+        let mut varint_buf = [0u8; 10];
+        if !shard_minimizers.is_empty() {
+            write_buf.extend_from_slice(&shard_minimizers[0].to_le_bytes());
+            if write_buf.len() >= WRITE_BUF_SIZE {
+                flush_buf(&mut write_buf, &mut encoder)?;
+            }
+
+            let mut prev = shard_minimizers[0];
+            for &min in &shard_minimizers[1..] {
+                let delta = min - prev;
+                let len = encode_varint(delta, &mut varint_buf);
+                write_buf.extend_from_slice(&varint_buf[..len]);
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
+                prev = min;
+            }
+        }
+        flush_buf(&mut write_buf, &mut encoder)?;
+
+        if max_bucket_id <= u8::MAX as u32 {
+            for &bid in shard_bucket_ids {
+                write_buf.push(bid as u8);
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
+            }
+        } else if max_bucket_id <= u16::MAX as u32 {
+            for &bid in shard_bucket_ids {
+                write_buf.extend_from_slice(&(bid as u16).to_le_bytes());
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
+            }
+        } else {
+            for &bid in shard_bucket_ids {
+                write_buf.extend_from_slice(&bid.to_le_bytes());
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
+            }
+        }
+        flush_buf(&mut write_buf, &mut encoder)?;
+
+        encoder.finish()?;
+
+        Ok(ShardInfo {
+            shard_id,
+            min_start,
+            min_end,
+            is_last_shard,
+            num_minimizers: shard_minimizers.len(),
+            num_bucket_ids: shard_bucket_ids.len(),
+        })
+    }
+
+    /// Load a shard file into an InvertedIndex.
+    pub fn load_shard(path: &Path) -> Result<Self> {
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut buf4 = [0u8; 4];
+        let mut buf8 = [0u8; 8];
+
+        reader.read_exact(&mut buf4)?;
+        if &buf4 != b"RYXS" {
+            return Err(anyhow!("Invalid shard format (expected RYXS)"));
+        }
+
+        reader.read_exact(&mut buf4)?;
+        let version = u32::from_le_bytes(buf4);
+        if version != 1 {
+            return Err(anyhow!("Unsupported shard version: {} (expected 1)", version));
+        }
+
+        reader.read_exact(&mut buf8)?;
+        let k = u64::from_le_bytes(buf8) as usize;
+        if !matches!(k, 16 | 32 | 64) {
+            return Err(anyhow!("Invalid K value in shard: {} (must be 16, 32, or 64)", k));
+        }
+
+        reader.read_exact(&mut buf8)?;
+        let w = u64::from_le_bytes(buf8) as usize;
+
+        reader.read_exact(&mut buf8)?;
+        let salt = u64::from_le_bytes(buf8);
+
+        reader.read_exact(&mut buf8)?;
+        let source_hash = u64::from_le_bytes(buf8);
+
+        reader.read_exact(&mut buf4)?; // shard_id
+        reader.read_exact(&mut buf8)?; // min_start
+        reader.read_exact(&mut buf8)?; // min_end
+
+        reader.read_exact(&mut buf4)?;
+        let max_bucket_id = u32::from_le_bytes(buf4);
+
+        reader.read_exact(&mut buf8)?;
+        let num_minimizers = u64::from_le_bytes(buf8) as usize;
+
+        reader.read_exact(&mut buf8)?;
+        let num_bucket_ids = u64::from_le_bytes(buf8) as usize;
+
+        if num_minimizers > MAX_INVERTED_MINIMIZERS {
+            return Err(anyhow!("Shard has too many minimizers: {}", num_minimizers));
+        }
+        if num_bucket_ids > MAX_INVERTED_BUCKET_IDS {
+            return Err(anyhow!("Shard has too many bucket IDs: {}", num_bucket_ids));
+        }
+
+        let mut decoder = zstd::stream::read::Decoder::new(reader)?;
+
+        const READ_BUF_SIZE: usize = 8 * 1024 * 1024;
+        let mut read_buf = vec![0u8; READ_BUF_SIZE];
+        let mut buf_pos = 0;
+        let mut buf_len = 0;
+
+        macro_rules! ensure_bytes {
+            ($n:expr) => {{
+                while buf_len - buf_pos < $n {
+                    if buf_pos > 0 {
+                        read_buf.copy_within(buf_pos..buf_len, 0);
+                        buf_len -= buf_pos;
+                        buf_pos = 0;
+                    }
+                    let space = read_buf.len() - buf_len;
+                    if space == 0 {
+                        read_buf.resize(read_buf.len() * 2, 0);
+                    }
+                    let n = decoder.read(&mut read_buf[buf_len..])?;
+                    if n == 0 {
+                        return Err(anyhow!("Unexpected end of shard data"));
+                    }
+                    buf_len += n;
+                }
+            }};
+        }
+
+        let offsets_count = num_minimizers + 1;
+        let mut offsets = Vec::with_capacity(offsets_count);
+        for _ in 0..offsets_count {
+            ensure_bytes!(4);
+            let offset = u32::from_le_bytes(read_buf[buf_pos..buf_pos + 4].try_into().unwrap());
+            offsets.push(offset);
+            buf_pos += 4;
+        }
+
+        if !offsets.is_empty() && offsets[0] != 0 {
+            return Err(anyhow!("Invalid shard: first offset must be 0"));
+        }
+        if offsets.windows(2).any(|w| w[0] > w[1]) {
+            return Err(anyhow!("Invalid shard: offsets not monotonically increasing"));
+        }
+        if !offsets.is_empty() && *offsets.last().unwrap() as usize != num_bucket_ids {
+            return Err(anyhow!("Invalid shard: final offset doesn't match bucket_ids count"));
+        }
+
+        let mut minimizers = Vec::with_capacity(num_minimizers);
+        if num_minimizers > 0 {
+            ensure_bytes!(8);
+            let first = u64::from_le_bytes(read_buf[buf_pos..buf_pos + 8].try_into().unwrap());
+            minimizers.push(first);
+            buf_pos += 8;
+
+            let mut prev = first;
+            for _ in 1..num_minimizers {
+                ensure_bytes!(1);
+                let (delta, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
+                if consumed == 0 {
+                    return Err(anyhow!("Invalid varint in shard"));
+                }
+                let val = prev + delta;
+                minimizers.push(val);
+                prev = val;
+                buf_pos += consumed;
+            }
+        }
+
+        let mut bucket_ids = Vec::with_capacity(num_bucket_ids);
+        if max_bucket_id <= u8::MAX as u32 {
+            for _ in 0..num_bucket_ids {
+                ensure_bytes!(1);
+                bucket_ids.push(read_buf[buf_pos] as u32);
+                buf_pos += 1;
+            }
+        } else if max_bucket_id <= u16::MAX as u32 {
+            for _ in 0..num_bucket_ids {
+                ensure_bytes!(2);
+                let val = u16::from_le_bytes(read_buf[buf_pos..buf_pos + 2].try_into().unwrap());
+                bucket_ids.push(val as u32);
+                buf_pos += 2;
+            }
+        } else {
+            for _ in 0..num_bucket_ids {
+                ensure_bytes!(4);
+                let val = u32::from_le_bytes(read_buf[buf_pos..buf_pos + 4].try_into().unwrap());
+                bucket_ids.push(val);
+                buf_pos += 4;
+            }
+        }
+
+        Ok(InvertedIndex {
+            k,
+            w,
+            salt,
+            source_hash,
+            minimizers,
+            offsets,
+            bucket_ids,
+        })
+    }
+
+    /// Save this inverted index as a sharded index with multiple files.
+    pub fn save_sharded(&self, base_path: &Path, num_shards: u32) -> Result<ShardManifest> {
+        if self.minimizers.is_empty() {
+            return Err(anyhow!("Cannot shard empty inverted index"));
+        }
+
+        let actual_shards = (num_shards as usize).min(self.minimizers.len()) as u32;
+        let per_shard = self.minimizers.len().div_ceil(actual_shards as usize);
+        let boundaries: Vec<(usize, usize)> = (0..actual_shards as usize)
+            .map(|i| {
+                let start = i * per_shard;
+                let end = ((i + 1) * per_shard).min(self.minimizers.len());
+                (start, end)
+            })
+            .filter(|(s, e)| s < e)
+            .collect();
+
+        let mut shards = Vec::with_capacity(boundaries.len());
+        let num_boundaries = boundaries.len();
+        for (shard_id, (start, end)) in boundaries.iter().enumerate() {
+            let shard_path = ShardManifest::shard_path(base_path, shard_id as u32);
+            let is_last = shard_id == num_boundaries - 1;
+            let shard_info = self.save_shard(&shard_path, shard_id as u32, *start, *end, is_last)?;
+            shards.push(shard_info);
+        }
+
+        let manifest = ShardManifest {
+            k: self.k,
+            w: self.w,
+            salt: self.salt,
+            source_hash: self.source_hash,
+            total_minimizers: self.minimizers.len(),
+            total_bucket_ids: self.bucket_ids.len(),
+            shards,
+        };
+
+        let manifest_path = ShardManifest::manifest_path(base_path);
+        manifest.save(&manifest_path)?;
+
+        Ok(manifest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::Index;
+    use crate::encoding::encode_varint;
+    use tempfile::NamedTempFile;
+    use std::io::Write;
+
+    #[test]
+    fn test_inverted_index_build() {
+        let mut index = Index::new(64, 50, 0x1234).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.buckets.insert(2, vec![200, 300, 400]);
+        index.buckets.insert(3, vec![500, 600]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.bucket_names.insert(3, "C".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        assert_eq!(inverted.k, 64);
+        assert_eq!(inverted.w, 50);
+        assert_eq!(inverted.salt, 0x1234);
+        assert_eq!(inverted.num_minimizers(), 6);
+        assert_eq!(inverted.num_bucket_entries(), 8);
+    }
+
+    #[test]
+    fn test_inverted_index_save_load_roundtrip() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        let mut index = Index::new(64, 50, 0xABCD).unwrap();
+        index.buckets.insert(1, vec![10, 20, 30]);
+        index.buckets.insert(2, vec![20, 30, 40]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save(&path)?;
+
+        let loaded = InvertedIndex::load(&path)?;
+
+        assert_eq!(loaded.k, 64);
+        assert_eq!(loaded.w, 50);
+        assert_eq!(loaded.salt, 0xABCD);
+        assert_eq!(loaded.num_minimizers(), inverted.num_minimizers());
+        assert_eq!(loaded.num_bucket_entries(), inverted.num_bucket_entries());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inverted_index_get_bucket_hits() {
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.buckets.insert(2, vec![200, 300, 400]);
+        index.buckets.insert(3, vec![500, 600]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.bucket_names.insert(3, "C".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        let query = vec![200, 300, 500];
+        let hits = inverted.get_bucket_hits(&query);
+
+        assert_eq!(hits.get(&1), Some(&2));
+        assert_eq!(hits.get(&2), Some(&2));
+        assert_eq!(hits.get(&3), Some(&1));
+    }
+
+    #[test]
+    fn test_inverted_index_get_bucket_hits_no_matches() {
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        let query = vec![999, 1000, 1001];
+        let hits = inverted.get_bucket_hits(&query);
+
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_inverted_index_validate_success() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        let mut index = Index::new(64, 50, 0x1234).unwrap();
+        index.buckets.insert(1, vec![100, 200]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_sources.insert(1, vec!["src".into()]);
+        index.save(&path)?;
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        let metadata = Index::load_metadata(&path)?;
+
+        inverted.validate_against_metadata(&metadata)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_inverted_index_validate_stale() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        let mut index = Index::new(64, 50, 0x1234).unwrap();
+        index.buckets.insert(1, vec![100, 200]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_sources.insert(1, vec!["src".into()]);
+        index.save(&path)?;
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        index.buckets.insert(2, vec![300, 400]);
+        index.bucket_names.insert(2, "B".into());
+        index.bucket_sources.insert(2, vec!["src2".into()]);
+        index.save(&path)?;
+
+        let metadata = Index::load_metadata(&path)?;
+
+        let result = inverted.validate_against_metadata(&metadata);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("stale"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inverted_index_load_invalid_format() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(path, b"NOTRYXI").unwrap();
+
+        let result = InvertedIndex::load(path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid inverted index format"));
+    }
+
+    #[test]
+    fn test_inverted_index_load_wrong_version() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+
+        let mut data = b"RYXI".to_vec();
+        data.extend_from_slice(&999u32.to_le_bytes());
+        std::fs::write(path, data).unwrap();
+
+        let result = InvertedIndex::load(path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unsupported inverted index version"));
+    }
+
+    #[test]
+    fn test_inverted_index_empty() {
+        let index = Index::new(64, 50, 0).unwrap();
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        assert_eq!(inverted.num_minimizers(), 0);
+        assert_eq!(inverted.num_bucket_entries(), 0);
+
+        let hits = inverted.get_bucket_hits(&[100, 200, 300]);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_inverted_index_hybrid_search_correctness() {
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, (0..1000).map(|i| i * 10).collect());
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        let query: Vec<u64> = vec![50, 500, 5000, 9990];
+        let hits = inverted.get_bucket_hits(&query);
+
+        assert_eq!(hits.get(&1), Some(&4));
+    }
+
+    #[test]
+    fn test_inverted_index_k16() -> Result<()> {
+        let mut index = Index::new(16, 10, 0)?;
+
+        index.buckets.insert(1, vec![100, 200, 300, 500]);
+        index.bucket_names.insert(1, "bucket_a".into());
+
+        index.buckets.insert(2, vec![200, 400, 600]);
+        index.bucket_names.insert(2, "bucket_b".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        assert_eq!(inverted.k, 16);
+
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+        inverted.save(&path)?;
+        let loaded = InvertedIndex::load(&path)?;
+
+        assert_eq!(loaded.k, 16);
+        assert_eq!(loaded.num_minimizers(), inverted.num_minimizers());
+
+        let hits = loaded.get_bucket_hits(&[100, 200, 400]);
+        assert_eq!(hits.get(&1), Some(&2));
+        assert_eq!(hits.get(&2), Some(&2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inverted_index_k32() -> Result<()> {
+        let mut index = Index::new(32, 20, 0)?;
+
+        let large_min: u64 = 1 << 30;
+        index.buckets.insert(1, vec![large_min, large_min + 100, large_min + 200]);
+        index.bucket_names.insert(1, "bucket_a".into());
+
+        index.buckets.insert(2, vec![large_min + 100, large_min + 300]);
+        index.bucket_names.insert(2, "bucket_b".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        assert_eq!(inverted.k, 32);
+
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+        inverted.save(&path)?;
+        let loaded = InvertedIndex::load(&path)?;
+
+        assert_eq!(loaded.k, 32);
+        assert_eq!(loaded.num_minimizers(), inverted.num_minimizers());
+
+        let hits = loaded.get_bucket_hits(&[large_min, large_min + 100, large_min + 300]);
+        assert_eq!(hits.get(&1), Some(&2));
+        assert_eq!(hits.get(&2), Some(&2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inverted_index_csr_validation() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+
+        {
+            let mut writer = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+            writer.write_all(b"RYXI").unwrap();
+            writer.write_all(&3u32.to_le_bytes()).unwrap();
+            writer.write_all(&64u64.to_le_bytes()).unwrap();
+            writer.write_all(&50u64.to_le_bytes()).unwrap();
+            writer.write_all(&0u64.to_le_bytes()).unwrap();
+            writer.write_all(&0u64.to_le_bytes()).unwrap();
+            writer.write_all(&0u32.to_le_bytes()).unwrap();
+            writer.write_all(&2u64.to_le_bytes()).unwrap();
+            writer.write_all(&3u64.to_le_bytes()).unwrap();
+
+            let mut encoder = zstd::stream::write::Encoder::new(writer, 3).unwrap();
+
+            encoder.write_all(&1u32.to_le_bytes()).unwrap(); // Invalid: first offset != 0
+            encoder.write_all(&2u32.to_le_bytes()).unwrap();
+            encoder.write_all(&3u32.to_le_bytes()).unwrap();
+            encoder.write_all(&100u64.to_le_bytes()).unwrap();
+            let delta: u64 = 100;
+            let mut varint_buf = [0u8; 10];
+            let len = encode_varint(delta, &mut varint_buf);
+            encoder.write_all(&varint_buf[..len]).unwrap();
+            encoder.write_all(&[0u8]).unwrap();
+            encoder.write_all(&[0u8]).unwrap();
+            encoder.write_all(&[0u8]).unwrap();
+
+            encoder.finish().unwrap();
+        }
+
+        let result = InvertedIndex::load(path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("first offset must be 0"), "Unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_shard_save_load_roundtrip() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        let mut index = Index::new(64, 50, 0xABCD).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.buckets.insert(2, vec![200, 300, 400]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        let shard_info = inverted.save_shard(&path, 0, 0, inverted.num_minimizers(), true)?;
+
+        assert_eq!(shard_info.shard_id, 0);
+        assert_eq!(shard_info.num_minimizers, inverted.num_minimizers());
+        assert_eq!(shard_info.num_bucket_ids, inverted.num_bucket_entries());
+
+        let loaded = InvertedIndex::load_shard(&path)?;
+
+        assert_eq!(loaded.k, 64);
+        assert_eq!(loaded.w, 50);
+        assert_eq!(loaded.salt, 0xABCD);
+        assert_eq!(loaded.num_minimizers(), inverted.num_minimizers());
+        assert_eq!(loaded.num_bucket_entries(), inverted.num_bucket_entries());
+
+        let hits = loaded.get_bucket_hits(&[200, 300]);
+        assert_eq!(hits.get(&1), Some(&2));
+        assert_eq!(hits.get(&2), Some(&2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_shard_partial_range() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        let mut index = Index::new(64, 50, 0x1234).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300, 400, 500]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        assert_eq!(inverted.num_minimizers(), 5);
+
+        let shard_info = inverted.save_shard(&path, 0, 0, 3, false)?;
+
+        assert_eq!(shard_info.shard_id, 0);
+        assert_eq!(shard_info.num_minimizers, 3);
+        assert!(!shard_info.is_last_shard);
+        assert_eq!(shard_info.min_start, 100);
+        assert_eq!(shard_info.min_end, 400);
+
+        let loaded = InvertedIndex::load_shard(&path)?;
+        assert_eq!(loaded.num_minimizers(), 3);
+
+        let hits = loaded.get_bucket_hits(&[100, 200, 300, 400, 500]);
+        assert_eq!(hits.get(&1), Some(&3));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_shard_invalid_magic() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(path, b"NOTS").unwrap();
+
+        let result = InvertedIndex::load_shard(path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid shard format"));
+    }
+
+    #[test]
+    fn test_save_sharded_creates_files() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        let mut index = Index::new(64, 50, 0xCAFE).unwrap();
+        for i in 0..100u64 {
+            index.buckets.entry(1).or_default().push(i * 10);
+            index.buckets.entry(2).or_default().push(i * 10 + 5);
+        }
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.finalize_bucket(1);
+        index.finalize_bucket(2);
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        let total_minimizers = inverted.num_minimizers();
+        let total_bucket_ids = inverted.num_bucket_entries();
+
+        let manifest = inverted.save_sharded(&base_path, 4)?;
+
+        assert_eq!(manifest.k, 64);
+        assert_eq!(manifest.w, 50);
+        assert_eq!(manifest.salt, 0xCAFE);
+        assert_eq!(manifest.shards.len(), 4);
+        assert_eq!(manifest.total_minimizers, total_minimizers);
+        assert_eq!(manifest.total_bucket_ids, total_bucket_ids);
+
+        let manifest_path = ShardManifest::manifest_path(&base_path);
+        assert!(manifest_path.exists(), "Manifest file should exist");
+
+        for i in 0..4 {
+            let shard_path = ShardManifest::shard_path(&base_path, i);
+            assert!(shard_path.exists(), "Shard {} file should exist", i);
+        }
+
+        let shard_mins: usize = manifest.shards.iter().map(|s| s.num_minimizers).sum();
+        assert_eq!(shard_mins, total_minimizers);
+
+        let shard_bids: usize = manifest.shards.iter().map(|s| s.num_bucket_ids).sum();
+        assert_eq!(shard_bids, total_bucket_ids);
+
+        for i in 1..manifest.shards.len() {
+            assert_eq!(
+                manifest.shards[i - 1].min_end,
+                manifest.shards[i].min_start,
+                "Shard ranges should be contiguous"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_save_sharded_single_shard() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        let manifest = inverted.save_sharded(&base_path, 1)?;
+
+        assert_eq!(manifest.shards.len(), 1);
+        assert_eq!(manifest.shards[0].num_minimizers, 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_save_sharded_more_shards_than_minimizers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        let manifest = inverted.save_sharded(&base_path, 10)?;
+
+        assert!(manifest.shards.len() <= 2);
+        let total: usize = manifest.shards.iter().map(|s| s.num_minimizers).sum();
+        assert_eq!(total, 2);
+
+        Ok(())
+    }
+}
