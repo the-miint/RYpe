@@ -19,7 +19,8 @@
 //! # Classification Functions
 //!
 //! - [`classify_batch`]: Classify against an Index (per-bucket binary search)
-//! - [`classify_batch_inverted`]: Classify using InvertedIndex (recommended)
+//! - [`classify_batch_inverted`]: Classify using InvertedIndex (recommended for small batches)
+//! - [`classify_batch_with_query_index`]: Classify using merge-join (recommended for large batches with high overlap)
 //! - [`classify_batch_sharded_sequential`]: Classify with sharded index (low memory)
 //! - [`aggregate_batch`]: Aggregated paired-end classification
 
@@ -62,7 +63,7 @@ pub use extraction::{
 pub use index::Index;
 
 // Re-export inverted index
-pub use inverted::InvertedIndex;
+pub use inverted::{InvertedIndex, QueryInvertedIndex};
 
 // Re-export sharded index types
 pub use sharded::{ShardInfo, ShardManifest, ShardedInvertedIndex};
@@ -72,5 +73,7 @@ pub use classify::{
     classify_batch,
     classify_batch_inverted,
     classify_batch_sharded_sequential,
+    classify_batch_merge_join,
+    classify_batch_with_query_index,
     aggregate_batch,
 };
