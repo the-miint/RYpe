@@ -116,9 +116,11 @@ pub fn classify_batch_inverted(
                 scores.entry(bucket_id).or_insert((0, 0)).1 = count;
             }
 
+            let fwd_total = fwd_mins.len();
+            let rc_total = rc_mins.len();
             let mut query_results = Vec::with_capacity(scores.len());
             for (bucket_id, (fwd_count, rc_count)) in scores {
-                let score = compute_score(fwd_count, fwd_mins.len(), rc_count, rc_mins.len());
+                let score = compute_score(fwd_count, fwd_total, rc_count, rc_total);
                 if score >= threshold {
                     query_results.push(HitResult {
                         query_id: *query_id,
@@ -184,10 +186,12 @@ pub fn classify_batch_sharded_sequential(
 
     let results: Vec<HitResult> = processed.iter().enumerate()
         .flat_map(|(idx, (query_id, fwd_mins, rc_mins))| {
+            let fwd_total = fwd_mins.len();
+            let rc_total = rc_mins.len();
             let hits = all_hits[idx].lock().unwrap();
 
             hits.iter().filter_map(|(&bucket_id, &(fwd_count, rc_count))| {
-                let score = compute_score(fwd_count, fwd_mins.len(), rc_count, rc_mins.len());
+                let score = compute_score(fwd_count, fwd_total, rc_count, rc_total);
                 if score >= threshold {
                     Some(HitResult { query_id: *query_id, bucket_id, score })
                 } else {
