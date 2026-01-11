@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use anyhow::{Context, Result, anyhow};
 
-use rype::{Index, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, classify_batch_sharded_sequential, aggregate_batch, ShardManifest, ShardedInvertedIndex, extract_with_positions, Strand};
+use rype::{Index, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, classify_batch_sharded_sequential, classify_batch_sharded_main, aggregate_batch, ShardManifest, ShardedInvertedIndex, MainIndexManifest, MainIndexShard, ShardedMainIndex, extract_into, extract_with_positions, Strand};
 use rype::config::{parse_config, validate_config, resolve_path};
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -70,6 +70,9 @@ enum IndexCommands {
         salt: u64,
         #[arg(long)]
         separate_buckets: bool,
+        /// Maximum shard size in bytes (e.g., 1073741824 for 1GB). If specified, creates a sharded index.
+        #[arg(long)]
+        max_shard_size: Option<usize>,
     },
 
     /// Show index statistics
@@ -125,12 +128,14 @@ enum IndexCommands {
         config: PathBuf,
     },
 
-    /// Create inverted index for faster classification
+    /// Create inverted index for faster classification.
+    /// If the main index is sharded, inverted shards are created with 1:1 correspondence.
     Invert {
         #[arg(short, long)]
         index: PathBuf,
 
-        /// Number of shards to split the inverted index into (default: 1 = single file)
+        /// Number of shards to split the inverted index into (default: 1 = single file).
+        /// Ignored if main index is sharded (uses 1:1 correspondence instead).
         #[arg(long, default_value_t = 1)]
         shards: u32,
     },
@@ -363,7 +368,7 @@ fn main() -> Result<()> {
 
     match args.command {
         Commands::Index(index_cmd) => match index_cmd {
-            IndexCommands::Create { output, reference, kmer_size, window, salt, separate_buckets } => {
+            IndexCommands::Create { output, reference, kmer_size, window, salt, separate_buckets, max_shard_size } => {
                 if !matches!(kmer_size, 16 | 32 | 64) {
                     return Err(anyhow!("K must be 16, 32, or 64 (got {})", kmer_size));
                 }
@@ -374,8 +379,14 @@ fn main() -> Result<()> {
                     add_reference_file_to_index(&mut index, &ref_file, separate_buckets, &mut next_id)?;
                 }
 
-                log::info!("Saving index to {:?}...", output);
-                index.save(&output)?;
+                if let Some(max_bytes) = max_shard_size {
+                    log::info!("Saving sharded index to {:?} (max {} bytes/shard)...", output, max_bytes);
+                    let manifest = index.save_sharded(&output, max_bytes)?;
+                    log::info!("Created {} shards with {} total minimizers.", manifest.shards.len(), manifest.total_minimizers);
+                } else {
+                    log::info!("Saving index to {:?}...", output);
+                    index.save(&output)?;
+                }
                 log::info!("Done.");
             }
 
@@ -401,13 +412,38 @@ fn main() -> Result<()> {
                             inv.num_bucket_entries() as f64 / inv.num_minimizers() as f64);
                     }
                 } else {
-                    // Show primary index stats
-                    let metadata = Index::load_metadata(&index)?;
-                    println!("Index Stats for {:?}", index);
-                    println!("  K: {}", metadata.k);
-                    println!("  Window (w): {}", metadata.w);
-                    println!("  Salt: 0x{:x}", metadata.salt);
-                    println!("  Buckets: {}", metadata.bucket_names.len());
+                    // Show primary index stats - detect sharded vs single-file
+                    let main_manifest_path = MainIndexManifest::manifest_path(&index);
+
+                    let metadata = if main_manifest_path.exists() {
+                        // Sharded main index
+                        let manifest = MainIndexManifest::load(&main_manifest_path)?;
+                        println!("Sharded Index Stats for {:?}", index);
+                        println!("  K: {}", manifest.k);
+                        println!("  Window (w): {}", manifest.w);
+                        println!("  Salt: 0x{:x}", manifest.salt);
+                        println!("  Buckets: {}", manifest.bucket_names.len());
+                        println!("  Shards: {}", manifest.shards.len());
+                        println!("  Total minimizers: {}", manifest.total_minimizers);
+
+                        println!("  ------------------------------------------------");
+                        println!("  Shard distribution:");
+                        for shard in &manifest.shards {
+                            println!("    Shard {}: {} buckets, {} minimizers, {} bytes",
+                                shard.shard_id, shard.bucket_ids.len(), shard.num_minimizers, shard.compressed_size);
+                        }
+
+                        manifest.to_metadata()
+                    } else {
+                        // Single-file main index
+                        let metadata = Index::load_metadata(&index)?;
+                        println!("Index Stats for {:?}", index);
+                        println!("  K: {}", metadata.k);
+                        println!("  Window (w): {}", metadata.w);
+                        println!("  Salt: 0x{:x}", metadata.salt);
+                        println!("  Buckets: {}", metadata.bucket_names.len());
+                        metadata
+                    };
 
                     // Check if inverted index exists
                     let inverted_path = index.with_extension("ryxdi");
@@ -460,39 +496,87 @@ fn main() -> Result<()> {
             }
 
             IndexCommands::BucketAdd { index, reference } => {
-                let mut idx = Index::load(&index)?;
-                let next_id = idx.next_id()?;
-                log::info!("Adding {:?} as new bucket ID {}", reference, next_id);
+                let main_manifest_path = MainIndexManifest::manifest_path(&index);
 
-                // Add all records from the file to a single new bucket
-                let mut reader = parse_fastx_file(&reference).context("Failed to open reference file")?;
-                let mut ws = MinimizerWorkspace::new();
-                let filename = reference.canonicalize().unwrap().to_string_lossy().to_string();
+                if main_manifest_path.exists() {
+                    // Sharded main index - add as new shard
+                    let mut sharded = ShardedMainIndex::open(&index)?;
+                    let next_id = sharded.next_id()?;
+                    log::info!("Adding {:?} as new bucket ID {} (sharded)", reference, next_id);
 
-                // Set the bucket name to the filename for consistency with 'index' command
-                idx.bucket_names.insert(next_id, sanitize_bucket_name(&filename));
+                    // Extract minimizers from reference file
+                    let mut reader = parse_fastx_file(&reference).context("Failed to open reference file")?;
+                    let mut ws = MinimizerWorkspace::new();
+                    let filename = reference.canonicalize().unwrap().to_string_lossy().to_string();
+                    let mut sources = Vec::new();
+                    let mut all_minimizers = Vec::new();
 
-                while let Some(record) = reader.next() {
-                    let rec = record.context("Invalid record")?;
-                    let seq = rec.seq();
-                    let name = String::from_utf8_lossy(rec.id()).to_string();
-                    let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
-                    idx.add_record(next_id, &source_label, &seq, &mut ws);
+                    while let Some(record) = reader.next() {
+                        let rec = record.context("Invalid record")?;
+                        let seq = rec.seq();
+                        let name = String::from_utf8_lossy(rec.id()).to_string();
+                        let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
+                        sources.push(source_label);
+
+                        extract_into(&seq, sharded.k(), sharded.w(), sharded.salt(), &mut ws);
+                        all_minimizers.extend_from_slice(&ws.buffer);
+                    }
+
+                    // Sort and deduplicate
+                    all_minimizers.sort_unstable();
+                    all_minimizers.dedup();
+                    sources.sort_unstable();
+                    sources.dedup();
+
+                    let minimizer_count = all_minimizers.len();
+                    sharded.add_bucket(next_id, &sanitize_bucket_name(&filename), sources, all_minimizers)?;
+
+                    log::info!("Done. Added {} minimizers to bucket {} (new shard {}).",
+                        minimizer_count, next_id, sharded.num_shards() - 1);
+                } else {
+                    // Single-file main index
+                    let mut idx = Index::load(&index)?;
+                    let next_id = idx.next_id()?;
+                    log::info!("Adding {:?} as new bucket ID {}", reference, next_id);
+
+                    let mut reader = parse_fastx_file(&reference).context("Failed to open reference file")?;
+                    let mut ws = MinimizerWorkspace::new();
+                    let filename = reference.canonicalize().unwrap().to_string_lossy().to_string();
+
+                    idx.bucket_names.insert(next_id, sanitize_bucket_name(&filename));
+
+                    while let Some(record) = reader.next() {
+                        let rec = record.context("Invalid record")?;
+                        let seq = rec.seq();
+                        let name = String::from_utf8_lossy(rec.id()).to_string();
+                        let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
+                        idx.add_record(next_id, &source_label, &seq, &mut ws);
+                    }
+
+                    idx.finalize_bucket(next_id);
+                    idx.save(&index)?;
+                    log::info!("Done. Added {} minimizers to bucket {}.",
+                             idx.buckets.get(&next_id).map(|v| v.len()).unwrap_or(0), next_id);
                 }
-
-                // Finalize the new bucket
-                idx.finalize_bucket(next_id);
-                idx.save(&index)?;
-                log::info!("Done. Added {} minimizers to bucket {}.",
-                         idx.buckets.get(&next_id).map(|v| v.len()).unwrap_or(0), next_id);
             }
 
             IndexCommands::BucketMerge { index, src, dest } => {
-                let mut idx = Index::load(&index)?;
-                log::info!("Merging Bucket {} -> Bucket {}...", src, dest);
-                idx.merge_buckets(src, dest)?;
-                idx.save(&index)?;
-                log::info!("Done.");
+                let main_manifest_path = MainIndexManifest::manifest_path(&index);
+
+                if main_manifest_path.exists() {
+                    // Sharded main index
+                    let mut sharded = ShardedMainIndex::open(&index)?;
+                    log::info!("Merging Bucket {} -> Bucket {} (sharded)...", src, dest);
+                    sharded.merge_buckets(src, dest)?;
+                    log::info!("Done.");
+                } else {
+                    // Single-file main index
+                    let mut idx = Index::load(&index)?;
+                    log::info!("Merging Bucket {} -> Bucket {}...", src, dest);
+                    idx.merge_buckets(src, dest)?;
+                    idx.save(&index)?;
+                    log::info!("Done.");
+                }
             }
 
             IndexCommands::Merge { output, inputs } => {
@@ -538,28 +622,114 @@ fn main() -> Result<()> {
             }
 
             IndexCommands::Invert { index, shards } => {
-                log::info!("Loading index from {:?}", index);
-                let idx = Index::load(&index)?;
-                log::info!("Index loaded: {} buckets", idx.buckets.len());
-
-                log::info!("Building inverted index...");
-                let inverted = InvertedIndex::build_from_index(&idx);
-                log::info!("Inverted index built: {} unique minimizers, {} bucket entries",
-                    inverted.num_minimizers(), inverted.num_bucket_entries());
-
                 let output_path = index.with_extension("ryxdi");
 
-                if shards > 1 {
-                    log::info!("Saving sharded inverted index ({} shards) to {:?}", shards, output_path);
-                    let manifest = inverted.save_sharded(&output_path, shards)?;
-                    log::info!("Created {} shards:", manifest.shards.len());
-                    for shard in &manifest.shards {
-                        log::info!("  Shard {}: {} minimizers, {} bucket entries",
-                            shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
+                // Check if main index is sharded
+                if MainIndexManifest::is_sharded(&index) {
+                    log::info!("Detected sharded main index, creating 1:1 inverted shards");
+                    let main_manifest = MainIndexManifest::load(&MainIndexManifest::manifest_path(&index))?;
+                    log::info!("Main index has {} shards, {} buckets",
+                        main_manifest.shards.len(), main_manifest.bucket_names.len());
+
+                    // Track files we create for cleanup on error
+                    let mut created_files: Vec<PathBuf> = Vec::new();
+
+                    let result = (|| -> Result<ShardManifest> {
+                        let mut inv_shards = Vec::new();
+                        let mut total_minimizers = 0usize;
+                        let mut total_bucket_ids = 0usize;
+                        let num_shards = main_manifest.shards.len();
+
+                        for (idx, shard_info) in main_manifest.shards.iter().enumerate() {
+                            let shard_path = MainIndexManifest::shard_path(&index, shard_info.shard_id);
+                            log::info!("Processing main shard {}: {} buckets, {} minimizers (raw)",
+                                shard_info.shard_id, shard_info.bucket_ids.len(), shard_info.num_minimizers);
+
+                            // Build inverted index from shard, dropping main shard immediately after
+                            let inverted = {
+                                let main_shard = MainIndexShard::load(&shard_path)?;
+                                InvertedIndex::build_from_shard(&main_shard)
+                            };
+
+                            log::info!("  Built inverted: {} unique minimizers, {} bucket entries",
+                                inverted.num_minimizers(), inverted.num_bucket_entries());
+
+                            // Save as inverted shard with same ID
+                            let inv_shard_path = ShardManifest::shard_path(&output_path, shard_info.shard_id);
+                            let is_last = idx == num_shards - 1;
+                            let inv_shard_info = inverted.save_shard(
+                                &inv_shard_path,
+                                shard_info.shard_id,
+                                0,
+                                inverted.num_minimizers(),
+                                is_last,
+                            )?;
+                            created_files.push(inv_shard_path);
+
+                            total_minimizers += inv_shard_info.num_minimizers;
+                            total_bucket_ids += inv_shard_info.num_bucket_ids;
+                            inv_shards.push(inv_shard_info);
+                        }
+
+                        // Create inverted manifest
+                        let inv_manifest = ShardManifest {
+                            k: main_manifest.k,
+                            w: main_manifest.w,
+                            salt: main_manifest.salt,
+                            source_hash: InvertedIndex::compute_metadata_hash(&main_manifest.to_metadata()),
+                            total_minimizers,
+                            total_bucket_ids,
+                            shards: inv_shards,
+                        };
+
+                        let manifest_path = ShardManifest::manifest_path(&output_path);
+                        inv_manifest.save(&manifest_path)?;
+                        created_files.push(manifest_path);
+
+                        Ok(inv_manifest)
+                    })();
+
+                    match result {
+                        Ok(inv_manifest) => {
+                            log::info!("Created {} inverted shards with 1:1 correspondence:", inv_manifest.shards.len());
+                            for shard in &inv_manifest.shards {
+                                log::info!("  Shard {}: {} unique minimizers, {} bucket entries",
+                                    shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
+                            }
+                        }
+                        Err(e) => {
+                            // Clean up partial files on error
+                            for path in &created_files {
+                                if path.exists() {
+                                    let _ = std::fs::remove_file(path);
+                                }
+                            }
+                            return Err(e);
+                        }
                     }
                 } else {
-                    log::info!("Saving inverted index to {:?}", output_path);
-                    inverted.save(&output_path)?;
+                    // Non-sharded main index
+                    log::info!("Loading index from {:?}", index);
+                    let idx = Index::load(&index)?;
+                    log::info!("Index loaded: {} buckets", idx.buckets.len());
+
+                    log::info!("Building inverted index...");
+                    let inverted = InvertedIndex::build_from_index(&idx);
+                    log::info!("Inverted index built: {} unique minimizers, {} bucket entries",
+                        inverted.num_minimizers(), inverted.num_bucket_entries());
+
+                    if shards > 1 {
+                        log::info!("Saving sharded inverted index ({} shards) to {:?}", shards, output_path);
+                        let manifest = inverted.save_sharded(&output_path, shards)?;
+                        log::info!("Created {} shards:", manifest.shards.len());
+                        for shard in &manifest.shards {
+                            log::info!("  Shard {}: {} unique minimizers, {} bucket entries",
+                                shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
+                        }
+                    } else {
+                        log::info!("Saving inverted index to {:?}", output_path);
+                        inverted.save(&output_path)?;
+                    }
                 }
                 log::info!("Done.");
             }
@@ -808,10 +978,8 @@ fn main() -> Result<()> {
                     log::info!("Classification complete: {} reads processed", total_reads);
                     io.finish()?;
                 } else {
-                    // Standard path - load full index
-                    log::info!("Loading index from {:?}", index);
-                    let engine = Index::load(&index)?;
-                    log::info!("Index loaded: {} buckets", engine.buckets.len());
+                    // Standard path - detect sharded vs single-file main index
+                    let main_manifest_path = MainIndexManifest::manifest_path(&index);
 
                     let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
                     io.write(b"read_id\tbucket_name\tscore\n".to_vec())?;
@@ -819,30 +987,71 @@ fn main() -> Result<()> {
                     let mut total_reads = 0;
                     let mut batch_num = 0;
 
-                    log::info!("Starting classification (batch_size={})", batch_size);
+                    if main_manifest_path.exists() {
+                        // Sharded main index - use sequential shard loading
+                        log::info!("Loading sharded main index from {:?}", index);
+                        let sharded = ShardedMainIndex::open(&index)?;
+                        log::info!("Sharded main index: {} shards, {} buckets, {} total minimizers",
+                            sharded.num_shards(), sharded.manifest().bucket_names.len(), sharded.total_minimizers());
 
-                    while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
-                        batch_num += 1;
-                        let batch_read_count = owned_records.len();
-                        total_reads += batch_read_count;
+                        let metadata = sharded.metadata();
 
-                        let batch_refs: Vec<QueryRecord> = owned_records.iter()
-                            .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
-                            .collect();
+                        log::info!("Starting classification with sequential main shard loading (batch_size={})", batch_size);
 
-                        let results = classify_batch(&engine, &batch_refs, threshold);
+                        while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
+                            batch_num += 1;
+                            let batch_read_count = owned_records.len();
+                            total_reads += batch_read_count;
 
-                        let mut chunk_out = Vec::with_capacity(1024);
-                        for res in results {
-                            let header = &headers[res.query_id as usize];
-                            let bucket_name = engine.bucket_names.get(&res.bucket_id)
-                                .map(|s| s.as_str())
-                                .unwrap_or("unknown");
-                            writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
+                            let batch_refs: Vec<QueryRecord> = owned_records.iter()
+                                .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                                .collect();
+
+                            let results = classify_batch_sharded_main(&sharded, &batch_refs, threshold)?;
+
+                            let mut chunk_out = Vec::with_capacity(1024);
+                            for res in results {
+                                let header = &headers[res.query_id as usize];
+                                let bucket_name = metadata.bucket_names.get(&res.bucket_id)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("unknown");
+                                writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
+                            }
+                            io.write(chunk_out)?;
+
+                            log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
                         }
-                        io.write(chunk_out)?;
+                    } else {
+                        // Single-file main index
+                        log::info!("Loading index from {:?}", index);
+                        let engine = Index::load(&index)?;
+                        log::info!("Index loaded: {} buckets", engine.buckets.len());
 
-                        log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+                        log::info!("Starting classification (batch_size={})", batch_size);
+
+                        while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
+                            batch_num += 1;
+                            let batch_read_count = owned_records.len();
+                            total_reads += batch_read_count;
+
+                            let batch_refs: Vec<QueryRecord> = owned_records.iter()
+                                .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                                .collect();
+
+                            let results = classify_batch(&engine, &batch_refs, threshold);
+
+                            let mut chunk_out = Vec::with_capacity(1024);
+                            for res in results {
+                                let header = &headers[res.query_id as usize];
+                                let bucket_name = engine.bucket_names.get(&res.bucket_id)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("unknown");
+                                writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
+                            }
+                            io.write(chunk_out)?;
+
+                            log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+                        }
                     }
 
                     log::info!("Classification complete: {} reads processed", total_reads);

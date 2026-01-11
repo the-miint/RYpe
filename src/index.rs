@@ -13,6 +13,7 @@ use std::path::Path;
 use crate::constants::{MAX_BUCKET_SIZE, MAX_STRING_LENGTH, MAX_NUM_BUCKETS};
 use crate::encoding::{encode_varint, decode_varint};
 use crate::extraction::extract_into;
+use crate::sharded_main::{MainIndexManifest, ShardedMainIndexBuilder, plan_shards};
 use crate::types::IndexMetadata;
 use crate::workspace::MinimizerWorkspace;
 
@@ -236,6 +237,58 @@ impl Index {
 
         encoder.finish()?;
         Ok(())
+    }
+
+    /// Save the index as a sharded format with memory budget-based sharding.
+    ///
+    /// This method creates multiple shard files based on the memory budget. Each shard
+    /// contains complete buckets - a bucket's minimizers are never split across shards.
+    ///
+    /// # Arguments
+    /// * `base_path` - Base path for output files (e.g., "index.ryidx")
+    /// * `max_shard_bytes` - Maximum estimated bytes per shard
+    ///
+    /// # Returns
+    /// The manifest for the created sharded index.
+    ///
+    /// # File Layout
+    /// - `base_path.manifest` - Manifest file with metadata
+    /// - `base_path.shard.0`, `base_path.shard.1`, ... - Shard files with minimizers
+    pub fn save_sharded(&self, base_path: &Path, max_shard_bytes: usize) -> Result<MainIndexManifest> {
+        // Plan which buckets go to which shards
+        let bucket_counts: HashMap<u32, usize> = self.buckets.iter()
+            .map(|(&id, v)| (id, v.len()))
+            .collect();
+
+        let shard_plan = plan_shards(&bucket_counts, max_shard_bytes);
+
+        // Use the builder to write shards
+        let mut builder = ShardedMainIndexBuilder::new(
+            self.k,
+            self.w,
+            self.salt,
+            base_path,
+            max_shard_bytes,
+        )?;
+
+        // Add buckets in shard order for efficient writing
+        for (_shard_id, bucket_ids) in &shard_plan {
+            for &bucket_id in bucket_ids {
+                let name = self.bucket_names.get(&bucket_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("unknown");
+                let sources = self.bucket_sources.get(&bucket_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let minimizers = self.buckets.get(&bucket_id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                builder.add_bucket(bucket_id, name, sources, minimizers)?;
+            }
+        }
+
+        builder.finish()
     }
 
     /// Load an index from a file (v5 format with delta+varint+zstd compressed minimizers).

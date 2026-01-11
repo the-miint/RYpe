@@ -15,6 +15,7 @@ use crate::extraction::{count_hits, get_paired_minimizers_into};
 use crate::index::Index;
 use crate::inverted::{InvertedIndex, QueryInvertedIndex};
 use crate::sharded::{ShardManifest, ShardedInvertedIndex};
+use crate::sharded_main::ShardedMainIndex;
 use crate::types::{HitResult, QueryRecord};
 use crate::workspace::MinimizerWorkspace;
 
@@ -184,6 +185,102 @@ pub fn classify_batch_sharded_sequential(
         // shard dropped here, freeing memory before loading next
     }
 
+    let results: Vec<HitResult> = processed.iter().enumerate()
+        .flat_map(|(idx, (query_id, fwd_mins, rc_mins))| {
+            let fwd_total = fwd_mins.len();
+            let rc_total = rc_mins.len();
+            let hits = all_hits[idx].lock().unwrap();
+
+            hits.iter().filter_map(|(&bucket_id, &(fwd_count, rc_count))| {
+                let score = compute_score(fwd_count, fwd_total, rc_count, rc_total);
+                if score >= threshold {
+                    Some(HitResult { query_id: *query_id, bucket_id, score })
+                } else {
+                    None
+                }
+            }).collect::<Vec<_>>()
+        })
+        .collect();
+
+    Ok(results)
+}
+
+/// Classify a batch of records against a sharded main index.
+///
+/// Loads one shard at a time to minimize memory usage. For each shard,
+/// uses binary search against the bucket minimizers (same algorithm as
+/// `classify_batch`).
+///
+/// Memory complexity: O(batch_size * minimizers_per_read) + O(single_shard_buckets)
+///
+/// # Arguments
+/// * `sharded` - The sharded main index
+/// * `records` - Batch of query records
+/// * `threshold` - Minimum score threshold
+///
+/// # Returns
+/// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
+pub fn classify_batch_sharded_main(
+    sharded: &ShardedMainIndex,
+    records: &[QueryRecord],
+    threshold: f64
+) -> Result<Vec<HitResult>> {
+    let manifest = sharded.manifest();
+
+    // Extract minimizers for all queries (parallel)
+    let processed: Vec<_> = records.par_iter()
+        .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
+            let (ha, hb) = get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
+            (*id, ha, hb)
+        }).collect();
+
+    // Build inverted maps: minimizer → query indices
+    let mut map_a: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut map_b: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut uniq_mins = HashSet::new();
+
+    for (idx, (_, ma, mb)) in processed.iter().enumerate() {
+        for &m in ma { map_a.entry(m).or_default().push(idx); uniq_mins.insert(m); }
+        for &m in mb { map_b.entry(m).or_default().push(idx); uniq_mins.insert(m); }
+    }
+    let uniq_vec: Vec<u64> = uniq_mins.into_iter().collect();
+
+    // Accumulator: query_idx → bucket_id → (fwd_hits, rc_hits)
+    let all_hits: Vec<Mutex<HashMap<u32, (usize, usize)>>> =
+        (0..processed.len()).map(|_| Mutex::new(HashMap::new())).collect();
+
+    // Process each shard sequentially (load one at a time)
+    for shard_info in &manifest.shards {
+        let shard = sharded.load_shard(shard_info.shard_id)?;
+
+        // Process all buckets in this shard in parallel
+        shard.buckets.par_iter().for_each(|(bucket_id, bucket_minimizers)| {
+            let mut bucket_hits: HashMap<usize, (usize, usize)> = HashMap::new();
+
+            // Binary search each unique query minimizer against this bucket
+            for &m in &uniq_vec {
+                if bucket_minimizers.binary_search(&m).is_ok() {
+                    if let Some(rs) = map_a.get(&m) {
+                        for &r in rs { bucket_hits.entry(r).or_insert((0, 0)).0 += 1; }
+                    }
+                    if let Some(rs) = map_b.get(&m) {
+                        for &r in rs { bucket_hits.entry(r).or_insert((0, 0)).1 += 1; }
+                    }
+                }
+            }
+
+            // Merge hits into per-query accumulators
+            for (r_idx, (fwd_count, rc_count)) in bucket_hits {
+                let mut hits = all_hits[r_idx].lock().unwrap();
+                let entry = hits.entry(*bucket_id).or_insert((0, 0));
+                entry.0 += fwd_count;
+                entry.1 += rc_count;
+            }
+        });
+        // shard dropped here, freeing memory before loading next
+    }
+
+    // Score and filter
     let results: Vec<HitResult> = processed.iter().enumerate()
         .flat_map(|(idx, (query_id, fwd_mins, rc_mins))| {
             let fwd_total = fwd_mins.len();
@@ -646,6 +743,62 @@ mod tests {
             assert_eq!(inv.bucket_id, seq.bucket_id, "Bucket IDs should match");
             assert!((inv.score - seq.score).abs() < 0.001,
                 "Scores should match: {} vs {}", inv.score, seq.score);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_classify_batch_sharded_main_matches_regular() -> anyhow::Result<()> {
+        use crate::sharded_main::ShardedMainIndex;
+
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryidx");
+
+        let mut index = Index::new(32, 10, 0x1234).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq2 = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+
+        index.add_record(1, "ref1", seq1, &mut ws);
+        index.add_record(2, "ref2", seq2, &mut ws);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.finalize_bucket(1);
+        index.finalize_bucket(2);
+
+        // Save as sharded (small budget to ensure multiple shards)
+        index.save_sharded(&base_path, 100)?;
+        let sharded = ShardedMainIndex::open(&base_path)?;
+
+        let query1: &[u8] = seq1;
+        let query2: &[u8] = seq2;
+        let records: Vec<QueryRecord> = vec![
+            (0, query1, None),
+            (1, query2, None),
+        ];
+
+        let threshold = 0.1;
+
+        let results_regular = classify_batch(&index, &records, threshold);
+        let results_sharded = classify_batch_sharded_main(&sharded, &records, threshold)?;
+
+        assert_eq!(results_regular.len(), results_sharded.len(),
+            "Result counts should match: regular={}, sharded={}",
+            results_regular.len(), results_sharded.len());
+
+        let mut sorted_regular = results_regular.clone();
+        sorted_regular.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
+
+        let mut sorted_sharded = results_sharded.clone();
+        sorted_sharded.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
+
+        for (reg, shr) in sorted_regular.iter().zip(sorted_sharded.iter()) {
+            assert_eq!(reg.query_id, shr.query_id, "Query IDs should match");
+            assert_eq!(reg.bucket_id, shr.bucket_id, "Bucket IDs should match");
+            assert!((reg.score - shr.score).abs() < 0.001,
+                "Scores should match: {} vs {}", reg.score, shr.score);
         }
 
         Ok(())

@@ -31,6 +31,7 @@ mod extraction;
 mod index;
 mod inverted;
 mod sharded;
+mod sharded_main;
 mod classify;
 mod types;
 mod workspace;
@@ -68,11 +69,23 @@ pub use inverted::{InvertedIndex, QueryInvertedIndex};
 // Re-export sharded index types
 pub use sharded::{ShardInfo, ShardManifest, ShardedInvertedIndex};
 
+// Re-export sharded main index types
+pub use sharded_main::{
+    MainIndexShardInfo,
+    MainIndexManifest,
+    MainIndexShard,
+    ShardedMainIndex,
+    ShardedMainIndexBuilder,
+    estimate_bucket_bytes,
+    plan_shards,
+};
+
 // Re-export classification functions
 pub use classify::{
     classify_batch,
     classify_batch_inverted,
     classify_batch_sharded_sequential,
+    classify_batch_sharded_main,
     classify_batch_merge_join,
     classify_batch_with_query_index,
     aggregate_batch,
