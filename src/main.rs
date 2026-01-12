@@ -29,7 +29,44 @@ fn sanitize_bucket_name(name: &str) -> String {
 
 #[derive(Parser)]
 #[command(name = "rype")]
-#[command(about = "High-performance Read Partitioning Engine (RY-Space, K=16/32/64)", long_about = None)]
+#[command(about = "High-performance Read Partitioning Engine (RY-Space, K=16/32/64)")]
+#[command(long_about = "Rype: High-performance genomic sequence classification using minimizer-based k-mer sketching in RY (purine/pyrimidine) space.
+
+WORKFLOW:
+  1. Create an index:     rype index create -o index.ryidx -r refs.fasta
+  2. (Optional) Invert:   rype index invert -i index.ryidx
+  3. Classify reads:      rype classify run -i index.ryidx -1 reads.fq
+
+INPUT FORMATS:
+  FASTA (.fa, .fasta, .fna) and FASTQ (.fq, .fastq) files are supported.
+  Gzip-compressed files (.gz) are automatically detected and decompressed.
+
+OUTPUT FORMAT (classify):
+  Tab-separated: read_id<TAB>bucket_name<TAB>score
+  - read_id: Sequence header (first whitespace-delimited token)
+  - bucket_name: Human-readable name from index
+  - score: Fraction of query minimizers matching (0.0-1.0)")]
+#[command(after_help = "EXAMPLES:
+  # Create index from reference genomes
+  rype index create -o bacteria.ryidx -r genome1.fna -r genome2.fna -k 64 -w 50
+
+  # Create index with one bucket per sequence
+  rype index create -o genes.ryidx -r genes.fasta --separate-buckets
+
+  # Build inverted index for faster classification
+  rype index invert -i bacteria.ryidx
+
+  # Classify single-end reads
+  rype classify run -i bacteria.ryidx -1 reads.fq -t 0.1 -o results.tsv
+
+  # Classify paired-end reads with negative filtering
+  rype classify run -i bacteria.ryidx -N host.ryidx -1 R1.fq -2 R2.fq -t 0.1
+
+  # Use inverted index for faster classification
+  rype classify run -i bacteria.ryidx -I -1 reads.fq
+
+  # Aggregate mode for higher sensitivity
+  rype classify aggregate -i bacteria.ryidx -1 R1.fq -2 R2.fq -t 0.05")]
 struct Cli {
     /// Enable verbose progress output with timestamps
     #[arg(short, long, global = true)]
@@ -49,7 +86,7 @@ enum Commands {
     #[command(subcommand)]
     Classify(ClassifyCommands),
 
-    /// Inspect minimizer details and matches
+    /// Inspect minimizer details and matches (debugging)
     #[command(subcommand)]
     Inspect(InspectCommands),
 }
@@ -57,97 +94,189 @@ enum Commands {
 #[derive(Subcommand)]
 enum IndexCommands {
     /// Create a new index from reference sequences
+    #[command(after_help = "EXAMPLES:
+  # Basic index creation
+  rype index create -o index.ryidx -r genome.fasta
+
+  # Multiple references, all in one bucket
+  rype index create -o index.ryidx -r chr1.fa -r chr2.fa
+
+  # One bucket per sequence (e.g., for gene-level classification)
+  rype index create -o genes.ryidx -r genes.fasta --separate-buckets
+
+  # Large index with sharding (for memory-constrained systems)
+  rype index create -o large.ryidx -r refs.fa --max-shard-size 1073741824")]
     Create {
+        /// Output index file path (.ryidx extension recommended)
         #[arg(short, long)]
         output: PathBuf,
+
+        /// Reference sequence files (FASTA/FASTQ, optionally gzipped).
+        /// Can specify multiple times: -r file1.fa -r file2.fa
         #[arg(short, long, required = true)]
         reference: Vec<PathBuf>,
+
+        /// K-mer size for minimizer computation. Must be 16, 32, or 64.
+        /// Larger k = more specific matches, fewer false positives.
+        /// Smaller k = more sensitive, may find distant homologs.
         #[arg(short = 'k', long, default_value_t = 64)]
         kmer_size: usize,
+
+        /// Minimizer window size. Larger values = smaller index, less sensitive.
+        /// Recommended: 30-100 for genomes, 20-50 for shorter sequences.
         #[arg(short, long, default_value_t = 50)]
         window: usize,
+
+        /// XOR salt for hash randomization. Must match for index compatibility.
+        /// Default is fine for most uses; change to create incompatible indices.
         #[arg(short, long, default_value_t = 0x5555555555555555)]
         salt: u64,
+
+        /// Create one bucket per input sequence instead of one per file.
+        /// Use when each sequence represents a distinct classification target
+        /// (e.g., individual genes, plasmids, or genomes in a multi-FASTA).
         #[arg(long)]
         separate_buckets: bool,
-        /// Maximum shard size in bytes (e.g., 1073741824 for 1GB). If specified, creates a sharded index.
+
+        /// Maximum shard size in bytes for large indices. Creates multiple
+        /// shard files that are loaded on-demand during classification.
+        /// Example: 1073741824 = 1GB per shard.
         #[arg(long)]
         max_shard_size: Option<usize>,
     },
 
-    /// Show index statistics
+    /// Show index statistics and bucket information
     Stats {
+        /// Path to index file (.ryidx)
         #[arg(short, long)]
         index: PathBuf,
-        /// Show inverted index stats (if .ryxdi exists)
+
+        /// Show inverted index stats instead of primary index
         #[arg(short = 'I', long)]
         inverted: bool,
     },
 
-    /// Show source details for a specific bucket
+    /// Show source file paths or sequence IDs for a bucket
     BucketSourceDetail {
+        /// Path to index file (.ryidx)
         #[arg(short, long)]
         index: PathBuf,
+
+        /// Bucket ID to inspect (from 'rype index stats' output)
         #[arg(short, long, required = true)]
         bucket: u32,
+
+        /// Show only unique file paths (one per line)
         #[arg(long)]
         paths: bool,
+
+        /// Show only bucket IDs (for scripting)
         #[arg(long)]
         ids: bool,
     },
 
-    /// Add sequences to an existing index as a new bucket
+    /// Add a new reference file as a new bucket to an existing index
     BucketAdd {
+        /// Path to existing index file
         #[arg(short, long)]
         index: PathBuf,
+
+        /// Reference file to add (creates a new bucket)
         #[arg(short, long)]
         reference: PathBuf,
     },
 
-    /// Merge two buckets within an index
+    /// Merge two buckets within an index (source absorbed into destination)
     BucketMerge {
+        /// Path to index file (modified in place)
         #[arg(short, long)]
         index: PathBuf,
+
+        /// Source bucket ID (will be removed after merge)
         #[arg(long)]
         src: u32,
+
+        /// Destination bucket ID (receives source's minimizers)
         #[arg(long)]
         dest: u32,
     },
 
-    /// Merge multiple indices into one
+    /// Merge multiple indices into one (buckets renumbered to avoid conflicts)
     Merge {
+        /// Output path for merged index
         #[arg(short, long)]
         output: PathBuf,
+
+        /// Input indices to merge (must have same k, w, salt)
         #[arg(short, long, required = true)]
         inputs: Vec<PathBuf>,
     },
 
-    /// Build index from a TOML configuration file
+    /// Build index from a TOML configuration file (see CONFIG FORMAT below)
+    #[command(after_help = "CONFIG FORMAT (from-config):
+  [index]
+  k = 64                           # K-mer size (16, 32, or 64)
+  window = 50                      # Minimizer window size
+  salt = 0x5555555555555555        # Hash salt (hex)
+  output = \"index.ryidx\"           # Output path
+
+  [buckets.BucketName]             # Define a bucket
+  files = [\"ref1.fa\", \"ref2.fa\"]   # Files for this bucket
+
+  [buckets.AnotherBucket]
+  files = [\"other.fasta\"]")]
     FromConfig {
+        /// Path to TOML config file
         #[arg(short, long)]
         config: PathBuf,
     },
 
-    /// Add files to existing index based on config file
+    /// Add files to existing index using TOML config (see CONFIG FORMAT below)
+    #[command(after_help = "CONFIG FORMAT (bucket-add-config):
+  [target]
+  index = \"existing.ryidx\"         # Index to modify
+
+  [assignment]
+  mode = \"new_bucket\"              # or \"existing_bucket\" or \"best_bin\"
+  bucket_name = \"MyBucket\"         # For new_bucket/existing_bucket modes
+  # For best_bin mode:
+  # threshold = 0.3                 # Min score to match existing bucket
+  # fallback = \"create_new\"        # or \"skip\" or \"error\"
+
+  [files]
+  paths = [\"new1.fa\", \"new2.fa\"]   # Files to add")]
     BucketAddConfig {
+        /// Path to TOML config file
         #[arg(short, long)]
         config: PathBuf,
     },
 
-    /// Create inverted index for faster classification.
-    /// If the main index is sharded, inverted shards are created with 1:1 correspondence.
+    /// Create inverted index for faster classification (2-10x speedup)
+    #[command(after_help = "The inverted index maps minimizers to buckets instead of buckets to
+minimizers, enabling O(Q log U) lookups instead of O(B × Q × log M).
+
+USAGE:
+  rype index invert -i index.ryidx      # Creates index.ryxdi
+  rype classify run -i index.ryidx -I   # Use inverted index
+
+SHARDING:
+  For very large indices that exceed RAM, use --shards to split the
+  inverted index into multiple files loaded on-demand during classification.")]
     Invert {
+        /// Path to primary index file (.ryidx)
         #[arg(short, long)]
         index: PathBuf,
 
-        /// Number of shards to split the inverted index into (default: 1 = single file).
-        /// Ignored if main index is sharded (uses 1:1 correspondence instead).
+        /// Number of shards (default: 1 = single file).
+        /// Use for memory-constrained classification of large indices.
+        /// Ignored if main index is already sharded (uses 1:1 correspondence).
         #[arg(long, default_value_t = 1)]
         shards: u32,
     },
 
-    /// Summarize index with detailed minimizer statistics
+    /// Show detailed minimizer statistics for compression analysis
     Summarize {
+        /// Path to index file (.ryidx)
         #[arg(short, long)]
         index: PathBuf,
     },
@@ -155,38 +284,87 @@ enum IndexCommands {
 
 #[derive(Subcommand)]
 enum ClassifyCommands {
-    /// Classify reads against an index (per-read output)
+    /// Classify reads against an index, one result line per read
+    #[command(after_help = "OUTPUT FORMAT:
+  Tab-separated values (TSV): read_id<TAB>bucket_name<TAB>score
+
+  read_id     - First whitespace-delimited token from FASTA/FASTQ header
+  bucket_name - Human-readable name from index (or filename if unnamed)
+  score       - Fraction of query minimizers matching bucket (0.0-1.0)
+
+  Only reads with score >= threshold for at least one bucket are output.
+  A single read may produce multiple lines if it matches multiple buckets.
+
+THRESHOLD GUIDANCE:
+  0.05  - High sensitivity, useful for detecting distant homologs
+  0.10  - Balanced (default), good for most metagenomic classification
+  0.20  - High specificity, fewer false positives
+  0.30+ - Very stringent, may miss true matches
+
+WHEN TO USE 'run' vs 'aggregate':
+  Use 'run' (this command) for:
+  - Per-read classification results
+  - Downstream analysis requiring read-level assignments
+  - When you need to know which specific reads matched
+
+  Use 'aggregate' for:
+  - Sample-level composition estimates
+  - Higher sensitivity (pools evidence across reads)
+  - Abundance estimation")]
     Run {
-        /// Path to positive index (targets to classify against)
+        /// Path to target index (references to classify against)
         #[arg(short, long, visible_alias = "positive-index")]
         index: PathBuf,
-        /// Path to negative index (minimizers to exclude from queries before scoring)
+
+        /// Path to negative index for contamination filtering.
+        /// Minimizers matching the negative index are excluded before scoring.
+        /// Use for host depletion (e.g., human reads) or adapter removal.
+        /// Must have same k, w, salt as positive index.
         #[arg(short = 'N', long)]
         negative_index: Option<PathBuf>,
+
+        /// Forward reads (FASTA/FASTQ, optionally gzipped)
         #[arg(short = '1', long)]
         r1: PathBuf,
+
+        /// Reverse reads for paired-end data (optional)
         #[arg(short = '2', long)]
         r2: Option<PathBuf>,
+
+        /// Minimum score threshold for reporting matches (0.0-1.0).
+        /// Score = matching_minimizers / total_query_minimizers.
+        /// Lower = more sensitive, higher = more specific.
         #[arg(short, long, default_value_t = 0.1)]
         threshold: f64,
+
+        /// Number of reads to process per batch.
+        /// Larger batches improve throughput but use more memory.
+        /// Reduce if running out of memory.
         #[arg(short, long, default_value_t = 50_000)]
         batch_size: usize,
+
+        /// Output file path (TSV format). Writes to stdout if not specified.
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Use inverted index (.ryxdi) for faster classification
+
+        /// Use inverted index (.ryxdi) for faster classification.
+        /// Creates index.ryxdi with: rype index invert -i index.ryidx
+        /// Recommended for large indices or repeated classifications.
         #[arg(short = 'I', long)]
         use_inverted: bool,
-        /// Use merge-join with query inverted index (requires --use-inverted)
+
+        /// Use merge-join algorithm (requires --use-inverted).
+        /// Faster when query and index have high overlap.
+        /// May be slower for queries with many unique minimizers.
         #[arg(short = 'M', long)]
         merge_join: bool,
     },
 
-    /// Batch classify reads (alias for 'run')
+    /// Batch classify reads (identical to 'run', kept for backwards compatibility)
+    #[command(hide = true)]
     Batch {
-        /// Path to positive index (targets to classify against)
         #[arg(short, long, visible_alias = "positive-index")]
         index: PathBuf,
-        /// Path to negative index (minimizers to exclude from queries before scoring)
         #[arg(short = 'N', long)]
         negative_index: Option<PathBuf>,
         #[arg(short = '1', long)]
@@ -199,31 +377,58 @@ enum ClassifyCommands {
         batch_size: usize,
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Use inverted index (.ryxdi) for faster classification
         #[arg(short = 'I', long)]
         use_inverted: bool,
-        /// Use merge-join with query inverted index (requires --use-inverted)
         #[arg(short = 'M', long)]
         merge_join: bool,
     },
 
-    /// Aggregate classification (higher sensitivity, aggregates paired-end reads)
+    /// Pool all reads for sample-level classification (higher sensitivity)
     #[command(alias = "agg")]
+    #[command(after_help = "AGGREGATE vs RUN:
+  'aggregate' pools minimizers from all reads before scoring, providing:
+  - Higher sensitivity for low-abundance targets
+  - Sample-level composition rather than per-read assignments
+  - Reduced noise from individual read variation
+
+  Use 'aggregate' when you want to know what's in a sample.
+  Use 'run' when you need read-level assignments.
+
+OUTPUT FORMAT:
+  Tab-separated: query_name<TAB>bucket_name<TAB>score
+
+  query_name is always 'global' since reads are aggregated.
+
+THRESHOLD:
+  Default 0.05 (lower than 'run') since aggregation reduces noise.
+  Score represents fraction of total unique minimizers matching bucket.")]
     Aggregate {
-        /// Path to positive index (targets to classify against)
+        /// Path to target index
         #[arg(short, long, visible_alias = "positive-index")]
         index: PathBuf,
-        /// Path to negative index (minimizers to exclude from queries before scoring)
+
+        /// Path to negative index for contamination filtering
         #[arg(short = 'N', long)]
         negative_index: Option<PathBuf>,
+
+        /// Forward reads (FASTA/FASTQ, optionally gzipped)
         #[arg(short = '1', long)]
         r1: PathBuf,
+
+        /// Reverse reads for paired-end data (optional)
         #[arg(short = '2', long)]
         r2: Option<PathBuf>,
+
+        /// Minimum score threshold (default lower than 'run' since
+        /// aggregation reduces noise)
         #[arg(short, long, default_value_t = 0.05)]
         threshold: f64,
+
+        /// Number of reads to process per batch
         #[arg(short, long, default_value_t = 50_000)]
         batch_size: usize,
+
+        /// Output file path (TSV format)
         #[arg(short, long)]
         output: Option<PathBuf>,
     },

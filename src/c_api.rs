@@ -1,8 +1,9 @@
-use crate::{Index, QueryRecord, classify_batch}; // Removed HitResult
+use crate::{Index, InvertedIndex, QueryRecord, classify_batch, classify_batch_inverted};
 use std::ffi::{CStr, CString};
 use std::slice;
 use std::path::Path;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use libc::{c_char, size_t, c_double};
 
 // --- Error Reporting ---
@@ -125,6 +126,285 @@ pub extern "C" fn rype_index_free(ptr: *mut Index) {
     }
 }
 
+// --- Index Metadata Accessors ---
+
+/// Returns the k-mer size of the index, or 0 if index is NULL.
+#[no_mangle]
+pub extern "C" fn rype_index_k(index_ptr: *const Index) -> size_t {
+    if index_ptr.is_null() {
+        return 0;
+    }
+    let index = unsafe { &*index_ptr };
+    index.k
+}
+
+/// Returns the window size of the index, or 0 if index is NULL.
+#[no_mangle]
+pub extern "C" fn rype_index_w(index_ptr: *const Index) -> size_t {
+    if index_ptr.is_null() {
+        return 0;
+    }
+    let index = unsafe { &*index_ptr };
+    index.w
+}
+
+/// Returns the salt of the index, or 0 if index is NULL.
+#[no_mangle]
+pub extern "C" fn rype_index_salt(index_ptr: *const Index) -> u64 {
+    if index_ptr.is_null() {
+        return 0;
+    }
+    let index = unsafe { &*index_ptr };
+    index.salt
+}
+
+/// Returns the number of buckets in the index, or 0 if index is NULL.
+#[no_mangle]
+pub extern "C" fn rype_index_num_buckets(index_ptr: *const Index) -> u32 {
+    if index_ptr.is_null() {
+        return 0;
+    }
+    let index = unsafe { &*index_ptr };
+    index.buckets.len() as u32
+}
+
+// --- Bucket Name Lookup ---
+
+// Thread-local storage for bucket name CStrings to maintain lifetime
+thread_local! {
+    static BUCKET_NAME_CACHE: RefCell<HashMap<u32, CString>> = RefCell::new(HashMap::new());
+}
+
+/// Returns the name of a bucket by ID, or NULL if not found.
+/// The returned string is owned by the library and must NOT be freed by the caller.
+/// The string remains valid until the next call to rype_bucket_name on this thread
+/// or until the index is freed.
+#[no_mangle]
+pub extern "C" fn rype_bucket_name(index_ptr: *const Index, bucket_id: u32) -> *const c_char {
+    if index_ptr.is_null() {
+        return std::ptr::null();
+    }
+
+    let index = unsafe { &*index_ptr };
+
+    match index.bucket_names.get(&bucket_id) {
+        Some(name) => {
+            BUCKET_NAME_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                // Insert/update the CString in our cache
+                let cstring = match CString::new(name.as_str()) {
+                    Ok(s) => s,
+                    Err(_) => return std::ptr::null(),
+                };
+                cache.insert(bucket_id, cstring);
+                // Return pointer to the cached CString
+                cache.get(&bucket_id).map(|s| s.as_ptr()).unwrap_or(std::ptr::null())
+            })
+        }
+        None => std::ptr::null(),
+    }
+}
+
+// --- Negative Index API ---
+
+use std::collections::HashSet;
+
+/// Opaque handle to a pre-built negative minimizer set for filtering.
+/// This allows efficient reuse when classifying multiple batches.
+pub struct RypeNegativeSet {
+    minimizers: HashSet<u64>,
+}
+
+/// Creates a negative minimizer set from an index.
+/// All minimizers from all buckets in the index will be used for filtering.
+/// Returns NULL on error; call rype_get_last_error() for details.
+///
+/// The negative index must have the same k, w, and salt as the positive index
+/// used for classification. This is NOT validated here but will affect results.
+#[no_mangle]
+pub extern "C" fn rype_negative_set_create(negative_index_ptr: *const Index) -> *mut RypeNegativeSet {
+    if negative_index_ptr.is_null() {
+        set_last_error("negative_index is NULL".to_string());
+        return std::ptr::null_mut();
+    }
+
+    let neg_index = unsafe { &*negative_index_ptr };
+
+    let minimizers: HashSet<u64> = neg_index.buckets.values()
+        .flat_map(|v| v.iter().copied())
+        .collect();
+
+    clear_last_error();
+    Box::into_raw(Box::new(RypeNegativeSet { minimizers }))
+}
+
+/// Frees a negative set. NULL is safe to pass.
+#[no_mangle]
+pub extern "C" fn rype_negative_set_free(ptr: *mut RypeNegativeSet) {
+    if !ptr.is_null() {
+        unsafe { let _ = Box::from_raw(ptr); }
+    }
+}
+
+/// Returns the number of unique minimizers in the negative set.
+#[no_mangle]
+pub extern "C" fn rype_negative_set_size(ptr: *const RypeNegativeSet) -> size_t {
+    if ptr.is_null() {
+        return 0;
+    }
+    let neg_set = unsafe { &*ptr };
+    neg_set.minimizers.len()
+}
+
+// --- Inverted Index API ---
+
+/// Loads an inverted index from disk.
+/// Returns NULL on error; call rype_get_last_error() for details.
+#[no_mangle]
+pub extern "C" fn rype_inverted_load(path: *const c_char) -> *mut InvertedIndex {
+    if path.is_null() {
+        set_last_error("path is NULL".to_string());
+        return std::ptr::null_mut();
+    }
+
+    let c_str = unsafe { CStr::from_ptr(path) };
+    let r_str = match c_str.to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(format!("Invalid UTF-8 in path: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    match InvertedIndex::load(Path::new(r_str)) {
+        Ok(inv) => {
+            clear_last_error();
+            Box::into_raw(Box::new(inv))
+        }
+        Err(e) => {
+            set_last_error(format!("Failed to load inverted index: {}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Frees an inverted index. NULL is safe to pass.
+#[no_mangle]
+pub extern "C" fn rype_inverted_free(ptr: *mut InvertedIndex) {
+    if !ptr.is_null() {
+        unsafe { let _ = Box::from_raw(ptr); }
+    }
+}
+
+/// Classifies a batch of queries using the inverted index for faster lookups.
+/// Returns NULL on error; call rype_get_last_error() for details.
+///
+/// Parameters:
+/// - inverted: The inverted index for fast minimizer → bucket lookups
+/// - negative_set: Optional negative set for filtering (NULL to disable)
+/// - queries: Array of query sequences
+/// - num_queries: Number of queries
+/// - threshold: Classification threshold (0.0-1.0)
+#[no_mangle]
+pub extern "C" fn rype_classify_inverted(
+    inverted_ptr: *const InvertedIndex,
+    negative_set_ptr: *const RypeNegativeSet,
+    queries_ptr: *const RypeQuery,
+    num_queries: size_t,
+    threshold: c_double
+) -> *mut RypeResultArray {
+    if inverted_ptr.is_null() {
+        set_last_error("inverted index is NULL".to_string());
+        return std::ptr::null_mut();
+    }
+    if queries_ptr.is_null() || num_queries == 0 {
+        set_last_error("Invalid arguments: queries or num_queries is invalid".to_string());
+        return std::ptr::null_mut();
+    }
+
+    // Validate threshold
+    if !threshold.is_finite() {
+        set_last_error("Invalid threshold: must be finite".to_string());
+        return std::ptr::null_mut();
+    }
+    if threshold < 0.0 || threshold > 1.0 {
+        set_last_error(format!("Invalid threshold: {} (expected 0.0-1.0)", threshold));
+        return std::ptr::null_mut();
+    }
+
+    // Validate num_queries is reasonable
+    if num_queries > isize::MAX as size_t {
+        set_last_error("num_queries exceeds maximum".to_string());
+        return std::ptr::null_mut();
+    }
+
+    let result = std::panic::catch_unwind(|| {
+        let inverted = unsafe { &*inverted_ptr };
+        let c_queries = unsafe { slice::from_raw_parts(queries_ptr, num_queries) };
+
+        // Get negative set if provided
+        let neg_mins: Option<&HashSet<u64>> = if negative_set_ptr.is_null() {
+            None
+        } else {
+            let neg_set = unsafe { &*negative_set_ptr };
+            Some(&neg_set.minimizers)
+        };
+
+        let rust_queries: Vec<QueryRecord> = c_queries.iter().enumerate().map(|(idx, q)| {
+            if let Err(msg) = validate_query(q) {
+                panic!("Query {} validation failed: {}", idx, msg);
+            }
+
+            let s1 = unsafe { slice::from_raw_parts(q.seq as *const u8, q.seq_len) };
+            let s2 = if !q.pair_seq.is_null() {
+                Some(unsafe { slice::from_raw_parts(q.pair_seq as *const u8, q.pair_len) })
+            } else {
+                None
+            };
+            (q.id, s1, s2)
+        }).collect();
+
+        let hits = classify_batch_inverted(inverted, neg_mins, &rust_queries, threshold);
+
+        let mut c_hits: Vec<RypeHit> = hits.into_iter().map(|h| RypeHit {
+            query_id: h.query_id,
+            bucket_id: h.bucket_id,
+            score: h.score,
+        }).collect();
+
+        c_hits.shrink_to_fit();
+        let len = c_hits.len();
+        let capacity = c_hits.capacity();
+        let data = c_hits.as_mut_ptr();
+        std::mem::forget(c_hits);
+
+        let result_array = Box::new(RypeResultArray { data, len, capacity });
+        Box::into_raw(result_array)
+    });
+
+    match result {
+        Ok(ptr) => {
+            clear_last_error();
+            ptr
+        }
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "Unknown error during classification".to_string()
+            };
+            set_last_error(msg);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// --- Primary Index Classification ---
+
+/// Classifies queries using the primary index without negative filtering.
+/// For negative filtering support, use rype_classify_with_negative().
 #[no_mangle]
 pub extern "C" fn rype_classify(
     index_ptr: *const Index,
@@ -132,8 +412,35 @@ pub extern "C" fn rype_classify(
     num_queries: size_t,
     threshold: c_double
 ) -> *mut RypeResultArray {
-    if index_ptr.is_null() || queries_ptr.is_null() || num_queries == 0 {
-        set_last_error("Invalid arguments: index, queries, or num_queries is invalid".to_string());
+    // Delegate to the full version with NULL negative set
+    rype_classify_with_negative(index_ptr, std::ptr::null(), queries_ptr, num_queries, threshold)
+}
+
+/// Classifies queries using the primary index with optional negative filtering.
+///
+/// Parameters:
+/// - index: Primary index for classification
+/// - negative_set: Optional negative set for filtering (NULL to disable)
+/// - queries: Array of query sequences
+/// - num_queries: Number of queries
+/// - threshold: Classification threshold (0.0-1.0)
+///
+/// Negative filtering removes minimizers that appear in the negative set from
+/// queries before scoring, reducing false positives from contaminating sequences.
+#[no_mangle]
+pub extern "C" fn rype_classify_with_negative(
+    index_ptr: *const Index,
+    negative_set_ptr: *const RypeNegativeSet,
+    queries_ptr: *const RypeQuery,
+    num_queries: size_t,
+    threshold: c_double
+) -> *mut RypeResultArray {
+    if index_ptr.is_null() {
+        set_last_error("index is NULL".to_string());
+        return std::ptr::null_mut();
+    }
+    if queries_ptr.is_null() || num_queries == 0 {
+        set_last_error("Invalid arguments: queries or num_queries is invalid".to_string());
         return std::ptr::null_mut();
     }
 
@@ -157,6 +464,14 @@ pub extern "C" fn rype_classify(
         let index = unsafe { &*index_ptr };
         let c_queries = unsafe { slice::from_raw_parts(queries_ptr, num_queries) };
 
+        // Get negative set if provided
+        let neg_mins: Option<&HashSet<u64>> = if negative_set_ptr.is_null() {
+            None
+        } else {
+            let neg_set = unsafe { &*negative_set_ptr };
+            Some(&neg_set.minimizers)
+        };
+
         let rust_queries: Vec<QueryRecord> = c_queries.iter().enumerate().map(|(idx, q)| {
             // Validate this query
             if let Err(msg) = validate_query(q) {
@@ -172,8 +487,7 @@ pub extern "C" fn rype_classify(
             (q.id, s1, s2)
         }).collect();
 
-        // None for negative_mins - no negative filtering in C API
-        let hits = classify_batch(index, None, &rust_queries, threshold);
+        let hits = classify_batch(index, neg_mins, &rust_queries, threshold);
 
         let mut c_hits: Vec<RypeHit> = hits.into_iter().map(|h| RypeHit {
             query_id: h.query_id,
