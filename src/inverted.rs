@@ -678,7 +678,10 @@ impl InvertedIndex {
 
         let shard_minimizers = &self.minimizers[start_idx..end_idx];
         let min_start = shard_minimizers[0];
-        let min_end = if is_last_shard {
+        // min_end is 0 for the last shard, or when end_idx == len (no next minimizer).
+        // The latter happens when building 1:1 inverted shards from main shards,
+        // where each shard contains all its minimizers but isn't marked as last.
+        let min_end = if is_last_shard || end_idx >= self.minimizers.len() {
             0
         } else {
             self.minimizers[end_idx]
@@ -1506,6 +1509,43 @@ mod tests {
 
         let hits = loaded.get_bucket_hits(&[100, 200, 300, 400, 500]);
         assert_eq!(hits.get(&1), Some(&3));
+
+        Ok(())
+    }
+
+    /// Regression test for panic when saving a full-range shard with is_last_shard=false.
+    /// This happens when building 1:1 inverted shards from a sharded main index,
+    /// where each inverted shard contains all minimizers (end_idx = len) but only
+    /// the final shard has is_last_shard=true.
+    #[test]
+    fn test_shard_full_range_not_last() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        let mut index = Index::new(64, 50, 0x9999).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300, 400, 500]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        assert_eq!(inverted.num_minimizers(), 5);
+
+        // This is the scenario that caused the panic: saving full range with is_last_shard=false
+        // This happens when building 1:1 inverted shards from sharded main index
+        let shard_info = inverted.save_shard(&path, 0, 0, inverted.num_minimizers(), false)?;
+
+        assert_eq!(shard_info.shard_id, 0);
+        assert_eq!(shard_info.num_minimizers, 5);
+        assert!(!shard_info.is_last_shard);
+        assert_eq!(shard_info.min_start, 100);
+        // When end_idx == len, min_end should be 0 (no next minimizer)
+        assert_eq!(shard_info.min_end, 0);
+
+        // Verify the shard can be loaded and used
+        let loaded = InvertedIndex::load_shard(&path)?;
+        assert_eq!(loaded.num_minimizers(), 5);
+
+        let hits = loaded.get_bucket_hits(&[100, 200, 300, 400, 500]);
+        assert_eq!(hits.get(&1), Some(&5));
 
         Ok(())
     }
