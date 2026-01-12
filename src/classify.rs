@@ -205,6 +205,82 @@ pub fn classify_batch_sharded_sequential(
     Ok(results)
 }
 
+/// Classify a batch of records against a sharded inverted index using merge-join.
+///
+/// Builds a QueryInvertedIndex once, then processes each shard sequentially
+/// using merge-join. This is more efficient than `classify_batch_sharded_sequential`
+/// when there is high minimizer overlap across reads.
+///
+/// Memory complexity: O(batch_size * minimizers_per_read) + O(single_shard_size)
+///
+/// # Arguments
+/// * `sharded` - The sharded inverted index
+/// * `records` - Batch of query records
+/// * `threshold` - Minimum score threshold
+///
+/// # Returns
+/// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
+pub fn classify_batch_sharded_merge_join(
+    sharded: &ShardedInvertedIndex,
+    records: &[QueryRecord],
+    threshold: f64,
+) -> Result<Vec<HitResult>> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let manifest = sharded.manifest();
+    let base_path = sharded.base_path();
+
+    // Extract minimizers in parallel
+    let extracted: Vec<_> = records.par_iter()
+        .map_init(MinimizerWorkspace::new, |ws, (_, s1, s2)| {
+            get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws)
+        }).collect();
+
+    // Collect query IDs
+    let query_ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
+
+    // Build query inverted index
+    let query_idx = QueryInvertedIndex::build(&extracted);
+
+    let num_reads = query_idx.num_reads();
+    if num_reads == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Per-read accumulator: bucket_id -> (fwd_hits, rc_hits)
+    let mut accumulators: Vec<HashMap<u32, (u32, u32)>> = (0..num_reads)
+        .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
+        .collect();
+
+    // Process each shard sequentially
+    for shard_info in &manifest.shards {
+        let shard_path = ShardManifest::shard_path(base_path, shard_info.shard_id);
+        let shard = InvertedIndex::load_shard(&shard_path)?;
+
+        // Accumulate hits from this shard
+        accumulate_merge_join(&query_idx, &shard, &mut accumulators);
+        // shard dropped here, freeing memory before loading next
+    }
+
+    // Score and filter
+    let mut results = Vec::new();
+    for (read_idx, buckets) in accumulators.into_iter().enumerate() {
+        let fwd_total = query_idx.fwd_counts[read_idx] as usize;
+        let rc_total = query_idx.rc_counts[read_idx] as usize;
+        let query_id = query_ids[read_idx];
+
+        for (bucket_id, (fwd_hits, rc_hits)) in buckets {
+            let score = compute_score(fwd_hits as usize, fwd_total, rc_hits as usize, rc_total);
+            if score >= threshold {
+                results.push(HitResult { query_id, bucket_id, score });
+            }
+        }
+    }
+    Ok(results)
+}
+
 /// Classify a batch of records against a sharded main index.
 ///
 /// Loads one shard at a time to minimize memory usage. For each shard,
@@ -435,30 +511,16 @@ pub fn classify_batch_merge_join(
     threshold: f64,
 ) -> Vec<HitResult> {
     let num_reads = query_idx.num_reads();
-    if num_reads == 0 || query_idx.num_minimizers() == 0 || ref_idx.num_minimizers() == 0 {
+    if num_reads == 0 {
         return Vec::new();
     }
 
     // Per-read accumulator: bucket_id -> (fwd_hits, rc_hits)
-    // Pre-allocate with estimated capacity to reduce rehashing
     let mut accumulators: Vec<HashMap<u32, (u32, u32)>> = (0..num_reads)
         .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
         .collect();
 
-    // Choose algorithm based on size ratio
-    let q_len = query_idx.minimizers.len();
-    let r_len = ref_idx.minimizers.len();
-
-    if q_len * GALLOP_THRESHOLD < r_len {
-        // Query much smaller: gallop through reference
-        gallop_join(query_idx, ref_idx, &mut accumulators, true);
-    } else if r_len * GALLOP_THRESHOLD < q_len {
-        // Reference much smaller: gallop through query
-        gallop_join(query_idx, ref_idx, &mut accumulators, false);
-    } else {
-        // Similar sizes: pure merge-join
-        merge_join(query_idx, ref_idx, &mut accumulators);
-    }
+    accumulate_merge_join(query_idx, ref_idx, &mut accumulators);
 
     // Score and filter
     let mut results = Vec::new();
@@ -474,7 +536,6 @@ pub fn classify_batch_merge_join(
             }
         }
     }
-
     results
 }
 
@@ -561,6 +622,34 @@ fn gallop_join(
                 larger_pos += rel_idx;
             }
         }
+    }
+}
+
+/// Accumulate hits from merge-join into existing accumulators.
+///
+/// This is the core accumulation logic extracted for reuse by sharded classification.
+/// Chooses between pure merge-join and galloping based on size ratio.
+fn accumulate_merge_join(
+    query_idx: &QueryInvertedIndex,
+    ref_idx: &InvertedIndex,
+    accumulators: &mut [HashMap<u32, (u32, u32)>],
+) {
+    if query_idx.num_minimizers() == 0 || ref_idx.num_minimizers() == 0 {
+        return;
+    }
+
+    let q_len = query_idx.minimizers.len();
+    let r_len = ref_idx.minimizers.len();
+
+    if q_len * GALLOP_THRESHOLD < r_len {
+        // Query much smaller: gallop through reference
+        gallop_join(query_idx, ref_idx, accumulators, true);
+    } else if r_len * GALLOP_THRESHOLD < q_len {
+        // Reference much smaller: gallop through query
+        gallop_join(query_idx, ref_idx, accumulators, false);
+    } else {
+        // Similar sizes: pure merge-join
+        merge_join(query_idx, ref_idx, accumulators);
     }
 }
 
@@ -743,6 +832,60 @@ mod tests {
             assert_eq!(inv.bucket_id, seq.bucket_id, "Bucket IDs should match");
             assert!((inv.score - seq.score).abs() < 0.001,
                 "Scores should match: {} vs {}", inv.score, seq.score);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_classify_batch_sharded_merge_join_matches_sequential() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        let mut index = Index::new(32, 10, 0x1234).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq2 = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+
+        index.add_record(1, "ref1", seq1, &mut ws);
+        index.add_record(2, "ref2", seq2, &mut ws);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.finalize_bucket(1);
+        index.finalize_bucket(2);
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_sharded(&base_path, 4)?;
+        let sharded = ShardedInvertedIndex::open(&base_path)?;
+
+        let query1: &[u8] = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let query2: &[u8] = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+        let records: Vec<QueryRecord> = vec![
+            (0, query1, None),
+            (1, query2, None),
+        ];
+
+        let threshold = 0.1;
+
+        let results_sequential = classify_batch_sharded_sequential(&sharded, &records, threshold)?;
+        let results_merge_join = classify_batch_sharded_merge_join(&sharded, &records, threshold)?;
+
+        assert_eq!(results_sequential.len(), results_merge_join.len(),
+            "Result counts should match: sequential={}, merge_join={}",
+            results_sequential.len(), results_merge_join.len());
+
+        let mut sorted_sequential = results_sequential.clone();
+        sorted_sequential.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
+
+        let mut sorted_merge_join = results_merge_join.clone();
+        sorted_merge_join.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
+
+        for (seq, mj) in sorted_sequential.iter().zip(sorted_merge_join.iter()) {
+            assert_eq!(seq.query_id, mj.query_id, "Query IDs should match");
+            assert_eq!(seq.bucket_id, mj.bucket_id, "Bucket IDs should match");
+            assert!((seq.score - mj.score).abs() < 0.001,
+                "Scores should match: {} vs {}", seq.score, mj.score);
         }
 
         Ok(())

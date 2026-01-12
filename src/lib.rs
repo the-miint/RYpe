@@ -85,6 +85,7 @@ pub use classify::{
     classify_batch,
     classify_batch_inverted,
     classify_batch_sharded_sequential,
+    classify_batch_sharded_merge_join,
     classify_batch_sharded_main,
     classify_batch_merge_join,
     classify_batch_with_query_index,

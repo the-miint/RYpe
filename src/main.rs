@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use anyhow::{Context, Result, anyhow};
 
-use rype::{Index, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, classify_batch_sharded_sequential, classify_batch_sharded_main, aggregate_batch, ShardManifest, ShardedInvertedIndex, MainIndexManifest, MainIndexShard, ShardedMainIndex, extract_into, extract_with_positions, Strand};
+use rype::{Index, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, classify_batch_with_query_index, classify_batch_sharded_sequential, classify_batch_sharded_merge_join, classify_batch_sharded_main, aggregate_batch, ShardManifest, ShardedInvertedIndex, MainIndexManifest, MainIndexShard, ShardedMainIndex, extract_into, extract_with_positions, Strand};
 use rype::config::{parse_config, validate_config, resolve_path};
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -166,6 +166,9 @@ enum ClassifyCommands {
         /// Use inverted index (.ryxdi) for faster classification
         #[arg(short = 'I', long)]
         use_inverted: bool,
+        /// Use merge-join with query inverted index (requires --use-inverted)
+        #[arg(short = 'M', long)]
+        merge_join: bool,
     },
 
     /// Batch classify reads (alias for 'run')
@@ -185,6 +188,9 @@ enum ClassifyCommands {
         /// Use inverted index (.ryxdi) for faster classification
         #[arg(short = 'I', long)]
         use_inverted: bool,
+        /// Use merge-join with query inverted index (requires --use-inverted)
+        #[arg(short = 'M', long)]
+        merge_join: bool,
     },
 
     /// Aggregate classification (higher sensitivity, aggregates paired-end reads)
@@ -881,8 +887,11 @@ fn main() -> Result<()> {
         },
 
         Commands::Classify(classify_cmd) => match classify_cmd {
-            ClassifyCommands::Run { index, r1, r2, threshold, batch_size, output, use_inverted } |
-            ClassifyCommands::Batch { index, r1, r2, threshold, batch_size, output, use_inverted } => {
+            ClassifyCommands::Run { index, r1, r2, threshold, batch_size, output, use_inverted, merge_join } |
+            ClassifyCommands::Batch { index, r1, r2, threshold, batch_size, output, use_inverted, merge_join } => {
+                if merge_join && !use_inverted {
+                    return Err(anyhow!("--merge-join requires --use-inverted"));
+                }
                 if use_inverted {
                     // Use inverted index path - detect sharded vs single-file format
                     let inverted_path = index.with_extension("ryxdi");
@@ -909,7 +918,11 @@ fn main() -> Result<()> {
                         sharded.validate_against_metadata(&metadata)?;
                         log::info!("Sharded index validated successfully");
 
-                        log::info!("Starting classification with sequential shard loading (batch_size={})", batch_size);
+                        if merge_join {
+                            log::info!("Starting merge-join classification with sequential shard loading (batch_size={})", batch_size);
+                        } else {
+                            log::info!("Starting classification with sequential shard loading (batch_size={})", batch_size);
+                        }
 
                         while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
                             batch_num += 1;
@@ -920,7 +933,11 @@ fn main() -> Result<()> {
                                 .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                                 .collect();
 
-                            let results = classify_batch_sharded_sequential(&sharded, &batch_refs, threshold)?;
+                            let results = if merge_join {
+                                classify_batch_sharded_merge_join(&sharded, &batch_refs, threshold)?
+                            } else {
+                                classify_batch_sharded_sequential(&sharded, &batch_refs, threshold)?
+                            };
 
                             let mut chunk_out = Vec::with_capacity(1024);
                             for res in results {
@@ -943,7 +960,11 @@ fn main() -> Result<()> {
                         inverted.validate_against_metadata(&metadata)?;
                         log::info!("Inverted index validated successfully");
 
-                        log::info!("Starting classification with inverted index (batch_size={})", batch_size);
+                        if merge_join {
+                            log::info!("Starting merge-join classification with inverted index (batch_size={})", batch_size);
+                        } else {
+                            log::info!("Starting classification with inverted index (batch_size={})", batch_size);
+                        }
 
                         while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
                             batch_num += 1;
@@ -954,7 +975,11 @@ fn main() -> Result<()> {
                                 .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                                 .collect();
 
-                            let results = classify_batch_inverted(&inverted, &batch_refs, threshold);
+                            let results = if merge_join {
+                                classify_batch_with_query_index(&inverted, &batch_refs, threshold)
+                            } else {
+                                classify_batch_inverted(&inverted, &batch_refs, threshold)
+                            };
 
                             let mut chunk_out = Vec::with_capacity(1024);
                             for res in results {
