@@ -644,8 +644,9 @@ fn gallop_join(
             jump *= 2;
         }
 
-        // Binary search in [larger_pos, larger_pos + jump]
-        let search_end = (larger_pos + jump).min(larger.len());
+        // Binary search in [larger_pos, larger_pos + jump] (inclusive)
+        // Note: +1 because the match could be AT position larger_pos + jump
+        let search_end = (larger_pos + jump + 1).min(larger.len());
         match larger[larger_pos..search_end].binary_search(&s_min) {
             Ok(rel_idx) => {
                 let larger_idx = larger_pos + rel_idx;
@@ -1176,6 +1177,41 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].bucket_id, 1);
         assert_eq!(results[0].score, 1.0);  // 1/1 fwd minimizers matched
+    }
+
+    #[test]
+    fn test_galloping_search_boundary_case() {
+        // This test triggers an off-by-one bug in gallop_join where matches
+        // at the gallop boundary position (larger_pos + jump) are missed.
+        //
+        // With query = [10] and ref = [0, 10, 20, ...], larger_pos=0:
+        // - gallop: jump=1, larger[1]=10, 10 < 10? NO → exit
+        // - search_end = min(0 + 1, len) = 1
+        // - search larger[0..1] = [0] for 10 → NOT FOUND (bug!)
+        //
+        // The match at position 1 is excluded from the search range.
+        let queries = vec![
+            (vec![10], vec![]),  // Single minimizer at boundary position
+        ];
+        let query_idx = QueryInvertedIndex::build(&queries);
+
+        // Large reference to trigger galloping (need q_len * 16 < r_len)
+        let mut index = Index::new(64, 50, 0).unwrap();
+        let minimizers: Vec<u64> = (0..100).map(|i| i * 10).collect(); // [0, 10, 20, ...]
+        index.buckets.insert(1, minimizers);
+        index.bucket_names.insert(1, "A".into());
+
+        let ref_idx = InvertedIndex::build_from_index(&index);
+        let query_ids = vec![101i64];
+
+        // 10 is at position 1 in the reference (1 * 10 = 10)
+        let results = classify_batch_merge_join(&query_idx, &ref_idx, &query_ids, 0.0);
+
+        // This assertion will FAIL with the bug (results.len() == 0)
+        // and PASS after the fix (results.len() == 1)
+        assert_eq!(results.len(), 1, "Minimizer at boundary position should be found");
+        assert_eq!(results[0].bucket_id, 1);
+        assert_eq!(results[0].score, 1.0);
     }
 
     #[test]
