@@ -1623,6 +1623,7 @@ mod tests {
             salt: 0x1234,
             shard_id: 0,
             buckets: HashMap::new(),
+            bucket_sources: HashMap::new(),
         };
         shard.buckets.insert(1, vec![100, 200, 300]);
         shard.buckets.insert(2, vec![200, 300, 400]);
@@ -1655,6 +1656,7 @@ mod tests {
             salt: 0xABCD,
             shard_id: 5,
             buckets: HashMap::new(),
+            bucket_sources: HashMap::new(),
         };
 
         let inverted = InvertedIndex::build_from_shard(&shard);
@@ -1676,6 +1678,7 @@ mod tests {
             salt: 0x5678,
             shard_id: 0,
             buckets: HashMap::new(),
+            bucket_sources: HashMap::new(),
         };
         shard.buckets.insert(42, vec![10, 20, 30, 40, 50]);
 
@@ -1700,6 +1703,7 @@ mod tests {
             salt: 0,
             shard_id: 0,
             buckets: HashMap::new(),
+            bucket_sources: HashMap::new(),
         };
         let shared_mins = vec![100, 200, 300, 400, 500];
         shard.buckets.insert(1, shared_mins.clone());
@@ -1740,6 +1744,7 @@ mod tests {
             salt: 0x1234,
             shard_id: 0,
             buckets: HashMap::new(),
+            bucket_sources: HashMap::new(),
         };
         shard.buckets.insert(1, vec![100, 200, 300]);
         shard.buckets.insert(2, vec![200, 300, 400]);

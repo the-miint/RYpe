@@ -23,6 +23,16 @@ use crate::types::IndexMetadata;
 /// Maximum number of shards allowed (DoS protection)
 pub const MAX_MAIN_SHARDS: u32 = 10_000;
 
+/// Maximum total size of the string table in bytes (DoS protection)
+/// 100MB should be plenty for even very large indices
+pub const MAX_STRING_TABLE_BYTES: usize = 100_000_000;
+
+/// Maximum number of unique filenames in string table (DoS protection)
+pub const MAX_STRING_TABLE_ENTRIES: u32 = 10_000_000;
+
+/// Maximum number of sources per bucket (DoS protection)
+pub const MAX_SOURCES_PER_BUCKET: usize = 100_000_000;
+
 /// Default bytes per minimizer estimate for shard planning (delta+varint+zstd)
 pub const BYTES_PER_MINIMIZER_ESTIMATE: usize = 4;
 
@@ -41,21 +51,23 @@ pub struct MainIndexShardInfo {
 
 /// Manifest describing a sharded main index.
 ///
-/// Format v1:
+/// Format v2 (current):
 /// - Magic: "RYPM" (4 bytes)
-/// - Version: 1 (u32)
+/// - Version: 2 (u32)
 /// - k (u64), w (u64), salt (u64)
 /// - num_buckets (u32), num_shards (u32), total_minimizers (u64)
 /// - For each bucket (sorted by ID): bucket_id (u32), shard_id (u32), minimizer_count (u64),
-///   name_len (u64), name bytes, source_count (u64), [source_len (u64), source bytes]...
+///   name_len (u64), name bytes
 /// - For each shard: shard_id (u32), bucket_count (u32), num_minimizers (u64), compressed_size (u64)
+///
+/// Note: Sources are stored in shard files, not in the manifest (moved in v2 for size reduction).
+/// Format v1 stored sources in the manifest; v1 files are still readable for backward compatibility.
 #[derive(Debug, Clone)]
 pub struct MainIndexManifest {
     pub k: usize,
     pub w: usize,
     pub salt: u64,
     pub bucket_names: HashMap<u32, String>,
-    pub bucket_sources: HashMap<u32, Vec<String>>,
     pub bucket_minimizer_counts: HashMap<u32, usize>,
     pub bucket_to_shard: HashMap<u32, u32>,
     pub shards: Vec<MainIndexShardInfo>,
@@ -63,13 +75,15 @@ pub struct MainIndexManifest {
 }
 
 impl MainIndexManifest {
-    /// Save the manifest to a file.
+    /// Save the manifest to a file (v2 format - sources stored in shards).
     pub fn save(&self, path: &Path) -> Result<()> {
-        let mut writer = BufWriter::new(File::create(path)?);
+        // Write to a temporary file, then atomically rename for crash safety
+        let temp_path = path.with_extension("tmp");
+        let mut writer = BufWriter::new(File::create(&temp_path)?);
 
         // Header
         writer.write_all(b"RYPM")?;
-        writer.write_all(&1u32.to_le_bytes())?; // Version 1
+        writer.write_all(&2u32.to_le_bytes())?; // Version 2
 
         writer.write_all(&(self.k as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
@@ -80,7 +94,7 @@ impl MainIndexManifest {
         writer.write_all(&(self.shards.len() as u32).to_le_bytes())?;
         writer.write_all(&(self.total_minimizers as u64).to_le_bytes())?;
 
-        // Bucket metadata (sorted by ID)
+        // Bucket metadata (sorted by ID) - no sources in v2
         let mut sorted_bucket_ids: Vec<_> = self.bucket_names.keys().copied().collect();
         sorted_bucket_ids.sort_unstable();
 
@@ -98,16 +112,6 @@ impl MainIndexManifest {
             let name_bytes = name.as_bytes();
             writer.write_all(&(name_bytes.len() as u64).to_le_bytes())?;
             writer.write_all(name_bytes)?;
-
-            // Sources
-            let empty = Vec::new();
-            let sources = self.bucket_sources.get(bucket_id).unwrap_or(&empty);
-            writer.write_all(&(sources.len() as u64).to_le_bytes())?;
-            for src in sources {
-                let src_bytes = src.as_bytes();
-                writer.write_all(&(src_bytes.len() as u64).to_le_bytes())?;
-                writer.write_all(src_bytes)?;
-            }
         }
 
         // Shard info
@@ -119,10 +123,24 @@ impl MainIndexManifest {
         }
 
         writer.flush()?;
+
+        // fsync to ensure data is persisted to disk
+        let file = writer.into_inner()?;
+        file.sync_all()?;
+
+        // Drop the file handle before rename
+        drop(file);
+
+        // Atomically rename temp file to final path
+        std::fs::rename(&temp_path, path)?;
+
         Ok(())
     }
 
-    /// Load a manifest from a file.
+    /// Load a manifest from a file (supports v1 and v2 formats).
+    ///
+    /// Note: v1 manifests stored sources in the manifest; these are skipped on load
+    /// since sources are now stored in shard files. Re-index to get source support.
     pub fn load(path: &Path) -> Result<Self> {
         let mut reader = BufReader::new(File::open(path)?);
         let mut buf4 = [0u8; 4];
@@ -136,8 +154,8 @@ impl MainIndexManifest {
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != 1 {
-            return Err(anyhow!("Unsupported main index manifest version: {} (expected 1)", version));
+        if version != 1 && version != 2 {
+            return Err(anyhow!("Unsupported main index manifest version: {} (expected 1 or 2)", version));
         }
 
         reader.read_exact(&mut buf8)?;
@@ -169,7 +187,6 @@ impl MainIndexManifest {
 
         // Bucket metadata
         let mut bucket_names = HashMap::new();
-        let mut bucket_sources = HashMap::new();
         let mut bucket_minimizer_counts = HashMap::new();
         let mut bucket_to_shard = HashMap::new();
 
@@ -197,23 +214,23 @@ impl MainIndexManifest {
             reader.read_exact(&mut name_buf)?;
             let name = String::from_utf8(name_buf)?;
 
-            // Sources
-            reader.read_exact(&mut buf8)?;
-            let source_count = u64::from_le_bytes(buf8) as usize;
-            let mut sources = Vec::with_capacity(source_count);
-            for _ in 0..source_count {
+            // v1 format has sources in manifest - skip them (now stored in shards)
+            if version == 1 {
                 reader.read_exact(&mut buf8)?;
-                let src_len = u64::from_le_bytes(buf8) as usize;
-                if src_len > MAX_STRING_LENGTH {
-                    return Err(anyhow!("Source string length {} exceeds maximum {}", src_len, MAX_STRING_LENGTH));
+                let source_count = u64::from_le_bytes(buf8) as usize;
+                for _ in 0..source_count {
+                    reader.read_exact(&mut buf8)?;
+                    let src_len = u64::from_le_bytes(buf8) as usize;
+                    if src_len > MAX_STRING_LENGTH {
+                        return Err(anyhow!("Source string length {} exceeds maximum {}", src_len, MAX_STRING_LENGTH));
+                    }
+                    // Skip the source bytes
+                    let mut src_buf = vec![0u8; src_len];
+                    reader.read_exact(&mut src_buf)?;
                 }
-                let mut src_buf = vec![0u8; src_len];
-                reader.read_exact(&mut src_buf)?;
-                sources.push(String::from_utf8(src_buf)?);
             }
 
             bucket_names.insert(bucket_id, name);
-            bucket_sources.insert(bucket_id, sources);
             bucket_minimizer_counts.insert(bucket_id, minimizer_count);
             bucket_to_shard.insert(bucket_id, shard_id);
         }
@@ -272,7 +289,6 @@ impl MainIndexManifest {
             w,
             salt,
             bucket_names,
-            bucket_sources,
             bucket_minimizer_counts,
             bucket_to_shard,
             shards,
@@ -302,19 +318,27 @@ impl MainIndexManifest {
     }
 
     /// Convert to IndexMetadata for compatibility with existing code.
+    ///
+    /// Note: bucket_sources will be empty since sources are stored in shards.
+    /// Use ShardedMainIndex::get_bucket_sources() to retrieve sources.
     pub fn to_metadata(&self) -> IndexMetadata {
         IndexMetadata {
             k: self.k,
             w: self.w,
             salt: self.salt,
             bucket_names: self.bucket_names.clone(),
-            bucket_sources: self.bucket_sources.clone(),
+            bucket_sources: HashMap::new(), // Sources are in shards, not manifest
             bucket_minimizer_counts: self.bucket_minimizer_counts.clone(),
         }
     }
 }
 
+/// Delimiter used to separate filename from sequence name in source strings.
+pub const SOURCE_DELIM: &str = "::";
+
 /// A single loaded shard containing a subset of buckets.
+///
+/// Shards now store both minimizers and sources (v2 format).
 #[derive(Debug)]
 pub struct MainIndexShard {
     pub k: usize,
@@ -322,27 +346,58 @@ pub struct MainIndexShard {
     pub salt: u64,
     pub shard_id: u32,
     pub buckets: HashMap<u32, Vec<u64>>,
+    pub bucket_sources: HashMap<u32, Vec<String>>,
 }
 
 impl MainIndexShard {
-    /// Save the shard to a file (RYPS v1 format with delta+varint+zstd).
+    /// Save the shard to a file (RYPS v2 format with sources and string deduplication).
+    ///
+    /// Format v2:
+    /// - Header (uncompressed): magic "RYPS", version 2, k, w, salt, shard_id, num_buckets
+    /// - Compressed stream (zstd):
+    ///   - String table: num_filenames (u32), then [len (varint), bytes]...
+    ///   - For each bucket (sorted by ID):
+    ///     - bucket_id (u32), minimizer_count (u64), source_count (u64)
+    ///     - Sources: [filename_idx (varint), seqname_len (varint), seqname bytes]...
+    ///     - Minimizers: first (u64), then deltas as varints
     pub fn save(&self, path: &Path) -> Result<u64> {
-        let mut writer = BufWriter::new(File::create(path)?);
+        // Write to a temporary file, then atomically rename for crash safety
+        let temp_path = path.with_extension("tmp");
+        let mut writer = BufWriter::new(File::create(&temp_path)?);
 
         // Header (uncompressed)
         writer.write_all(b"RYPS")?;
-        writer.write_all(&1u32.to_le_bytes())?; // Version 1
+        writer.write_all(&2u32.to_le_bytes())?; // Version 2
         writer.write_all(&(self.k as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
         writer.write_all(&self.salt.to_le_bytes())?;
         writer.write_all(&self.shard_id.to_le_bytes())?;
         writer.write_all(&(self.buckets.len() as u32).to_le_bytes())?;
 
-        // Bucket data with delta+varint encoding (zstd compressed)
-        let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
+        // Build string table from all sources (deduplicate filenames)
+        let mut filename_to_idx: HashMap<String, u32> = HashMap::new();
+        let mut filenames: Vec<String> = Vec::new();
 
-        let mut sorted_ids: Vec<_> = self.buckets.keys().copied().collect();
-        sorted_ids.sort_unstable();
+        let empty_sources = Vec::new();
+        for bucket_id in self.buckets.keys() {
+            let sources = self.bucket_sources.get(bucket_id).unwrap_or(&empty_sources);
+            for source in sources {
+                let filename = source.split(SOURCE_DELIM).next().unwrap_or(source);
+                if !filename_to_idx.contains_key(filename) {
+                    // Check for string table overflow
+                    let idx = u32::try_from(filenames.len())
+                        .map_err(|_| anyhow!("String table overflow: more than {} unique filenames", u32::MAX))?;
+                    if idx >= MAX_STRING_TABLE_ENTRIES {
+                        return Err(anyhow!("String table overflow: more than {} unique filenames", MAX_STRING_TABLE_ENTRIES));
+                    }
+                    filename_to_idx.insert(filename.to_string(), idx);
+                    filenames.push(filename.to_string());
+                }
+            }
+        }
+
+        // Compressed stream
+        let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
 
         const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024;
         let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
@@ -356,45 +411,95 @@ impl MainIndexShard {
             Ok(())
         };
 
-        for id in &sorted_ids {
-            let vec = &self.buckets[id];
-
-            // Bucket ID and minimizer count (uncompressed within stream)
-            write_buf.extend_from_slice(&id.to_le_bytes());
-            write_buf.extend_from_slice(&(vec.len() as u64).to_le_bytes());
-
-            if vec.is_empty() {
-                continue;
-            }
-
-            // First minimizer: full u64
-            write_buf.extend_from_slice(&vec[0].to_le_bytes());
+        // Write string table (with overflow check)
+        let num_filenames = u32::try_from(filenames.len())
+            .map_err(|_| anyhow!("String table overflow: more than {} unique filenames", u32::MAX))?;
+        write_buf.extend_from_slice(&num_filenames.to_le_bytes());
+        for filename in &filenames {
+            let bytes = filename.as_bytes();
+            let len = encode_varint(bytes.len() as u64, &mut varint_buf);
+            write_buf.extend_from_slice(&varint_buf[..len]);
+            write_buf.extend_from_slice(bytes);
             if write_buf.len() >= WRITE_BUF_SIZE {
                 flush_buf(&mut write_buf, &mut encoder)?;
             }
+        }
 
-            // Remaining: delta-encoded varints
-            let mut prev = vec[0];
-            for &val in &vec[1..] {
-                let delta = val - prev;
-                let len = encode_varint(delta, &mut varint_buf);
+        // Write buckets
+        let mut sorted_ids: Vec<_> = self.buckets.keys().copied().collect();
+        sorted_ids.sort_unstable();
+
+        for id in &sorted_ids {
+            let minimizers = &self.buckets[id];
+            let sources = self.bucket_sources.get(id).unwrap_or(&empty_sources);
+
+            // Bucket ID, minimizer count, source count
+            write_buf.extend_from_slice(&id.to_le_bytes());
+            write_buf.extend_from_slice(&(minimizers.len() as u64).to_le_bytes());
+            write_buf.extend_from_slice(&(sources.len() as u64).to_le_bytes());
+
+            // Sources with string deduplication
+            for source in sources {
+                let mut parts = source.splitn(2, SOURCE_DELIM);
+                let filename = parts.next().unwrap_or(source);
+                let seqname = parts.next().unwrap_or("");
+
+                let filename_idx = filename_to_idx.get(filename).copied().unwrap_or(0);
+                let len = encode_varint(filename_idx as u64, &mut varint_buf);
                 write_buf.extend_from_slice(&varint_buf[..len]);
+
+                let seqname_bytes = seqname.as_bytes();
+                let len = encode_varint(seqname_bytes.len() as u64, &mut varint_buf);
+                write_buf.extend_from_slice(&varint_buf[..len]);
+                write_buf.extend_from_slice(seqname_bytes);
+
                 if write_buf.len() >= WRITE_BUF_SIZE {
                     flush_buf(&mut write_buf, &mut encoder)?;
                 }
-                prev = val;
+            }
+
+            // Minimizers
+            if !minimizers.is_empty() {
+                write_buf.extend_from_slice(&minimizers[0].to_le_bytes());
+                if write_buf.len() >= WRITE_BUF_SIZE {
+                    flush_buf(&mut write_buf, &mut encoder)?;
+                }
+
+                let mut prev = minimizers[0];
+                for &val in &minimizers[1..] {
+                    let delta = val - prev;
+                    let len = encode_varint(delta, &mut varint_buf);
+                    write_buf.extend_from_slice(&varint_buf[..len]);
+                    if write_buf.len() >= WRITE_BUF_SIZE {
+                        flush_buf(&mut write_buf, &mut encoder)?;
+                    }
+                    prev = val;
+                }
             }
         }
         flush_buf(&mut write_buf, &mut encoder)?;
 
         let writer = encoder.finish()?;
-        let inner = writer.into_inner()?;
-        let compressed_size = inner.metadata()?.len();
+        let file = writer.into_inner()?;
+
+        // fsync to ensure data is persisted to disk
+        file.sync_all()?;
+
+        let compressed_size = file.metadata()?.len();
+
+        // Drop the file handle before rename
+        drop(file);
+
+        // Atomically rename temp file to final path
+        std::fs::rename(&temp_path, path)?;
 
         Ok(compressed_size)
     }
 
-    /// Load a shard from a file (RYPS v1 format).
+    /// Load a shard from a file (supports RYPS v1 and v2 formats).
+    ///
+    /// v1 format: minimizers only (no sources)
+    /// v2 format: minimizers + sources with string deduplication
     pub fn load(path: &Path) -> Result<Self> {
         let mut reader = BufReader::new(File::open(path)?);
         let mut buf4 = [0u8; 4];
@@ -408,8 +513,8 @@ impl MainIndexShard {
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != 1 {
-            return Err(anyhow!("Unsupported main index shard version: {} (expected 1)", version));
+        if version != 1 && version != 2 {
+            return Err(anyhow!("Unsupported main index shard version: {} (expected 1 or 2)", version));
         }
 
         reader.read_exact(&mut buf8)?;
@@ -433,7 +538,7 @@ impl MainIndexShard {
             return Err(anyhow!("Number of buckets {} exceeds maximum {}", num_buckets, MAX_NUM_BUCKETS));
         }
 
-        // Bucket data with delta+varint decoding (zstd compressed)
+        // Compressed stream
         let mut decoder = zstd::stream::read::Decoder::new(reader)
             .map_err(|e| anyhow!("Failed to create zstd decoder: {}", e))?;
 
@@ -442,88 +547,213 @@ impl MainIndexShard {
         let mut buf_pos = 0usize;
         let mut buf_len = 0usize;
 
-        let mut buckets = HashMap::new();
-
-        for _ in 0..num_buckets {
-            // Helper to ensure bytes available
-            macro_rules! ensure_bytes {
-                ($need:expr) => {{
-                    let need = $need;
-                    if buf_pos + need > buf_len {
-                        if buf_pos > 0 {
-                            read_buf.copy_within(buf_pos..buf_len, 0);
-                            buf_len -= buf_pos;
-                            buf_pos = 0;
-                        }
-                        while buf_len < need {
-                            let n = decoder.read(&mut read_buf[buf_len..])?;
-                            if n == 0 {
-                                return Err(anyhow!("Unexpected end of compressed data"));
-                            }
-                            buf_len += n;
-                        }
-                    }
-                }};
-            }
-
-            macro_rules! refill_if_low {
-                () => {{
-                    if buf_pos >= buf_len {
-                        buf_pos = 0;
-                        let n = decoder.read(&mut read_buf)?;
-                        if n == 0 {
-                            return Err(anyhow!("Unexpected end of compressed data"));
-                        }
-                        buf_len = n;
-                    } else if buf_len - buf_pos < 10 {
+        // Helper macros for buffered reading
+        macro_rules! ensure_bytes {
+            ($need:expr) => {{
+                let need = $need;
+                if buf_pos + need > buf_len {
+                    if buf_pos > 0 {
                         read_buf.copy_within(buf_pos..buf_len, 0);
                         buf_len -= buf_pos;
                         buf_pos = 0;
+                    }
+                    while buf_len < need {
                         let n = decoder.read(&mut read_buf[buf_len..])?;
+                        if n == 0 {
+                            return Err(anyhow!("Unexpected end of compressed data"));
+                        }
                         buf_len += n;
                     }
-                }};
+                }
+            }};
+        }
+
+        macro_rules! refill_if_low {
+            () => {{
+                if buf_pos >= buf_len {
+                    buf_pos = 0;
+                    let n = decoder.read(&mut read_buf)?;
+                    if n == 0 {
+                        return Err(anyhow!("Unexpected end of compressed data"));
+                    }
+                    buf_len = n;
+                } else if buf_len - buf_pos < 10 {
+                    read_buf.copy_within(buf_pos..buf_len, 0);
+                    buf_len -= buf_pos;
+                    buf_pos = 0;
+                    let n = decoder.read(&mut read_buf[buf_len..])?;
+                    buf_len += n;
+                }
+            }};
+        }
+
+        // For v2, read string table first
+        let filenames: Vec<String> = if version == 2 {
+            ensure_bytes!(4);
+            let num_filenames = u32::from_le_bytes(read_buf[buf_pos..buf_pos + 4].try_into().unwrap());
+            buf_pos += 4;
+
+            // Validate string table entry count
+            if num_filenames > MAX_STRING_TABLE_ENTRIES {
+                return Err(anyhow!(
+                    "String table has {} entries, exceeds maximum {}",
+                    num_filenames,
+                    MAX_STRING_TABLE_ENTRIES
+                ));
             }
 
+            let num_filenames = num_filenames as usize;
+            let mut names = Vec::with_capacity(num_filenames);
+            let mut total_string_bytes: usize = 0;
+
+            for _ in 0..num_filenames {
+                refill_if_low!();
+                let (str_len, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
+                buf_pos += consumed;
+
+                // Validate string length with overflow-safe conversion
+                let str_len = usize::try_from(str_len).map_err(|_| {
+                    anyhow!("Filename length {} overflows usize", str_len)
+                })?;
+
+                if str_len > MAX_STRING_LENGTH {
+                    return Err(anyhow!("Filename length {} exceeds maximum {}", str_len, MAX_STRING_LENGTH));
+                }
+
+                // Track total bytes for DoS protection
+                total_string_bytes = total_string_bytes.saturating_add(str_len);
+                if total_string_bytes > MAX_STRING_TABLE_BYTES {
+                    return Err(anyhow!(
+                        "String table exceeds {} bytes limit",
+                        MAX_STRING_TABLE_BYTES
+                    ));
+                }
+
+                ensure_bytes!(str_len);
+                let name = String::from_utf8(read_buf[buf_pos..buf_pos + str_len].to_vec())?;
+                buf_pos += str_len;
+                names.push(name);
+            }
+            names
+        } else {
+            eprintln!("Warning: Loading v1 shard format. Consider re-creating index for smaller shard files.");
+            Vec::new()
+        };
+
+        let mut buckets = HashMap::new();
+        let mut bucket_sources = HashMap::new();
+
+        for _ in 0..num_buckets {
             // Read bucket ID
             ensure_bytes!(4);
             let bucket_id = u32::from_le_bytes(read_buf[buf_pos..buf_pos + 4].try_into().unwrap());
             buf_pos += 4;
 
-            // Read minimizer count
+            // Read minimizer count with overflow-safe conversion
             ensure_bytes!(8);
-            let vec_len = u64::from_le_bytes(read_buf[buf_pos..buf_pos + 8].try_into().unwrap()) as usize;
+            let minimizer_count_u64 = u64::from_le_bytes(read_buf[buf_pos..buf_pos + 8].try_into().unwrap());
             buf_pos += 8;
 
-            if vec_len > MAX_BUCKET_SIZE {
-                return Err(anyhow!("Bucket {} size {} exceeds maximum {}", bucket_id, vec_len, MAX_BUCKET_SIZE));
+            let minimizer_count = usize::try_from(minimizer_count_u64).map_err(|_| {
+                anyhow!("Bucket {} minimizer count {} overflows usize", bucket_id, minimizer_count_u64)
+            })?;
+
+            if minimizer_count > MAX_BUCKET_SIZE {
+                return Err(anyhow!("Bucket {} size {} exceeds maximum {}", bucket_id, minimizer_count, MAX_BUCKET_SIZE));
             }
 
-            let mut vec = Vec::with_capacity(vec_len);
+            // For v2, read source count and sources
+            let sources: Vec<String> = if version == 2 {
+                ensure_bytes!(8);
+                let source_count_u64 = u64::from_le_bytes(read_buf[buf_pos..buf_pos + 8].try_into().unwrap());
+                buf_pos += 8;
 
-            if vec_len == 0 {
-                buckets.insert(bucket_id, vec);
-                continue;
+                let source_count = usize::try_from(source_count_u64).map_err(|_| {
+                    anyhow!("Bucket {} source count {} overflows usize", bucket_id, source_count_u64)
+                })?;
+
+                if source_count > MAX_SOURCES_PER_BUCKET {
+                    return Err(anyhow!(
+                        "Bucket {} has {} sources, exceeds maximum {}",
+                        bucket_id,
+                        source_count,
+                        MAX_SOURCES_PER_BUCKET
+                    ));
+                }
+
+                let mut srcs = Vec::with_capacity(source_count);
+                for source_idx in 0..source_count {
+                    refill_if_low!();
+                    let (filename_idx_raw, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
+                    buf_pos += consumed;
+
+                    let filename_idx = usize::try_from(filename_idx_raw).map_err(|_| {
+                        anyhow!("Bucket {} source {} filename index {} overflows usize",
+                            bucket_id, source_idx, filename_idx_raw)
+                    })?;
+
+                    // Validate filename index is in bounds
+                    if filename_idx >= filenames.len() {
+                        return Err(anyhow!(
+                            "Bucket {} source {} has invalid filename index {} (string table has {} entries)",
+                            bucket_id, source_idx, filename_idx, filenames.len()
+                        ));
+                    }
+
+                    refill_if_low!();
+                    let (seqname_len_raw, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
+                    buf_pos += consumed;
+
+                    let seqname_len = usize::try_from(seqname_len_raw).map_err(|_| {
+                        anyhow!("Bucket {} source {} seqname length {} overflows usize",
+                            bucket_id, source_idx, seqname_len_raw)
+                    })?;
+
+                    if seqname_len > MAX_STRING_LENGTH {
+                        return Err(anyhow!("Seqname length {} exceeds maximum {}", seqname_len, MAX_STRING_LENGTH));
+                    }
+
+                    ensure_bytes!(seqname_len);
+                    let seqname = String::from_utf8(read_buf[buf_pos..buf_pos + seqname_len].to_vec())?;
+                    buf_pos += seqname_len;
+
+                    // Reconstruct full source string (bounds already validated above)
+                    let filename = &filenames[filename_idx];
+                    let source = if seqname.is_empty() {
+                        filename.clone()
+                    } else {
+                        format!("{}{}{}", filename, SOURCE_DELIM, seqname)
+                    };
+                    srcs.push(source);
+                }
+                srcs
+            } else {
+                Vec::new()
+            };
+
+            // Read minimizers
+            let mut minimizers = Vec::with_capacity(minimizer_count);
+            if minimizer_count > 0 {
+                ensure_bytes!(8);
+                let first = u64::from_le_bytes(read_buf[buf_pos..buf_pos + 8].try_into().unwrap());
+                buf_pos += 8;
+                minimizers.push(first);
+
+                let mut prev = first;
+                for _ in 1..minimizer_count {
+                    refill_if_low!();
+                    let (delta, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
+                    buf_pos += consumed;
+                    let val = prev + delta;
+                    minimizers.push(val);
+                    prev = val;
+                }
             }
 
-            // First minimizer
-            ensure_bytes!(8);
-            let first = u64::from_le_bytes(read_buf[buf_pos..buf_pos + 8].try_into().unwrap());
-            buf_pos += 8;
-            vec.push(first);
-
-            // Remaining: delta-decoded varints
-            let mut prev = first;
-            for _ in 1..vec_len {
-                refill_if_low!();
-                let (delta, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
-                buf_pos += consumed;
-                let val = prev + delta;
-                vec.push(val);
-                prev = val;
+            buckets.insert(bucket_id, minimizers);
+            if !sources.is_empty() {
+                bucket_sources.insert(bucket_id, sources);
             }
-
-            buckets.insert(bucket_id, vec);
         }
 
         Ok(MainIndexShard {
@@ -532,6 +762,7 @@ impl MainIndexShard {
             salt,
             shard_id,
             buckets,
+            bucket_sources,
         })
     }
 }
@@ -622,7 +853,7 @@ impl ShardedMainIndex {
             return Err(anyhow!("Bucket {} already exists in the index", bucket_id));
         }
 
-        // Create new shard
+        // Create new shard with sources
         let new_shard_id = self.manifest.shards.len() as u32;
         let minimizer_count = minimizers.len();
 
@@ -636,15 +867,19 @@ impl ShardedMainIndex {
                 buckets.insert(bucket_id, minimizers);
                 buckets
             },
+            bucket_sources: {
+                let mut bucket_sources = HashMap::new();
+                bucket_sources.insert(bucket_id, sources);
+                bucket_sources
+            },
         };
 
         // Save new shard
         let shard_path = MainIndexManifest::shard_path(&self.base_path, new_shard_id);
         let compressed_size = shard.save(&shard_path)?;
 
-        // Update manifest
+        // Update manifest (sources stored in shard, not manifest)
         self.manifest.bucket_names.insert(bucket_id, name.to_string());
-        self.manifest.bucket_sources.insert(bucket_id, sources);
         self.manifest.bucket_minimizer_counts.insert(bucket_id, minimizer_count);
         self.manifest.bucket_to_shard.insert(bucket_id, new_shard_id);
         self.manifest.total_minimizers += minimizer_count;
@@ -666,7 +901,7 @@ impl ShardedMainIndex {
     /// Merge one bucket into another.
     ///
     /// If both buckets are in the same shard, modifies that shard.
-    /// If in different shards, moves minimizers from src to dest shard.
+    /// If in different shards, moves minimizers and sources from src to dest shard.
     pub fn merge_buckets(&mut self, src_id: u32, dest_id: u32) -> Result<()> {
         if !self.manifest.bucket_names.contains_key(&src_id) {
             return Err(anyhow!("Source bucket {} does not exist", src_id));
@@ -683,27 +918,41 @@ impl ShardedMainIndex {
         let src_minimizer_count = self.manifest.bucket_minimizer_counts.get(&src_id).copied().unwrap_or(0);
 
         if src_shard_id == dest_shard_id {
-            // Same shard - load, merge, save
+            // Same shard - load, merge minimizers and sources, save
             let shard_path = MainIndexManifest::shard_path(&self.base_path, src_shard_id);
             let mut shard = MainIndexShard::load(&shard_path)?;
 
             let src_minimizers = shard.buckets.remove(&src_id)
                 .ok_or_else(|| anyhow!("Source bucket {} not found in shard", src_id))?;
+            let src_sources = shard.bucket_sources.remove(&src_id).unwrap_or_default();
 
             let dest_vec = shard.buckets.entry(dest_id).or_default();
+            let old_dest_count = dest_vec.len();
             dest_vec.extend(src_minimizers);
             dest_vec.sort_unstable();
             dest_vec.dedup();
+            let new_dest_count = dest_vec.len();
+
+            // Merge sources
+            let dest_sources = shard.bucket_sources.entry(dest_id).or_default();
+            dest_sources.extend(src_sources);
+            dest_sources.sort_unstable();
+            dest_sources.dedup();
 
             let compressed_size = shard.save(&shard_path)?;
 
-            // Update shard info
+            // Update shard info - recalculate num_minimizers after dedup
             let shard_info = &mut self.manifest.shards[src_shard_id as usize];
             shard_info.bucket_ids.retain(|&id| id != src_id);
             shard_info.compressed_size = compressed_size;
-            // Note: num_minimizers stays the same (minimizers moved within shard)
+            // Adjust num_minimizers: removed src_count, dest changed from old_dest_count to new_dest_count
+            let minimizers_removed = (src_minimizer_count + old_dest_count).saturating_sub(new_dest_count);
+            shard_info.num_minimizers = shard_info.num_minimizers.saturating_sub(minimizers_removed);
+
+            // Update bucket_minimizer_counts with actual count after dedup
+            self.manifest.bucket_minimizer_counts.insert(dest_id, new_dest_count);
         } else {
-            // Different shards - load both, move minimizers, save both
+            // Different shards - load both, move minimizers and sources, save both
             let src_shard_path = MainIndexManifest::shard_path(&self.base_path, src_shard_id);
             let dest_shard_path = MainIndexManifest::shard_path(&self.base_path, dest_shard_id);
 
@@ -712,38 +961,42 @@ impl ShardedMainIndex {
 
             let src_minimizers = src_shard.buckets.remove(&src_id)
                 .ok_or_else(|| anyhow!("Source bucket {} not found in source shard", src_id))?;
+            let src_sources = src_shard.bucket_sources.remove(&src_id).unwrap_or_default();
 
             let dest_vec = dest_shard.buckets.entry(dest_id).or_default();
+            let old_dest_count = dest_vec.len();
             dest_vec.extend(src_minimizers);
             dest_vec.sort_unstable();
             dest_vec.dedup();
+            let new_dest_count = dest_vec.len();
+
+            // Merge sources
+            let dest_sources = dest_shard.bucket_sources.entry(dest_id).or_default();
+            dest_sources.extend(src_sources);
+            dest_sources.sort_unstable();
+            dest_sources.dedup();
 
             let src_compressed_size = src_shard.save(&src_shard_path)?;
             let dest_compressed_size = dest_shard.save(&dest_shard_path)?;
 
-            // Update shard infos
+            // Update shard infos with actual counts after dedup
             let src_shard_info = &mut self.manifest.shards[src_shard_id as usize];
             src_shard_info.bucket_ids.retain(|&id| id != src_id);
-            src_shard_info.num_minimizers -= src_minimizer_count;
+            src_shard_info.num_minimizers = src_shard_info.num_minimizers.saturating_sub(src_minimizer_count);
             src_shard_info.compressed_size = src_compressed_size;
 
+            // Calculate actual change in dest shard: added new_dest_count - old_dest_count minimizers
             let dest_shard_info = &mut self.manifest.shards[dest_shard_id as usize];
-            dest_shard_info.num_minimizers += src_minimizer_count;
+            let dest_delta = new_dest_count.saturating_sub(old_dest_count);
+            dest_shard_info.num_minimizers = dest_shard_info.num_minimizers.saturating_add(dest_delta);
             dest_shard_info.compressed_size = dest_compressed_size;
+
+            // Update bucket_minimizer_counts with actual count after dedup
+            self.manifest.bucket_minimizer_counts.insert(dest_id, new_dest_count);
         }
 
-        // Update manifest metadata
+        // Update manifest metadata (no sources in manifest)
         self.manifest.bucket_names.remove(&src_id);
-        if let Some(mut src_sources) = self.manifest.bucket_sources.remove(&src_id) {
-            let dest_sources = self.manifest.bucket_sources.entry(dest_id).or_default();
-            dest_sources.append(&mut src_sources);
-            dest_sources.sort_unstable();
-            dest_sources.dedup();
-        }
-
-        // Update dest minimizer count (add src count - may have some duplicates removed but we don't track that)
-        let dest_count = self.manifest.bucket_minimizer_counts.get(&dest_id).copied().unwrap_or(0);
-        self.manifest.bucket_minimizer_counts.insert(dest_id, dest_count + src_minimizer_count);
         self.manifest.bucket_minimizer_counts.remove(&src_id);
 
         self.manifest.bucket_to_shard.remove(&src_id);
@@ -757,7 +1010,7 @@ impl ShardedMainIndex {
 
     /// Update an existing bucket by adding new minimizers and sources.
     ///
-    /// Loads the shard containing the bucket, extends its minimizers,
+    /// Loads the shard containing the bucket, extends its minimizers and sources,
     /// sorts and deduplicates, then saves the shard back.
     pub fn update_bucket(
         &mut self,
@@ -776,7 +1029,7 @@ impl ShardedMainIndex {
         let shard_path = MainIndexManifest::shard_path(&self.base_path, shard_id);
         let mut shard = MainIndexShard::load(&shard_path)?;
 
-        // Get the bucket's minimizers and extend
+        // Extend minimizers
         let bucket_mins = shard.buckets.entry(bucket_id).or_default();
         let old_count = bucket_mins.len();
         bucket_mins.extend(new_minimizers);
@@ -784,16 +1037,16 @@ impl ShardedMainIndex {
         bucket_mins.dedup();
         let new_count = bucket_mins.len();
 
-        // Save the shard
-        let compressed_size = shard.save(&shard_path)?;
-
-        // Update manifest - sources
-        let sources = self.manifest.bucket_sources.entry(bucket_id).or_default();
+        // Extend sources (stored in shard, not manifest)
+        let sources = shard.bucket_sources.entry(bucket_id).or_default();
         sources.extend(new_sources);
         sources.sort_unstable();
         sources.dedup();
 
-        // Update manifest - minimizer count
+        // Save the shard
+        let compressed_size = shard.save(&shard_path)?;
+
+        // Update manifest - minimizer count only (no sources in manifest)
         let added_minimizers = new_count.saturating_sub(old_count);
         self.manifest.bucket_minimizer_counts.insert(bucket_id, new_count);
         self.manifest.total_minimizers += added_minimizers;
@@ -809,6 +1062,17 @@ impl ShardedMainIndex {
         self.manifest.save(&manifest_path)?;
 
         Ok(())
+    }
+
+    /// Get sources for a specific bucket by loading its shard.
+    ///
+    /// Returns the sources or an empty Vec if the bucket has no sources.
+    pub fn get_bucket_sources(&self, bucket_id: u32) -> Result<Vec<String>> {
+        let shard_id = *self.manifest.bucket_to_shard.get(&bucket_id)
+            .ok_or_else(|| anyhow!("Bucket {} not found in index", bucket_id))?;
+
+        let shard = self.load_shard(shard_id)?;
+        Ok(shard.bucket_sources.get(&bucket_id).cloned().unwrap_or_default())
     }
 
     /// Get the next available bucket ID.
@@ -889,14 +1153,14 @@ pub struct ShardedMainIndexBuilder {
     base_path: PathBuf,
     max_shard_bytes: usize,
 
-    // Current shard accumulator
+    // Current shard accumulator (minimizers and sources stored together)
     current_shard_id: u32,
     current_shard_buckets: HashMap<u32, Vec<u64>>,
+    current_shard_sources: HashMap<u32, Vec<String>>,
     current_shard_bytes: usize,
 
-    // Metadata accumulators (kept in memory for manifest)
+    // Metadata accumulators (kept in memory for manifest - no sources)
     bucket_names: HashMap<u32, String>,
-    bucket_sources: HashMap<u32, Vec<String>>,
     bucket_minimizer_counts: HashMap<u32, usize>,
     bucket_to_shard: HashMap<u32, u32>,
     shards: Vec<MainIndexShardInfo>,
@@ -925,9 +1189,9 @@ impl ShardedMainIndexBuilder {
             max_shard_bytes,
             current_shard_id: 0,
             current_shard_buckets: HashMap::new(),
+            current_shard_sources: HashMap::new(),
             current_shard_bytes: 0,
             bucket_names: HashMap::new(),
-            bucket_sources: HashMap::new(),
             bucket_minimizer_counts: HashMap::new(),
             bucket_to_shard: HashMap::new(),
             shards: Vec::new(),
@@ -964,13 +1228,13 @@ impl ShardedMainIndexBuilder {
             self.flush_shard()?;
         }
 
-        // Add bucket to current shard
+        // Add bucket minimizers and sources to current shard
         self.current_shard_buckets.insert(id, minimizers);
+        self.current_shard_sources.insert(id, sources);
         self.current_shard_bytes += bucket_bytes;
 
-        // Store metadata
+        // Store manifest metadata (no sources - they go in shards)
         self.bucket_names.insert(id, name.to_string());
-        self.bucket_sources.insert(id, sources);
         self.bucket_minimizer_counts.insert(id, minimizer_count);
         self.bucket_to_shard.insert(id, self.current_shard_id);
         self.total_minimizers += minimizer_count;
@@ -990,6 +1254,7 @@ impl ShardedMainIndexBuilder {
             salt: self.salt,
             shard_id: self.current_shard_id,
             buckets: std::mem::take(&mut self.current_shard_buckets),
+            bucket_sources: std::mem::take(&mut self.current_shard_sources),
         };
 
         let shard_path = MainIndexManifest::shard_path(&self.base_path, self.current_shard_id);
@@ -1025,7 +1290,6 @@ impl ShardedMainIndexBuilder {
             w: self.w,
             salt: self.salt,
             bucket_names: self.bucket_names,
-            bucket_sources: self.bucket_sources,
             bucket_minimizer_counts: self.bucket_minimizer_counts,
             bucket_to_shard: self.bucket_to_shard,
             shards: self.shards,
@@ -1064,7 +1328,6 @@ mod tests {
             w: 50,
             salt: 0xDEADBEEF,
             bucket_names: HashMap::new(),
-            bucket_sources: HashMap::new(),
             bucket_minimizer_counts: HashMap::new(),
             bucket_to_shard: HashMap::new(),
             shards: vec![
@@ -1087,9 +1350,6 @@ mod tests {
         manifest.bucket_names.insert(1, "BucketA".into());
         manifest.bucket_names.insert(2, "BucketB".into());
         manifest.bucket_names.insert(3, "BucketC".into());
-        manifest.bucket_sources.insert(1, vec!["src1".into()]);
-        manifest.bucket_sources.insert(2, vec!["src2".into()]);
-        manifest.bucket_sources.insert(3, vec!["src3a".into(), "src3b".into()]);
         manifest.bucket_minimizer_counts.insert(1, 400);
         manifest.bucket_minimizer_counts.insert(2, 600);
         manifest.bucket_minimizer_counts.insert(3, 500);
@@ -1124,9 +1384,12 @@ mod tests {
             salt: 0x1234,
             shard_id: 0,
             buckets: HashMap::new(),
+            bucket_sources: HashMap::new(),
         };
         shard.buckets.insert(1, vec![100, 200, 300]);
         shard.buckets.insert(2, vec![400, 500]);
+        shard.bucket_sources.insert(1, vec!["file1.fa::seq1".into(), "file1.fa::seq2".into()]);
+        shard.bucket_sources.insert(2, vec!["file2.fa::seq1".into()]);
 
         shard.save(&path)?;
         let loaded = MainIndexShard::load(&path)?;
@@ -1138,6 +1401,12 @@ mod tests {
         assert_eq!(loaded.buckets.len(), 2);
         assert_eq!(loaded.buckets[&1], vec![100, 200, 300]);
         assert_eq!(loaded.buckets[&2], vec![400, 500]);
+        // Verify sources with string deduplication roundtrip
+        assert_eq!(loaded.bucket_sources[&1].len(), 2);
+        assert_eq!(loaded.bucket_sources[&1][0], "file1.fa::seq1");
+        assert_eq!(loaded.bucket_sources[&1][1], "file1.fa::seq2");
+        assert_eq!(loaded.bucket_sources[&2].len(), 1);
+        assert_eq!(loaded.bucket_sources[&2][0], "file2.fa::seq1");
 
         Ok(())
     }
@@ -1273,6 +1542,117 @@ mod tests {
         assert_eq!(shard1.buckets.len(), 2);
         assert!(shard1.buckets.contains_key(&2));
         assert!(shard1.buckets.contains_key(&3));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_v1_shard_migration() -> Result<()> {
+        use std::io::Write;
+        use zstd::stream::write::Encoder;
+
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        // Manually create a v1 format shard (no sources, no string table)
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&path)?);
+
+        // Header
+        writer.write_all(b"RYPS")?;
+        writer.write_all(&1u32.to_le_bytes())?; // Version 1
+        writer.write_all(&64u64.to_le_bytes())?; // k
+        writer.write_all(&50u64.to_le_bytes())?; // w
+        writer.write_all(&0x1234u64.to_le_bytes())?; // salt
+        writer.write_all(&0u32.to_le_bytes())?; // shard_id
+        writer.write_all(&1u32.to_le_bytes())?; // num_buckets
+
+        // Compressed content
+        let mut encoder = Encoder::new(writer, 3)?;
+
+        // Bucket: id, count, then minimizers (delta-encoded)
+        encoder.write_all(&1u32.to_le_bytes())?; // bucket_id
+        encoder.write_all(&3u64.to_le_bytes())?; // minimizer_count
+        encoder.write_all(&100u64.to_le_bytes())?; // first minimizer
+
+        // Delta-encoded remaining minimizers (200-100=100, 300-200=100)
+        let mut varint_buf = [0u8; 10];
+        let len = encode_varint(100, &mut varint_buf); // delta for 200
+        encoder.write_all(&varint_buf[..len])?;
+        let len = encode_varint(100, &mut varint_buf); // delta for 300
+        encoder.write_all(&varint_buf[..len])?;
+
+        encoder.finish()?;
+
+        // Load and verify v1 shard loads correctly
+        let loaded = MainIndexShard::load(&path)?;
+
+        assert_eq!(loaded.k, 64);
+        assert_eq!(loaded.w, 50);
+        assert_eq!(loaded.salt, 0x1234);
+        assert_eq!(loaded.shard_id, 0);
+        assert_eq!(loaded.buckets.len(), 1);
+        assert_eq!(loaded.buckets[&1], vec![100, 200, 300]);
+        // v1 format has no sources
+        assert!(loaded.bucket_sources.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_v1_manifest_migration() -> Result<()> {
+        use std::io::Write;
+
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        // Manually create a v1 format manifest (with sources)
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&path)?);
+
+        // Header
+        writer.write_all(b"RYPM")?;
+        writer.write_all(&1u32.to_le_bytes())?; // Version 1
+        writer.write_all(&64u64.to_le_bytes())?; // k
+        writer.write_all(&50u64.to_le_bytes())?; // w
+        writer.write_all(&0x1234u64.to_le_bytes())?; // salt
+        writer.write_all(&1u32.to_le_bytes())?; // num_buckets
+        writer.write_all(&1u32.to_le_bytes())?; // num_shards
+        writer.write_all(&100u64.to_le_bytes())?; // total_minimizers
+
+        // Bucket metadata (v1 format includes sources)
+        writer.write_all(&1u32.to_le_bytes())?; // bucket_id
+        writer.write_all(&0u32.to_le_bytes())?; // shard_id
+        writer.write_all(&100u64.to_le_bytes())?; // minimizer_count
+
+        let name = b"TestBucket";
+        writer.write_all(&(name.len() as u64).to_le_bytes())?;
+        writer.write_all(name)?;
+
+        // v1 has sources in manifest
+        writer.write_all(&1u64.to_le_bytes())?; // source_count
+        let source = b"test.fa::seq1";
+        writer.write_all(&(source.len() as u64).to_le_bytes())?;
+        writer.write_all(source)?;
+
+        // Shard info
+        writer.write_all(&0u32.to_le_bytes())?; // shard_id
+        writer.write_all(&1u32.to_le_bytes())?; // num_bucket_ids
+        writer.write_all(&100u64.to_le_bytes())?; // num_minimizers
+        writer.write_all(&500u64.to_le_bytes())?; // compressed_size
+
+        writer.flush()?;
+        drop(writer);
+
+        // Load and verify v1 manifest loads correctly
+        let loaded = MainIndexManifest::load(&path)?;
+
+        assert_eq!(loaded.k, 64);
+        assert_eq!(loaded.w, 50);
+        assert_eq!(loaded.salt, 0x1234);
+        assert_eq!(loaded.total_minimizers, 100);
+        assert_eq!(loaded.bucket_names.len(), 1);
+        assert_eq!(loaded.bucket_names[&1], "TestBucket");
+        assert_eq!(loaded.bucket_to_shard[&1], 0);
+        assert_eq!(loaded.shards.len(), 1);
 
         Ok(())
     }
