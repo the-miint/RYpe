@@ -40,6 +40,10 @@ mod workspace;
 pub mod c_api;
 pub mod config;
 
+// Arrow integration (optional feature)
+#[cfg(feature = "arrow")]
+pub mod arrow;
+
 // Re-export types
 pub use types::{QueryRecord, HitResult, IndexMetadata};
 
