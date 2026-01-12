@@ -75,6 +75,110 @@ pub fn resolve_path(base: &Path, path: &Path) -> PathBuf {
     }
 }
 
+// ============================================================================
+// BucketAddConfig - for adding files to an existing index
+// ============================================================================
+
+/// Configuration for bucket-add-config command
+#[derive(Debug, Deserialize)]
+pub struct BucketAddConfig {
+    pub target: BucketAddTarget,
+    pub assignment: AssignmentSettings,
+    pub files: FileList,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BucketAddTarget {
+    pub index: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "mode")]
+pub enum AssignmentSettings {
+    #[serde(rename = "new_bucket")]
+    NewBucket {
+        /// Optional name for the new bucket (defaults to first filename)
+        bucket_name: Option<String>,
+    },
+    #[serde(rename = "existing_bucket")]
+    ExistingBucket {
+        /// Name of existing bucket to add files to
+        bucket_name: String,
+    },
+    #[serde(rename = "best_bin")]
+    BestBin {
+        /// Query-centric overlap threshold (0.0-1.0)
+        threshold: f64,
+        /// What to do when no bucket meets threshold
+        #[serde(default)]
+        fallback: BestBinFallback,
+    },
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum BestBinFallback {
+    #[default]
+    CreateNew,
+    Skip,
+    Error,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FileList {
+    pub paths: Vec<PathBuf>,
+    /// Optional bucket name override (for new_bucket mode)
+    pub bucket_name: Option<String>,
+}
+
+pub fn parse_bucket_add_config(path: &Path) -> Result<BucketAddConfig> {
+    let contents = fs::read_to_string(path)
+        .context(format!("Failed to read config file: {}", path.display()))?;
+
+    let config: BucketAddConfig = toml::from_str(&contents)
+        .context("Failed to parse TOML config")?;
+
+    // Validate threshold for best_bin mode
+    if let AssignmentSettings::BestBin { threshold, .. } = &config.assignment {
+        if *threshold < 0.0 || *threshold > 1.0 {
+            return Err(anyhow!(
+                "Config error: threshold must be between 0.0 and 1.0 (got {})",
+                threshold
+            ));
+        }
+    }
+
+    if config.files.paths.is_empty() {
+        return Err(anyhow!("Config must specify at least one file in [files].paths"));
+    }
+
+    Ok(config)
+}
+
+pub fn validate_bucket_add_config(config: &BucketAddConfig, config_dir: &Path) -> Result<()> {
+    // Check target index exists
+    let index_path = resolve_path(config_dir, &config.target.index);
+    if !index_path.exists() {
+        return Err(anyhow!(
+            "Target index not found: {}",
+            index_path.display()
+        ));
+    }
+
+    // Check all file paths exist
+    for file_path in &config.files.paths {
+        let abs_path = resolve_path(config_dir, file_path);
+        if !abs_path.exists() {
+            return Err(anyhow!(
+                "File not found: {}",
+                abs_path.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

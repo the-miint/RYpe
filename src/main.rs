@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use anyhow::{Context, Result, anyhow};
 
 use rype::{Index, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, classify_batch_with_query_index, classify_batch_sharded_sequential, classify_batch_sharded_merge_join, classify_batch_sharded_main, aggregate_batch, ShardManifest, ShardedInvertedIndex, MainIndexManifest, MainIndexShard, ShardedMainIndex, extract_into, extract_with_positions, Strand};
-use rype::config::{parse_config, validate_config, resolve_path};
+use rype::config::{parse_config, validate_config, resolve_path, parse_bucket_add_config, validate_bucket_add_config, AssignmentSettings, BestBinFallback};
 use std::collections::HashMap;
 use std::io::BufRead;
 
@@ -124,6 +124,12 @@ enum IndexCommands {
 
     /// Build index from a TOML configuration file
     FromConfig {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+
+    /// Add files to existing index based on config file
+    BucketAddConfig {
         #[arg(short, long)]
         config: PathBuf,
     },
@@ -625,6 +631,10 @@ fn main() -> Result<()> {
 
             IndexCommands::FromConfig { config } => {
                 build_index_from_config(&config)?;
+            }
+
+            IndexCommands::BucketAddConfig { config } => {
+                bucket_add_from_config(&config)?;
             }
 
             IndexCommands::Invert { index, shards } => {
@@ -1220,6 +1230,738 @@ fn build_index_from_config(config_path: &Path) -> Result<()> {
     log::info!("  Total minimizers: {}", total_minimizers);
 
     Ok(())
+}
+
+// --- BUCKET ADD FROM CONFIG ---
+//
+// CONCURRENCY WARNING: bucket-add-config operations are NOT safe for concurrent use.
+// Running multiple bucket-add-config commands simultaneously on the same index may
+// result in data corruption. Use file locking or sequential processing in pipelines.
+
+/// Represents a file assignment during bucket-add-config processing
+#[derive(Debug)]
+struct FileAssignment {
+    file_path: PathBuf,
+    bucket_id: u32,
+    bucket_name: String,
+    mode: &'static str,  // "new_bucket", "existing_bucket", "matched", "created"
+    score: Option<f64>,
+}
+
+/// Data extracted from a single file in one pass
+struct FileData {
+    path: PathBuf,
+    minimizers: Vec<u64>,  // sorted, deduplicated
+    sources: Vec<String>,  // source labels for each sequence
+}
+
+/// Extract minimizers and source labels from a file in a single pass
+fn extract_file_data(path: &Path, k: usize, w: usize, salt: u64) -> Result<FileData> {
+    let mut reader = parse_fastx_file(path)
+        .context(format!("Failed to open file {}", path.display()))?;
+
+    let filename = path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+
+    let mut ws = MinimizerWorkspace::new();
+    let mut all_mins = Vec::new();
+    let mut sources = Vec::new();
+
+    while let Some(record) = reader.next() {
+        let rec = record.context(format!("Invalid record in file {}", path.display()))?;
+        let seq_name = String::from_utf8_lossy(rec.id()).to_string();
+        let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, seq_name);
+        sources.push(source_label);
+
+        extract_into(&rec.seq(), k, w, salt, &mut ws);
+        all_mins.extend_from_slice(&ws.buffer);
+    }
+
+    all_mins.sort_unstable();
+    all_mins.dedup();
+
+    Ok(FileData {
+        path: path.to_path_buf(),
+        minimizers: all_mins,
+        sources,
+    })
+}
+
+/// Count intersection using two-pointer merge - O(Q + B) instead of O(Q log B)
+/// Both arrays must be sorted.
+fn count_intersection_merge(query: &[u64], bucket: &[u64]) -> usize {
+    let mut i = 0;
+    let mut j = 0;
+    let mut hits = 0;
+
+    while i < query.len() && j < bucket.len() {
+        match query[i].cmp(&bucket[j]) {
+            std::cmp::Ordering::Equal => {
+                hits += 1;
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    hits
+}
+
+/// Find bucket ID by name, with helpful error message listing available buckets
+fn find_bucket_by_name(bucket_names: &HashMap<u32, String>, name: &str) -> Result<u32> {
+    for (&id, bucket_name) in bucket_names {
+        if bucket_name == name {
+            return Ok(id);
+        }
+    }
+    let available: Vec<_> = bucket_names.values().collect();
+    Err(anyhow!(
+        "Bucket '{}' not found. Available buckets: {:?}",
+        name, available
+    ))
+}
+
+/// Index parameters for validation
+struct IndexParams {
+    k: usize,
+    w: usize,
+    salt: u64,
+}
+
+fn bucket_add_from_config(config_path: &Path) -> Result<()> {
+    log::info!("Adding files to index from config: {}", config_path.display());
+
+    // 1. Parse and validate config
+    let cfg = parse_bucket_add_config(config_path)?;
+    let config_dir = config_path.parent()
+        .ok_or_else(|| anyhow!("Invalid config path"))?;
+
+    log::info!("Validating file paths...");
+    validate_bucket_add_config(&cfg, config_dir)?;
+    log::info!("Validation successful.");
+
+    // 2. Resolve index path and detect type
+    let index_path = resolve_path(config_dir, &cfg.target.index);
+
+    if MainIndexManifest::is_sharded(&index_path) {
+        bucket_add_sharded(&index_path, &cfg, config_dir)
+    } else {
+        bucket_add_single(&index_path, &cfg, config_dir)
+    }
+}
+
+/// Handle bucket-add-config for single-file indices
+fn bucket_add_single(
+    index_path: &Path,
+    cfg: &rype::config::BucketAddConfig,
+    config_dir: &Path,
+) -> Result<()> {
+    let mut index = Index::load(index_path)?;
+    let mut assignments: Vec<FileAssignment> = Vec::new();
+    let params = IndexParams { k: index.k, w: index.w, salt: index.salt };
+
+    log::info!("Loaded index: k={}, w={}, {} buckets, {} total minimizers",
+        index.k, index.w, index.buckets.len(),
+        index.buckets.values().map(|v| v.len()).sum::<usize>());
+
+    match &cfg.assignment {
+        AssignmentSettings::NewBucket { bucket_name } => {
+            let new_id = index.next_id()?;
+            let name = bucket_name.clone()
+                .or_else(|| cfg.files.bucket_name.clone())
+                .unwrap_or_else(|| make_bucket_name_from_files(&cfg.files.paths));
+            let name = sanitize_bucket_name(&name);
+
+            log::info!("Creating new bucket {} ('{}')", new_id, name);
+            index.bucket_names.insert(new_id, name.clone());
+
+            // Extract all file data in single pass per file
+            for file_path in &cfg.files.paths {
+                let abs_path = resolve_path(config_dir, file_path);
+                let data = extract_file_data(&abs_path, params.k, params.w, params.salt)?;
+
+                // Add minimizers and sources directly
+                let bucket = index.buckets.entry(new_id).or_default();
+                bucket.extend(&data.minimizers);
+                let sources = index.bucket_sources.entry(new_id).or_default();
+                sources.extend(data.sources);
+
+                log::info!("  {} -> bucket {} ('{}') [{} minimizers]",
+                    file_path.display(), new_id, name, data.minimizers.len());
+                assignments.push(FileAssignment {
+                    file_path: file_path.clone(),
+                    bucket_id: new_id,
+                    bucket_name: name.clone(),
+                    mode: "new_bucket",
+                    score: None,
+                });
+            }
+
+            index.finalize_bucket(new_id);
+        }
+
+        AssignmentSettings::ExistingBucket { bucket_name } => {
+            let bucket_id = find_bucket_by_name(&index.bucket_names, bucket_name)?;
+            log::info!("Adding to existing bucket {} ('{}')", bucket_id, bucket_name);
+
+            for file_path in &cfg.files.paths {
+                let abs_path = resolve_path(config_dir, file_path);
+                let data = extract_file_data(&abs_path, params.k, params.w, params.salt)?;
+
+                let bucket = index.buckets.entry(bucket_id).or_default();
+                bucket.extend(&data.minimizers);
+                let sources = index.bucket_sources.entry(bucket_id).or_default();
+                sources.extend(data.sources);
+
+                log::info!("  {} -> bucket {} ('{}') [{} minimizers]",
+                    file_path.display(), bucket_id, bucket_name, data.minimizers.len());
+                assignments.push(FileAssignment {
+                    file_path: file_path.clone(),
+                    bucket_id,
+                    bucket_name: bucket_name.clone(),
+                    mode: "existing_bucket",
+                    score: None,
+                });
+            }
+
+            index.finalize_bucket(bucket_id);
+        }
+
+        AssignmentSettings::BestBin { threshold, fallback } => {
+            best_bin_assign(&mut index, cfg, config_dir, params, *threshold, *fallback, &mut assignments)?;
+        }
+    }
+
+    // Save updated index
+    index.save(index_path)?;
+    log::info!("Index saved to {}", index_path.display());
+
+    print_assignment_summary(&assignments);
+    Ok(())
+}
+
+/// Unified best-bin assignment for single-file index
+fn best_bin_assign(
+    index: &mut Index,
+    cfg: &rype::config::BucketAddConfig,
+    config_dir: &Path,
+    params: IndexParams,
+    threshold: f64,
+    fallback: BestBinFallback,
+    assignments: &mut Vec<FileAssignment>,
+) -> Result<()> {
+    log::info!("Best-bin mode: threshold={}, fallback={:?}", threshold, fallback);
+
+    // Track assignments by category
+    let mut matched: Vec<(FileData, u32, f64)> = Vec::new();  // file, bucket_id, score
+    let mut to_create: HashMap<String, Vec<FileData>> = HashMap::new();  // stem -> files
+    let mut skipped_count = 0;
+
+    // 1. Extract all file data and find best bucket for each
+    for file_path in &cfg.files.paths {
+        let abs_path = resolve_path(config_dir, file_path);
+        let data = extract_file_data(&abs_path, params.k, params.w, params.salt)?;
+
+        if data.minimizers.is_empty() {
+            log::warn!("{}: No minimizers extracted, skipping", file_path.display());
+            skipped_count += 1;
+            continue;
+        }
+
+        // Find best bucket using O(Q+B) merge
+        let mut best: Option<(u32, f64)> = None;
+        for (&bucket_id, bucket_mins) in &index.buckets {
+            let hits = count_intersection_merge(&data.minimizers, bucket_mins);
+            let score = hits as f64 / data.minimizers.len() as f64;
+
+            if best.map(|(_, s)| score > s).unwrap_or(true) {
+                best = Some((bucket_id, score));
+            }
+        }
+
+        // Log and decide
+        if let Some((id, score)) = best {
+            let name = index.bucket_names.get(&id).map(|s| s.as_str()).unwrap_or("unknown");
+            log::info!("{}: best match is bucket {} ('{}') with score {:.4}",
+                file_path.display(), id, name, score);
+
+            if score >= threshold {
+                matched.push((data, id, score));
+            } else {
+                handle_below_threshold(file_path, &data, score, threshold, fallback,
+                    &mut to_create, &mut skipped_count)?;
+            }
+        } else {
+            // No existing buckets
+            log::info!("{}: no existing buckets to match against", file_path.display());
+            handle_no_buckets(file_path, data, fallback, &mut to_create, &mut skipped_count)?;
+        }
+    }
+
+    // 2. Add matched files to their buckets (reusing extracted data)
+    for (data, bucket_id, score) in matched {
+        let bucket = index.buckets.entry(bucket_id).or_default();
+        bucket.extend(&data.minimizers);
+        let sources = index.bucket_sources.entry(bucket_id).or_default();
+        sources.extend(data.sources);
+
+        let name = index.bucket_names.get(&bucket_id).cloned().unwrap_or_default();
+        assignments.push(FileAssignment {
+            file_path: data.path,
+            bucket_id,
+            bucket_name: name,
+            mode: "matched",
+            score: Some(score),
+        });
+    }
+
+    // 3. Create new buckets for unmatched files (reusing extracted data)
+    for (stem, files) in to_create {
+        let new_id = index.next_id()?;
+        let bucket_name = sanitize_bucket_name(&stem);
+        index.bucket_names.insert(new_id, bucket_name.clone());
+        log::info!("Creating new bucket {} ('{}') for {} file(s)", new_id, bucket_name, files.len());
+
+        for data in files {
+            let bucket = index.buckets.entry(new_id).or_default();
+            bucket.extend(&data.minimizers);
+            let sources = index.bucket_sources.entry(new_id).or_default();
+            sources.extend(data.sources);
+
+            assignments.push(FileAssignment {
+                file_path: data.path,
+                bucket_id: new_id,
+                bucket_name: bucket_name.clone(),
+                mode: "created",
+                score: None,
+            });
+        }
+
+        index.finalize_bucket(new_id);
+    }
+
+    // 4. Finalize modified existing buckets
+    let modified: HashSet<u32> = assignments.iter()
+        .filter(|a| a.mode == "matched")
+        .map(|a| a.bucket_id)
+        .collect();
+    for id in modified {
+        index.finalize_bucket(id);
+    }
+
+    if skipped_count > 0 {
+        log::info!("{} file(s) skipped", skipped_count);
+    }
+
+    Ok(())
+}
+
+/// Handle file that scored below threshold
+fn handle_below_threshold(
+    file_path: &Path,
+    data: &FileData,
+    score: f64,
+    threshold: f64,
+    fallback: BestBinFallback,
+    to_create: &mut HashMap<String, Vec<FileData>>,
+    skipped_count: &mut usize,
+) -> Result<()> {
+    match fallback {
+        BestBinFallback::CreateNew => {
+            let stem = get_file_stem(file_path);
+            // Clone data since we need to move it
+            to_create.entry(stem).or_default().push(FileData {
+                path: data.path.clone(),
+                minimizers: data.minimizers.clone(),
+                sources: data.sources.clone(),
+            });
+            log::info!("{}: will create new bucket (best score {:.4} < threshold {})",
+                file_path.display(), score, threshold);
+        }
+        BestBinFallback::Skip => {
+            log::info!("{}: skipped (best score {:.4} < threshold {})",
+                file_path.display(), score, threshold);
+            *skipped_count += 1;
+        }
+        BestBinFallback::Error => {
+            return Err(anyhow!(
+                "{}: No bucket meets threshold {} (best: {:.4})",
+                file_path.display(), threshold, score
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Handle file when no buckets exist
+fn handle_no_buckets(
+    file_path: &Path,
+    data: FileData,
+    fallback: BestBinFallback,
+    to_create: &mut HashMap<String, Vec<FileData>>,
+    skipped_count: &mut usize,
+) -> Result<()> {
+    match fallback {
+        BestBinFallback::CreateNew => {
+            let stem = get_file_stem(file_path);
+            to_create.entry(stem).or_default().push(data);
+            log::info!("{}: will create new bucket (no existing buckets)", file_path.display());
+        }
+        BestBinFallback::Skip => {
+            // FIXED: Skip means skip, not create
+            log::info!("{}: skipped (no existing buckets)", file_path.display());
+            *skipped_count += 1;
+        }
+        BestBinFallback::Error => {
+            return Err(anyhow!(
+                "{}: No existing buckets to match against",
+                file_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Get file stem as string for bucket naming
+fn get_file_stem(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Handle bucket-add-config for sharded main indices
+fn bucket_add_sharded(
+    index_path: &Path,
+    cfg: &rype::config::BucketAddConfig,
+    config_dir: &Path,
+) -> Result<()> {
+    let mut sharded = ShardedMainIndex::open(index_path)?;
+    let mut assignments: Vec<FileAssignment> = Vec::new();
+    let params = IndexParams {
+        k: sharded.k(),
+        w: sharded.w(),
+        salt: sharded.salt(),
+    };
+
+    log::info!("Loaded sharded index: k={}, w={}, {} shards, {} buckets",
+        params.k, params.w,
+        sharded.manifest().shards.len(),
+        sharded.manifest().bucket_names.len());
+
+    match &cfg.assignment {
+        AssignmentSettings::NewBucket { bucket_name } => {
+            let new_id = sharded.next_id()?;
+            let name = bucket_name.clone()
+                .or_else(|| cfg.files.bucket_name.clone())
+                .unwrap_or_else(|| make_bucket_name_from_files(&cfg.files.paths));
+            let name = sanitize_bucket_name(&name);
+
+            log::info!("Creating new bucket {} ('{}') as new shard", new_id, name);
+
+            let mut all_mins = Vec::new();
+            let mut all_sources = Vec::new();
+
+            for file_path in &cfg.files.paths {
+                let abs_path = resolve_path(config_dir, file_path);
+                let data = extract_file_data(&abs_path, params.k, params.w, params.salt)?;
+
+                log::info!("  {} -> bucket {} ('{}') [{} minimizers]",
+                    file_path.display(), new_id, name, data.minimizers.len());
+
+                all_mins.extend(data.minimizers);
+                all_sources.extend(data.sources);
+                assignments.push(FileAssignment {
+                    file_path: file_path.clone(),
+                    bucket_id: new_id,
+                    bucket_name: name.clone(),
+                    mode: "new_bucket",
+                    score: None,
+                });
+            }
+
+            all_mins.sort_unstable();
+            all_mins.dedup();
+            all_sources.sort_unstable();
+            all_sources.dedup();
+
+            sharded.add_bucket(new_id, &name, all_sources, all_mins)?;
+        }
+
+        AssignmentSettings::ExistingBucket { bucket_name } => {
+            let bucket_id = find_bucket_by_name(&sharded.manifest().bucket_names, bucket_name)?;
+            log::info!("Adding to existing bucket {} ('{}')", bucket_id, bucket_name);
+
+            let mut all_mins = Vec::new();
+            let mut all_sources = Vec::new();
+
+            for file_path in &cfg.files.paths {
+                let abs_path = resolve_path(config_dir, file_path);
+                let data = extract_file_data(&abs_path, params.k, params.w, params.salt)?;
+
+                log::info!("  {} -> bucket {} ('{}') [{} minimizers]",
+                    file_path.display(), bucket_id, bucket_name, data.minimizers.len());
+
+                all_mins.extend(data.minimizers);
+                all_sources.extend(data.sources);
+                assignments.push(FileAssignment {
+                    file_path: file_path.clone(),
+                    bucket_id,
+                    bucket_name: bucket_name.clone(),
+                    mode: "existing_bucket",
+                    score: None,
+                });
+            }
+
+            all_mins.sort_unstable();
+            all_mins.dedup();
+
+            sharded.update_bucket(bucket_id, all_sources, all_mins)?;
+        }
+
+        AssignmentSettings::BestBin { threshold, fallback } => {
+            best_bin_assign_sharded(&mut sharded, cfg, config_dir, params, *threshold, *fallback, &mut assignments)?;
+        }
+    }
+
+    print_assignment_summary(&assignments);
+    Ok(())
+}
+
+/// Best-bin assignment for sharded index - streams through shards to avoid loading all into memory
+fn best_bin_assign_sharded(
+    sharded: &mut ShardedMainIndex,
+    cfg: &rype::config::BucketAddConfig,
+    config_dir: &Path,
+    params: IndexParams,
+    threshold: f64,
+    fallback: BestBinFallback,
+    assignments: &mut Vec<FileAssignment>,
+) -> Result<()> {
+    log::info!("Best-bin mode (sharded): threshold={}, fallback={:?}", threshold, fallback);
+
+    // 1. Extract all file data upfront (single pass per file)
+    let mut file_data: Vec<FileData> = Vec::new();
+    for file_path in &cfg.files.paths {
+        let abs_path = resolve_path(config_dir, file_path);
+        let data = extract_file_data(&abs_path, params.k, params.w, params.salt)?;
+        file_data.push(data);
+    }
+
+    // 2. Track best match for each file across all shards
+    let mut file_best: Vec<Option<(u32, f64)>> = vec![None; file_data.len()];
+
+    // 3. Stream through shards one at a time (memory efficient)
+    let shard_infos: Vec<_> = sharded.manifest().shards.iter().cloned().collect();
+    log::info!("Scanning {} shards for best matches...", shard_infos.len());
+
+    for shard_info in &shard_infos {
+        let shard_path = MainIndexManifest::shard_path(&sharded.base_path(), shard_info.shard_id);
+        let shard = MainIndexShard::load(&shard_path)?;
+
+        // Check each file against buckets in this shard
+        for (idx, data) in file_data.iter().enumerate() {
+            if data.minimizers.is_empty() {
+                continue;
+            }
+
+            for (&bucket_id, bucket_mins) in &shard.buckets {
+                let hits = count_intersection_merge(&data.minimizers, bucket_mins);
+                let score = hits as f64 / data.minimizers.len() as f64;
+
+                if file_best[idx].map(|(_, s)| score > s).unwrap_or(true) {
+                    file_best[idx] = Some((bucket_id, score));
+                }
+            }
+        }
+        // Shard is dropped here, freeing memory before loading next
+    }
+
+    // 4. Make assignment decisions
+    let mut matched: Vec<(usize, u32, f64)> = Vec::new();  // file_idx, bucket_id, score
+    let mut to_create: HashMap<String, Vec<usize>> = HashMap::new();  // stem -> file indices
+    let mut skipped_count = 0;
+
+    for (idx, data) in file_data.iter().enumerate() {
+        if data.minimizers.is_empty() {
+            log::warn!("{}: No minimizers extracted, skipping", data.path.display());
+            skipped_count += 1;
+            continue;
+        }
+
+        if let Some((bucket_id, score)) = file_best[idx] {
+            let name = sharded.manifest().bucket_names.get(&bucket_id)
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            log::info!("{}: best match is bucket {} ('{}') with score {:.4}",
+                data.path.display(), bucket_id, name, score);
+
+            if score >= threshold {
+                matched.push((idx, bucket_id, score));
+            } else {
+                match fallback {
+                    BestBinFallback::CreateNew => {
+                        let stem = get_file_stem(&data.path);
+                        to_create.entry(stem).or_default().push(idx);
+                        log::info!("{}: will create new bucket (score {:.4} < threshold {})",
+                            data.path.display(), score, threshold);
+                    }
+                    BestBinFallback::Skip => {
+                        log::info!("{}: skipped (score {:.4} < threshold {})",
+                            data.path.display(), score, threshold);
+                        skipped_count += 1;
+                    }
+                    BestBinFallback::Error => {
+                        return Err(anyhow!(
+                            "{}: No bucket meets threshold {} (best: {:.4})",
+                            data.path.display(), threshold, score
+                        ));
+                    }
+                }
+            }
+        } else {
+            log::info!("{}: no existing buckets to match against", data.path.display());
+            match fallback {
+                BestBinFallback::CreateNew => {
+                    let stem = get_file_stem(&data.path);
+                    to_create.entry(stem).or_default().push(idx);
+                    log::info!("{}: will create new bucket (no existing buckets)", data.path.display());
+                }
+                BestBinFallback::Skip => {
+                    log::info!("{}: skipped (no existing buckets)", data.path.display());
+                    skipped_count += 1;
+                }
+                BestBinFallback::Error => {
+                    return Err(anyhow!(
+                        "{}: No existing buckets to match against",
+                        data.path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    // 5. Update existing buckets with matched files (group by bucket for efficiency)
+    let mut by_bucket: HashMap<u32, Vec<(usize, f64)>> = HashMap::new();
+    for (idx, bucket_id, score) in matched {
+        by_bucket.entry(bucket_id).or_default().push((idx, score));
+    }
+
+    for (bucket_id, files) in by_bucket {
+        let bucket_name = sharded.manifest().bucket_names.get(&bucket_id).cloned().unwrap_or_default();
+        log::info!("Updating bucket {} ('{}') with {} file(s)", bucket_id, bucket_name, files.len());
+
+        let mut all_mins = Vec::new();
+        let mut all_sources = Vec::new();
+
+        for (idx, score) in &files {
+            let data = &file_data[*idx];
+            all_mins.extend(&data.minimizers);
+            all_sources.extend(data.sources.iter().cloned());
+
+            assignments.push(FileAssignment {
+                file_path: data.path.clone(),
+                bucket_id,
+                bucket_name: bucket_name.clone(),
+                mode: "matched",
+                score: Some(*score),
+            });
+        }
+
+        all_mins.sort_unstable();
+        all_mins.dedup();
+
+        sharded.update_bucket(bucket_id, all_sources, all_mins)?;
+    }
+
+    // 6. Create new buckets for unmatched files
+    for (stem, indices) in to_create {
+        let new_id = sharded.next_id()?;
+        let bucket_name = sanitize_bucket_name(&stem);
+        log::info!("Creating new bucket {} ('{}') for {} file(s)", new_id, bucket_name, indices.len());
+
+        let mut all_mins = Vec::new();
+        let mut all_sources = Vec::new();
+
+        for idx in indices {
+            let data = &file_data[idx];
+            all_mins.extend(&data.minimizers);
+            all_sources.extend(data.sources.iter().cloned());
+
+            assignments.push(FileAssignment {
+                file_path: data.path.clone(),
+                bucket_id: new_id,
+                bucket_name: bucket_name.clone(),
+                mode: "created",
+                score: None,
+            });
+        }
+
+        all_mins.sort_unstable();
+        all_mins.dedup();
+        all_sources.sort_unstable();
+        all_sources.dedup();
+
+        sharded.add_bucket(new_id, &bucket_name, all_sources, all_mins)?;
+    }
+
+    if skipped_count > 0 {
+        log::info!("{} file(s) skipped", skipped_count);
+    }
+
+    Ok(())
+}
+
+// --- HELPER FUNCTIONS FOR BUCKET ADD CONFIG ---
+
+/// Generate bucket name from list of file paths
+fn make_bucket_name_from_files(paths: &[PathBuf]) -> String {
+    const UNNAMED_BUCKET: &str = "__unnamed__";
+    if paths.is_empty() {
+        return UNNAMED_BUCKET.to_string();
+    }
+    paths[0].file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(UNNAMED_BUCKET)
+        .to_string()
+}
+
+/// Print assignment summary
+fn print_assignment_summary(assignments: &[FileAssignment]) {
+    if assignments.is_empty() {
+        println!("\n=== Assignment Summary ===");
+        println!("No files were assigned.");
+        return;
+    }
+
+    println!("\n=== Assignment Summary ===");
+
+    // Group by bucket
+    let mut by_bucket: HashMap<u32, Vec<&FileAssignment>> = HashMap::new();
+    for assignment in assignments {
+        by_bucket.entry(assignment.bucket_id).or_default().push(assignment);
+    }
+
+    let mut bucket_ids: Vec<_> = by_bucket.keys().copied().collect();
+    bucket_ids.sort();
+
+    for bucket_id in bucket_ids {
+        let files = &by_bucket[&bucket_id];
+        let first = files[0];
+        println!("\nBucket {} ('{}') [{}]:", bucket_id, first.bucket_name, first.mode);
+        for assignment in files {
+            if let Some(score) = assignment.score {
+                println!("  - {} (score: {:.4})", assignment.file_path.display(), score);
+            } else {
+                println!("  - {}", assignment.file_path.display());
+            }
+        }
+    }
+
+    println!("\n{} files assigned to {} bucket(s)", assignments.len(), by_bucket.len());
 }
 
 // --- INSPECT COMMAND HELPERS ---

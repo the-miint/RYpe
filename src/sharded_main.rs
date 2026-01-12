@@ -755,6 +755,62 @@ impl ShardedMainIndex {
         Ok(())
     }
 
+    /// Update an existing bucket by adding new minimizers and sources.
+    ///
+    /// Loads the shard containing the bucket, extends its minimizers,
+    /// sorts and deduplicates, then saves the shard back.
+    pub fn update_bucket(
+        &mut self,
+        bucket_id: u32,
+        new_sources: Vec<String>,
+        new_minimizers: Vec<u64>,
+    ) -> Result<()> {
+        if !self.manifest.bucket_names.contains_key(&bucket_id) {
+            return Err(anyhow!("Bucket {} does not exist in the index", bucket_id));
+        }
+
+        let shard_id = *self.manifest.bucket_to_shard.get(&bucket_id)
+            .ok_or_else(|| anyhow!("Bucket {} not mapped to any shard", bucket_id))?;
+
+        // Load the shard
+        let shard_path = MainIndexManifest::shard_path(&self.base_path, shard_id);
+        let mut shard = MainIndexShard::load(&shard_path)?;
+
+        // Get the bucket's minimizers and extend
+        let bucket_mins = shard.buckets.entry(bucket_id).or_default();
+        let old_count = bucket_mins.len();
+        bucket_mins.extend(new_minimizers);
+        bucket_mins.sort_unstable();
+        bucket_mins.dedup();
+        let new_count = bucket_mins.len();
+
+        // Save the shard
+        let compressed_size = shard.save(&shard_path)?;
+
+        // Update manifest - sources
+        let sources = self.manifest.bucket_sources.entry(bucket_id).or_default();
+        sources.extend(new_sources);
+        sources.sort_unstable();
+        sources.dedup();
+
+        // Update manifest - minimizer count
+        let added_minimizers = new_count.saturating_sub(old_count);
+        self.manifest.bucket_minimizer_counts.insert(bucket_id, new_count);
+        self.manifest.total_minimizers += added_minimizers;
+
+        // Update shard info
+        if let Some(shard_info) = self.manifest.shards.iter_mut().find(|s| s.shard_id == shard_id) {
+            shard_info.num_minimizers = shard_info.num_minimizers.saturating_sub(old_count) + new_count;
+            shard_info.compressed_size = compressed_size;
+        }
+
+        // Save updated manifest
+        let manifest_path = MainIndexManifest::manifest_path(&self.base_path);
+        self.manifest.save(&manifest_path)?;
+
+        Ok(())
+    }
+
     /// Get the next available bucket ID.
     pub fn next_id(&self) -> Result<u32> {
         let max_id = self.manifest.bucket_names.keys().max().copied().unwrap_or(0);
