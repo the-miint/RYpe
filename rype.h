@@ -11,7 +11,7 @@ extern "C" {
 /**
  * Rype: RY-encoded K-mer Partitioning Engine
  *
- * Version: 1.1.0
+ * Version: 1.2.0
  *
  * A high-performance genomic sequence classification library using
  * minimizer-based k-mer sketching in RY (purine/pyrimidine) space.
@@ -649,6 +649,321 @@ void rype_results_free(RypeResultArray* results);
  *     }
  */
 const char* rype_get_last_error(void);
+
+// ============================================================================
+// ARROW C DATA INTERFACE API (Optional Feature)
+// ============================================================================
+//
+// These functions are only available when rype is built with --features arrow.
+// They use the Arrow C Data Interface for zero-copy data exchange with
+// Arrow-compatible systems (Python/PyArrow, R/arrow, DuckDB, Polars, etc.).
+//
+// Reference: https://arrow.apache.org/docs/format/CDataInterface.html
+//
+// ## Building with Arrow support
+//
+//     cargo build --release --features arrow
+//
+// ## Linking
+//
+// When linking against rype with Arrow support, you must define RYPE_ARROW
+// before including this header to enable the Arrow API declarations:
+//
+//     #define RYPE_ARROW
+//     #include "rype.h"
+//
+
+#ifdef RYPE_ARROW
+
+// ----------------------------------------------------------------------------
+// Arrow C Data Interface Structures
+// ----------------------------------------------------------------------------
+// These structures match the Arrow C Data Interface specification exactly.
+// See: https://arrow.apache.org/docs/format/CDataInterface.html
+
+#ifndef ARROW_C_DATA_INTERFACE
+#define ARROW_C_DATA_INTERFACE
+
+#define ARROW_FLAG_DICTIONARY_ORDERED 1
+#define ARROW_FLAG_NULLABLE 2
+#define ARROW_FLAG_MAP_KEYS_SORTED 4
+
+/**
+ * Arrow C Data Interface schema structure
+ *
+ * Describes the type and metadata of an Arrow array.
+ * Part of the Arrow C Data Interface standard.
+ */
+struct ArrowSchema {
+    const char* format;
+    const char* name;
+    const char* metadata;
+    int64_t flags;
+    int64_t n_children;
+    struct ArrowSchema** children;
+    struct ArrowSchema* dictionary;
+    void (*release)(struct ArrowSchema*);
+    void* private_data;
+};
+
+/**
+ * Arrow C Data Interface array structure
+ *
+ * Contains the actual data buffers for an Arrow array.
+ * Part of the Arrow C Data Interface standard.
+ */
+struct ArrowArray {
+    int64_t length;
+    int64_t null_count;
+    int64_t offset;
+    int64_t n_buffers;
+    int64_t n_children;
+    const void** buffers;
+    struct ArrowArray** children;
+    struct ArrowArray* dictionary;
+    void (*release)(struct ArrowArray*);
+    void* private_data;
+};
+
+/**
+ * Arrow C Stream Interface structure
+ *
+ * A streaming interface for Arrow record batches.
+ * Part of the Arrow C Stream Interface standard.
+ * See: https://arrow.apache.org/docs/format/CStreamInterface.html
+ */
+struct ArrowArrayStream {
+    int (*get_schema)(struct ArrowArrayStream*, struct ArrowSchema* out);
+    int (*get_next)(struct ArrowArrayStream*, struct ArrowArray* out);
+    const char* (*get_last_error)(struct ArrowArrayStream*);
+    void (*release)(struct ArrowArrayStream*);
+    void* private_data;
+};
+
+#endif // ARROW_C_DATA_INTERFACE
+
+// ----------------------------------------------------------------------------
+// Sharded Inverted Index (for large indices that don't fit in memory)
+// ----------------------------------------------------------------------------
+
+/**
+ * Opaque pointer to a sharded inverted index
+ *
+ * Sharded indices split the inverted index across multiple files, allowing
+ * classification when the full index exceeds available memory. Shards are
+ * loaded on-demand during classification.
+ *
+ * Create with rype_sharded_load(), free with rype_sharded_free().
+ */
+typedef struct ShardedInvertedIndex ShardedInvertedIndex;
+
+/**
+ * Load a sharded inverted index from a manifest file
+ *
+ * @param path  Null-terminated UTF-8 path to the .ryxdi.manifest file
+ * @return      Non-NULL ShardedInvertedIndex pointer on success, NULL on failure
+ *
+ * ## Creating Sharded Indices
+ *
+ * Use the CLI with --shards to create sharded inverted indices:
+ *
+ *     rype index invert -i primary.ryidx --shards 4
+ *
+ * This creates:
+ *   - primary.ryxdi.manifest   (manifest file - pass this to rype_sharded_load)
+ *   - primary.ryxdi.shard.0    (shard 0)
+ *   - primary.ryxdi.shard.1    (shard 1)
+ *   - ...
+ *
+ * ## Memory Usage
+ *
+ * Only the manifest is loaded immediately. Individual shards are loaded
+ * on-demand during classification, keeping memory usage proportional to
+ * a single shard rather than the full index.
+ *
+ * ## Errors (returns NULL)
+ *
+ * - path is NULL
+ * - Manifest file not found
+ * - Invalid manifest format
+ * - Shard files missing or corrupted
+ *
+ * ## Thread Safety
+ *
+ * NOT thread-safe for loading. Safe for concurrent classification.
+ */
+ShardedInvertedIndex* rype_sharded_load(const char* path);
+
+/**
+ * Free a sharded inverted index
+ *
+ * @param sharded  ShardedInvertedIndex pointer, or NULL (no-op)
+ *
+ * ## Thread Safety
+ *
+ * NOT thread-safe. Do NOT call while any thread is classifying.
+ */
+void rype_sharded_free(ShardedInvertedIndex* sharded);
+
+// ----------------------------------------------------------------------------
+// Arrow Classification Functions
+// ----------------------------------------------------------------------------
+
+/**
+ * Classify sequences from an Arrow RecordBatch using a primary Index
+ *
+ * Uses the Arrow C Data Interface for zero-copy data exchange.
+ *
+ * @param index          Non-NULL Index pointer from rype_index_load()
+ * @param negative_set   Optional RypeNegativeSet for filtering (NULL to disable)
+ * @param input_stream   Input ArrowArrayStream containing sequence batches
+ * @param threshold      Classification threshold (0.0-1.0)
+ * @param out_stream     Output ArrowArrayStream for results (caller-allocated)
+ * @return               0 on success, -1 on error
+ *
+ * ## Input Schema
+ *
+ * The input stream must produce RecordBatches with these columns:
+ *
+ * | Column         | Type                    | Nullable | Description              |
+ * |----------------|-------------------------|----------|--------------------------|
+ * | id             | Int64                   | No       | Query identifier         |
+ * | sequence       | Binary or LargeBinary   | No       | DNA sequence bytes       |
+ * | pair_sequence  | Binary or LargeBinary   | Yes      | Paired-end sequence      |
+ *
+ * ## Output Schema
+ *
+ * The output stream produces RecordBatches with these columns:
+ *
+ * | Column    | Type    | Description                     |
+ * |-----------|---------|-------------------------------------|
+ * | query_id  | Int64   | Matching query ID from input        |
+ * | bucket_id | UInt32  | Matched bucket/reference ID         |
+ * | score     | Float64 | Classification score (0.0-1.0)      |
+ *
+ * ## Memory Management
+ *
+ * - input_stream: Consumed by this function (stream reader takes ownership)
+ * - out_stream: Function writes a new stream; caller must release when done
+ *
+ * ## Thread Safety
+ *
+ * Thread-safe for concurrent classification with the same Index.
+ * Each thread must use its own input/output streams.
+ *
+ * ## Example
+ *
+ *     struct ArrowArrayStream input_stream;
+ *     struct ArrowArrayStream output_stream;
+ *
+ *     // ... initialize input_stream from PyArrow, DuckDB, etc. ...
+ *
+ *     int result = rype_classify_arrow_batch(
+ *         idx, NULL, &input_stream, 0.1, &output_stream);
+ *
+ *     if (result == 0) {
+ *         // ... consume output_stream ...
+ *         output_stream.release(&output_stream);
+ *     } else {
+ *         fprintf(stderr, "Error: %s\n", rype_get_last_error());
+ *     }
+ */
+int rype_classify_arrow_batch(
+    const Index* index,
+    const RypeNegativeSet* negative_set,
+    struct ArrowArrayStream* input_stream,
+    double threshold,
+    struct ArrowArrayStream* out_stream
+);
+
+/**
+ * Classify sequences from an Arrow RecordBatch using an InvertedIndex
+ *
+ * This is the recommended API for large indices. Uses the inverted index
+ * for O(Q log U) complexity instead of O(B × Q × log M).
+ *
+ * @param inverted       Non-NULL InvertedIndex pointer from rype_inverted_load()
+ * @param negative_set   Optional RypeNegativeSet for filtering (NULL to disable)
+ * @param input_stream   Input ArrowArrayStream containing sequence batches
+ * @param threshold      Classification threshold (0.0-1.0)
+ * @param out_stream     Output ArrowArrayStream for results (caller-allocated)
+ * @return               0 on success, -1 on error
+ *
+ * See rype_classify_arrow_batch() for input/output schema and usage details.
+ */
+int rype_classify_arrow_batch_inverted(
+    const InvertedIndex* inverted,
+    const RypeNegativeSet* negative_set,
+    struct ArrowArrayStream* input_stream,
+    double threshold,
+    struct ArrowArrayStream* out_stream
+);
+
+/**
+ * Classify sequences from an Arrow RecordBatch using a ShardedInvertedIndex
+ *
+ * Use this when the full inverted index exceeds available memory. Shards are
+ * loaded on-demand from disk during classification.
+ *
+ * @param sharded        Non-NULL ShardedInvertedIndex from rype_sharded_load()
+ * @param negative_set   Optional RypeNegativeSet for filtering (NULL to disable)
+ * @param input_stream   Input ArrowArrayStream containing sequence batches
+ * @param threshold      Classification threshold (0.0-1.0)
+ * @param use_merge_join Non-zero for merge-join strategy, 0 for sequential lookup
+ * @param out_stream     Output ArrowArrayStream for results (caller-allocated)
+ * @return               0 on success, -1 on error
+ *
+ * ## Algorithm Selection
+ *
+ * - use_merge_join=0: Sequential lookup - loads each shard and queries it
+ * - use_merge_join=1: Merge-join - more efficient when queries have high
+ *   minimizer overlap with the index
+ *
+ * ## Memory Complexity
+ *
+ * O(batch_size × minimizers_per_read) + O(single_shard_size)
+ *
+ * See rype_classify_arrow_batch() for input/output schema and usage details.
+ */
+int rype_classify_arrow_batch_sharded(
+    const ShardedInvertedIndex* sharded,
+    const RypeNegativeSet* negative_set,
+    struct ArrowArrayStream* input_stream,
+    double threshold,
+    int use_merge_join,
+    struct ArrowArrayStream* out_stream
+);
+
+/**
+ * Get the output schema for Arrow classification results
+ *
+ * Returns the schema that all Arrow classification functions produce.
+ * Useful for pre-allocating memory or validating expected output format.
+ *
+ * @param out_schema  Pointer to caller-allocated ArrowSchema to initialize
+ * @return            0 on success, -1 on error
+ *
+ * ## Output Schema
+ *
+ * - query_id: Int64 (non-nullable)
+ * - bucket_id: UInt32 (non-nullable)
+ * - score: Float64 (non-nullable)
+ *
+ * ## Memory
+ *
+ * Caller must call out_schema->release(out_schema) when done.
+ *
+ * ## Example
+ *
+ *     struct ArrowSchema schema;
+ *     if (rype_arrow_result_schema(&schema) == 0) {
+ *         // Use schema...
+ *         schema.release(&schema);
+ *     }
+ */
+int rype_arrow_result_schema(struct ArrowSchema* out_schema);
+
+#endif // RYPE_ARROW
 
 #ifdef __cplusplus
 }
