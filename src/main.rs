@@ -219,16 +219,40 @@ enum IndexCommands {
   window = 50                      # Minimizer window size
   salt = 0x5555555555555555        # Hash salt (hex)
   output = \"index.ryidx\"           # Output path
+  max_shard_size = 1073741824      # Optional: shard main index (bytes)
+
+  [index.invert]                   # Optional: create inverted index
+  shards = 4                       # Number of shards (default: 1)
 
   [buckets.BucketName]             # Define a bucket
   files = [\"ref1.fa\", \"ref2.fa\"]   # Files for this bucket
 
   [buckets.AnotherBucket]
-  files = [\"other.fasta\"]")]
+  files = [\"other.fasta\"]
+
+CLI OPTIONS OVERRIDE CONFIG FILE:
+  --max-shard-size overrides [index].max_shard_size
+  --invert enables inverted index creation (even without [index.invert])
+  --invert-shards overrides [index.invert].shards
+
+NOTE: Cannot combine max_shard_size with [index.invert]. When main index is
+sharded, use 'rype index invert' separately (creates 1:1 inverted shards).")]
     FromConfig {
         /// Path to TOML config file
         #[arg(short, long)]
         config: PathBuf,
+
+        /// Maximum shard size in bytes for main index (overrides config)
+        #[arg(long)]
+        max_shard_size: Option<usize>,
+
+        /// Create inverted index after building (overrides config)
+        #[arg(short = 'I', long)]
+        invert: bool,
+
+        /// Number of shards for inverted index (overrides config, implies --invert)
+        #[arg(long)]
+        invert_shards: Option<u32>,
     },
 
     /// Add files to existing index using TOML config (see CONFIG FORMAT below)
@@ -846,8 +870,8 @@ fn main() -> Result<()> {
                 log::info!("Merged index saved to {:?}", output);
             }
 
-            IndexCommands::FromConfig { config } => {
-                build_index_from_config(&config)?;
+            IndexCommands::FromConfig { config, max_shard_size, invert, invert_shards } => {
+                build_index_from_config(&config, max_shard_size, invert, invert_shards)?;
             }
 
             IndexCommands::BucketAddConfig { config } => {
@@ -1440,7 +1464,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_index_from_config(config_path: &Path) -> Result<()> {
+fn build_index_from_config(
+    config_path: &Path,
+    cli_max_shard_size: Option<usize>,
+    cli_invert: bool,
+    cli_invert_shards: Option<u32>,
+) -> Result<()> {
     log::info!("Building index from config: {}", config_path.display());
 
     // 1. Parse and validate config
@@ -1451,6 +1480,29 @@ fn build_index_from_config(config_path: &Path) -> Result<()> {
     log::info!("Validating file paths...");
     validate_config(&cfg, config_dir)?;
     log::info!("Validation successful.");
+
+    // Resolve CLI overrides for sharding options
+    // CLI takes precedence over config file
+    let max_shard_size = cli_max_shard_size.or(cfg.index.max_shard_size);
+
+    // Determine if we should create inverted index and how many shards
+    // --invert-shards implies --invert
+    let should_invert = cli_invert || cli_invert_shards.is_some() || cfg.index.invert.is_some();
+    let invert_shards = cli_invert_shards
+        .or_else(|| cfg.index.invert.as_ref().map(|i| i.shards))
+        .unwrap_or(1);
+
+    // Disallow combining main index sharding with inverted index creation
+    // When main index is sharded, inverted shards must be 1:1 with main shards,
+    // which requires loading each shard separately. Use 'index invert' for this.
+    if max_shard_size.is_some() && should_invert {
+        return Err(anyhow!(
+            "Cannot create inverted index when sharding main index.\n\
+             When --max-shard-size is used, inverted shards must be 1:1 with main shards.\n\
+             Run 'rype index invert -i {}' after building to create the inverted index.",
+            cfg.index.output.display()
+        ));
+    }
 
     // 2. Sort bucket names for deterministic ordering
     let mut bucket_names: Vec<_> = cfg.buckets.keys().cloned().collect();
@@ -1514,15 +1566,43 @@ fn build_index_from_config(config_path: &Path) -> Result<()> {
         }
     }
 
-    // 5. Save final index
-    log::info!("Saving index to {}...", cfg.index.output.display());
-    final_index.save(&cfg.index.output)?;
+    // 5. Save final index (with optional sharding)
+    if let Some(max_bytes) = max_shard_size {
+        log::info!("Saving sharded index to {:?} (max {} bytes/shard)...", cfg.index.output, max_bytes);
+        let manifest = final_index.save_sharded(&cfg.index.output, max_bytes)?;
+        log::info!("Created {} shards with {} total minimizers.", manifest.shards.len(), manifest.total_minimizers);
+    } else {
+        log::info!("Saving index to {}...", cfg.index.output.display());
+        final_index.save(&cfg.index.output)?;
+    }
 
     log::info!("Done! Index saved successfully.");
     log::info!("\nFinal statistics:");
     log::info!("  Buckets: {}", final_index.buckets.len());
     let total_minimizers: usize = final_index.buckets.values().map(|v| v.len()).sum();
     log::info!("  Total minimizers: {}", total_minimizers);
+
+    // 6. Optionally create inverted index
+    if should_invert {
+        let inverted_path = cfg.index.output.with_extension("ryxdi");
+        log::info!("Building inverted index...");
+        let inverted = InvertedIndex::build_from_index(&final_index);
+        log::info!("Inverted index built: {} unique minimizers, {} bucket entries",
+            inverted.num_minimizers(), inverted.num_bucket_entries());
+
+        if invert_shards > 1 {
+            log::info!("Saving sharded inverted index ({} shards) to {:?}", invert_shards, inverted_path);
+            let manifest = inverted.save_sharded(&inverted_path, invert_shards)?;
+            log::info!("Created {} inverted shards:", manifest.shards.len());
+            for shard in &manifest.shards {
+                log::info!("  Shard {}: {} unique minimizers, {} bucket entries",
+                    shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
+            }
+        } else {
+            log::info!("Saving inverted index to {:?}", inverted_path);
+            inverted.save(&inverted_path)?;
+        }
+    }
 
     Ok(())
 }

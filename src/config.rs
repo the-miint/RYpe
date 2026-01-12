@@ -17,6 +17,21 @@ pub struct IndexSettings {
     pub window: usize,
     pub salt: u64,
     pub output: PathBuf,
+    /// Maximum shard size in bytes for main index sharding (optional)
+    pub max_shard_size: Option<usize>,
+    /// Optional settings for creating an inverted index after building
+    pub invert: Option<InvertSettings>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct InvertSettings {
+    /// Number of shards for the inverted index (default: 1 = single file)
+    #[serde(default = "default_shards")]
+    pub shards: u32,
+}
+
+fn default_shards() -> u32 {
+    1
 }
 
 fn default_k() -> usize {
