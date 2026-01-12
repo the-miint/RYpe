@@ -19,27 +19,50 @@ use crate::sharded_main::ShardedMainIndex;
 use crate::types::{HitResult, QueryRecord};
 use crate::workspace::MinimizerWorkspace;
 
-/// Classify a batch of query records against an Index.
+/// Filter out negative minimizers from forward and reverse-complement minimizer vectors.
+///
+/// Uses `retain()` to filter in-place, avoiding unnecessary allocations in hot paths.
+/// If `negative_mins` is None, the vectors are returned unchanged.
+#[inline]
+fn filter_negative_mins(
+    mut fwd: Vec<u64>,
+    mut rc: Vec<u64>,
+    negative_mins: Option<&HashSet<u64>>,
+) -> (Vec<u64>, Vec<u64>) {
+    if let Some(neg_set) = negative_mins {
+        fwd.retain(|m| !neg_set.contains(m));
+        rc.retain(|m| !neg_set.contains(m));
+    }
+    (fwd, rc)
+}
+
+/// Classify a batch of query records against an Index with optional negative filtering.
 ///
 /// Uses parallel minimizer extraction and per-bucket binary search.
 ///
+/// When negative minimizers are provided, they are removed from query minimizer sets
+/// BEFORE scoring against the positive index. This allows filtering out known
+/// contaminant or off-target sequences.
+///
 /// # Arguments
 /// * `engine` - The index to classify against
+/// * `negative_mins` - Optional set of minimizers to exclude from queries before scoring
 /// * `records` - Batch of query records
 /// * `threshold` - Minimum score threshold for reporting hits
 ///
 /// # Returns
-/// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
+/// Vector of HitResult for all (query, bucket) pairs meeting threshold.
 pub fn classify_batch(
     engine: &Index,
+    negative_mins: Option<&HashSet<u64>>,
     records: &[QueryRecord],
     threshold: f64
 ) -> Vec<HitResult> {
-
     let processed: Vec<_> = records.par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
             let (ha, hb) = get_paired_minimizers_into(s1, *s2, engine.k, engine.w, engine.salt, ws);
-            (*id, ha, hb)
+            let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
+            (*id, fa, fb)
         }).collect();
 
     let mut map_a: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -87,6 +110,7 @@ pub fn classify_batch(
 ///
 /// # Arguments
 /// * `inverted` - The inverted index for minimizer → bucket lookups
+/// * `negative_mins` - Optional set of minimizers to exclude from queries before scoring
 /// * `records` - Batch of query records to classify
 /// * `threshold` - Minimum score threshold for reporting hits
 ///
@@ -94,13 +118,15 @@ pub fn classify_batch(
 /// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
 pub fn classify_batch_inverted(
     inverted: &InvertedIndex,
+    negative_mins: Option<&HashSet<u64>>,
     records: &[QueryRecord],
     threshold: f64
 ) -> Vec<HitResult> {
     let processed: Vec<_> = records.par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
             let (ha, hb) = get_paired_minimizers_into(s1, *s2, inverted.k, inverted.w, inverted.salt, ws);
-            (*id, ha, hb)
+            let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
+            (*id, fa, fb)
         }).collect();
 
     let results: Vec<HitResult> = processed.par_iter()
@@ -144,6 +170,7 @@ pub fn classify_batch_inverted(
 ///
 /// # Arguments
 /// * `sharded` - The sharded inverted index
+/// * `negative_mins` - Optional set of minimizers to exclude from queries before scoring
 /// * `records` - Batch of query records
 /// * `threshold` - Minimum score threshold
 ///
@@ -151,6 +178,7 @@ pub fn classify_batch_inverted(
 /// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
 pub fn classify_batch_sharded_sequential(
     sharded: &ShardedInvertedIndex,
+    negative_mins: Option<&HashSet<u64>>,
     records: &[QueryRecord],
     threshold: f64
 ) -> Result<Vec<HitResult>> {
@@ -160,7 +188,8 @@ pub fn classify_batch_sharded_sequential(
     let processed: Vec<_> = records.par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
             let (ha, hb) = get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
-            (*id, ha, hb)
+            let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
+            (*id, fa, fb)
         }).collect();
 
     let all_hits: Vec<Mutex<HashMap<u32, (usize, usize)>>> =
@@ -215,6 +244,7 @@ pub fn classify_batch_sharded_sequential(
 ///
 /// # Arguments
 /// * `sharded` - The sharded inverted index
+/// * `negative_mins` - Optional set of minimizers to exclude from queries before scoring
 /// * `records` - Batch of query records
 /// * `threshold` - Minimum score threshold
 ///
@@ -222,6 +252,7 @@ pub fn classify_batch_sharded_sequential(
 /// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
 pub fn classify_batch_sharded_merge_join(
     sharded: &ShardedInvertedIndex,
+    negative_mins: Option<&HashSet<u64>>,
     records: &[QueryRecord],
     threshold: f64,
 ) -> Result<Vec<HitResult>> {
@@ -232,10 +263,11 @@ pub fn classify_batch_sharded_merge_join(
     let manifest = sharded.manifest();
     let base_path = sharded.base_path();
 
-    // Extract minimizers in parallel
+    // Extract minimizers in parallel, filtering negatives if provided
     let extracted: Vec<_> = records.par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (_, s1, s2)| {
-            get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws)
+            let (ha, hb) = get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
+            filter_negative_mins(ha, hb, negative_mins)
         }).collect();
 
     // Collect query IDs
@@ -291,6 +323,7 @@ pub fn classify_batch_sharded_merge_join(
 ///
 /// # Arguments
 /// * `sharded` - The sharded main index
+/// * `negative_mins` - Optional set of minimizers to exclude from queries before scoring
 /// * `records` - Batch of query records
 /// * `threshold` - Minimum score threshold
 ///
@@ -298,16 +331,18 @@ pub fn classify_batch_sharded_merge_join(
 /// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
 pub fn classify_batch_sharded_main(
     sharded: &ShardedMainIndex,
+    negative_mins: Option<&HashSet<u64>>,
     records: &[QueryRecord],
     threshold: f64
 ) -> Result<Vec<HitResult>> {
     let manifest = sharded.manifest();
 
-    // Extract minimizers for all queries (parallel)
+    // Extract minimizers for all queries (parallel), filtering negatives if provided
     let processed: Vec<_> = records.par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
             let (ha, hb) = get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
-            (*id, ha, hb)
+            let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
+            (*id, fa, fb)
         }).collect();
 
     // Build inverted maps: minimizer → query indices
@@ -391,6 +426,7 @@ pub fn classify_batch_sharded_main(
 /// Vector of HitResult with query_id = -1 for all buckets meeting the threshold.
 pub fn aggregate_batch(
     engine: &Index,
+    negative_mins: Option<&HashSet<u64>>,
     records: &[QueryRecord],
     threshold: f64
 ) -> Vec<HitResult> {
@@ -400,6 +436,9 @@ pub fn aggregate_batch(
         .map_init(MinimizerWorkspace::new, |ws, (_, s1, s2)| {
             let (mut a, b) = get_paired_minimizers_into(s1, *s2, engine.k, engine.w, engine.salt, ws);
             a.extend(b);
+            if let Some(neg_set) = negative_mins {
+                a.retain(|m| !neg_set.contains(m));
+            }
             a
         }).collect();
 
@@ -667,6 +706,7 @@ fn accumulate_merge_join(
 /// See `classify_batch_merge_join` for detailed performance characteristics.
 pub fn classify_batch_with_query_index(
     ref_idx: &InvertedIndex,
+    negative_mins: Option<&HashSet<u64>>,
     records: &[QueryRecord],
     threshold: f64,
 ) -> Vec<HitResult> {
@@ -674,10 +714,11 @@ pub fn classify_batch_with_query_index(
         return Vec::new();
     }
 
-    // Extract minimizers in parallel
+    // Extract minimizers in parallel, filtering negatives if provided
     let extracted: Vec<_> = records.par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (_, s1, s2)| {
-            get_paired_minimizers_into(s1, *s2, ref_idx.k, ref_idx.w, ref_idx.salt, ws)
+            let (ha, hb) = get_paired_minimizers_into(s1, *s2, ref_idx.k, ref_idx.w, ref_idx.salt, ws);
+            filter_negative_mins(ha, hb, negative_mins)
         }).collect();
 
     // Collect query IDs
@@ -712,7 +753,7 @@ mod tests {
             (101, &query_seq, None)
         ];
 
-        let results = classify_batch(&index, &records, 0.5);
+        let results = classify_batch(&index, None, &records, 0.5);
 
         assert!(!results.is_empty());
         let hit = &results[0];
@@ -742,7 +783,7 @@ mod tests {
             (2, q2, None),
         ];
 
-        let results = aggregate_batch(&index, &records, 0.5);
+        let results = aggregate_batch(&index, None, &records, 0.5);
 
         assert_eq!(results.len(), 1, "Should only match bucket 2");
         assert_eq!(results[0].bucket_id, 2);
@@ -769,8 +810,8 @@ mod tests {
         let query_seq = seq_a.clone();
         let records: Vec<QueryRecord> = vec![(101, &query_seq[..], None)];
 
-        let results_regular = classify_batch(&index, &records, 0.5);
-        let results_inverted = classify_batch_inverted(&inverted, &records, 0.5);
+        let results_regular = classify_batch(&index, None, &records, 0.5);
+        let results_inverted = classify_batch_inverted(&inverted, None, &records, 0.5);
 
         assert_eq!(results_regular.len(), results_inverted.len());
         if !results_regular.is_empty() {
@@ -814,8 +855,8 @@ mod tests {
 
         let threshold = 0.1;
 
-        let results_inverted = classify_batch_inverted(&inverted, &records, threshold);
-        let results_sequential = classify_batch_sharded_sequential(&sharded, &records, threshold)?;
+        let results_inverted = classify_batch_inverted(&inverted, None, &records, threshold);
+        let results_sequential = classify_batch_sharded_sequential(&sharded, None, &records, threshold)?;
 
         assert_eq!(results_inverted.len(), results_sequential.len(),
             "Result counts should match: inverted={}, sequential={}",
@@ -868,8 +909,8 @@ mod tests {
 
         let threshold = 0.1;
 
-        let results_sequential = classify_batch_sharded_sequential(&sharded, &records, threshold)?;
-        let results_merge_join = classify_batch_sharded_merge_join(&sharded, &records, threshold)?;
+        let results_sequential = classify_batch_sharded_sequential(&sharded, None, &records, threshold)?;
+        let results_merge_join = classify_batch_sharded_merge_join(&sharded, None, &records, threshold)?;
 
         assert_eq!(results_sequential.len(), results_merge_join.len(),
             "Result counts should match: sequential={}, merge_join={}",
@@ -924,8 +965,8 @@ mod tests {
 
         let threshold = 0.1;
 
-        let results_regular = classify_batch(&index, &records, threshold);
-        let results_sharded = classify_batch_sharded_main(&sharded, &records, threshold)?;
+        let results_regular = classify_batch(&index, None, &records, threshold);
+        let results_sharded = classify_batch_sharded_main(&sharded, None, &records, threshold)?;
 
         assert_eq!(results_regular.len(), results_sharded.len(),
             "Result counts should match: regular={}, sharded={}",
@@ -1037,8 +1078,8 @@ mod tests {
         let query_seq = seq_a.clone();
         let records: Vec<QueryRecord> = vec![(101, &query_seq[..], None)];
 
-        let results_inverted = classify_batch_inverted(&inverted, &records, 0.5);
-        let results_merge = classify_batch_with_query_index(&inverted, &records, 0.5);
+        let results_inverted = classify_batch_inverted(&inverted, None, &records, 0.5);
+        let results_merge = classify_batch_with_query_index(&inverted, None, &records, 0.5);
 
         assert_eq!(results_inverted.len(), results_merge.len(),
             "Result counts should match: inverted={}, merge={}",
@@ -1087,8 +1128,8 @@ mod tests {
         ];
 
         let threshold = 0.1;
-        let results_inverted = classify_batch_inverted(&inverted, &records, threshold);
-        let results_merge = classify_batch_with_query_index(&inverted, &records, threshold);
+        let results_inverted = classify_batch_inverted(&inverted, None, &records, threshold);
+        let results_merge = classify_batch_with_query_index(&inverted, None, &records, threshold);
 
         assert_eq!(results_inverted.len(), results_merge.len(),
             "Result counts should match");
@@ -1161,5 +1202,346 @@ mod tests {
         assert_eq!(results[0].bucket_id, 1);
         // 1/100 fwd minimizers matched = 0.01
         assert!((results[0].score - 0.01).abs() < 0.001);
+    }
+
+    // ==================== Negative Filtering Tests ====================
+
+    #[test]
+    fn test_classify_batch_negative_filtering() {
+        let mut index = Index::new(64, 10, 0).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq_a = vec![b'A'; 80];
+        index.add_record(1, "ref_a", &seq_a, &mut ws);
+        index.finalize_bucket(1);
+
+        let query_seq = seq_a.clone();
+        let records: Vec<QueryRecord> = vec![(101, &query_seq, None)];
+
+        // Without negative filtering: should match bucket 1
+        let results_no_neg = classify_batch(&index, None, &records, 0.5);
+        assert!(!results_no_neg.is_empty(), "Should have hits without negative filtering");
+        assert_eq!(results_no_neg[0].score, 1.0);
+
+        // Extract the minimizers that would be in the query
+        let (query_mins, _) = crate::extraction::get_paired_minimizers_into(
+            &query_seq, None, index.k, index.w, index.salt, &mut ws
+        );
+
+        // Create negative set containing all query minimizers
+        let neg_set: HashSet<u64> = query_mins.into_iter().collect();
+
+        // With full negative filtering: should have no hits (score = 0)
+        let results_with_neg = classify_batch(&index, Some(&neg_set), &records, 0.5);
+        assert!(results_with_neg.is_empty(), "Should have no hits above threshold when all minimizers filtered");
+    }
+
+    #[test]
+    fn test_classify_batch_inverted_negative_filtering() -> anyhow::Result<()> {
+        let mut index = Index::new(64, 10, 0).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq_a = vec![b'A'; 80];
+        index.add_record(1, "ref_a", &seq_a, &mut ws);
+        index.finalize_bucket(1);
+        index.bucket_names.insert(1, "BucketA".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        let query_seq = seq_a.clone();
+        let records: Vec<QueryRecord> = vec![(101, &query_seq[..], None)];
+
+        // Without negative filtering
+        let results_no_neg = classify_batch_inverted(&inverted, None, &records, 0.5);
+        assert!(!results_no_neg.is_empty());
+        assert_eq!(results_no_neg[0].score, 1.0);
+
+        // With full negative filtering - should produce no hits
+        let (query_mins, _) = crate::extraction::get_paired_minimizers_into(
+            &query_seq, None, inverted.k, inverted.w, inverted.salt, &mut ws
+        );
+        let full_neg: HashSet<u64> = query_mins.into_iter().collect();
+
+        let results_full_neg = classify_batch_inverted(&inverted, Some(&full_neg), &records, 0.5);
+        assert!(results_full_neg.is_empty(), "Should have no hits when all minimizers filtered");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_classify_batch_sharded_sequential_negative_filtering() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        let mut index = Index::new(32, 10, 0x1234).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        index.add_record(1, "ref1", seq1, &mut ws);
+        index.bucket_names.insert(1, "A".into());
+        index.finalize_bucket(1);
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_sharded(&base_path, 2)?;
+        let sharded = ShardedInvertedIndex::open(&base_path)?;
+
+        let query: &[u8] = seq1;
+        let records: Vec<QueryRecord> = vec![(0, query, None)];
+
+        // Without negative filtering
+        let results_no_neg = classify_batch_sharded_sequential(&sharded, None, &records, 0.5)?;
+        assert!(!results_no_neg.is_empty());
+
+        // Extract query minimizers for filtering
+        let (query_mins, _) = crate::extraction::get_paired_minimizers_into(
+            query, None, sharded.manifest().k, sharded.manifest().w, sharded.manifest().salt, &mut ws
+        );
+        let full_neg: HashSet<u64> = query_mins.into_iter().collect();
+
+        // With full negative filtering: no hits above threshold
+        let results_full_neg = classify_batch_sharded_sequential(&sharded, Some(&full_neg), &records, 0.5)?;
+        assert!(results_full_neg.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_classify_batch_sharded_merge_join_negative_filtering() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        let mut index = Index::new(32, 10, 0x1234).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        index.add_record(1, "ref1", seq1, &mut ws);
+        index.bucket_names.insert(1, "A".into());
+        index.finalize_bucket(1);
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_sharded(&base_path, 2)?;
+        let sharded = ShardedInvertedIndex::open(&base_path)?;
+
+        let query: &[u8] = seq1;
+        let records: Vec<QueryRecord> = vec![(0, query, None)];
+
+        // Without negative filtering
+        let results_no_neg = classify_batch_sharded_merge_join(&sharded, None, &records, 0.5)?;
+        assert!(!results_no_neg.is_empty());
+
+        // Extract query minimizers for filtering
+        let (query_mins, _) = crate::extraction::get_paired_minimizers_into(
+            query, None, sharded.manifest().k, sharded.manifest().w, sharded.manifest().salt, &mut ws
+        );
+        let full_neg: HashSet<u64> = query_mins.into_iter().collect();
+
+        // With full negative filtering: no hits above threshold
+        let results_full_neg = classify_batch_sharded_merge_join(&sharded, Some(&full_neg), &records, 0.5)?;
+        assert!(results_full_neg.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_classify_batch_sharded_main_negative_filtering() -> anyhow::Result<()> {
+        use crate::sharded_main::ShardedMainIndex;
+
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryidx");
+
+        let mut index = Index::new(32, 10, 0x1234).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        index.add_record(1, "ref1", seq1, &mut ws);
+        index.bucket_names.insert(1, "A".into());
+        index.finalize_bucket(1);
+
+        // Save as sharded (small budget to ensure multiple shards)
+        index.save_sharded(&base_path, 100)?;
+        let sharded = ShardedMainIndex::open(&base_path)?;
+
+        let query: &[u8] = seq1;
+        let records: Vec<QueryRecord> = vec![(0, query, None)];
+
+        // Without negative filtering
+        let results_no_neg = classify_batch_sharded_main(&sharded, None, &records, 0.5)?;
+        assert!(!results_no_neg.is_empty());
+
+        // Extract query minimizers for filtering
+        let (query_mins, _) = crate::extraction::get_paired_minimizers_into(
+            query, None, sharded.manifest().k, sharded.manifest().w, sharded.manifest().salt, &mut ws
+        );
+        let full_neg: HashSet<u64> = query_mins.into_iter().collect();
+
+        // With full negative filtering: no hits above threshold
+        let results_full_neg = classify_batch_sharded_main(&sharded, Some(&full_neg), &records, 0.5)?;
+        assert!(results_full_neg.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_classify_batch_with_query_index_negative_filtering() -> anyhow::Result<()> {
+        let mut index = Index::new(64, 10, 0).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq_a = vec![b'A'; 80];
+        index.add_record(1, "ref_a", &seq_a, &mut ws);
+        index.finalize_bucket(1);
+        index.bucket_names.insert(1, "BucketA".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        let query_seq = seq_a.clone();
+        let records: Vec<QueryRecord> = vec![(101, &query_seq[..], None)];
+
+        // Without negative filtering
+        let results_no_neg = classify_batch_with_query_index(&inverted, None, &records, 0.5);
+        assert!(!results_no_neg.is_empty());
+        assert_eq!(results_no_neg[0].score, 1.0);
+
+        // With full negative filtering
+        let (query_mins, _) = crate::extraction::get_paired_minimizers_into(
+            &query_seq, None, inverted.k, inverted.w, inverted.salt, &mut ws
+        );
+        let full_neg: HashSet<u64> = query_mins.into_iter().collect();
+
+        let results_full_neg = classify_batch_with_query_index(&inverted, Some(&full_neg), &records, 0.5);
+        assert!(results_full_neg.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregate_batch_negative_filtering() {
+        // Use K=32 to allow shorter sequences to produce minimizers
+        let mut index = Index::new(32, 10, 0).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq_a = vec![b'A'; 100];
+        index.add_record(1, "ref_a", &seq_a, &mut ws);
+        index.finalize_bucket(1);
+
+        let records: Vec<QueryRecord> = vec![
+            (1, &seq_a[0..50], None),
+            (2, &seq_a[50..100], None),
+        ];
+
+        // Without negative filtering
+        let results_no_neg = aggregate_batch(&index, None, &records, 0.5);
+        assert!(!results_no_neg.is_empty(), "Should have results without negative filtering");
+
+        // Get all minimizers from the queries
+        let (mins1, _) = crate::extraction::get_paired_minimizers_into(
+            &seq_a[0..50], None, index.k, index.w, index.salt, &mut ws
+        );
+        let (mins2, _) = crate::extraction::get_paired_minimizers_into(
+            &seq_a[50..100], None, index.k, index.w, index.salt, &mut ws
+        );
+        let mut full_neg: HashSet<u64> = mins1.into_iter().collect();
+        full_neg.extend(mins2);
+
+        // With full negative filtering
+        let results_full_neg = aggregate_batch(&index, Some(&full_neg), &records, 0.5);
+        assert!(results_full_neg.is_empty(), "Should have no hits when all minimizers filtered");
+    }
+
+    // ==================== Edge Case Tests ====================
+
+    #[test]
+    fn test_negative_filtering_empty_set() {
+        // Empty negative set should have no effect
+        let mut index = Index::new(64, 10, 0).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq_a = vec![b'A'; 80];
+        index.add_record(1, "ref_a", &seq_a, &mut ws);
+        index.finalize_bucket(1);
+
+        let query_seq = seq_a.clone();
+        let records: Vec<QueryRecord> = vec![(101, &query_seq, None)];
+
+        let empty_neg: HashSet<u64> = HashSet::new();
+
+        let results_none = classify_batch(&index, None, &records, 0.5);
+        let results_empty = classify_batch(&index, Some(&empty_neg), &records, 0.5);
+
+        assert_eq!(results_none.len(), results_empty.len());
+        if !results_none.is_empty() {
+            assert_eq!(results_none[0].bucket_id, results_empty[0].bucket_id);
+            assert!((results_none[0].score - results_empty[0].score).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn test_negative_filtering_no_overlap() {
+        // Negative set with minimizers that don't appear in query should have no effect
+        // Note: Use alternating AT sequence since all-A gives minimizer = u64::MAX
+        let mut index = Index::new(64, 10, 0).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        // Use alternating sequence to get non-trivial minimizers
+        let seq_at: Vec<u8> = (0..80).map(|i| if i % 2 == 0 { b'A' } else { b'T' }).collect();
+        index.add_record(1, "ref_at", &seq_at, &mut ws);
+        index.finalize_bucket(1);
+
+        let query_seq = seq_at.clone();
+        let records: Vec<QueryRecord> = vec![(101, &query_seq[..], None)];
+
+        // Create negative set with minimizers that won't match (use values far from typical hashes)
+        // Value 1 is unlikely since it would require a very specific pattern
+        let no_overlap_neg: HashSet<u64> = vec![1, 2, 3].into_iter().collect();
+
+        let results_none = classify_batch(&index, None, &records, 0.5);
+        let results_no_overlap = classify_batch(&index, Some(&no_overlap_neg), &records, 0.5);
+
+        assert_eq!(results_none.len(), results_no_overlap.len(),
+            "No-overlap negative filtering should not change result count");
+        if !results_none.is_empty() {
+            assert_eq!(results_none[0].bucket_id, results_no_overlap[0].bucket_id);
+            assert!((results_none[0].score - results_no_overlap[0].score).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn test_negative_filtering_preserves_consistency_across_methods() -> anyhow::Result<()> {
+        // Verify that negative filtering produces consistent results across
+        // all classification methods
+        let mut index = Index::new(64, 10, 0).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq_a = vec![b'A'; 80];
+        index.add_record(1, "ref_a", &seq_a, &mut ws);
+        index.finalize_bucket(1);
+        index.bucket_names.insert(1, "BucketA".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        let query_seq = seq_a.clone();
+        let records: Vec<QueryRecord> = vec![(101, &query_seq[..], None)];
+
+        // Extract partial negative set (half the minimizers)
+        let (query_mins, _) = crate::extraction::get_paired_minimizers_into(
+            &query_seq, None, index.k, index.w, index.salt, &mut ws
+        );
+        let half: HashSet<u64> = query_mins.iter().take(query_mins.len() / 2).copied().collect();
+
+        let results_batch = classify_batch(&index, Some(&half), &records, 0.0);
+        let results_inverted = classify_batch_inverted(&inverted, Some(&half), &records, 0.0);
+        let results_merge = classify_batch_with_query_index(&inverted, Some(&half), &records, 0.0);
+
+        // All methods should produce consistent results
+        assert_eq!(results_batch.len(), results_inverted.len());
+        assert_eq!(results_batch.len(), results_merge.len());
+
+        if !results_batch.is_empty() {
+            assert_eq!(results_batch[0].bucket_id, results_inverted[0].bucket_id);
+            assert_eq!(results_batch[0].bucket_id, results_merge[0].bucket_id);
+            assert!((results_batch[0].score - results_inverted[0].score).abs() < 0.001);
+            assert!((results_batch[0].score - results_merge[0].score).abs() < 0.001);
+        }
+
+        Ok(())
     }
 }

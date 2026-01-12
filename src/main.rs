@@ -157,8 +157,12 @@ enum IndexCommands {
 enum ClassifyCommands {
     /// Classify reads against an index (per-read output)
     Run {
-        #[arg(short, long)]
+        /// Path to positive index (targets to classify against)
+        #[arg(short, long, visible_alias = "positive-index")]
         index: PathBuf,
+        /// Path to negative index (minimizers to exclude from queries before scoring)
+        #[arg(short = 'N', long)]
+        negative_index: Option<PathBuf>,
         #[arg(short = '1', long)]
         r1: PathBuf,
         #[arg(short = '2', long)]
@@ -179,8 +183,12 @@ enum ClassifyCommands {
 
     /// Batch classify reads (alias for 'run')
     Batch {
-        #[arg(short, long)]
+        /// Path to positive index (targets to classify against)
+        #[arg(short, long, visible_alias = "positive-index")]
         index: PathBuf,
+        /// Path to negative index (minimizers to exclude from queries before scoring)
+        #[arg(short = 'N', long)]
+        negative_index: Option<PathBuf>,
         #[arg(short = '1', long)]
         r1: PathBuf,
         #[arg(short = '2', long)]
@@ -202,8 +210,12 @@ enum ClassifyCommands {
     /// Aggregate classification (higher sensitivity, aggregates paired-end reads)
     #[command(alias = "agg")]
     Aggregate {
-        #[arg(short, long)]
+        /// Path to positive index (targets to classify against)
+        #[arg(short, long, visible_alias = "positive-index")]
         index: PathBuf,
+        /// Path to negative index (minimizers to exclude from queries before scoring)
+        #[arg(short = 'N', long)]
+        negative_index: Option<PathBuf>,
         #[arg(short = '1', long)]
         r1: PathBuf,
         #[arg(short = '2', long)]
@@ -897,11 +909,51 @@ fn main() -> Result<()> {
         },
 
         Commands::Classify(classify_cmd) => match classify_cmd {
-            ClassifyCommands::Run { index, r1, r2, threshold, batch_size, output, use_inverted, merge_join } |
-            ClassifyCommands::Batch { index, r1, r2, threshold, batch_size, output, use_inverted, merge_join } => {
+            ClassifyCommands::Run { index, negative_index, r1, r2, threshold, batch_size, output, use_inverted, merge_join } |
+            ClassifyCommands::Batch { index, negative_index, r1, r2, threshold, batch_size, output, use_inverted, merge_join } => {
                 if merge_join && !use_inverted {
                     return Err(anyhow!("--merge-join requires --use-inverted"));
                 }
+
+                // Load negative index if provided, validate parameters, and build minimizer set
+                let neg_mins: Option<HashSet<u64>> = match &negative_index {
+                    None => None,
+                    Some(neg_path) => {
+                        log::info!("Loading negative index from {:?}", neg_path);
+                        let neg = Index::load(neg_path)?;
+
+                        // Load positive index metadata to validate parameters match
+                        let pos_metadata = Index::load_metadata(&index)?;
+                        if neg.k != pos_metadata.k {
+                            return Err(anyhow!(
+                                "Negative index K ({}) does not match positive index K ({})",
+                                neg.k, pos_metadata.k
+                            ));
+                        }
+                        if neg.w != pos_metadata.w {
+                            return Err(anyhow!(
+                                "Negative index W ({}) does not match positive index W ({})",
+                                neg.w, pos_metadata.w
+                            ));
+                        }
+                        if neg.salt != pos_metadata.salt {
+                            return Err(anyhow!(
+                                "Negative index salt (0x{:x}) does not match positive index salt (0x{:x})",
+                                neg.salt, pos_metadata.salt
+                            ));
+                        }
+
+                        let total_mins: usize = neg.buckets.values().map(|v| v.len()).sum();
+                        log::info!("Negative index loaded: {} buckets, {} minimizers",
+                            neg.buckets.len(), total_mins);
+                        let neg_set: HashSet<u64> = neg.buckets.values()
+                            .flat_map(|v| v.iter().copied())
+                            .collect();
+                        log::info!("Built negative minimizer set: {} unique minimizers", neg_set.len());
+                        Some(neg_set)
+                    }
+                };
+
                 if use_inverted {
                     // Use inverted index path - detect sharded vs single-file format
                     let inverted_path = index.with_extension("ryxdi");
@@ -944,9 +996,9 @@ fn main() -> Result<()> {
                                 .collect();
 
                             let results = if merge_join {
-                                classify_batch_sharded_merge_join(&sharded, &batch_refs, threshold)?
+                                classify_batch_sharded_merge_join(&sharded, neg_mins.as_ref(), &batch_refs, threshold)?
                             } else {
-                                classify_batch_sharded_sequential(&sharded, &batch_refs, threshold)?
+                                classify_batch_sharded_sequential(&sharded, neg_mins.as_ref(), &batch_refs, threshold)?
                             };
 
                             let mut chunk_out = Vec::with_capacity(1024);
@@ -986,9 +1038,9 @@ fn main() -> Result<()> {
                                 .collect();
 
                             let results = if merge_join {
-                                classify_batch_with_query_index(&inverted, &batch_refs, threshold)
+                                classify_batch_with_query_index(&inverted, neg_mins.as_ref(), &batch_refs, threshold)
                             } else {
-                                classify_batch_inverted(&inverted, &batch_refs, threshold)
+                                classify_batch_inverted(&inverted, neg_mins.as_ref(), &batch_refs, threshold)
                             };
 
                             let mut chunk_out = Vec::with_capacity(1024);
@@ -1042,7 +1094,7 @@ fn main() -> Result<()> {
                                 .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                                 .collect();
 
-                            let results = classify_batch_sharded_main(&sharded, &batch_refs, threshold)?;
+                            let results = classify_batch_sharded_main(&sharded, neg_mins.as_ref(), &batch_refs, threshold)?;
 
                             let mut chunk_out = Vec::with_capacity(1024);
                             for res in results {
@@ -1073,7 +1125,7 @@ fn main() -> Result<()> {
                                 .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                                 .collect();
 
-                            let results = classify_batch(&engine, &batch_refs, threshold);
+                            let results = classify_batch(&engine, neg_mins.as_ref(), &batch_refs, threshold);
 
                             let mut chunk_out = Vec::with_capacity(1024);
                             for res in results {
@@ -1094,10 +1146,48 @@ fn main() -> Result<()> {
                 }
             }
 
-            ClassifyCommands::Aggregate { index, r1, r2, threshold, batch_size, output } => {
+            ClassifyCommands::Aggregate { index, negative_index, r1, r2, threshold, batch_size, output } => {
                 log::info!("Loading index from {:?}", index);
                 let engine = Index::load(&index)?;
                 log::info!("Index loaded: {} buckets", engine.buckets.len());
+
+                // Load negative index if provided, validate parameters, and build minimizer set
+                let neg_mins: Option<HashSet<u64>> = match &negative_index {
+                    None => None,
+                    Some(neg_path) => {
+                        log::info!("Loading negative index from {:?}", neg_path);
+                        let neg = Index::load(neg_path)?;
+
+                        // Validate parameters match
+                        if neg.k != engine.k {
+                            return Err(anyhow!(
+                                "Negative index K ({}) does not match positive index K ({})",
+                                neg.k, engine.k
+                            ));
+                        }
+                        if neg.w != engine.w {
+                            return Err(anyhow!(
+                                "Negative index W ({}) does not match positive index W ({})",
+                                neg.w, engine.w
+                            ));
+                        }
+                        if neg.salt != engine.salt {
+                            return Err(anyhow!(
+                                "Negative index salt (0x{:x}) does not match positive index salt (0x{:x})",
+                                neg.salt, engine.salt
+                            ));
+                        }
+
+                        let total_mins: usize = neg.buckets.values().map(|v| v.len()).sum();
+                        log::info!("Negative index loaded: {} buckets, {} minimizers",
+                            neg.buckets.len(), total_mins);
+                        let neg_set: HashSet<u64> = neg.buckets.values()
+                            .flat_map(|v| v.iter().copied())
+                            .collect();
+                        log::info!("Built negative minimizer set: {} unique minimizers", neg_set.len());
+                        Some(neg_set)
+                    }
+                };
 
                 let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
                 io.write(b"query_name\tbucket_name\tscore\n".to_vec())?;
@@ -1116,7 +1206,7 @@ fn main() -> Result<()> {
                         .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                         .collect();
 
-                    let results = aggregate_batch(&engine, &batch_refs, threshold);
+                    let results = aggregate_batch(&engine, neg_mins.as_ref(), &batch_refs, threshold);
 
                     let mut chunk_out = Vec::with_capacity(1024);
                     for res in results {

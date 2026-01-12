@@ -172,7 +172,8 @@ pub extern "C" fn rype_classify(
             (q.id, s1, s2)
         }).collect();
 
-        let hits = classify_batch(index, &rust_queries, threshold);
+        // None for negative_mins - no negative filtering in C API
+        let hits = classify_batch(index, None, &rust_queries, threshold);
 
         let mut c_hits: Vec<RypeHit> = hits.into_iter().map(|h| RypeHit {
             query_id: h.query_id,
