@@ -386,6 +386,78 @@ int rype_index_is_sharded(const RypeIndex* index);
  */
 uint32_t rype_index_num_shards(const RypeIndex* index);
 
+// ============================================================================
+// MEMORY UTILITIES
+// ============================================================================
+
+/**
+ * Get the estimated memory footprint of the loaded index in bytes
+ *
+ * For single-file indices, returns total memory used by the loaded data.
+ * For sharded indices, returns only the manifest memory (shards load on-demand).
+ *
+ * @param index  Non-NULL RypeIndex pointer
+ * @return       Estimated memory in bytes, 0 if NULL
+ *
+ * ## Thread Safety
+ *
+ * Thread-safe (read-only access).
+ */
+size_t rype_index_memory_bytes(const RypeIndex* index);
+
+/**
+ * Get the estimated size of the largest shard in bytes
+ *
+ * For single-file indices, returns 0 (no shards).
+ * For sharded indices, returns the size needed to load the largest shard.
+ *
+ * Use this for memory planning when classifying against sharded indices.
+ *
+ * @param index  Non-NULL RypeIndex pointer
+ * @return       Largest shard size in bytes, 0 if NULL or not sharded
+ *
+ * ## Thread Safety
+ *
+ * Thread-safe (read-only access).
+ */
+size_t rype_index_largest_shard_bytes(const RypeIndex* index);
+
+/**
+ * Detect available system memory
+ *
+ * Detection order:
+ * - Linux: cgroups v2, cgroups v1, /proc/meminfo
+ * - macOS: sysctl hw.memsize
+ * - Fallback: 8GB
+ *
+ * @return  Available memory in bytes
+ *
+ * ## Thread Safety
+ *
+ * Thread-safe.
+ */
+size_t rype_detect_available_memory(void);
+
+/**
+ * Parse a byte size string (e.g., "4G", "512M", "1024K")
+ *
+ * Supported suffixes (case-insensitive): B, K, KB, M, MB, G, GB, T, TB
+ * Decimal values are supported: "1.5G"
+ *
+ * @param str  Null-terminated string to parse
+ * @return     Size in bytes, or 0 on parse error or NULL input
+ *
+ * ## Notes
+ *
+ * - "auto" returns 0 (use rype_detect_available_memory() instead)
+ * - Returns 0 for invalid input - no error message set
+ *
+ * ## Thread Safety
+ *
+ * Thread-safe.
+ */
+size_t rype_parse_byte_suffix(const char* str);
+
 /**
  * Get the name of a bucket by ID
  *

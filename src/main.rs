@@ -9,12 +9,28 @@ use anyhow::{Context, Result, anyhow};
 
 use rype::{Index, IndexMetadata, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, classify_batch_with_query_index, classify_batch_sharded_sequential, classify_batch_sharded_merge_join, classify_batch_sharded_main, aggregate_batch, ShardManifest, ShardedInvertedIndex, MainIndexManifest, MainIndexShard, ShardedMainIndex, extract_into, extract_with_positions, Strand};
 use rype::config::{parse_config, validate_config, resolve_path, parse_bucket_add_config, validate_bucket_add_config, AssignmentSettings, BestBinFallback};
+use rype::memory::{parse_byte_suffix, detect_available_memory, ReadMemoryProfile, MemoryConfig, calculate_batch_config, format_bytes, MemorySource};
 use std::collections::HashMap;
 use std::io::BufRead;
 
 mod logging;
 
 // --- HELPER FUNCTIONS ---
+
+/// Parse a byte size string from CLI (e.g., "4G", "512M", "auto").
+/// Returns None for "auto" (signals auto-detection), Some(bytes) otherwise.
+fn parse_max_memory_arg(s: &str) -> Result<Option<usize>, String> {
+    parse_byte_suffix(s).map_err(|e| e.to_string())
+}
+
+/// Parse a byte size string from CLI, requiring a concrete value (no "auto").
+fn parse_shard_size_arg(s: &str) -> Result<usize, String> {
+    match parse_byte_suffix(s) {
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => Err("'auto' not supported for shard size".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
 
 /// Sanitize bucket names by replacing nonprintable characters with "_"
 fn sanitize_bucket_name(name: &str) -> String {
@@ -151,10 +167,9 @@ enum IndexCommands {
         #[arg(long)]
         separate_buckets: bool,
 
-        /// Maximum shard size in bytes for large indices. Creates multiple
-        /// shard files that are loaded on-demand during classification.
-        /// Example: 1073741824 = 1GB per shard.
-        #[arg(long)]
+        /// Maximum shard size for large indices (e.g., "1G", "512M").
+        /// Creates multiple shard files loaded on-demand during classification.
+        #[arg(long, value_parser = parse_shard_size_arg)]
         max_shard_size: Option<usize>,
     },
 
@@ -255,8 +270,8 @@ sharded, use 'rype index invert' separately (creates 1:1 inverted shards).")]
         #[arg(short, long)]
         config: PathBuf,
 
-        /// Maximum shard size in bytes for main index (overrides config)
-        #[arg(long)]
+        /// Maximum shard size for main index (e.g., "1G", overrides config)
+        #[arg(long, value_parser = parse_shard_size_arg)]
         max_shard_size: Option<usize>,
 
         /// Create inverted index after building (overrides config)
@@ -374,11 +389,16 @@ WHEN TO USE 'run' vs 'aggregate':
         #[arg(short, long, default_value_t = 0.1)]
         threshold: f64,
 
-        /// Number of reads to process per batch.
-        /// Larger batches improve throughput but use more memory.
-        /// Reduce if running out of memory.
-        #[arg(short, long, default_value_t = 50_000)]
-        batch_size: usize,
+        /// Maximum memory to use (e.g., "4G", "512M", "auto").
+        /// Default: auto-detect available memory.
+        /// Batch size is calculated automatically based on this limit.
+        #[arg(long, default_value = "auto", value_parser = parse_max_memory_arg)]
+        max_memory: Option<usize>,
+
+        /// Override automatic batch size calculation.
+        /// If set, uses this fixed batch size instead of adaptive sizing.
+        #[arg(short, long)]
+        batch_size: Option<usize>,
 
         /// Output file path (TSV format). Writes to stdout if not specified.
         #[arg(short, long)]
@@ -410,8 +430,10 @@ WHEN TO USE 'run' vs 'aggregate':
         r2: Option<PathBuf>,
         #[arg(short, long, default_value_t = 0.1)]
         threshold: f64,
-        #[arg(short, long, default_value_t = 50_000)]
-        batch_size: usize,
+        #[arg(long, default_value = "auto", value_parser = parse_max_memory_arg)]
+        max_memory: Option<usize>,
+        #[arg(short, long)]
+        batch_size: Option<usize>,
         #[arg(short, long)]
         output: Option<PathBuf>,
         #[arg(short = 'I', long)]
@@ -461,9 +483,13 @@ THRESHOLD:
         #[arg(short, long, default_value_t = 0.05)]
         threshold: f64,
 
-        /// Number of reads to process per batch
-        #[arg(short, long, default_value_t = 50_000)]
-        batch_size: usize,
+        /// Maximum memory to use (e.g., "4G", "512M", "auto").
+        #[arg(long, default_value = "auto", value_parser = parse_max_memory_arg)]
+        max_memory: Option<usize>,
+
+        /// Override automatic batch size calculation
+        #[arg(short, long)]
+        batch_size: Option<usize>,
 
         /// Output file path (TSV format)
         #[arg(short, long)]
@@ -1175,11 +1201,68 @@ fn main() -> Result<()> {
         },
 
         Commands::Classify(classify_cmd) => match classify_cmd {
-            ClassifyCommands::Run { index, negative_index, r1, r2, threshold, batch_size, output, use_inverted, merge_join } |
-            ClassifyCommands::Batch { index, negative_index, r1, r2, threshold, batch_size, output, use_inverted, merge_join } => {
+            ClassifyCommands::Run { index, negative_index, r1, r2, threshold, max_memory, batch_size, output, use_inverted, merge_join } |
+            ClassifyCommands::Batch { index, negative_index, r1, r2, threshold, max_memory, batch_size, output, use_inverted, merge_join } => {
                 if merge_join && !use_inverted {
                     return Err(anyhow!("--merge-join requires --use-inverted"));
                 }
+
+                // Determine effective batch size: user override or adaptive
+                let effective_batch_size = if let Some(bs) = batch_size {
+                    log::info!("Using user-specified batch size: {}", bs);
+                    bs
+                } else {
+                    // Load index metadata to get k, w, num_buckets
+                    let metadata = load_index_metadata(&index)?;
+
+                    // Detect or use specified memory limit
+                    let mem_limit = max_memory.unwrap_or_else(|| {
+                        let detected = detect_available_memory();
+                        if detected.source == MemorySource::Fallback {
+                            log::warn!("Could not detect available memory, using 8GB fallback. \
+                                Consider specifying --max-memory explicitly.");
+                        } else {
+                            log::info!("Auto-detected available memory: {} (source: {:?})",
+                                format_bytes(detected.bytes), detected.source);
+                        }
+                        detected.bytes
+                    });
+
+                    // Sample read lengths from input files
+                    let is_paired = r2.is_some();
+                    let read_profile = ReadMemoryProfile::from_files(
+                        &r1,
+                        r2.as_deref(),
+                        1000,  // sample size
+                        metadata.k,
+                        metadata.w,
+                    ).unwrap_or_else(|| {
+                        log::warn!("Could not sample read lengths, using default profile");
+                        ReadMemoryProfile::default_profile(is_paired, metadata.k, metadata.w)
+                    });
+
+                    log::debug!("Read profile: avg_read_length={}, avg_query_length={}, minimizers_per_query={}",
+                        read_profile.avg_read_length, read_profile.avg_query_length, read_profile.minimizers_per_query);
+
+                    // For now, use a simple heuristic since we don't have index loaded yet
+                    // We'll estimate index memory from metadata
+                    let estimated_index_mem = metadata.bucket_minimizer_counts.values().sum::<usize>() * 8;
+                    let num_buckets = metadata.bucket_names.len();
+
+                    let mem_config = MemoryConfig {
+                        max_memory: mem_limit,
+                        num_threads: rayon::current_num_threads(),
+                        index_memory: estimated_index_mem,
+                        shard_reservation: 0, // Will be updated after loading index
+                        read_profile,
+                        num_buckets,
+                    };
+
+                    let batch_config = calculate_batch_config(&mem_config);
+                    log::info!("Adaptive batch sizing: batch_size={}, estimated peak memory={}",
+                        batch_config.batch_size, format_bytes(batch_config.peak_memory));
+                    batch_config.batch_size
+                };
 
                 // Load negative index if provided, validate parameters, and build minimizer set
                 let neg_mins: Option<HashSet<u64>> = match &negative_index {
@@ -1247,12 +1330,12 @@ fn main() -> Result<()> {
                         log::info!("Sharded index validated successfully");
 
                         if merge_join {
-                            log::info!("Starting merge-join classification with sequential shard loading (batch_size={})", batch_size);
+                            log::info!("Starting merge-join classification with sequential shard loading (batch_size={})", effective_batch_size);
                         } else {
-                            log::info!("Starting classification with sequential shard loading (batch_size={})", batch_size);
+                            log::info!("Starting classification with sequential shard loading (batch_size={})", effective_batch_size);
                         }
 
-                        while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
+                        while let Some((owned_records, headers)) = io.next_batch_records(effective_batch_size)? {
                             batch_num += 1;
                             let batch_read_count = owned_records.len();
                             total_reads += batch_read_count;
@@ -1289,12 +1372,12 @@ fn main() -> Result<()> {
                         log::info!("Inverted index validated successfully");
 
                         if merge_join {
-                            log::info!("Starting merge-join classification with inverted index (batch_size={})", batch_size);
+                            log::info!("Starting merge-join classification with inverted index (batch_size={})", effective_batch_size);
                         } else {
-                            log::info!("Starting classification with inverted index (batch_size={})", batch_size);
+                            log::info!("Starting classification with inverted index (batch_size={})", effective_batch_size);
                         }
 
-                        while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
+                        while let Some((owned_records, headers)) = io.next_batch_records(effective_batch_size)? {
                             batch_num += 1;
                             let batch_read_count = owned_records.len();
                             total_reads += batch_read_count;
@@ -1349,9 +1432,9 @@ fn main() -> Result<()> {
 
                         let metadata = sharded.metadata();
 
-                        log::info!("Starting classification with sequential main shard loading (batch_size={})", batch_size);
+                        log::info!("Starting classification with sequential main shard loading (batch_size={})", effective_batch_size);
 
-                        while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
+                        while let Some((owned_records, headers)) = io.next_batch_records(effective_batch_size)? {
                             batch_num += 1;
                             let batch_read_count = owned_records.len();
                             total_reads += batch_read_count;
@@ -1380,9 +1463,9 @@ fn main() -> Result<()> {
                         let engine = Index::load(&index)?;
                         log::info!("Index loaded: {} buckets", engine.buckets.len());
 
-                        log::info!("Starting classification (batch_size={})", batch_size);
+                        log::info!("Starting classification (batch_size={})", effective_batch_size);
 
-                        while let Some((owned_records, headers)) = io.next_batch_records(batch_size)? {
+                        while let Some((owned_records, headers)) = io.next_batch_records(effective_batch_size)? {
                             batch_num += 1;
                             let batch_read_count = owned_records.len();
                             total_reads += batch_read_count;
@@ -1412,10 +1495,57 @@ fn main() -> Result<()> {
                 }
             }
 
-            ClassifyCommands::Aggregate { index, negative_index, r1, r2, threshold, batch_size, output } => {
+            ClassifyCommands::Aggregate { index, negative_index, r1, r2, threshold, max_memory, batch_size, output } => {
                 log::info!("Loading index from {:?}", index);
                 let engine = Index::load(&index)?;
                 log::info!("Index loaded: {} buckets", engine.buckets.len());
+
+                // Determine effective batch size: user override or adaptive
+                let effective_batch_size = if let Some(bs) = batch_size {
+                    log::info!("Using user-specified batch size: {}", bs);
+                    bs
+                } else {
+                    let mem_limit = max_memory.unwrap_or_else(|| {
+                        let detected = detect_available_memory();
+                        if detected.source == MemorySource::Fallback {
+                            log::warn!("Could not detect available memory, using 8GB fallback. \
+                                Consider specifying --max-memory explicitly.");
+                        } else {
+                            log::info!("Auto-detected available memory: {} (source: {:?})",
+                                format_bytes(detected.bytes), detected.source);
+                        }
+                        detected.bytes
+                    });
+
+                    let is_paired = r2.is_some();
+                    let read_profile = ReadMemoryProfile::from_files(
+                        &r1,
+                        r2.as_deref(),
+                        1000,
+                        engine.k,
+                        engine.w,
+                    ).unwrap_or_else(|| {
+                        log::warn!("Could not sample read lengths, using default profile");
+                        ReadMemoryProfile::default_profile(is_paired, engine.k, engine.w)
+                    });
+
+                    let estimated_index_mem = engine.buckets.values().map(|v| v.len() * 8).sum::<usize>();
+                    let num_buckets = engine.buckets.len();
+
+                    let mem_config = MemoryConfig {
+                        max_memory: mem_limit,
+                        num_threads: rayon::current_num_threads(),
+                        index_memory: estimated_index_mem,
+                        shard_reservation: 0,
+                        read_profile,
+                        num_buckets,
+                    };
+
+                    let batch_config = calculate_batch_config(&mem_config);
+                    log::info!("Adaptive batch sizing: batch_size={}, estimated peak memory={}",
+                        batch_config.batch_size, format_bytes(batch_config.peak_memory));
+                    batch_config.batch_size
+                };
 
                 // Load negative index if provided, validate parameters, and build minimizer set
                 let neg_mins: Option<HashSet<u64>> = match &negative_index {
@@ -1461,9 +1591,9 @@ fn main() -> Result<()> {
                 let mut total_reads = 0;
                 let mut batch_num = 0;
 
-                log::info!("Starting aggregate classification (batch_size={})", batch_size);
+                log::info!("Starting aggregate classification (batch_size={})", effective_batch_size);
 
-                while let Some((owned_records, _)) = io.next_batch_records(batch_size)? {
+                while let Some((owned_records, _)) = io.next_batch_records(effective_batch_size)? {
                     batch_num += 1;
                     let batch_read_count = owned_records.len();
                     total_reads += batch_read_count;

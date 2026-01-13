@@ -5,6 +5,7 @@ use crate::{
     ShardedMainIndex, ShardedInvertedIndex,
     MainIndexManifest, ShardManifest,
 };
+use crate::memory::{parse_byte_suffix, detect_available_memory};
 use std::ffi::{CStr, CString};
 use std::slice;
 use std::path::Path;
@@ -118,6 +119,75 @@ impl RypeIndex {
     /// Returns whether this is an inverted index.
     pub fn is_inverted(&self) -> bool {
         matches!(self, RypeIndex::Inverted(_) | RypeIndex::ShardedInverted(_))
+    }
+
+    /// Estimate the memory footprint of the currently loaded index structures.
+    ///
+    /// For single-file indices, this estimates the memory used by all loaded data.
+    /// For sharded indices, this only counts the manifest (shards are loaded on-demand).
+    pub fn estimate_memory_bytes(&self) -> usize {
+        match self {
+            RypeIndex::Single(idx) => {
+                // HashMap overhead: ~56 bytes per entry + Vec<u64> data
+                let bucket_mem: usize = idx.buckets.iter()
+                    .map(|(_, v)| 56 + v.len() * 8 + v.capacity() * 8)
+                    .sum();
+                // bucket_names: ~56 bytes per entry + String data
+                let names_mem: usize = idx.bucket_names.iter()
+                    .map(|(_, s)| 56 + s.len())
+                    .sum();
+                // bucket_sources: ~56 bytes per entry + Vec + Strings
+                let sources_mem: usize = idx.bucket_sources.iter()
+                    .map(|(_, v)| 56 + v.iter().map(|s| 24 + s.len()).sum::<usize>())
+                    .sum();
+                bucket_mem + names_mem + sources_mem
+            }
+            RypeIndex::ShardedMain(idx) => {
+                // Only manifest is loaded; estimate based on bucket count
+                let manifest = idx.manifest();
+                let num_buckets = manifest.bucket_names.len();
+                // Rough estimate: 200 bytes per bucket for names/maps
+                num_buckets * 200
+            }
+            RypeIndex::Inverted(idx) => {
+                // CSR format: minimizers Vec<u64> + offsets Vec<u32> + bucket_ids Vec<u32>
+                idx.minimizers.len() * 8 +
+                idx.offsets.len() * 4 +
+                idx.bucket_ids.len() * 4
+            }
+            RypeIndex::ShardedInverted(idx) => {
+                // Only manifest is loaded
+                let manifest = idx.manifest();
+                // Rough estimate based on shard count
+                manifest.shards.len() * 100 + 1000
+            }
+        }
+    }
+
+    /// Estimate the memory needed to load a single shard.
+    ///
+    /// For single-file indices, returns 0 (no shards to load).
+    /// For sharded indices, returns the estimated size of the largest shard.
+    pub fn largest_shard_bytes(&self) -> usize {
+        match self {
+            RypeIndex::Single(_) | RypeIndex::Inverted(_) => 0,
+            RypeIndex::ShardedMain(idx) => {
+                // Estimate: 8 bytes per minimizer + HashMap overhead
+                let manifest = idx.manifest();
+                manifest.shards.iter()
+                    .map(|s| s.num_minimizers * 8 + s.bucket_ids.len() * 100)
+                    .max()
+                    .unwrap_or(0)
+            }
+            RypeIndex::ShardedInverted(idx) => {
+                // CSR format: minimizers (8 bytes) + offsets (4 bytes) + bucket_ids (4 bytes)
+                let manifest = idx.manifest();
+                manifest.shards.iter()
+                    .map(|s| s.num_minimizers * 8 + s.num_minimizers * 4 + s.num_bucket_ids * 4)
+                    .max()
+                    .unwrap_or(0)
+            }
+        }
     }
 
     /// Collects all minimizers from all buckets.
@@ -428,6 +498,92 @@ pub extern "C" fn rype_index_num_shards(index_ptr: *const RypeIndex) -> u32 {
     }
     let index = unsafe { &*index_ptr };
     index.num_shards() as u32
+}
+
+// --- Memory Management ---
+
+/// Returns the estimated memory footprint of the loaded index in bytes.
+///
+/// For single-file indices, returns total memory used by the loaded data.
+/// For sharded indices, returns only the manifest memory (shards load on-demand).
+///
+/// Returns 0 if index_ptr is invalid.
+#[no_mangle]
+pub extern "C" fn rype_index_memory_bytes(index_ptr: *const RypeIndex) -> size_t {
+    if !is_valid_ptr(index_ptr) {
+        return 0;
+    }
+    let index = unsafe { &*index_ptr };
+    index.estimate_memory_bytes()
+}
+
+/// Returns the estimated size of the largest shard in bytes.
+///
+/// For single-file indices, returns 0 (no shards).
+/// For sharded indices, returns the size needed to load the largest shard.
+///
+/// Use this for memory planning when classifying against sharded indices.
+#[no_mangle]
+pub extern "C" fn rype_index_largest_shard_bytes(index_ptr: *const RypeIndex) -> size_t {
+    if !is_valid_ptr(index_ptr) {
+        return 0;
+    }
+    let index = unsafe { &*index_ptr };
+    index.largest_shard_bytes()
+}
+
+/// Detect available system memory.
+///
+/// On Linux: tries cgroups v2, cgroups v1, then /proc/meminfo
+/// On macOS: uses sysctl hw.memsize
+/// Fallback: returns 8GB
+///
+/// Returns the detected memory in bytes.
+#[no_mangle]
+pub extern "C" fn rype_detect_available_memory() -> size_t {
+    detect_available_memory().bytes
+}
+
+/// Parse a byte size string (e.g., "4G", "512M", "1024K").
+///
+/// Supports suffixes: B, K, KB, M, MB, G, GB, T, TB (case-insensitive)
+/// Also supports decimal values: "1.5G"
+///
+/// Returns the size in bytes, or 0 for "auto" or parse errors.
+/// To distinguish between "auto" and errors, call rype_get_last_error() after:
+/// - If returns 0 and rype_get_last_error() is NULL: input was "auto"
+/// - If returns 0 and rype_get_last_error() is non-NULL: parse error
+#[no_mangle]
+pub extern "C" fn rype_parse_byte_suffix(str_ptr: *const c_char) -> size_t {
+    if str_ptr.is_null() {
+        set_last_error("str is NULL".to_string());
+        return 0;
+    }
+
+    let c_str = unsafe { CStr::from_ptr(str_ptr) };
+    let s = match c_str.to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(format!("Invalid UTF-8 in string: {}", e));
+            return 0;
+        }
+    };
+
+    match parse_byte_suffix(s) {
+        Ok(Some(bytes)) => {
+            clear_last_error();
+            bytes
+        }
+        Ok(None) => {
+            // "auto" returns 0 with no error set
+            clear_last_error();
+            0
+        }
+        Err(e) => {
+            set_last_error(format!("{}", e));
+            0
+        }
+    }
 }
 
 // --- Bucket Name Lookup ---
@@ -1192,6 +1348,50 @@ mod c_api_tests {
             CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
         };
         assert!(err.contains("NULL"));
+    }
+
+    #[test]
+    fn test_rype_index_estimate_memory_single() {
+        use crate::{Index, MinimizerWorkspace};
+
+        let mut index = Index::new(64, 50, 0x1234).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        // Add some data
+        let seq = vec![b'A'; 200];
+        index.add_record(1, "test::seq1", &seq, &mut ws);
+        index.finalize_bucket(1);
+        index.bucket_names.insert(1, "TestBucket".into());
+
+        let rype_index = RypeIndex::Single(index);
+
+        let mem = rype_index.estimate_memory_bytes();
+        // Should be non-zero (we have data)
+        assert!(mem > 0, "Memory estimate should be non-zero");
+
+        // Shard bytes should be 0 for single index
+        assert_eq!(rype_index.largest_shard_bytes(), 0);
+    }
+
+    #[test]
+    fn test_rype_index_estimate_memory_inverted() {
+        use crate::{Index, InvertedIndex, MinimizerWorkspace};
+
+        let mut index = Index::new(64, 50, 0x1234).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq = vec![b'A'; 200];
+        index.add_record(1, "test::seq1", &seq, &mut ws);
+        index.finalize_bucket(1);
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        let rype_index = RypeIndex::Inverted(inverted);
+
+        let mem = rype_index.estimate_memory_bytes();
+        assert!(mem > 0, "Memory estimate should be non-zero");
+
+        // Shard bytes should be 0 for single inverted index
+        assert_eq!(rype_index.largest_shard_bytes(), 0);
     }
 }
 

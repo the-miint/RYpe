@@ -37,6 +37,7 @@ mod types;
 mod workspace;
 
 // Public modules
+pub mod memory;
 pub mod c_api;
 pub mod config;
 

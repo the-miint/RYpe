@@ -22,6 +22,10 @@ arrow = { version = "57", default-features = false, features = ["ffi"], optional
 [dev-dependencies]
 tempfile = "3.24.0"
 
+[[bin]]
+name = "debug_inverted"
+path = "src/bin/debug_inverted.rs"
+
 [features]
 default = []
 arrow = ["dep:arrow"]
