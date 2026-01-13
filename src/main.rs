@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use anyhow::{Context, Result, anyhow};
 
-use rype::{Index, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, classify_batch_with_query_index, classify_batch_sharded_sequential, classify_batch_sharded_merge_join, classify_batch_sharded_main, aggregate_batch, ShardManifest, ShardedInvertedIndex, MainIndexManifest, MainIndexShard, ShardedMainIndex, extract_into, extract_with_positions, Strand};
+use rype::{Index, IndexMetadata, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, classify_batch_with_query_index, classify_batch_sharded_sequential, classify_batch_sharded_merge_join, classify_batch_sharded_main, aggregate_batch, ShardManifest, ShardedInvertedIndex, MainIndexManifest, MainIndexShard, ShardedMainIndex, extract_into, extract_with_positions, Strand};
 use rype::config::{parse_config, validate_config, resolve_path, parse_bucket_add_config, validate_bucket_add_config, AssignmentSettings, BestBinFallback};
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -25,6 +25,19 @@ fn sanitize_bucket_name(name: &str) -> String {
             c
         })
         .collect()
+}
+
+/// Load metadata from either a sharded or non-sharded main index.
+///
+/// This helper handles the case where the main index might be sharded (with .manifest
+/// and .shard.* files) or a single-file index.
+fn load_index_metadata(path: &Path) -> Result<IndexMetadata> {
+    if MainIndexManifest::is_sharded(path) {
+        let manifest = MainIndexManifest::load(&MainIndexManifest::manifest_path(path))?;
+        Ok(manifest.to_metadata())
+    } else {
+        Index::load_metadata(path)
+    }
 }
 
 #[derive(Parser)]
@@ -717,7 +730,7 @@ fn main() -> Result<()> {
             }
 
             IndexCommands::BucketSourceDetail { index, bucket, paths, ids } => {
-                let metadata = Index::load_metadata(&index)?;
+                let metadata = load_index_metadata(&index)?;
                 let sources = metadata.bucket_sources.get(&bucket).unwrap();
 
                 if paths && ids {
@@ -1152,7 +1165,7 @@ fn main() -> Result<()> {
                         let neg = Index::load(neg_path)?;
 
                         // Load positive index metadata to validate parameters match
-                        let pos_metadata = Index::load_metadata(&index)?;
+                        let pos_metadata = load_index_metadata(&index)?;
                         if neg.k != pos_metadata.k {
                             return Err(anyhow!(
                                 "Negative index K ({}) does not match positive index K ({})",
@@ -1190,7 +1203,7 @@ fn main() -> Result<()> {
 
                     // Load index metadata first (needed for both paths)
                     log::info!("Loading index metadata from {:?}", index);
-                    let metadata = Index::load_metadata(&index)?;
+                    let metadata = load_index_metadata(&index)?;
                     log::info!("Metadata loaded: {} buckets", metadata.bucket_names.len());
 
                     let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
