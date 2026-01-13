@@ -391,12 +391,32 @@ uint32_t rype_index_num_shards(const RypeIndex* index);
  *
  * @param index      Non-NULL RypeIndex pointer
  * @param bucket_id  Bucket ID from RypeHit.bucket_id
- * @return           Bucket name string, or NULL if not found
+ * @return           Bucket name string, or NULL (see below)
  *
- * ## Note
+ * ## NULL Return Cases
  *
- * Returns NULL for inverted indices (they don't store bucket names).
- * Use the original main index to look up bucket names.
+ * This function returns NULL in the following situations:
+ *
+ * 1. **index is NULL**: Caller error - always check index pointer validity
+ * 2. **Inverted index**: Inverted indices (.ryxdi) don't store bucket names.
+ *    Use the original main index (.ryidx) to look up bucket names.
+ *    Check with rype_index_is_inverted() if uncertain.
+ * 3. **Invalid bucket_id**: The bucket_id doesn't exist in the index.
+ *    This is unexpected if bucket_id came from a valid RypeHit result.
+ *    May indicate index corruption or version mismatch.
+ *
+ * ## Recommended Usage Pattern
+ *
+ *     const char* name = rype_bucket_name(idx, hit->bucket_id);
+ *     if (name) {
+ *         printf("Matched: %s\n", name);
+ *     } else if (rype_index_is_inverted(idx)) {
+ *         // Expected for inverted indices - use main index for names
+ *         printf("Matched bucket ID: %u\n", hit->bucket_id);
+ *     } else {
+ *         // Unexpected - bucket_id should exist in main index
+ *         fprintf(stderr, "Warning: unknown bucket ID %u\n", hit->bucket_id);
+ *     }
  *
  * ## Memory
  *
@@ -406,13 +426,6 @@ uint32_t rype_index_num_shards(const RypeIndex* index);
  * ## Thread Safety
  *
  * Thread-safe (read-only access).
- *
- * ## Example
- *
- *     for (size_t i = 0; i < results->len; i++) {
- *         const char* name = rype_bucket_name(idx, results->data[i].bucket_id);
- *         printf("Matched: %s\n", name ? name : "unknown");
- *     }
  */
 const char* rype_bucket_name(const RypeIndex* index, uint32_t bucket_id);
 
@@ -783,10 +796,26 @@ struct ArrowArrayStream {
  * | bucket_id | UInt32  | Matched bucket/reference ID         |
  * | score     | Float64 | Classification score (0.0-1.0)      |
  *
- * ## Memory Management
+ * ## Memory Management and Ownership
  *
- * - input_stream: Consumed by this function (stream reader takes ownership)
- * - out_stream: Function writes a new stream; caller must release when done
+ * **Input Stream Ownership (CRITICAL):**
+ * - This function TAKES OWNERSHIP of input_stream via the Arrow C Data Interface
+ *   release callback mechanism
+ * - After this function returns, input_stream->release has been called internally
+ * - The caller MUST NOT call input_stream->release() again (causes double-free)
+ * - The caller MUST NOT wrap input_stream in another structure that also manages
+ *   its lifetime (e.g., a C++ RAII wrapper that calls release in destructor)
+ * - If using PyArrow or similar: the stream is consumed; do not reuse it
+ *
+ * **Output Stream Ownership:**
+ * - out_stream is initialized by this function with a new stream
+ * - Caller owns out_stream and MUST call out_stream->release(out_stream) when done
+ * - Do NOT release out_stream if this function returns -1 (error case)
+ *
+ * **Schema Lifetime (Arrow C Data Interface requirement):**
+ * - When consuming out_stream, the schema obtained via get_schema() must be
+ *   kept alive (not released) while iterating batches via get_next()
+ * - Release order: finish all get_next() calls, then release schema, then release stream
  *
  * ## Thread Safety
  *
