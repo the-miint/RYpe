@@ -68,7 +68,7 @@ pub use extraction::{
 pub use index::Index;
 
 // Re-export inverted index
-pub use inverted::{InvertedIndex, QueryInvertedIndex};
+pub use inverted::{InvertedIndex, InvertedIndexStats, QueryInvertedIndex};
 
 // Re-export sharded index types
 pub use sharded::{ShardInfo, ShardManifest, ShardedInvertedIndex};

@@ -658,24 +658,48 @@ fn main() -> Result<()> {
 
             IndexCommands::Stats { index, inverted } => {
                 if inverted {
-                    // Show inverted index stats
+                    // Show inverted index stats - check for sharded vs single-file
                     let inverted_path = index.with_extension("ryxdi");
-                    if !inverted_path.exists() {
+                    let manifest_path = ShardManifest::manifest_path(&inverted_path);
+
+                    if manifest_path.exists() {
+                        // Sharded inverted index - manifest is already lightweight
+                        let manifest = ShardManifest::load(&manifest_path)?;
+                        println!("Sharded Inverted Index Stats for {:?}", inverted_path);
+                        println!("  K: {}", manifest.k);
+                        println!("  Window (w): {}", manifest.w);
+                        println!("  Salt: 0x{:x}", manifest.salt);
+                        println!("  Shards: {}", manifest.shards.len());
+                        println!("  Unique minimizers: {}", manifest.total_minimizers);
+                        println!("  Total bucket references: {}", manifest.total_bucket_ids);
+                        if manifest.total_minimizers > 0 {
+                            println!("  Avg buckets per minimizer: {:.2}",
+                                manifest.total_bucket_ids as f64 / manifest.total_minimizers as f64);
+                        }
+                        println!("  ------------------------------------------------");
+                        println!("  Shard distribution:");
+                        for shard in &manifest.shards {
+                            println!("    Shard {}: {} minimizers, {} bucket refs",
+                                shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
+                        }
+                    } else if inverted_path.exists() {
+                        // Single-file inverted index - use load_stats() for header only
+                        let stats = InvertedIndex::load_stats(&inverted_path)?;
+                        println!("Inverted Index Stats for {:?}", inverted_path);
+                        println!("  K: {}", stats.k);
+                        println!("  Window (w): {}", stats.w);
+                        println!("  Salt: 0x{:x}", stats.salt);
+                        println!("  Unique minimizers: {}", stats.num_minimizers);
+                        println!("  Total bucket references: {}", stats.num_bucket_ids);
+                        if stats.num_minimizers > 0 {
+                            println!("  Avg buckets per minimizer: {:.2}",
+                                stats.num_bucket_ids as f64 / stats.num_minimizers as f64);
+                        }
+                    } else {
                         return Err(anyhow!(
                             "Inverted index not found: {:?}. Create it with 'rype index invert -i {:?}'",
                             inverted_path, index
                         ));
-                    }
-                    let inv = InvertedIndex::load(&inverted_path)?;
-                    println!("Inverted Index Stats for {:?}", inverted_path);
-                    println!("  K: {}", inv.k);
-                    println!("  Window (w): {}", inv.w);
-                    println!("  Salt: 0x{:x}", inv.salt);
-                    println!("  Unique minimizers: {}", inv.num_minimizers());
-                    println!("  Total bucket references: {}", inv.num_bucket_entries());
-                    if inv.num_minimizers() > 0 {
-                        println!("  Avg buckets per minimizer: {:.2}",
-                            inv.num_bucket_entries() as f64 / inv.num_minimizers() as f64);
                     }
                 } else {
                     // Show primary index stats - detect sharded vs single-file

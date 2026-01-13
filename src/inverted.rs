@@ -19,6 +19,20 @@ use crate::sharded::{ShardInfo, ShardManifest};
 use crate::sharded_main::MainIndexShard;
 use crate::types::IndexMetadata;
 
+/// Lightweight stats from an inverted index header.
+///
+/// Use `InvertedIndex::load_stats()` to read only the 60-byte header
+/// without loading the full index into memory.
+#[derive(Debug, Clone)]
+pub struct InvertedIndexStats {
+    pub k: usize,
+    pub w: usize,
+    pub salt: u64,
+    pub source_hash: u64,
+    pub num_minimizers: usize,
+    pub num_bucket_ids: usize,
+}
+
 /// CSR-format inverted index for fast minimizer → bucket lookups.
 ///
 /// # Invariants
@@ -669,6 +683,61 @@ impl InvertedIndex {
         self.bucket_ids.len()
     }
 
+    /// Load only the header stats from an inverted index file (v3 format).
+    ///
+    /// This reads just the 60-byte uncompressed header, avoiding the expensive
+    /// zstd decompression and memory allocation needed for the full index.
+    /// Use this for `rype index stats -I` instead of `load()`.
+    pub fn load_stats(path: &Path) -> Result<InvertedIndexStats> {
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut buf4 = [0u8; 4];
+        let mut buf8 = [0u8; 8];
+
+        reader.read_exact(&mut buf4)?;
+        if &buf4 != b"RYXI" {
+            return Err(anyhow!("Invalid inverted index format (expected RYXI)"));
+        }
+
+        reader.read_exact(&mut buf4)?;
+        let version = u32::from_le_bytes(buf4);
+        if version != 3 {
+            return Err(anyhow!("Unsupported inverted index version: {} (expected 3)", version));
+        }
+
+        reader.read_exact(&mut buf8)?;
+        let k = u64::from_le_bytes(buf8) as usize;
+        if !matches!(k, 16 | 32 | 64) {
+            return Err(anyhow!("Invalid K value in inverted index: {} (must be 16, 32, or 64)", k));
+        }
+
+        reader.read_exact(&mut buf8)?;
+        let w = u64::from_le_bytes(buf8) as usize;
+
+        reader.read_exact(&mut buf8)?;
+        let salt = u64::from_le_bytes(buf8);
+
+        reader.read_exact(&mut buf8)?;
+        let source_hash = u64::from_le_bytes(buf8);
+
+        reader.read_exact(&mut buf4)?;
+        // max_bucket_id - not needed for stats, skip it
+
+        reader.read_exact(&mut buf8)?;
+        let num_minimizers = u64::from_le_bytes(buf8) as usize;
+
+        reader.read_exact(&mut buf8)?;
+        let num_bucket_ids = u64::from_le_bytes(buf8) as usize;
+
+        Ok(InvertedIndexStats {
+            k,
+            w,
+            salt,
+            source_hash,
+            num_minimizers,
+            num_bucket_ids,
+        })
+    }
+
     /// Save a subset of this inverted index as a shard file (RYXS format v1).
     pub fn save_shard(&self, path: &Path, shard_id: u32, start_idx: usize, end_idx: usize, is_last_shard: bool) -> Result<ShardInfo> {
         let end_idx = end_idx.min(self.minimizers.len());
@@ -1219,6 +1288,51 @@ mod tests {
         assert_eq!(loaded.num_bucket_entries(), inverted.num_bucket_entries());
 
         Ok(())
+    }
+
+    #[test]
+    fn test_inverted_index_load_stats() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        let mut index = Index::new(32, 25, 0xDEADBEEF).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300, 400, 500]);
+        index.buckets.insert(2, vec![200, 300, 600, 700]);
+        index.bucket_names.insert(1, "bucket_a".into());
+        index.bucket_names.insert(2, "bucket_b".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save(&path)?;
+
+        // Load stats only (header-only, no decompression)
+        let stats = InvertedIndex::load_stats(&path)?;
+
+        assert_eq!(stats.k, 32);
+        assert_eq!(stats.w, 25);
+        assert_eq!(stats.salt, 0xDEADBEEF);
+        assert_eq!(stats.num_minimizers, inverted.num_minimizers());
+        assert_eq!(stats.num_bucket_ids, inverted.num_bucket_entries());
+
+        // Verify it matches full load
+        let loaded = InvertedIndex::load(&path)?;
+        assert_eq!(stats.k, loaded.k);
+        assert_eq!(stats.w, loaded.w);
+        assert_eq!(stats.salt, loaded.salt);
+        assert_eq!(stats.num_minimizers, loaded.num_minimizers());
+        assert_eq!(stats.num_bucket_ids, loaded.num_bucket_entries());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inverted_index_load_stats_invalid_format() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(path, b"NOTRYXI").unwrap();
+
+        let result = InvertedIndex::load_stats(path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid inverted index format"));
     }
 
     #[test]
