@@ -18,9 +18,11 @@ mod logging;
 // --- HELPER FUNCTIONS ---
 
 /// Parse a byte size string from CLI (e.g., "4G", "512M", "auto").
-/// Returns None for "auto" (signals auto-detection), Some(bytes) otherwise.
-fn parse_max_memory_arg(s: &str) -> Result<Option<usize>, String> {
-    parse_byte_suffix(s).map_err(|e| e.to_string())
+/// Returns 0 for "auto" (signals auto-detection), bytes otherwise.
+fn parse_max_memory_arg(s: &str) -> Result<usize, String> {
+    parse_byte_suffix(s)
+        .map(|opt| opt.unwrap_or(0))  // None (auto) -> 0
+        .map_err(|e| e.to_string())
 }
 
 /// Parse a byte size string from CLI, requiring a concrete value (no "auto").
@@ -393,7 +395,7 @@ WHEN TO USE 'run' vs 'aggregate':
         /// Default: auto-detect available memory.
         /// Batch size is calculated automatically based on this limit.
         #[arg(long, default_value = "auto", value_parser = parse_max_memory_arg)]
-        max_memory: Option<usize>,
+        max_memory: usize,
 
         /// Override automatic batch size calculation.
         /// If set, uses this fixed batch size instead of adaptive sizing.
@@ -431,7 +433,7 @@ WHEN TO USE 'run' vs 'aggregate':
         #[arg(short, long, default_value_t = 0.1)]
         threshold: f64,
         #[arg(long, default_value = "auto", value_parser = parse_max_memory_arg)]
-        max_memory: Option<usize>,
+        max_memory: usize,
         #[arg(short, long)]
         batch_size: Option<usize>,
         #[arg(short, long)]
@@ -485,7 +487,7 @@ THRESHOLD:
 
         /// Maximum memory to use (e.g., "4G", "512M", "auto").
         #[arg(long, default_value = "auto", value_parser = parse_max_memory_arg)]
-        max_memory: Option<usize>,
+        max_memory: usize,
 
         /// Override automatic batch size calculation
         #[arg(short, long)]
@@ -1215,8 +1217,8 @@ fn main() -> Result<()> {
                     // Load index metadata to get k, w, num_buckets
                     let metadata = load_index_metadata(&index)?;
 
-                    // Detect or use specified memory limit
-                    let mem_limit = max_memory.unwrap_or_else(|| {
+                    // Detect or use specified memory limit (0 = auto)
+                    let mem_limit = if max_memory == 0 {
                         let detected = detect_available_memory();
                         if detected.source == MemorySource::Fallback {
                             log::warn!("Could not detect available memory, using 8GB fallback. \
@@ -1226,7 +1228,9 @@ fn main() -> Result<()> {
                                 format_bytes(detected.bytes), detected.source);
                         }
                         detected.bytes
-                    });
+                    } else {
+                        max_memory
+                    };
 
                     // Sample read lengths from input files
                     let is_paired = r2.is_some();
@@ -1505,7 +1509,8 @@ fn main() -> Result<()> {
                     log::info!("Using user-specified batch size: {}", bs);
                     bs
                 } else {
-                    let mem_limit = max_memory.unwrap_or_else(|| {
+                    // Detect or use specified memory limit (0 = auto)
+                    let mem_limit = if max_memory == 0 {
                         let detected = detect_available_memory();
                         if detected.source == MemorySource::Fallback {
                             log::warn!("Could not detect available memory, using 8GB fallback. \
@@ -1515,7 +1520,9 @@ fn main() -> Result<()> {
                                 format_bytes(detected.bytes), detected.source);
                         }
                         detected.bytes
-                    });
+                    } else {
+                        max_memory
+                    };
 
                     let is_paired = r2.is_some();
                     let read_profile = ReadMemoryProfile::from_files(
