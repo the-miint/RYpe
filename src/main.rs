@@ -1263,8 +1263,8 @@ fn main() -> Result<()> {
                     };
 
                     let batch_config = calculate_batch_config(&mem_config);
-                    log::info!("Adaptive batch sizing: batch_size={}, estimated peak memory={}",
-                        batch_config.batch_size, format_bytes(batch_config.peak_memory));
+                    log::info!("Adaptive batch sizing: batch_size={}, parallel_batches={}, threads={}, estimated peak memory={}",
+                        batch_config.batch_size, batch_config.batch_count, rayon::current_num_threads(), format_bytes(batch_config.peak_memory));
                     batch_config.batch_size
                 };
 
@@ -1549,8 +1549,8 @@ fn main() -> Result<()> {
                     };
 
                     let batch_config = calculate_batch_config(&mem_config);
-                    log::info!("Adaptive batch sizing: batch_size={}, estimated peak memory={}",
-                        batch_config.batch_size, format_bytes(batch_config.peak_memory));
+                    log::info!("Adaptive batch sizing: batch_size={}, parallel_batches={}, threads={}, estimated peak memory={}",
+                        batch_config.batch_size, batch_config.batch_count, rayon::current_num_threads(), format_bytes(batch_config.peak_memory));
                     batch_config.batch_size
                 };
 

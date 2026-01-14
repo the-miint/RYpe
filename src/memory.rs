@@ -73,6 +73,8 @@ pub enum MemorySource {
     CgroupsV2,
     /// cgroups v1 memory.limit_in_bytes
     CgroupsV1,
+    /// SLURM job info (scontrol show job)
+    Slurm,
     /// /proc/meminfo MemAvailable
     ProcMeminfo,
     /// macOS sysctl hw.memsize
@@ -97,7 +99,8 @@ pub const FALLBACK_MEMORY_BYTES: usize = 8 * 1024 * 1024 * 1024;
 /// On Linux, tries (in order):
 /// 1. cgroups v2: /sys/fs/cgroup/memory.max
 /// 2. cgroups v1: /sys/fs/cgroup/memory/memory.limit_in_bytes
-/// 3. /proc/meminfo MemAvailable field
+/// 3. SLURM: scontrol show job $SLURM_JOB_ID
+/// 4. /proc/meminfo MemAvailable field
 ///
 /// On macOS: sysctl hw.memsize
 ///
@@ -113,6 +116,11 @@ pub fn detect_available_memory() -> AvailableMemory {
         // Try cgroups v1
         if let Some(bytes) = read_cgroups_v1_limit() {
             return AvailableMemory { bytes, source: MemorySource::CgroupsV1 };
+        }
+
+        // Try SLURM job info
+        if let Some(bytes) = read_slurm_job_memory() {
+            return AvailableMemory { bytes, source: MemorySource::Slurm };
         }
 
         // Try /proc/meminfo
@@ -137,7 +145,25 @@ pub fn detect_available_memory() -> AvailableMemory {
 
 #[cfg(target_os = "linux")]
 fn read_cgroups_v2_limit() -> Option<usize> {
-    let content = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
+    // Find the process's cgroup path from /proc/self/cgroup
+    // v2 format: "0::<path>"
+    let cgroup_content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mut cgroup_path = None;
+
+    for line in cgroup_content.lines() {
+        let parts: Vec<&str> = line.splitn(3, ':').collect();
+        if parts.len() == 3 && parts[0] == "0" && parts[1].is_empty() {
+            let path = parts[2];
+            if !path.is_empty() && path != "/" {
+                cgroup_path = Some(path.to_string());
+            }
+            break;
+        }
+    }
+
+    let path = cgroup_path?;
+    let memory_max_path = format!("/sys/fs/cgroup{}/memory.max", path);
+    let content = std::fs::read_to_string(&memory_max_path).ok()?;
     let trimmed = content.trim();
 
     // "max" means no limit
@@ -150,7 +176,23 @@ fn read_cgroups_v2_limit() -> Option<usize> {
 
 #[cfg(target_os = "linux")]
 fn read_cgroups_v1_limit() -> Option<usize> {
-    let content = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok()?;
+    // Find the process's memory cgroup path from /proc/self/cgroup
+    let cgroup_content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mut memory_path = None;
+
+    for line in cgroup_content.lines() {
+        // v1 format: "<id>:<controllers>:<path>"
+        // e.g., "6:memory:/slurm/uid_1156392/job_3532212/step_0/task_0"
+        let parts: Vec<&str> = line.splitn(3, ':').collect();
+        if parts.len() == 3 && parts[1] == "memory" {
+            memory_path = Some(parts[2].to_string());
+            break;
+        }
+    }
+
+    let path = memory_path?;
+    let limit_path = format!("/sys/fs/cgroup/memory{}/memory.limit_in_bytes", path);
+    let content = std::fs::read_to_string(&limit_path).ok()?;
     let value: usize = content.trim().parse().ok()?;
 
     // Very large values mean "no limit" (usually 2^63 - page_size)
@@ -161,6 +203,66 @@ fn read_cgroups_v1_limit() -> Option<usize> {
     }
 
     Some(value)
+}
+
+/// Read memory limit from SLURM job info via scontrol.
+/// Parses MinMemoryNode from `scontrol show job $SLURM_JOB_ID`.
+#[cfg(target_os = "linux")]
+fn read_slurm_job_memory() -> Option<usize> {
+    use std::process::Command;
+
+    let job_id = std::env::var("SLURM_JOB_ID").ok()?;
+
+    let output = Command::new("scontrol")
+        .args(["show", "job", &job_id])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Look for MinMemoryNode=32G or similar
+    for line in stdout.lines() {
+        for field in line.split_whitespace() {
+            if field.starts_with("MinMemoryNode=") {
+                let value = field.strip_prefix("MinMemoryNode=")?;
+                return parse_slurm_memory(value);
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse SLURM memory string (e.g., "32G", "4096M", "1T").
+#[cfg(target_os = "linux")]
+fn parse_slurm_memory(s: &str) -> Option<usize> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Find where numeric part ends
+    let numeric_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    if numeric_end == 0 {
+        return None;
+    }
+
+    let numeric: usize = s[..numeric_end].parse().ok()?;
+    let suffix = &s[numeric_end..];
+
+    let multiplier: usize = match suffix.to_ascii_uppercase().as_str() {
+        "" | "M" => 1024 * 1024,           // Default is MB
+        "G" => 1024 * 1024 * 1024,
+        "T" => 1024 * 1024 * 1024 * 1024,
+        "K" => 1024,
+        _ => return None,
+    };
+
+    numeric.checked_mul(multiplier)
 }
 
 #[cfg(target_os = "linux")]
