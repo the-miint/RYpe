@@ -459,8 +459,10 @@ pub struct BatchConfig {
 /// Minimum batch size (processing fewer reads than this is inefficient).
 pub const MIN_BATCH_SIZE: usize = 1000;
 
-/// Maximum batch size (avoid excessive memory for single batch).
-pub const MAX_BATCH_SIZE: usize = 500_000;
+/// Maximum batch size.
+/// Set high enough to allow efficient memory utilization for short reads.
+/// The memory estimation will still constrain batch sizes based on available memory.
+pub const MAX_BATCH_SIZE: usize = 5_000_000;
 
 /// Safety margin: max(256MB, 10% of max_memory)
 const SAFETY_MARGIN_PERCENT: f64 = 0.10;
