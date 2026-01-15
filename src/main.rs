@@ -994,6 +994,9 @@ fn main() -> Result<()> {
                         }
 
                         // Create inverted manifest
+                        // Bucket-partitioned because each inverted shard corresponds to a
+                        // main index shard (which contains a subset of buckets). Minimizer
+                        // ranges may overlap between shards.
                         let inv_manifest = ShardManifest {
                             k: main_manifest.k,
                             w: main_manifest.w,
@@ -1001,6 +1004,7 @@ fn main() -> Result<()> {
                             source_hash: InvertedIndex::compute_metadata_hash(&main_manifest.to_metadata()),
                             total_minimizers,
                             total_bucket_ids,
+                            has_overlapping_shards: true,
                             shards: inv_shards,
                         };
 

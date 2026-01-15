@@ -1046,6 +1046,7 @@ impl InvertedIndex {
             source_hash: self.source_hash,
             total_minimizers: self.minimizers.len(),
             total_bucket_ids: self.bucket_ids.len(),
+            has_overlapping_shards: false, // Range-partitioned by save_sharded
             shards,
         };
 

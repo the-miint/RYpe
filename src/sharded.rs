@@ -31,21 +31,50 @@ pub struct ShardInfo {
 
 /// Manifest describing a sharded inverted index.
 ///
-/// Format v2:
+/// Format v3:
 /// - Magic: "RYXM" (4 bytes)
-/// - Version: 2 (u32)
+/// - Version: 3 (u32)
 /// - k (u64), w (u64), salt (u64), source_hash (u64)
 /// - total_minimizers (u64), total_bucket_ids (u64)
+/// - has_overlapping_shards (u8): 1 if shards have overlapping minimizer ranges, 0 otherwise
 /// - num_shards (u32)
 /// - For each shard: shard_id (u32), min_start (u64), min_end (u64), is_last_shard (u8), num_minimizers (u64), num_bucket_ids (u64)
+///
+/// # Shard Partitioning Strategies
+///
+/// **Range-partitioned** (`has_overlapping_shards = false`):
+/// - Created by `InvertedIndex::save_sharded()` which splits a single inverted index
+/// - Minimizer ranges are sorted and contiguous: `[0, 500), [500, 1000), ...`
+/// - Each minimizer appears in exactly one shard
+/// - `total_minimizers` equals the unique minimizer count
+///
+/// **Bucket-partitioned** (`has_overlapping_shards = true`):
+/// - Created by inverting each main index shard independently (1:1 correspondence)
+/// - Minimizer ranges may overlap (same minimizer can appear in multiple shards)
+/// - `min_start`/`min_end` are advisory only (not sorted or contiguous)
+/// - `total_minimizers` is the SUM across shards (includes duplicates, NOT unique count)
+/// - Classification must iterate through ALL shards for each query
+///
+/// # Migration Note (v2 → v3)
+///
+/// Version 2 manifests did not have the `has_overlapping_shards` flag and assumed
+/// range-partitioned shards. If you have v2 manifests that were created from sharded
+/// main indices (bucket-partitioned), they will fail validation and must be regenerated.
 #[derive(Debug, Clone)]
 pub struct ShardManifest {
     pub k: usize,
     pub w: usize,
     pub salt: u64,
     pub source_hash: u64,
+    /// Total minimizer entries across all shards.
+    /// For range-partitioned shards: equals unique minimizer count (no duplicates).
+    /// For overlapping shards: includes duplicates (same minimizer counted per shard).
     pub total_minimizers: usize,
+    /// Total bucket ID entries across all shards (same duplicate semantics as total_minimizers).
     pub total_bucket_ids: usize,
+    /// If true, shards have overlapping minimizer ranges and classification must check all shards.
+    /// If false, shards are range-partitioned with sorted, contiguous, non-overlapping ranges.
+    pub has_overlapping_shards: bool,
     pub shards: Vec<ShardInfo>,
 }
 
@@ -58,7 +87,7 @@ impl ShardManifest {
         let mut writer = BufWriter::new(File::create(path)?);
 
         writer.write_all(b"RYXM")?;
-        writer.write_all(&2u32.to_le_bytes())?;
+        writer.write_all(&3u32.to_le_bytes())?;
 
         writer.write_all(&(self.k as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
@@ -68,6 +97,7 @@ impl ShardManifest {
         writer.write_all(&(self.total_minimizers as u64).to_le_bytes())?;
         writer.write_all(&(self.total_bucket_ids as u64).to_le_bytes())?;
 
+        writer.write_all(&[if self.has_overlapping_shards { 1u8 } else { 0u8 }])?;
         writer.write_all(&(self.shards.len() as u32).to_le_bytes())?;
 
         for shard in &self.shards {
@@ -97,8 +127,8 @@ impl ShardManifest {
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != 2 {
-            return Err(anyhow!("Unsupported shard manifest version: {} (expected 2)", version));
+        if !matches!(version, 2 | 3) {
+            return Err(anyhow!("Unsupported shard manifest version: {} (expected 2 or 3)", version));
         }
 
         reader.read_exact(&mut buf8)?;
@@ -133,6 +163,14 @@ impl ShardManifest {
                 total_bucket_ids, MAX_INVERTED_BUCKET_IDS
             ));
         }
+
+        // Version 3 adds has_overlapping_shards flag
+        let has_overlapping_shards = if version >= 3 {
+            reader.read_exact(&mut buf1)?;
+            buf1[0] != 0
+        } else {
+            false // v2 manifests are always range-partitioned
+        };
 
         reader.read_exact(&mut buf4)?;
         let num_shards = u32::from_le_bytes(buf4);
@@ -171,8 +209,9 @@ impl ShardManifest {
             });
         }
 
-        // Validate shard ranges
+        // Validate shard structure
         if !shards.is_empty() {
+            // Check shard IDs are sequential (applies to all shard types)
             for i in 1..shards.len() {
                 if shards[i].shard_id != shards[i - 1].shard_id + 1 {
                     return Err(anyhow!(
@@ -180,38 +219,46 @@ impl ShardManifest {
                         shards[i - 1].shard_id, shards[i].shard_id
                     ));
                 }
-                if shards[i].min_start < shards[i - 1].min_start {
-                    return Err(anyhow!(
-                        "Invalid manifest: shards not sorted by min_start (shard {} has min_start {} < shard {} min_start {})",
-                        shards[i].shard_id, shards[i].min_start, shards[i - 1].shard_id, shards[i - 1].min_start
-                    ));
+            }
+
+            // Range-partitioned shards have strict ordering and contiguity requirements.
+            // Bucket-partitioned shards can have overlapping/unordered ranges.
+            if !has_overlapping_shards {
+                for i in 1..shards.len() {
+                    if shards[i].min_start < shards[i - 1].min_start {
+                        return Err(anyhow!(
+                            "Invalid manifest: shards not sorted by min_start (shard {} has min_start {} < shard {} min_start {})",
+                            shards[i].shard_id, shards[i].min_start, shards[i - 1].shard_id, shards[i - 1].min_start
+                        ));
+                    }
+                }
+
+                for i in 0..shards.len() - 1 {
+                    if shards[i].is_last_shard {
+                        return Err(anyhow!(
+                            "Invalid manifest: shard {} marked as last but not final shard",
+                            shards[i].shard_id
+                        ));
+                    }
+                    if shards[i].min_end != shards[i + 1].min_start {
+                        return Err(anyhow!(
+                            "Invalid manifest: shard ranges not contiguous (shard {} ends at {}, shard {} starts at {})",
+                            shards[i].shard_id, shards[i].min_end, shards[i + 1].shard_id, shards[i + 1].min_start
+                        ));
+                    }
+                }
+
+                if let Some(last) = shards.last() {
+                    if !last.is_last_shard {
+                        return Err(anyhow!(
+                            "Invalid manifest: final shard {} not marked as is_last_shard",
+                            last.shard_id
+                        ));
+                    }
                 }
             }
 
-            for i in 0..shards.len() - 1 {
-                if shards[i].is_last_shard {
-                    return Err(anyhow!(
-                        "Invalid manifest: shard {} marked as last but not final shard",
-                        shards[i].shard_id
-                    ));
-                }
-                if shards[i].min_end != shards[i + 1].min_start {
-                    return Err(anyhow!(
-                        "Invalid manifest: shard ranges not contiguous (shard {} ends at {}, shard {} starts at {})",
-                        shards[i].shard_id, shards[i].min_end, shards[i + 1].shard_id, shards[i + 1].min_start
-                    ));
-                }
-            }
-
-            if let Some(last) = shards.last() {
-                if !last.is_last_shard {
-                    return Err(anyhow!(
-                        "Invalid manifest: final shard {} not marked as is_last_shard",
-                        last.shard_id
-                    ));
-                }
-            }
-
+            // Total counts must match (applies to all shard types)
             let sum_minimizers: usize = shards.iter().map(|s| s.num_minimizers).sum();
             let sum_bucket_ids: usize = shards.iter().map(|s| s.num_bucket_ids).sum();
             if sum_minimizers != total_minimizers {
@@ -235,6 +282,7 @@ impl ShardManifest {
             source_hash,
             total_minimizers,
             total_bucket_ids,
+            has_overlapping_shards,
             shards,
         })
     }
@@ -365,6 +413,7 @@ mod tests {
             source_hash: 0x12345678,
             total_minimizers: 1000,
             total_bucket_ids: 5000,
+            has_overlapping_shards: false,
             shards: vec![
                 ShardInfo {
                     shard_id: 0,
@@ -394,6 +443,7 @@ mod tests {
         assert_eq!(loaded.source_hash, 0x12345678);
         assert_eq!(loaded.total_minimizers, 1000);
         assert_eq!(loaded.total_bucket_ids, 5000);
+        assert!(!loaded.has_overlapping_shards);
         assert_eq!(loaded.shards.len(), 2);
 
         assert_eq!(loaded.shards[0].shard_id, 0);
@@ -409,6 +459,71 @@ mod tests {
         assert!(loaded.shards[1].is_last_shard);
         assert_eq!(loaded.shards[1].num_minimizers, 600);
         assert_eq!(loaded.shards[1].num_bucket_ids, 3000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_shard_manifest_overlapping_roundtrip() -> Result<()> {
+        // Test round-trip for bucket-partitioned (overlapping) shards
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        // Simulate overlapping shards created from main index shards
+        // Note: min_start values are NOT sorted, ranges overlap, min_end is 0
+        let manifest = ShardManifest {
+            k: 32,
+            w: 20,
+            salt: 0xCAFEBABE,
+            source_hash: 0x87654321,
+            total_minimizers: 150, // Sum with duplicates, not unique count
+            total_bucket_ids: 150,
+            has_overlapping_shards: true,
+            shards: vec![
+                ShardInfo {
+                    shard_id: 0,
+                    min_start: 100,  // Overlaps with shard 1
+                    min_end: 0,
+                    is_last_shard: false,
+                    num_minimizers: 50,
+                    num_bucket_ids: 50,
+                },
+                ShardInfo {
+                    shard_id: 1,
+                    min_start: 100,  // Same min_start as shard 0 (overlapping)
+                    min_end: 0,
+                    is_last_shard: false,
+                    num_minimizers: 50,
+                    num_bucket_ids: 50,
+                },
+                ShardInfo {
+                    shard_id: 2,
+                    min_start: 50,   // Lower than previous shards (not sorted)
+                    min_end: 0,
+                    is_last_shard: true,
+                    num_minimizers: 50,
+                    num_bucket_ids: 50,
+                },
+            ],
+        };
+
+        manifest.save(&path)?;
+        let loaded = ShardManifest::load(&path)?;
+
+        // Verify all fields round-trip correctly
+        assert_eq!(loaded.k, 32);
+        assert_eq!(loaded.w, 20);
+        assert_eq!(loaded.salt, 0xCAFEBABE);
+        assert_eq!(loaded.source_hash, 0x87654321);
+        assert_eq!(loaded.total_minimizers, 150);
+        assert_eq!(loaded.total_bucket_ids, 150);
+        assert!(loaded.has_overlapping_shards); // Critical: flag preserved
+        assert_eq!(loaded.shards.len(), 3);
+
+        // Verify shard info preserved (including "invalid" range data)
+        assert_eq!(loaded.shards[0].min_start, 100);
+        assert_eq!(loaded.shards[1].min_start, 100); // Same as shard 0
+        assert_eq!(loaded.shards[2].min_start, 50);  // Lower than previous
 
         Ok(())
     }
