@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use anyhow::{Context, Result, anyhow};
 
-use rype::{Index, IndexMetadata, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, classify_batch_with_query_index, classify_batch_sharded_sequential, classify_batch_sharded_merge_join, classify_batch_sharded_main, aggregate_batch, ShardManifest, ShardedInvertedIndex, MainIndexManifest, MainIndexShard, ShardedMainIndex, extract_into, extract_with_positions, Strand};
+use rype::{Index, IndexMetadata, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, classify_batch_with_query_index, classify_batch_sharded_sequential, classify_batch_sharded_merge_join, classify_batch_sharded_main, aggregate_batch, ShardManifest, ShardedInvertedIndex, MainIndexManifest, MainIndexShard, ShardedMainIndex, ShardedMainIndexBuilder, extract_into, extract_with_positions, Strand};
 use rype::config::{parse_config, validate_config, resolve_path, parse_bucket_add_config, validate_bucket_add_config, AssignmentSettings, BestBinFallback};
 use rype::memory::{parse_byte_suffix, detect_available_memory, ReadMemoryProfile, MemoryConfig, calculate_batch_config, format_bytes, MemorySource};
 use std::collections::HashMap;
@@ -1642,6 +1642,52 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Build a single bucket from its files, returning the name, minimizers, and sources.
+///
+/// This helper extracts the bucket-building logic for reuse in both batched and
+/// non-batched index building paths. Follows fail-fast: errors are propagated immediately.
+fn build_single_bucket(
+    bucket_name: &str,
+    files: &[PathBuf],
+    config_dir: &Path,
+    k: usize,
+    w: usize,
+    salt: u64,
+) -> Result<(String, Vec<u64>, Vec<String>)> {
+    log::info!("Processing bucket '{}'...", bucket_name);
+    let mut idx = Index::new(k, w, salt)?;
+    let mut ws = MinimizerWorkspace::new();
+
+    for file_path in files {
+        let abs_path = resolve_path(config_dir, file_path);
+        let mut reader = parse_fastx_file(&abs_path)
+            .context(format!("Failed to open file {} for bucket '{}'",
+                           abs_path.display(), bucket_name))?;
+
+        let filename = file_path.canonicalize()
+            .unwrap_or_else(|_| file_path.to_path_buf())
+            .to_string_lossy()
+            .to_string();
+
+        while let Some(record) = reader.next() {
+            let rec = record.context(format!("Invalid record in file {} (bucket '{}')",
+                                            abs_path.display(), bucket_name))?;
+            let seq_name = String::from_utf8_lossy(rec.id()).to_string();
+            let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, seq_name);
+            idx.add_record(1, &source_label, &rec.seq(), &mut ws);
+        }
+    }
+
+    idx.finalize_bucket(1);
+    let minimizer_count = idx.buckets.get(&1).map(|v| v.len()).unwrap_or(0);
+    log::info!("Completed bucket '{}': {} minimizers", bucket_name, minimizer_count);
+
+    let minimizers = idx.buckets.remove(&1).unwrap_or_default();
+    let sources = idx.bucket_sources.remove(&1).unwrap_or_default();
+
+    Ok((bucket_name.to_string(), minimizers, sources))
+}
+
 fn build_index_from_config(
     config_path: &Path,
     cli_max_shard_size: Option<usize>,
@@ -1682,103 +1728,135 @@ fn build_index_from_config(
         ));
     }
 
-    // 2. Sort bucket names for deterministic ordering
+    // 2. Sort bucket names for deterministic ordering (critical for bucket ID consistency)
     let mut bucket_names: Vec<_> = cfg.buckets.keys().cloned().collect();
     bucket_names.sort();
 
-    log::info!("Building {} buckets in parallel...", bucket_names.len());
+    // Fail-fast: check bucket count before processing (matches MAX_NUM_BUCKETS in constants.rs)
+    const MAX_BUCKETS: usize = 100_000;
+    if bucket_names.len() > MAX_BUCKETS {
+        return Err(anyhow!(
+            "Too many buckets: {} exceeds maximum {}",
+            bucket_names.len(),
+            MAX_BUCKETS
+        ));
+    }
+
     for name in &bucket_names {
         let file_count = cfg.buckets[name].files.len();
         log::info!("  - {}: {} file{}", name, file_count, if file_count == 1 { "" } else { "s" });
     }
 
-    // 3. Build indices in parallel (one per bucket)
-    let bucket_indices: Vec<_> = bucket_names.par_iter()
-        .map(|bucket_name| {
-            log::info!("Processing bucket '{}'...", bucket_name);
-            let mut idx = Index::new(cfg.index.k, cfg.index.window, cfg.index.salt)?;
-            let mut ws = MinimizerWorkspace::new();
-
-            // Process all files for this bucket
-            for file_path in &cfg.buckets[bucket_name].files {
-                let abs_path = resolve_path(config_dir, file_path);
-                let mut reader = parse_fastx_file(&abs_path)
-                    .context(format!("Failed to open file {} for bucket '{}'",
-                                   abs_path.display(), bucket_name))?;
-
-                let filename = file_path.canonicalize()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string();
-
-                while let Some(record) = reader.next() {
-                    let rec = record.context(format!("Invalid record in file {} (bucket '{}')",
-                                                    abs_path.display(), bucket_name))?;
-                    let seq_name = String::from_utf8_lossy(rec.id()).to_string();
-                    let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, seq_name);
-                    idx.add_record(1, &source_label, &rec.seq(), &mut ws);
-                }
-            }
-
-            idx.finalize_bucket(1);
-            let minimizer_count = idx.buckets.get(&1).map(|v| v.len()).unwrap_or(0);
-            log::info!("Completed bucket '{}': {} minimizers", bucket_name, minimizer_count);
-            Ok::<_, anyhow::Error>((bucket_name.clone(), idx))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    log::info!("Processing complete. Merging buckets...");
-
-    // 4. Merge all bucket indices into final index
-    let mut final_index = Index::new(cfg.index.k, cfg.index.window, cfg.index.salt)?;
-    for (bucket_id, (bucket_name, bucket_idx)) in bucket_indices.into_iter().enumerate() {
-        let new_id = (bucket_id + 1) as u32;
-        final_index.bucket_names.insert(new_id, sanitize_bucket_name(&bucket_name));
-
-        // Transfer bucket data
-        if let Some(minimizers) = bucket_idx.buckets.get(&1) {
-            final_index.buckets.insert(new_id, minimizers.clone());
-        }
-        if let Some(sources) = bucket_idx.bucket_sources.get(&1) {
-            final_index.bucket_sources.insert(new_id, sources.clone());
-        }
-    }
-
-    // 5. Save final index (with optional sharding)
+    // 3. Build and save index - use batched approach for sharded, parallel for non-sharded
     if let Some(max_bytes) = max_shard_size {
-        log::info!("Saving sharded index to {:?} (max {} bytes/shard)...", cfg.index.output, max_bytes);
-        let manifest = final_index.save_sharded(&cfg.index.output, max_bytes)?;
-        log::info!("Created {} shards with {} total minimizers.", manifest.shards.len(), manifest.total_minimizers);
+        // BATCHED PARALLEL: Process buckets in batches to bound memory usage.
+        // Memory bound: O(batch_size × avg_bucket + max_shard_size) instead of O(total_index)
+        let batch_size = rayon::current_num_threads();
+        log::info!("Building {} buckets in batches of {} (memory-efficient mode)...",
+                   bucket_names.len(), batch_size);
+
+        let mut builder = ShardedMainIndexBuilder::new(
+            cfg.index.k,
+            cfg.index.window,
+            cfg.index.salt,
+            &cfg.index.output,
+            max_bytes,
+        )?;
+
+        let mut bucket_id = 1u32;
+        for chunk in bucket_names.chunks(batch_size) {
+            // Build this batch in parallel (parallel FASTA reading preserved)
+            let batch_results: Vec<_> = chunk.par_iter()
+                .map(|bucket_name| {
+                    build_single_bucket(
+                        bucket_name,
+                        &cfg.buckets[bucket_name].files,
+                        config_dir,
+                        cfg.index.k,
+                        cfg.index.window,
+                        cfg.index.salt,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            // Feed to builder (auto-flushes shards as they fill)
+            for (name, minimizers, sources) in batch_results {
+                builder.add_bucket(
+                    bucket_id,
+                    &sanitize_bucket_name(&name),
+                    sources,
+                    minimizers,
+                )?;
+                bucket_id += 1;
+            }
+            // batch_results dropped here, memory freed before next batch
+
+            log::info!("Completed batch, {} buckets processed so far", bucket_id - 1);
+        }
+
+        let manifest = builder.finish()?;
+        log::info!("Done! Sharded index saved successfully.");
+        log::info!("\nFinal statistics:");
+        log::info!("  Buckets: {}", bucket_id - 1);
+        log::info!("  Shards: {}", manifest.shards.len());
+        log::info!("  Total minimizers: {}", manifest.total_minimizers);
     } else {
+        // NON-SHARDED: Build all buckets in parallel (memory not constrained)
+        log::info!("Building {} buckets in parallel...", bucket_names.len());
+
+        let bucket_results: Vec<_> = bucket_names.par_iter()
+            .map(|bucket_name| {
+                build_single_bucket(
+                    bucket_name,
+                    &cfg.buckets[bucket_name].files,
+                    config_dir,
+                    cfg.index.k,
+                    cfg.index.window,
+                    cfg.index.salt,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        log::info!("Processing complete. Merging buckets...");
+
+        // Merge all bucket data into final index
+        let mut final_index = Index::new(cfg.index.k, cfg.index.window, cfg.index.salt)?;
+        for (bucket_id, (bucket_name, minimizers, sources)) in bucket_results.into_iter().enumerate() {
+            let new_id = (bucket_id + 1) as u32;
+            final_index.bucket_names.insert(new_id, sanitize_bucket_name(&bucket_name));
+            final_index.buckets.insert(new_id, minimizers);
+            final_index.bucket_sources.insert(new_id, sources);
+        }
+
         log::info!("Saving index to {}...", cfg.index.output.display());
         final_index.save(&cfg.index.output)?;
-    }
 
-    log::info!("Done! Index saved successfully.");
-    log::info!("\nFinal statistics:");
-    log::info!("  Buckets: {}", final_index.buckets.len());
-    let total_minimizers: usize = final_index.buckets.values().map(|v| v.len()).sum();
-    log::info!("  Total minimizers: {}", total_minimizers);
+        log::info!("Done! Index saved successfully.");
+        log::info!("\nFinal statistics:");
+        log::info!("  Buckets: {}", final_index.buckets.len());
+        let total_minimizers: usize = final_index.buckets.values().map(|v| v.len()).sum();
+        log::info!("  Total minimizers: {}", total_minimizers);
 
-    // 6. Optionally create inverted index
-    if should_invert {
-        let inverted_path = cfg.index.output.with_extension("ryxdi");
-        log::info!("Building inverted index...");
-        let inverted = InvertedIndex::build_from_index(&final_index);
-        log::info!("Inverted index built: {} unique minimizers, {} bucket entries",
-            inverted.num_minimizers(), inverted.num_bucket_entries());
+        // Optionally create inverted index (only for non-sharded path)
+        if should_invert {
+            let inverted_path = cfg.index.output.with_extension("ryxdi");
+            log::info!("Building inverted index...");
+            let inverted = InvertedIndex::build_from_index(&final_index);
+            log::info!("Inverted index built: {} unique minimizers, {} bucket entries",
+                inverted.num_minimizers(), inverted.num_bucket_entries());
 
-        if invert_shards > 1 {
-            log::info!("Saving sharded inverted index ({} shards) to {:?}", invert_shards, inverted_path);
-            let manifest = inverted.save_sharded(&inverted_path, invert_shards)?;
-            log::info!("Created {} inverted shards:", manifest.shards.len());
-            for shard in &manifest.shards {
-                log::info!("  Shard {}: {} unique minimizers, {} bucket entries",
-                    shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
+            if invert_shards > 1 {
+                log::info!("Saving sharded inverted index ({} shards) to {:?}", invert_shards, inverted_path);
+                let manifest = inverted.save_sharded(&inverted_path, invert_shards)?;
+                log::info!("Created {} inverted shards:", manifest.shards.len());
+                for shard in &manifest.shards {
+                    log::info!("  Shard {}: {} unique minimizers, {} bucket entries",
+                        shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
+                }
+            } else {
+                log::info!("Saving inverted index to {:?}", inverted_path);
+                inverted.save(&inverted_path)?;
             }
-        } else {
-            log::info!("Saving inverted index to {:?}", inverted_path);
-            inverted.save(&inverted_path)?;
         }
     }
 

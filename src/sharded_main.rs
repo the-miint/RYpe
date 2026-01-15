@@ -10,7 +10,7 @@
 //! - Sharding is by memory budget, not by minimizer count
 //! - 1:1 correspondence possible with inverted index shards
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, Context};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -33,8 +33,11 @@ pub const MAX_STRING_TABLE_ENTRIES: u32 = 10_000_000;
 /// Maximum number of sources per bucket (DoS protection)
 pub const MAX_SOURCES_PER_BUCKET: usize = 100_000_000;
 
-/// Default bytes per minimizer estimate for shard planning (delta+varint+zstd)
-pub const BYTES_PER_MINIMIZER_ESTIMATE: usize = 4;
+/// Bytes per minimizer for compressed output estimation (delta+varint+zstd)
+pub const BYTES_PER_MINIMIZER_COMPRESSED: usize = 4;
+
+/// Bytes per minimizer for in-memory estimation (u64 = 8 bytes)
+pub const BYTES_PER_MINIMIZER_MEMORY: usize = 8;
 
 /// Information about a single shard in a sharded main index.
 #[derive(Debug, Clone)]
@@ -1083,9 +1086,17 @@ impl ShardedMainIndex {
     }
 }
 
-/// Estimate the compressed byte size of a bucket.
+/// Estimate the compressed byte size of a bucket (for output planning).
 pub fn estimate_bucket_bytes(minimizer_count: usize) -> usize {
-    minimizer_count * BYTES_PER_MINIMIZER_ESTIMATE
+    minimizer_count * BYTES_PER_MINIMIZER_COMPRESSED
+}
+
+/// Estimate the in-memory byte size of a bucket (for memory budgeting).
+///
+/// This accounts for the actual memory footprint: 8 bytes per u64 minimizer.
+/// Does not include source string overhead (unbounded).
+pub fn estimate_bucket_memory_bytes(minimizer_count: usize) -> usize {
+    minimizer_count * BYTES_PER_MINIMIZER_MEMORY
 }
 
 /// Plan shard assignment based on memory budget using first-fit-decreasing bin packing.
@@ -1165,6 +1176,9 @@ pub struct ShardedMainIndexBuilder {
     bucket_to_shard: HashMap<u32, u32>,
     shards: Vec<MainIndexShardInfo>,
     total_minimizers: usize,
+
+    // Temp files written (for atomic commit on finish)
+    pending_shard_renames: Vec<(PathBuf, PathBuf)>, // (temp_path, final_path)
 }
 
 impl ShardedMainIndexBuilder {
@@ -1196,12 +1210,13 @@ impl ShardedMainIndexBuilder {
             bucket_to_shard: HashMap::new(),
             shards: Vec::new(),
             total_minimizers: 0,
+            pending_shard_renames: Vec::new(),
         })
     }
 
-    /// Add a finalized bucket to the index.
+    /// Add a bucket to the index.
     ///
-    /// The minimizers should already be sorted and deduplicated.
+    /// Minimizers are defensively sorted and deduplicated to ensure correctness.
     /// If the current shard exceeds the memory budget after adding this bucket,
     /// the shard is flushed to disk automatically.
     ///
@@ -1209,15 +1224,19 @@ impl ShardedMainIndexBuilder {
     /// * `id` - Bucket ID
     /// * `name` - Human-readable bucket name
     /// * `sources` - List of source sequences
-    /// * `minimizers` - Sorted, deduplicated minimizers
+    /// * `minimizers` - Minimizers (will be sorted and deduplicated)
     pub fn add_bucket(
         &mut self,
         id: u32,
         name: &str,
         sources: Vec<String>,
-        minimizers: Vec<u64>,
+        mut minimizers: Vec<u64>,
     ) -> Result<()> {
-        let bucket_bytes = estimate_bucket_bytes(minimizers.len());
+        // Defensive: ensure minimizers are sorted and deduplicated
+        minimizers.sort_unstable();
+        minimizers.dedup();
+
+        let bucket_bytes = estimate_bucket_memory_bytes(minimizers.len());
         let minimizer_count = minimizers.len();
 
         // Check if we need to flush current shard first
@@ -1257,8 +1276,14 @@ impl ShardedMainIndexBuilder {
             bucket_sources: std::mem::take(&mut self.current_shard_sources),
         };
 
-        let shard_path = MainIndexManifest::shard_path(&self.base_path, self.current_shard_id);
-        let compressed_size = shard.save(&shard_path)?;
+        // Write to temp path first (atomic commit on finish)
+        let final_path = MainIndexManifest::shard_path(&self.base_path, self.current_shard_id);
+        let temp_path = final_path.with_extension(format!(
+            "{}.tmp",
+            final_path.extension().unwrap_or_default().to_string_lossy()
+        ));
+        let compressed_size = shard.save(&temp_path)?;
+        self.pending_shard_renames.push((temp_path, final_path));
 
         // Collect bucket IDs that were in this shard
         let bucket_ids: Vec<u32> = shard.buckets.keys().copied().collect();
@@ -1280,6 +1305,10 @@ impl ShardedMainIndexBuilder {
 
     /// Finalize the index: flush remaining buckets and write the manifest.
     ///
+    /// All shard files are written to temporary paths during building, then renamed
+    /// atomically on success. If this method fails, no permanent files are left behind
+    /// (only `.tmp` files which can be cleaned up).
+    ///
     /// Returns the manifest for the created sharded index.
     pub fn finish(mut self) -> Result<MainIndexManifest> {
         // Flush any remaining buckets
@@ -1296,8 +1325,21 @@ impl ShardedMainIndexBuilder {
             total_minimizers: self.total_minimizers,
         };
 
+        // Write manifest to temp path first
         let manifest_path = MainIndexManifest::manifest_path(&self.base_path);
-        manifest.save(&manifest_path)?;
+        let manifest_temp = manifest_path.with_extension("manifest.tmp");
+        manifest.save(&manifest_temp)?;
+
+        // Atomically commit: rename all temp files to final paths
+        // Shards first, then manifest (manifest signals completion)
+        for (temp_path, final_path) in &self.pending_shard_renames {
+            std::fs::rename(temp_path, final_path)
+                .with_context(|| format!("Failed to rename {} to {}",
+                    temp_path.display(), final_path.display()))?;
+        }
+        std::fs::rename(&manifest_temp, &manifest_path)
+            .with_context(|| format!("Failed to rename manifest {} to {}",
+                manifest_temp.display(), manifest_path.display()))?;
 
         Ok(manifest)
     }
@@ -1452,9 +1494,18 @@ mod tests {
 
     #[test]
     fn test_estimate_bucket_bytes() {
+        // Compressed estimate: 4 bytes per minimizer
         assert_eq!(estimate_bucket_bytes(0), 0);
         assert_eq!(estimate_bucket_bytes(100), 400);
         assert_eq!(estimate_bucket_bytes(1000), 4000);
+    }
+
+    #[test]
+    fn test_estimate_bucket_memory_bytes() {
+        // Memory estimate: 8 bytes per minimizer (u64)
+        assert_eq!(estimate_bucket_memory_bytes(0), 0);
+        assert_eq!(estimate_bucket_memory_bytes(100), 800);
+        assert_eq!(estimate_bucket_memory_bytes(1000), 8000);
     }
 
     #[test]
@@ -1513,13 +1564,13 @@ mod tests {
         let base_path = dir.path().join("test.ryidx");
 
         // Very small budget to force multiple shards
-        // Each minimizer ~4 bytes, so 10 minimizers = 40 bytes
-        let mut builder = ShardedMainIndexBuilder::new(64, 50, 0x1234, &base_path, 50)?;
+        // Each minimizer = 8 bytes in memory, so 10 minimizers = 80 bytes
+        let mut builder = ShardedMainIndexBuilder::new(64, 50, 0x1234, &base_path, 100)?;
 
         // Add buckets that will force flushing
-        builder.add_bucket(1, "A", vec![], vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])?; // 40 bytes
-        builder.add_bucket(2, "B", vec![], vec![11, 12, 13, 14, 15])?; // 20 bytes - new shard
-        builder.add_bucket(3, "C", vec![], vec![21, 22, 23, 24, 25])?; // 20 bytes - fits in shard 1
+        builder.add_bucket(1, "A", vec![], vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])?; // 80 bytes
+        builder.add_bucket(2, "B", vec![], vec![11, 12, 13, 14, 15])?; // 40 bytes - new shard
+        builder.add_bucket(3, "C", vec![], vec![21, 22, 23, 24, 25])?; // 40 bytes - fits in shard 1
 
         let manifest = builder.finish()?;
 
@@ -1653,6 +1704,183 @@ mod tests {
         assert_eq!(loaded.bucket_names[&1], "TestBucket");
         assert_eq!(loaded.bucket_to_shard[&1], 0);
         assert_eq!(loaded.shards.len(), 1);
+
+        Ok(())
+    }
+
+    /// Test that ShardedMainIndexBuilder produces identical output to Index::save_sharded().
+    /// This validates that batched progressive building yields the same result as
+    /// building everything in memory then sharding.
+    #[test]
+    fn test_builder_matches_save_sharded() -> Result<()> {
+        use crate::Index;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let path_a = dir.path().join("index_a.ryidx");
+        let path_b = dir.path().join("index_b.ryidx");
+
+        let k = 32;
+        let w = 10;
+        let salt = 0x1234u64;
+        let max_shard_bytes = 500; // Small to force multiple shards
+
+        // Create test data: 5 buckets with varying minimizers
+        let bucket_data: Vec<(u32, &str, Vec<String>, Vec<u64>)> = vec![
+            (1, "BucketA", vec!["src1".into()], vec![100, 200, 300, 400, 500]),
+            (2, "BucketB", vec!["src2".into()], vec![150, 250, 350]),
+            (3, "BucketC", vec!["src3a".into(), "src3b".into()], vec![600, 700, 800, 900]),
+            (4, "BucketD", vec!["src4".into()], vec![50, 60, 70, 80, 90, 110]),
+            (5, "BucketE", vec!["src5".into()], vec![1000, 2000, 3000]),
+        ];
+
+        // Approach A: Build full Index, then save_sharded
+        let mut index = Index::new(k, w, salt)?;
+        for (id, name, sources, minimizers) in &bucket_data {
+            index.bucket_names.insert(*id, name.to_string());
+            index.bucket_sources.insert(*id, sources.clone());
+            index.buckets.insert(*id, minimizers.clone());
+        }
+        let manifest_a = index.save_sharded(&path_a, max_shard_bytes)?;
+
+        // Approach B: Use ShardedMainIndexBuilder (progressive)
+        let mut builder = ShardedMainIndexBuilder::new(k, w, salt, &path_b, max_shard_bytes)?;
+        for (id, name, sources, minimizers) in &bucket_data {
+            builder.add_bucket(*id, name, sources.clone(), minimizers.clone())?;
+        }
+        let manifest_b = builder.finish()?;
+
+        // Verify manifests match
+        assert_eq!(manifest_a.k, manifest_b.k, "k mismatch");
+        assert_eq!(manifest_a.w, manifest_b.w, "w mismatch");
+        assert_eq!(manifest_a.salt, manifest_b.salt, "salt mismatch");
+        assert_eq!(manifest_a.total_minimizers, manifest_b.total_minimizers, "total_minimizers mismatch");
+        assert_eq!(manifest_a.shards.len(), manifest_b.shards.len(), "shard count mismatch");
+        assert_eq!(manifest_a.bucket_names, manifest_b.bucket_names, "bucket_names mismatch");
+        assert_eq!(manifest_a.bucket_to_shard, manifest_b.bucket_to_shard, "bucket_to_shard mismatch");
+
+        // Verify each shard has same buckets and minimizers
+        // Note: bucket_ids order may differ (HashMap vs insertion order) - sort for comparison
+        for (shard_a, shard_b) in manifest_a.shards.iter().zip(manifest_b.shards.iter()) {
+            assert_eq!(shard_a.shard_id, shard_b.shard_id, "shard_id mismatch");
+            let mut ids_a = shard_a.bucket_ids.clone();
+            let mut ids_b = shard_b.bucket_ids.clone();
+            ids_a.sort();
+            ids_b.sort();
+            assert_eq!(ids_a, ids_b, "bucket_ids mismatch for shard {}", shard_a.shard_id);
+            assert_eq!(shard_a.num_minimizers, shard_b.num_minimizers, "num_minimizers mismatch for shard {}", shard_a.shard_id);
+        }
+
+        // Load and verify actual shard contents match
+        for shard_info in &manifest_a.shards {
+            let shard_path_a = MainIndexManifest::shard_path(&path_a, shard_info.shard_id);
+            let shard_path_b = MainIndexManifest::shard_path(&path_b, shard_info.shard_id);
+
+            let shard_a = MainIndexShard::load(&shard_path_a)?;
+            let shard_b = MainIndexShard::load(&shard_path_b)?;
+
+            assert_eq!(shard_a.buckets, shard_b.buckets, "buckets mismatch in shard {}", shard_info.shard_id);
+            assert_eq!(shard_a.bucket_sources, shard_b.bucket_sources, "sources mismatch in shard {}", shard_info.shard_id);
+        }
+
+        Ok(())
+    }
+
+    /// Verify bucket IDs are assigned deterministically based on sorted bucket name order.
+    /// This invariant is critical for inverted index consistency.
+    #[test]
+    fn test_bucket_id_assignment_is_deterministic() -> Result<()> {
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let path = dir.path().join("test.ryidx");
+
+        // Names intentionally out of alphabetical order
+        let names = vec!["Zebra", "Apple", "Mango", "Banana"];
+        let sorted_names: Vec<_> = {
+            let mut v = names.clone();
+            v.sort();
+            v
+        };
+
+        let mut builder = ShardedMainIndexBuilder::new(32, 10, 0, &path, 10_000_000)?;
+
+        // Add buckets in sorted order (as build_index_from_config does)
+        for (i, name) in sorted_names.iter().enumerate() {
+            let id = (i + 1) as u32;
+            builder.add_bucket(id, name, vec![], vec![100 * id as u64])?;
+        }
+
+        let manifest = builder.finish()?;
+
+        // Verify: bucket ID 1 = "Apple", 2 = "Banana", 3 = "Mango", 4 = "Zebra"
+        assert_eq!(manifest.bucket_names[&1], "Apple");
+        assert_eq!(manifest.bucket_names[&2], "Banana");
+        assert_eq!(manifest.bucket_names[&3], "Mango");
+        assert_eq!(manifest.bucket_names[&4], "Zebra");
+
+        Ok(())
+    }
+
+    /// Test that batched parallel processing preserves bucket ID ordering.
+    ///
+    /// This simulates what build_index_from_config does: sort names, chunk into batches,
+    /// process each batch with par_iter, assign IDs sequentially. The key invariant is
+    /// that rayon's par_iter().collect() preserves order within each batch.
+    #[test]
+    fn test_batched_parallel_ordering_preserved() -> Result<()> {
+        use rayon::prelude::*;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let path = dir.path().join("test.ryidx");
+
+        // 20 bucket names, intentionally unordered
+        let mut names: Vec<String> = (0..20)
+            .map(|i| format!("Bucket_{:02}", 19 - i)) // Reverse order: 19, 18, ..., 0
+            .collect();
+
+        // Sort (as build_index_from_config does)
+        names.sort();
+
+        // Process in small batches to exercise multiple batch iterations
+        let batch_size = 3;
+        let mut builder = ShardedMainIndexBuilder::new(32, 10, 0, &path, 10_000_000)?;
+        let mut bucket_id = 1u32;
+
+        for chunk in names.chunks(batch_size) {
+            // Simulate build_single_bucket with par_iter (just returns name and dummy data)
+            let batch_results: Vec<_> = chunk.par_iter()
+                .map(|name| {
+                    // Simulate some work
+                    let minimizers = vec![bucket_id as u64 * 100];
+                    (name.clone(), minimizers)
+                })
+                .collect();
+
+            // Assign IDs sequentially (as build_index_from_config does)
+            for (name, minimizers) in batch_results {
+                builder.add_bucket(bucket_id, &name, vec![], minimizers)?;
+                bucket_id += 1;
+            }
+        }
+
+        let manifest = builder.finish()?;
+
+        // Verify: bucket IDs should be assigned in sorted name order
+        // Bucket_00 -> ID 1, Bucket_01 -> ID 2, ..., Bucket_19 -> ID 20
+        for i in 0..20 {
+            let expected_name = format!("Bucket_{:02}", i);
+            let expected_id = (i + 1) as u32;
+            assert_eq!(
+                manifest.bucket_names[&expected_id],
+                expected_name,
+                "Bucket ID {} should be '{}', got '{}'",
+                expected_id,
+                expected_name,
+                manifest.bucket_names[&expected_id]
+            );
+        }
 
         Ok(())
     }
