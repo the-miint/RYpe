@@ -11,7 +11,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::constants::{MAX_BUCKET_SIZE, MAX_STRING_LENGTH, MAX_NUM_BUCKETS};
-use crate::encoding::{encode_varint, decode_varint};
+use crate::encoding::{encode_varint, decode_varint, VarIntError};
 use crate::extraction::extract_into;
 use crate::sharded_main::{MainIndexManifest, ShardedMainIndexBuilder, plan_shards};
 use crate::types::IndexMetadata;
@@ -431,14 +431,42 @@ impl Index {
 
             // Read remaining minimizers as delta-encoded varints
             let mut prev = first;
-            for _ in 1..vec_len {
-                // Ensure we have some bytes available
-                refill_if_low!();
+            for i in 1..vec_len {
+                // Loop until we successfully decode or hit a real error
+                let (delta, consumed) = loop {
+                    refill_if_low!();
 
-                let (delta, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
+                    match decode_varint(&read_buf[buf_pos..buf_len]) {
+                        Ok((delta, consumed)) => break (delta, consumed),
+                        Err(VarIntError::Truncated(_)) => {
+                            // Need more data - shift and read more
+                            read_buf.copy_within(buf_pos..buf_len, 0);
+                            buf_len -= buf_pos;
+                            buf_pos = 0;
+                            let n = decoder.read(&mut read_buf[buf_len..])?;
+                            if n == 0 {
+                                return Err(anyhow!(
+                                    "Truncated varint at bucket {} minimizer {} (EOF with continuation bit set)",
+                                    id, i
+                                ));
+                            }
+                            buf_len += n;
+                        }
+                        Err(VarIntError::Overflow(bytes)) => {
+                            return Err(anyhow!(
+                                "Malformed varint at bucket {} minimizer {}: exceeded 10 bytes (consumed {})",
+                                id, i, bytes
+                            ));
+                        }
+                    }
+                };
                 buf_pos += consumed;
 
-                let val = prev + delta;
+                let val = prev.checked_add(delta)
+                    .ok_or_else(|| anyhow!(
+                        "Minimizer overflow at bucket {} index {} (prev={}, delta={})",
+                        id, i, prev, delta
+                    ))?;
                 vec.push(val);
                 prev = val;
             }

@@ -17,7 +17,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::constants::{MAX_BUCKET_SIZE, MAX_STRING_LENGTH, MAX_NUM_BUCKETS};
-use crate::encoding::{encode_varint, decode_varint};
+use crate::encoding::{encode_varint, decode_varint, VarIntError};
 use crate::types::IndexMetadata;
 
 /// Maximum number of shards allowed (DoS protection)
@@ -609,14 +609,39 @@ impl MainIndexShard {
             let mut names = Vec::with_capacity(num_filenames);
             let mut total_string_bytes: usize = 0;
 
-            for _ in 0..num_filenames {
-                refill_if_low!();
-                let (str_len, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
+            for filename_idx in 0..num_filenames {
+                // Decode varint with proper truncation handling
+                let (str_len, consumed) = loop {
+                    refill_if_low!();
+                    match decode_varint(&read_buf[buf_pos..buf_len]) {
+                        Ok((val, consumed)) => break (val, consumed),
+                        Err(VarIntError::Truncated(_)) => {
+                            // Need more data - shift and read more
+                            read_buf.copy_within(buf_pos..buf_len, 0);
+                            buf_len -= buf_pos;
+                            buf_pos = 0;
+                            let n = decoder.read(&mut read_buf[buf_len..])?;
+                            if n == 0 {
+                                return Err(anyhow!(
+                                    "Truncated varint at filename {} length",
+                                    filename_idx
+                                ));
+                            }
+                            buf_len += n;
+                        }
+                        Err(VarIntError::Overflow(bytes)) => {
+                            return Err(anyhow!(
+                                "Malformed varint at filename {} length: exceeded 10 bytes (consumed {})",
+                                filename_idx, bytes
+                            ));
+                        }
+                    }
+                };
                 buf_pos += consumed;
 
                 // Validate string length with overflow-safe conversion
                 let str_len = usize::try_from(str_len).map_err(|_| {
-                    anyhow!("Filename length {} overflows usize", str_len)
+                    anyhow!("Filename {} length {} overflows usize", filename_idx, str_len)
                 })?;
 
                 if str_len > MAX_STRING_LENGTH {
@@ -686,8 +711,32 @@ impl MainIndexShard {
 
                 let mut srcs = Vec::with_capacity(source_count);
                 for source_idx in 0..source_count {
-                    refill_if_low!();
-                    let (filename_idx_raw, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
+                    // Decode filename index varint with proper truncation handling
+                    let (filename_idx_raw, consumed) = loop {
+                        refill_if_low!();
+                        match decode_varint(&read_buf[buf_pos..buf_len]) {
+                            Ok((val, consumed)) => break (val, consumed),
+                            Err(VarIntError::Truncated(_)) => {
+                                read_buf.copy_within(buf_pos..buf_len, 0);
+                                buf_len -= buf_pos;
+                                buf_pos = 0;
+                                let n = decoder.read(&mut read_buf[buf_len..])?;
+                                if n == 0 {
+                                    return Err(anyhow!(
+                                        "Truncated varint at bucket {} source {} filename index",
+                                        bucket_id, source_idx
+                                    ));
+                                }
+                                buf_len += n;
+                            }
+                            Err(VarIntError::Overflow(bytes)) => {
+                                return Err(anyhow!(
+                                    "Malformed varint at bucket {} source {} filename index: exceeded 10 bytes (consumed {})",
+                                    bucket_id, source_idx, bytes
+                                ));
+                            }
+                        }
+                    };
                     buf_pos += consumed;
 
                     let filename_idx = usize::try_from(filename_idx_raw).map_err(|_| {
@@ -703,8 +752,32 @@ impl MainIndexShard {
                         ));
                     }
 
-                    refill_if_low!();
-                    let (seqname_len_raw, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
+                    // Decode seqname length varint with proper truncation handling
+                    let (seqname_len_raw, consumed) = loop {
+                        refill_if_low!();
+                        match decode_varint(&read_buf[buf_pos..buf_len]) {
+                            Ok((val, consumed)) => break (val, consumed),
+                            Err(VarIntError::Truncated(_)) => {
+                                read_buf.copy_within(buf_pos..buf_len, 0);
+                                buf_len -= buf_pos;
+                                buf_pos = 0;
+                                let n = decoder.read(&mut read_buf[buf_len..])?;
+                                if n == 0 {
+                                    return Err(anyhow!(
+                                        "Truncated varint at bucket {} source {} seqname length",
+                                        bucket_id, source_idx
+                                    ));
+                                }
+                                buf_len += n;
+                            }
+                            Err(VarIntError::Overflow(bytes)) => {
+                                return Err(anyhow!(
+                                    "Malformed varint at bucket {} source {} seqname length: exceeded 10 bytes (consumed {})",
+                                    bucket_id, source_idx, bytes
+                                ));
+                            }
+                        }
+                    };
                     buf_pos += consumed;
 
                     let seqname_len = usize::try_from(seqname_len_raw).map_err(|_| {
@@ -743,11 +816,40 @@ impl MainIndexShard {
                 minimizers.push(first);
 
                 let mut prev = first;
-                for _ in 1..minimizer_count {
-                    refill_if_low!();
-                    let (delta, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
+                for i in 1..minimizer_count {
+                    // Decode minimizer delta varint with proper truncation handling
+                    let (delta, consumed) = loop {
+                        refill_if_low!();
+                        match decode_varint(&read_buf[buf_pos..buf_len]) {
+                            Ok((val, consumed)) => break (val, consumed),
+                            Err(VarIntError::Truncated(_)) => {
+                                read_buf.copy_within(buf_pos..buf_len, 0);
+                                buf_len -= buf_pos;
+                                buf_pos = 0;
+                                let n = decoder.read(&mut read_buf[buf_len..])?;
+                                if n == 0 {
+                                    return Err(anyhow!(
+                                        "Truncated varint at bucket {} minimizer {}",
+                                        bucket_id, i
+                                    ));
+                                }
+                                buf_len += n;
+                            }
+                            Err(VarIntError::Overflow(bytes)) => {
+                                return Err(anyhow!(
+                                    "Malformed varint at bucket {} minimizer {}: exceeded 10 bytes (consumed {})",
+                                    bucket_id, i, bytes
+                                ));
+                            }
+                        }
+                    };
                     buf_pos += consumed;
-                    let val = prev + delta;
+
+                    let val = prev.checked_add(delta)
+                        .ok_or_else(|| anyhow!(
+                            "Minimizer overflow at bucket {} index {} (prev={}, delta={})",
+                            bucket_id, i, prev, delta
+                        ))?;
                     minimizers.push(val);
                     prev = val;
                 }

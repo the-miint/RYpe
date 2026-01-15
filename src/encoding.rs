@@ -55,6 +55,35 @@ pub(crate) fn reverse_complement(kmer: u64, k: usize) -> u64 {
 
 // --- VARINT ENCODING (LEB128) ---
 
+/// Maximum number of bytes needed to encode a u64 as LEB128 varint.
+pub(crate) const MAX_VARINT_BYTES: usize = 10;
+
+/// Error type for varint decoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VarIntError {
+    /// Buffer ended before varint was complete (continuation bit was set on last byte).
+    /// Contains the number of bytes that were available.
+    Truncated(usize),
+    /// Varint exceeds maximum size (>10 bytes for u64).
+    /// Contains the number of bytes consumed before overflow.
+    Overflow(usize),
+}
+
+impl std::fmt::Display for VarIntError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VarIntError::Truncated(bytes) => {
+                write!(f, "Truncated varint: buffer ended after {} bytes with continuation bit set", bytes)
+            }
+            VarIntError::Overflow(bytes) => {
+                write!(f, "Malformed varint: exceeded 10 bytes at {} bytes consumed", bytes)
+            }
+        }
+    }
+}
+
+impl std::error::Error for VarIntError {}
+
 /// Encode a u64 as a variable-length integer (LEB128 format).
 ///
 /// Smaller values use fewer bytes (1 byte for 0-127, 2 bytes for 128-16383, etc.).
@@ -88,33 +117,43 @@ pub(crate) fn encode_varint(mut value: u64, buf: &mut [u8]) -> usize {
 /// * `buf` - Input buffer containing the varint
 ///
 /// # Returns
-/// A tuple of (decoded_value, bytes_consumed). If the buffer is truncated
-/// or the varint is malformed (>10 bytes), returns (partial_value, bytes_read).
-/// The caller should validate that the entire varint was consumed.
+/// * `Ok((value, bytes_consumed))` - Successfully decoded varint
+/// * `Err(VarIntError::Truncated(n))` - Buffer ended with continuation bit set after n bytes
+/// * `Err(VarIntError::Overflow(n))` - Varint exceeded 10 bytes
+///
+/// # Example
+/// ```ignore
+/// let buf = [0x80, 0x80, 0x01]; // encodes 16384
+/// let (val, consumed) = decode_varint(&buf)?;
+/// assert_eq!(val, 16384);
+/// assert_eq!(consumed, 3);
+/// ```
 #[inline]
-pub(crate) fn decode_varint(buf: &[u8]) -> (u64, usize) {
+pub(crate) fn decode_varint(buf: &[u8]) -> Result<(u64, usize), VarIntError> {
     let mut value: u64 = 0;
     let mut shift = 0;
     let mut i = 0;
     loop {
         // Bounds check - prevent buffer overrun
         if i >= buf.len() {
-            // Truncated varint - return what we have
-            return (value, i);
+            // Buffer exhausted with continuation bit still set on previous byte
+            return Err(VarIntError::Truncated(i));
         }
         let byte = buf[i];
         value |= ((byte & 0x7F) as u64) << shift;
         i += 1;
         if byte & 0x80 == 0 {
-            return (value, i);
+            // Complete varint - continuation bit clear
+            return Ok((value, i));
         }
         shift += 7;
         if shift >= 64 {
-            // Malformed varint (>10 bytes) - return what we have
-            return (value, i);
+            // Malformed varint (>10 bytes)
+            return Err(VarIntError::Overflow(i));
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -149,7 +188,7 @@ mod tests {
         // Test small values
         for val in [0u64, 1, 127, 128, 255, 256, 16383, 16384] {
             let len = encode_varint(val, &mut buf);
-            let (decoded, consumed) = decode_varint(&buf[..len]);
+            let (decoded, consumed) = decode_varint(&buf[..len]).expect("decode failed");
             assert_eq!(decoded, val);
             assert_eq!(consumed, len);
         }
@@ -157,8 +196,100 @@ mod tests {
         // Test large value
         let large = u64::MAX;
         let len = encode_varint(large, &mut buf);
-        let (decoded, consumed) = decode_varint(&buf[..len]);
+        let (decoded, consumed) = decode_varint(&buf[..len]).expect("decode failed");
         assert_eq!(decoded, large);
         assert_eq!(consumed, len);
+    }
+
+    #[test]
+    fn test_varint_truncation_detection() {
+        let mut buf = [0u8; 10];
+
+        // Encode a 3-byte varint (16384 = [0x80, 0x80, 0x01])
+        let val = 16384u64;
+        let len = encode_varint(val, &mut buf);
+        assert_eq!(len, 3);
+        assert_eq!(&buf[..3], &[0x80, 0x80, 0x01]);
+
+        // Full buffer decodes correctly
+        let result = decode_varint(&buf[..3]);
+        assert_eq!(result, Ok((16384, 3)));
+
+        // Truncated to 2 bytes should return Truncated error
+        let result = decode_varint(&buf[..2]);
+        assert_eq!(result, Err(VarIntError::Truncated(2)));
+
+        // Truncated to 1 byte should return Truncated error
+        let result = decode_varint(&buf[..1]);
+        assert_eq!(result, Err(VarIntError::Truncated(1)));
+
+        // Empty buffer should return Truncated error
+        let result = decode_varint(&[]);
+        assert_eq!(result, Err(VarIntError::Truncated(0)));
+    }
+
+    #[test]
+    fn test_varint_large_values() {
+        let mut buf = [0u8; 10];
+
+        // Test values that require different numbers of bytes
+        let test_cases = [
+            (0u64, 1),
+            (127u64, 1),
+            (128u64, 2),
+            (16383u64, 2),
+            (16384u64, 3),
+            (2097151u64, 3),
+            (2097152u64, 4),
+            (u64::MAX >> 1, 9),
+            (u64::MAX, 10),
+        ];
+
+        for (val, expected_len) in test_cases {
+            let len = encode_varint(val, &mut buf);
+            assert_eq!(len, expected_len, "Encoded length mismatch for {}", val);
+
+            let (decoded, consumed) = decode_varint(&buf[..len]).expect("decode failed");
+            assert_eq!(decoded, val, "Value mismatch for {}", val);
+            assert_eq!(consumed, len, "Consumed mismatch for {}", val);
+        }
+    }
+
+    #[test]
+    fn test_varint_boundary_values() {
+        let mut buf = [0u8; 10];
+
+        // Values at byte boundaries (where encoding length changes)
+        let boundary_values = [
+            127u64,           // max 1-byte
+            128u64,           // min 2-byte
+            16383u64,         // max 2-byte
+            16384u64,         // min 3-byte
+            2097151u64,       // max 3-byte
+            2097152u64,       // min 4-byte
+            268435455u64,     // max 4-byte
+            268435456u64,     // min 5-byte
+        ];
+
+        for val in boundary_values {
+            let len = encode_varint(val, &mut buf);
+            let (decoded, _) = decode_varint(&buf[..len]).expect("decode failed");
+            assert_eq!(decoded, val, "Boundary value {} failed roundtrip", val);
+
+            // Test truncation at each byte
+            for truncate_at in 1..len {
+                let result = decode_varint(&buf[..truncate_at]);
+                assert!(
+                    result.is_err(),
+                    "Truncation at byte {} of {} should fail for value {}",
+                    truncate_at, len, val
+                );
+                assert_eq!(
+                    result,
+                    Err(VarIntError::Truncated(truncate_at)),
+                    "Wrong error type for truncation"
+                );
+            }
+        }
     }
 }

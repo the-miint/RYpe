@@ -13,7 +13,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::constants::{MAX_INVERTED_MINIMIZERS, MAX_INVERTED_BUCKET_IDS};
-use crate::encoding::{encode_varint, decode_varint};
+use crate::encoding::{encode_varint, decode_varint, VarIntError, MAX_VARINT_BYTES};
 use crate::index::Index;
 use crate::sharded::{ShardInfo, ShardManifest};
 use crate::sharded_main::MainIndexShard;
@@ -549,12 +549,41 @@ impl InvertedIndex {
                 }
 
                 for i in 1..num_minimizers {
-                    refill_if_low!();
-                    if buf_pos >= buf_len {
-                        return Err(anyhow!("Unexpected end of data at minimizer {}", i));
-                    }
+                    // Ensure we have enough bytes for a complete varint.
+                    // Loop until we successfully decode or hit a real error.
+                    let (delta, consumed) = loop {
+                        refill_if_low!();
+                        if buf_pos >= buf_len {
+                            return Err(anyhow!("Unexpected end of data at minimizer {}", i));
+                        }
 
-                    let (delta, consumed) = decode_varint(&varint_read_buf[buf_pos..buf_len]);
+                        match decode_varint(&varint_read_buf[buf_pos..buf_len]) {
+                            Ok((delta, consumed)) => break (delta, consumed),
+                            Err(VarIntError::Truncated(_)) => {
+                                // Need more data - force a refill by shifting and reading
+                                let remaining = buf_len - buf_pos;
+                                if remaining > 0 && buf_pos > 0 {
+                                    varint_read_buf.copy_within(buf_pos..buf_len, 0);
+                                }
+                                buf_len = remaining;
+                                buf_pos = 0;
+                                match decoder.read(&mut varint_read_buf[buf_len..]) {
+                                    Ok(0) => return Err(anyhow!(
+                                        "Truncated varint at minimizer {} (EOF with continuation bit set)",
+                                        i
+                                    )),
+                                    Ok(n) => buf_len += n,
+                                    Err(e) => return Err(anyhow!("I/O error reading minimizers: {}", e)),
+                                }
+                            }
+                            Err(VarIntError::Overflow(bytes)) => {
+                                return Err(anyhow!(
+                                    "Malformed varint at minimizer {}: exceeded 10 bytes (consumed {})",
+                                    i, bytes
+                                ));
+                            }
+                        }
+                    };
                     buf_pos += consumed;
 
                     let min = prev.checked_add(delta)
@@ -681,6 +710,11 @@ impl InvertedIndex {
     /// Returns the total number of bucket ID entries.
     pub fn num_bucket_entries(&self) -> usize {
         self.bucket_ids.len()
+    }
+
+    /// Get the sorted minimizer array (for debugging/inspection).
+    pub fn minimizers(&self) -> &[u64] {
+        &self.minimizers
     }
 
     /// Load only the header stats from an inverted index file (v3 format).
@@ -966,16 +1000,54 @@ impl InvertedIndex {
             buf_pos += 8;
 
             let mut prev = first;
-            for _ in 1..num_minimizers {
-                ensure_bytes!(1);
-                let (delta, consumed) = decode_varint(&read_buf[buf_pos..buf_len]);
-                if consumed == 0 {
-                    return Err(anyhow!("Invalid varint in shard"));
+            for i in 1..num_minimizers {
+                // Ensure enough bytes for a complete varint.
+                // Loop until we successfully decode or hit a real error.
+                let (delta, consumed) = loop {
+                    // Ensure we have at least MAX_VARINT_BYTES available if possible
+                    ensure_bytes!(MAX_VARINT_BYTES.min(1));
+
+                    match decode_varint(&read_buf[buf_pos..buf_len]) {
+                        Ok((delta, consumed)) => break (delta, consumed),
+                        Err(VarIntError::Truncated(_)) => {
+                            // Need more data - shift remaining bytes and read more
+                            read_buf.copy_within(buf_pos..buf_len, 0);
+                            buf_len -= buf_pos;
+                            buf_pos = 0;
+                            let n = decoder.read(&mut read_buf[buf_len..])?;
+                            if n == 0 {
+                                return Err(anyhow!(
+                                    "Truncated varint at minimizer {} (EOF with continuation bit set, buf_len={})",
+                                    i, buf_len
+                                ));
+                            }
+                            buf_len += n;
+                        }
+                        Err(VarIntError::Overflow(bytes)) => {
+                            return Err(anyhow!(
+                                "Malformed varint at minimizer {}: exceeded 10 bytes (consumed {})",
+                                i, bytes
+                            ));
+                        }
+                    }
+                };
+                buf_pos += consumed;
+
+                let val = prev.checked_add(delta)
+                    .ok_or_else(|| anyhow!(
+                        "Minimizer overflow at index {} (prev={}, delta={})",
+                        i, prev, delta
+                    ))?;
+
+                if val <= prev && i > 0 {
+                    return Err(anyhow!(
+                        "Minimizers not strictly increasing at index {} (prev={}, val={})",
+                        i, prev, val
+                    ));
                 }
-                let val = prev + delta;
+
                 minimizers.push(val);
                 prev = val;
-                buf_pos += consumed;
             }
         }
 
@@ -2132,5 +2204,155 @@ mod tests {
         let mins = qidx.minimizers();
         assert!(mins.is_sorted());
         assert_eq!(mins.len(), qidx.num_minimizers());
+    }
+
+    /// Regression test for varint boundary bug in load_shard().
+    ///
+    /// The bug: load_shard() used `ensure_bytes!(1)` before decoding varints,
+    /// but LEB128 varints can be up to 10 bytes. When a large delta value
+    /// happened to span buffer boundaries during streaming decompression,
+    /// only part of the varint was decoded, corrupting subsequent minimizers.
+    ///
+    /// This test creates minimizers with large gaps (requiring multi-byte varints)
+    /// and verifies save/load round-trip preserves all values correctly.
+    #[test]
+    fn test_shard_varint_boundary_roundtrip() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        // Create minimizers with large gaps requiring multi-byte varints.
+        // LEB128 encoding:
+        // - 1 byte: values 0-127
+        // - 2 bytes: values 128-16383
+        // - 3 bytes: values 16384-2097151
+        // - 10 bytes: max u64
+        //
+        // We intentionally create values with gaps of varying sizes to trigger
+        // varints of different lengths, increasing the chance of hitting buffer boundaries.
+        let mut minimizers: Vec<u64> = Vec::new();
+
+        // Start with small values (small deltas, 1-byte varints)
+        for i in 0..50 {
+            minimizers.push(i * 10);
+        }
+
+        // Add medium gaps (2-3 byte varints)
+        let mut val = 500;
+        for _ in 0..100 {
+            minimizers.push(val);
+            val += 50000; // ~2-3 byte varint deltas
+        }
+
+        // Add large gaps (4+ byte varints)
+        for _ in 0..50 {
+            minimizers.push(val);
+            val += 1_000_000_000; // ~5 byte varint deltas
+        }
+
+        // Add very large values near u64::MAX (requiring large absolute values and deltas)
+        let high_base = 10_000_000_000_000_000_000u64;
+        for i in 0..20 {
+            minimizers.push(high_base + i * 100_000_000_000);
+        }
+
+        minimizers.sort();
+        minimizers.dedup();
+
+        // Create index with these minimizers
+        let mut index = Index::new(64, 50, 0xDEADBEEF).unwrap();
+        index.buckets.insert(1, minimizers.clone());
+        index.bucket_names.insert(1, "test".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        let original_count = inverted.num_minimizers();
+
+        // Save as shard
+        let shard_info = inverted.save_shard(&path, 0, 0, original_count, true)?;
+        assert_eq!(shard_info.num_minimizers, original_count);
+
+        // Load shard back
+        let loaded = InvertedIndex::load_shard(&path)?;
+
+        // Verify all minimizers were preserved
+        assert_eq!(
+            loaded.num_minimizers(), original_count,
+            "Minimizer count changed after save/load: {} -> {}",
+            original_count, loaded.num_minimizers()
+        );
+
+        // Verify specific high-value minimizers weren't truncated
+        for &m in &minimizers {
+            let found = loaded.minimizers().binary_search(&m).is_ok();
+            assert!(
+                found,
+                "Minimizer {} was lost after save/load round-trip (varint boundary bug?)",
+                m
+            );
+        }
+
+        // Verify the actual minimizer values match exactly
+        assert_eq!(
+            loaded.minimizers(), inverted.minimizers(),
+            "Minimizer arrays differ after save/load"
+        );
+
+        // Verify queries still work correctly
+        let hits = loaded.get_bucket_hits(&minimizers[..10]);
+        assert_eq!(hits.get(&1), Some(&10));
+
+        Ok(())
+    }
+
+    /// Regression test: ensure very large minimizer values near u64::MAX survive round-trip.
+    /// This tests the upper range where varint deltas could overflow or be misinterpreted.
+    #[test]
+    fn test_shard_large_minimizers_roundtrip() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        // Create minimizers near the top of the u64 range
+        let minimizers: Vec<u64> = vec![
+            12297829382473034403,
+            12297829382473034405,
+            12297829382473034408,
+            12297829382473034409,
+            12297829382473034410,
+            14168481312020516,  // The actual problematic minimizer from the bug report
+            u64::MAX - 1000,
+            u64::MAX - 100,
+            u64::MAX - 10,
+            u64::MAX - 1,
+        ];
+
+        let mut sorted_mins = minimizers.clone();
+        sorted_mins.sort();
+
+        let mut index = Index::new(64, 200, 0x5555555555555555).unwrap();
+        index.buckets.insert(30, sorted_mins.clone());
+        index.bucket_names.insert(30, "bucket-125".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        let shard_info = inverted.save_shard(&path, 0, 0, inverted.num_minimizers(), true)?;
+
+        let loaded = InvertedIndex::load_shard(&path)?;
+
+        assert_eq!(loaded.num_minimizers(), shard_info.num_minimizers);
+
+        // Check the specific minimizer that was missing in the bug
+        let test_min = 14168481312020516u64;
+        let found = loaded.minimizers().binary_search(&test_min).is_ok();
+        assert!(
+            found,
+            "Minimizer {} (from bug report) not found after save/load",
+            test_min
+        );
+
+        // Verify all minimizers survived
+        for &m in &sorted_mins {
+            let found = loaded.minimizers().binary_search(&m).is_ok();
+            assert!(found, "Minimizer {} lost after round-trip", m);
+        }
+
+        Ok(())
     }
 }
