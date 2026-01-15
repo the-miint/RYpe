@@ -1,6 +1,6 @@
 use crate::{
-    Index, InvertedIndex, QueryRecord,
-    classify_batch, classify_batch_inverted,
+    Index, QueryRecord,
+    classify_batch,
     classify_batch_sharded_sequential, classify_batch_sharded_main,
     ShardedMainIndex, ShardedInvertedIndex,
     MainIndexManifest, ShardManifest,
@@ -15,7 +15,7 @@ use libc::{c_char, size_t, c_double};
 
 #[cfg(feature = "arrow")]
 use crate::arrow::{
-    classify_arrow_batch, classify_arrow_batch_inverted,
+    classify_arrow_batch,
     classify_arrow_batch_sharded, classify_arrow_batch_sharded_main,
 };
 #[cfg(feature = "arrow")]
@@ -33,16 +33,13 @@ use arrow::record_batch::RecordBatch;
 /// automatically handles:
 /// - Single-file main indices (.ryidx)
 /// - Sharded main indices (.ryidx.manifest + .ryidx.shard.*)
-/// - Single-file inverted indices (.ryxdi)
 /// - Sharded inverted indices (.ryxdi.manifest + .ryxdi.shard.*)
 pub enum RypeIndex {
     /// Single-file main index
     Single(Index),
     /// Sharded main index (manifest + shard files)
     ShardedMain(ShardedMainIndex),
-    /// Single-file inverted index
-    Inverted(InvertedIndex),
-    /// Sharded inverted index (manifest + shard files)
+    /// Sharded inverted index (manifest + shard files, includes 1-shard case)
     ShardedInverted(ShardedInvertedIndex),
 }
 
@@ -52,7 +49,6 @@ impl RypeIndex {
         match self {
             RypeIndex::Single(idx) => idx.k,
             RypeIndex::ShardedMain(idx) => idx.k(),
-            RypeIndex::Inverted(idx) => idx.k,
             RypeIndex::ShardedInverted(idx) => idx.k(),
         }
     }
@@ -62,7 +58,6 @@ impl RypeIndex {
         match self {
             RypeIndex::Single(idx) => idx.w,
             RypeIndex::ShardedMain(idx) => idx.w(),
-            RypeIndex::Inverted(idx) => idx.w,
             RypeIndex::ShardedInverted(idx) => idx.w(),
         }
     }
@@ -72,7 +67,6 @@ impl RypeIndex {
         match self {
             RypeIndex::Single(idx) => idx.salt,
             RypeIndex::ShardedMain(idx) => idx.salt(),
-            RypeIndex::Inverted(idx) => idx.salt,
             RypeIndex::ShardedInverted(idx) => idx.salt(),
         }
     }
@@ -85,8 +79,7 @@ impl RypeIndex {
         match self {
             RypeIndex::Single(idx) => Some(idx.buckets.len()),
             RypeIndex::ShardedMain(idx) => Some(idx.manifest().bucket_names.len()),
-            RypeIndex::Inverted(_) => None, // Inverted indices don't store bucket names
-            RypeIndex::ShardedInverted(_) => None,
+            RypeIndex::ShardedInverted(_) => None, // Inverted indices don't store bucket names
         }
     }
 
@@ -96,7 +89,6 @@ impl RypeIndex {
         match self {
             RypeIndex::Single(idx) => idx.bucket_names.get(&bucket_id).map(|s| s.as_str()),
             RypeIndex::ShardedMain(idx) => idx.manifest().bucket_names.get(&bucket_id).map(|s| s.as_str()),
-            RypeIndex::Inverted(_) => None,
             RypeIndex::ShardedInverted(_) => None,
         }
     }
@@ -111,14 +103,13 @@ impl RypeIndex {
         match self {
             RypeIndex::Single(_) => 1,
             RypeIndex::ShardedMain(idx) => idx.num_shards(),
-            RypeIndex::Inverted(_) => 1,
             RypeIndex::ShardedInverted(idx) => idx.num_shards(),
         }
     }
 
     /// Returns whether this is an inverted index.
     pub fn is_inverted(&self) -> bool {
-        matches!(self, RypeIndex::Inverted(_) | RypeIndex::ShardedInverted(_))
+        matches!(self, RypeIndex::ShardedInverted(_))
     }
 
     /// Estimate the memory footprint of the currently loaded index structures.
@@ -149,12 +140,6 @@ impl RypeIndex {
                 // Rough estimate: 200 bytes per bucket for names/maps
                 num_buckets * 200
             }
-            RypeIndex::Inverted(idx) => {
-                // CSR format: minimizers Vec<u64> + offsets Vec<u32> + bucket_ids Vec<u32>
-                idx.minimizers.len() * 8 +
-                idx.offsets.len() * 4 +
-                idx.bucket_ids.len() * 4
-            }
             RypeIndex::ShardedInverted(idx) => {
                 // Only manifest is loaded
                 let manifest = idx.manifest();
@@ -170,7 +155,7 @@ impl RypeIndex {
     /// For sharded indices, returns the estimated size of the largest shard.
     pub fn largest_shard_bytes(&self) -> usize {
         match self {
-            RypeIndex::Single(_) | RypeIndex::Inverted(_) => 0,
+            RypeIndex::Single(_) => 0,
             RypeIndex::ShardedMain(idx) => {
                 // Estimate: 8 bytes per minimizer + HashMap overhead
                 let manifest = idx.manifest();
@@ -206,9 +191,6 @@ impl RypeIndex {
             }
             RypeIndex::ShardedMain(_) => {
                 Err("Cannot collect minimizers from sharded main index: would require loading all shards into memory. Use single-file index for negative set creation.".to_string())
-            }
-            RypeIndex::Inverted(idx) => {
-                Ok(idx.minimizers.iter().copied().collect())
             }
             RypeIndex::ShardedInverted(_) => {
                 Err("Cannot collect minimizers from sharded inverted index: would require loading all shards into memory. Use single-file index for negative set creation.".to_string())
@@ -364,17 +346,12 @@ pub extern "C" fn rype_index_load(path: *const c_char) -> *mut RypeIndex {
                 }
             }
         } else {
-            // Single-file inverted index
-            match InvertedIndex::load(path) {
-                Ok(idx) => {
-                    clear_last_error();
-                    Box::into_raw(Box::new(RypeIndex::Inverted(idx)))
-                }
-                Err(e) => {
-                    set_last_error(format!("Failed to load inverted index: {}", e));
-                    std::ptr::null_mut()
-                }
-            }
+            // Legacy single-file inverted index not supported
+            set_last_error(format!(
+                "Legacy single-file inverted index format (RYXI) is no longer supported. \
+                 Re-create the inverted index with: rype index invert -i <main_index>"
+            ));
+            std::ptr::null_mut()
         }
     } else {
         // Main index: check for sharded
@@ -715,7 +692,6 @@ pub extern "C" fn rype_classify(
 /// algorithm based on the index type:
 /// - Single main index: uses classify_batch
 /// - Sharded main index: uses classify_batch_sharded_main
-/// - Single inverted index: uses classify_batch_inverted
 /// - Sharded inverted index: uses classify_batch_sharded_sequential
 ///
 /// Parameters:
@@ -817,9 +793,6 @@ pub extern "C" fn rype_classify_with_negative(
             RypeIndex::ShardedMain(idx) => {
                 classify_batch_sharded_main(idx, neg_mins, &rust_queries, threshold)
                     .map_err(|e| format!("Sharded main classification failed: {}", e))
-            }
-            RypeIndex::Inverted(idx) => {
-                Ok(classify_batch_inverted(idx, neg_mins, &rust_queries, threshold))
             }
             RypeIndex::ShardedInverted(idx) => {
                 classify_batch_sharded_sequential(idx, neg_mins, &rust_queries, threshold)
@@ -1219,9 +1192,6 @@ mod arrow_ffi {
                 RypeIndex::ShardedMain(idx) => {
                     classify_arrow_batch_sharded_main(idx, neg_mins, batch, threshold)
                 }
-                RypeIndex::Inverted(idx) => {
-                    classify_arrow_batch_inverted(idx, neg_mins, batch, threshold)
-                }
                 RypeIndex::ShardedInverted(idx) => {
                     classify_arrow_batch_sharded(idx, neg_mins, batch, threshold, merge_join)
                 }
@@ -1373,26 +1343,6 @@ mod c_api_tests {
         assert_eq!(rype_index.largest_shard_bytes(), 0);
     }
 
-    #[test]
-    fn test_rype_index_estimate_memory_inverted() {
-        use crate::{Index, InvertedIndex, MinimizerWorkspace};
-
-        let mut index = Index::new(64, 50, 0x1234).unwrap();
-        let mut ws = MinimizerWorkspace::new();
-
-        let seq = vec![b'A'; 200];
-        index.add_record(1, "test::seq1", &seq, &mut ws);
-        index.finalize_bucket(1);
-
-        let inverted = InvertedIndex::build_from_index(&index);
-        let rype_index = RypeIndex::Inverted(inverted);
-
-        let mem = rype_index.estimate_memory_bytes();
-        assert!(mem > 0, "Memory estimate should be non-zero");
-
-        // Shard bytes should be 0 for single inverted index
-        assert_eq!(rype_index.largest_shard_bytes(), 0);
-    }
 }
 
 // Arrow FFI tests

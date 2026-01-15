@@ -124,7 +124,7 @@ Implementation uses monotonic deque for O(n) time complexity (see `extract_into(
 - `finalize_bucket()` - Sort and deduplicate minimizers
 
 **Serialization** (src/lib.rs:282-389):
-- Custom binary format: "RYP3" magic + version 2
+- Custom binary format: "RYP5" magic + version 5
 - Stores K, w, salt, then buckets with names/sources/minimizers
 - Safe deserialization with MAX_BUCKET_SIZE, MAX_STRING_LENGTH, MAX_NUM_BUCKETS checks
 
@@ -161,10 +161,11 @@ Nested subcommands using clap:
 - `bucket-merge` - Merge two buckets within an index
 - `merge` - Merge multiple indices into one
 - `from-config` - Build index from TOML configuration file
-- `invert` - Create inverted index for faster classification (supports `--shards N` for sharding)
+- `shard` - Convert single-file index to sharded format
+- `invert` - Create inverted index (bucket-partitioned shards, 1:1 with main index)
 
 **`rype classify`** - Classification operations:
-- `run` - Per-read classification (auto-detects sharded vs single-file inverted index)
+- `run` - Per-read classification (uses sharded inverted index when available)
 - `batch` - Batch classify (alias for run)
 - `aggregate` - Aggregated classification for paired-end (alias: `agg`)
 
@@ -220,27 +221,30 @@ This format achieves ~65% compression compared to raw storage by:
 
 ### Sharded Inverted Index
 
-For very large inverted indexes that exceed available memory, the index can be split into multiple shard files:
+Inverted indexes are stored as bucket-partitioned shards with 1:1 correspondence to main index shards:
 
 ```
 index.ryxdi.manifest     # Manifest describing all shards
-index.ryxdi.shard.0      # Shard 0
-index.ryxdi.shard.1      # Shard 1
+index.ryxdi.shard.0      # Shard 0 (corresponds to main shard 0)
+index.ryxdi.shard.1      # Shard 1 (corresponds to main shard 1)
 ...
 ```
 
-**Manifest Format (RYXM v1)**:
+For a single-file main index, the inverted index has 1 shard (index.ryxdi.manifest + index.ryxdi.shard.0).
+
+**Manifest Format (RYXM v3)**:
 ```
 Magic: "RYXM" (4 bytes)
-Version: 1 (u32)
+Version: 3 (u32)
 k, w, salt, source_hash (u64 each)
 total_minimizers, total_bucket_ids (u64 each)
+has_overlapping_shards: u8 (always 1 for bucket-partitioned)
 num_shards (u32)
 For each shard: shard_id (u32), min_start (u64), min_end (u64), num_minimizers (u64), num_bucket_ids (u64)
 ```
 
 **Shard Format (RYXS v1)**:
-Each shard is a complete inverted index containing a contiguous range of minimizers. Uses same encoding as RYXI (delta+varint+zstd) with additional shard metadata in header.
+Each shard is a complete inverted index for a subset of buckets. Uses delta+varint+zstd encoding with shard metadata in header.
 
 **Key Data Structures**:
 - `ShardManifest` - Describes shard layout and totals
@@ -249,10 +253,14 @@ Each shard is a complete inverted index containing a contiguous range of minimiz
 
 **Usage**:
 ```bash
-# Create sharded inverted index (4 shards)
-cargo run --release -- index invert -i index.ryidx --shards 4
+# Create inverted index (automatic 1:1 shard correspondence)
+cargo run --release -- index invert -i index.ryidx
 
-# Classification auto-detects sharded format
+# Convert single-file to sharded main index, then create inverted
+cargo run --release -- index shard -i large.ryidx -o sharded.ryidx --max-shard-size 1G
+cargo run --release -- index invert -i sharded.ryidx
+
+# Classification with inverted index
 cargo run --release -- classify run -i index.ryidx --use-inverted -1 reads.fq
 ```
 

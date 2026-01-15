@@ -1,7 +1,12 @@
 //! Sharded inverted index structures.
 //!
-//! For very large indices that exceed available memory, the inverted index can be
-//! split into multiple shard files that are loaded on-demand during classification.
+//! All inverted indices use the sharded format, even when there's only one shard.
+//! This unified approach simplifies the codebase at the cost of having two files
+//! (manifest + shard) instead of one for small indices.
+//!
+//! For small indices, the overhead is minimal: an extra file open and a small manifest
+//! read. For large indices, sharding enables memory-efficient classification by loading
+//! one shard at a time.
 
 use anyhow::{Result, anyhow};
 use std::fs::File;
@@ -40,40 +45,32 @@ pub struct ShardInfo {
 /// - num_shards (u32)
 /// - For each shard: shard_id (u32), min_start (u64), min_end (u64), is_last_shard (u8), num_minimizers (u64), num_bucket_ids (u64)
 ///
-/// # Shard Partitioning Strategies
+/// # Shard Partitioning
 ///
-/// **Range-partitioned** (`has_overlapping_shards = false`):
-/// - Created by `InvertedIndex::save_sharded()` which splits a single inverted index
-/// - Minimizer ranges are sorted and contiguous: `[0, 500), [500, 1000), ...`
-/// - Each minimizer appears in exactly one shard
-/// - `total_minimizers` equals the unique minimizer count
+/// Shards are created by inverting each main index shard independently (1:1 correspondence).
+/// This is called "bucket-partitioned" because each main shard contains complete buckets,
+/// so each inverted shard contains only bucket IDs from its corresponding main shard.
 ///
-/// **Bucket-partitioned** (`has_overlapping_shards = true`):
-/// - Created by inverting each main index shard independently (1:1 correspondence)
-/// - Minimizer ranges may overlap (same minimizer can appear in multiple shards)
-/// - `min_start`/`min_end` are advisory only (not sorted or contiguous)
+/// **Key consequence**: Since different buckets can share the same minimizers, the same
+/// minimizer value can appear in multiple inverted shards. This is why `has_overlapping_shards`
+/// is always `true` for bucket-partitioned shards.
+///
+/// - For non-sharded main index, creates a 1-shard inverted index
+/// - `min_start`/`min_end` are advisory only (not sorted or contiguous across shards)
 /// - `total_minimizers` is the SUM across shards (includes duplicates, NOT unique count)
-/// - Classification must iterate through ALL shards for each query
-///
-/// # Migration Note (v2 → v3)
-///
-/// Version 2 manifests did not have the `has_overlapping_shards` flag and assumed
-/// range-partitioned shards. If you have v2 manifests that were created from sharded
-/// main indices (bucket-partitioned), they will fail validation and must be regenerated.
+/// - Classification must iterate through ALL shards for each query (no range-based skipping)
 #[derive(Debug, Clone)]
 pub struct ShardManifest {
     pub k: usize,
     pub w: usize,
     pub salt: u64,
     pub source_hash: u64,
-    /// Total minimizer entries across all shards.
-    /// For range-partitioned shards: equals unique minimizer count (no duplicates).
-    /// For overlapping shards: includes duplicates (same minimizer counted per shard).
+    /// Total minimizer entries across all shards (includes duplicates across shards).
     pub total_minimizers: usize,
-    /// Total bucket ID entries across all shards (same duplicate semantics as total_minimizers).
+    /// Total bucket ID entries across all shards (includes duplicates across shards).
     pub total_bucket_ids: usize,
-    /// If true, shards have overlapping minimizer ranges and classification must check all shards.
-    /// If false, shards are range-partitioned with sorted, contiguous, non-overlapping ranges.
+    /// Always `true` for bucket-partitioned shards (the only type currently supported).
+    /// When true, shards have overlapping minimizer ranges and classification must check all shards.
     pub has_overlapping_shards: bool,
     pub shards: Vec<ShardInfo>,
 }
@@ -127,8 +124,13 @@ impl ShardManifest {
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if !matches!(version, 2 | 3) {
-            return Err(anyhow!("Unsupported shard manifest version: {} (expected 2 or 3)", version));
+        if version != 3 {
+            return Err(anyhow!(
+                "Unsupported inverted index manifest version: {} (expected 3).\n\
+                 This inverted index was created with an older version. Regenerate it:\n  \
+                 rype index invert -i <main-index.ryidx>",
+                version
+            ));
         }
 
         reader.read_exact(&mut buf8)?;
@@ -164,13 +166,8 @@ impl ShardManifest {
             ));
         }
 
-        // Version 3 adds has_overlapping_shards flag
-        let has_overlapping_shards = if version >= 3 {
-            reader.read_exact(&mut buf1)?;
-            buf1[0] != 0
-        } else {
-            false // v2 manifests are always range-partitioned
-        };
+        reader.read_exact(&mut buf1)?;
+        let has_overlapping_shards = buf1[0] != 0;
 
         reader.read_exact(&mut buf4)?;
         let num_shards = u32::from_le_bytes(buf4);
@@ -211,7 +208,7 @@ impl ShardManifest {
 
         // Validate shard structure
         if !shards.is_empty() {
-            // Check shard IDs are sequential (applies to all shard types)
+            // Check shard IDs are sequential
             for i in 1..shards.len() {
                 if shards[i].shard_id != shards[i - 1].shard_id + 1 {
                     return Err(anyhow!(
@@ -221,44 +218,7 @@ impl ShardManifest {
                 }
             }
 
-            // Range-partitioned shards have strict ordering and contiguity requirements.
-            // Bucket-partitioned shards can have overlapping/unordered ranges.
-            if !has_overlapping_shards {
-                for i in 1..shards.len() {
-                    if shards[i].min_start < shards[i - 1].min_start {
-                        return Err(anyhow!(
-                            "Invalid manifest: shards not sorted by min_start (shard {} has min_start {} < shard {} min_start {})",
-                            shards[i].shard_id, shards[i].min_start, shards[i - 1].shard_id, shards[i - 1].min_start
-                        ));
-                    }
-                }
-
-                for i in 0..shards.len() - 1 {
-                    if shards[i].is_last_shard {
-                        return Err(anyhow!(
-                            "Invalid manifest: shard {} marked as last but not final shard",
-                            shards[i].shard_id
-                        ));
-                    }
-                    if shards[i].min_end != shards[i + 1].min_start {
-                        return Err(anyhow!(
-                            "Invalid manifest: shard ranges not contiguous (shard {} ends at {}, shard {} starts at {})",
-                            shards[i].shard_id, shards[i].min_end, shards[i + 1].shard_id, shards[i + 1].min_start
-                        ));
-                    }
-                }
-
-                if let Some(last) = shards.last() {
-                    if !last.is_last_shard {
-                        return Err(anyhow!(
-                            "Invalid manifest: final shard {} not marked as is_last_shard",
-                            last.shard_id
-                        ));
-                    }
-                }
-            }
-
-            // Total counts must match (applies to all shard types)
+            // Total counts must match
             let sum_minimizers: usize = shards.iter().map(|s| s.num_minimizers).sum();
             let sum_bucket_ids: usize = shards.iter().map(|s| s.num_bucket_ids).sum();
             if sum_minimizers != total_minimizers {
@@ -551,7 +511,25 @@ mod tests {
 
         let result = ShardManifest::load(path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unsupported shard manifest version"));
+        assert!(result.unwrap_err().to_string().contains("Unsupported inverted index manifest version"));
+    }
+
+    #[test]
+    fn test_shard_manifest_v2_rejected_with_helpful_error() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+
+        // Write a v2 manifest (magic + version 2)
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RYXM");
+        data.extend_from_slice(&2u32.to_le_bytes());
+        std::fs::write(path, data).unwrap();
+
+        let result = ShardManifest::load(path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unsupported inverted index manifest version"), "Error should mention version: {}", err);
+        assert!(err.contains("rype index invert"), "Error should suggest regenerating: {}", err);
     }
 
     #[test]
@@ -574,14 +552,30 @@ mod tests {
         index.buckets.insert(1, vec![100, 200, 300, 400]);
         index.bucket_names.insert(1, "A".into());
         let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_sharded(&base_path, 2)?;
+
+        // Save as single shard
+        let shard_path = ShardManifest::shard_path(&base_path, 0);
+        let shard_info = inverted.save_shard(&shard_path, 0, 0, inverted.num_minimizers(), true)?;
+
+        let manifest = ShardManifest {
+            k: inverted.k,
+            w: inverted.w,
+            salt: inverted.salt,
+            source_hash: 0,
+            total_minimizers: inverted.num_minimizers(),
+            total_bucket_ids: inverted.num_bucket_entries(),
+            has_overlapping_shards: true,
+            shards: vec![shard_info],
+        };
+        let manifest_path = ShardManifest::manifest_path(&base_path);
+        manifest.save(&manifest_path)?;
 
         let sharded = ShardedInvertedIndex::open(&base_path)?;
 
         assert_eq!(sharded.k(), 64);
         assert_eq!(sharded.w(), 50);
         assert_eq!(sharded.salt(), 0x1234);
-        assert_eq!(sharded.num_shards(), 2);
+        assert_eq!(sharded.num_shards(), 1);
 
         Ok(())
     }

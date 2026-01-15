@@ -64,7 +64,7 @@ pub struct MainIndexShardInfo {
 /// - For each shard: shard_id (u32), bucket_count (u32), num_minimizers (u64), compressed_size (u64)
 ///
 /// Note: Sources are stored in shard files, not in the manifest (moved in v2 for size reduction).
-/// Format v1 stored sources in the manifest; v1 files are still readable for backward compatibility.
+/// Format v1 is no longer supported; re-index with current version if you have v1 files.
 #[derive(Debug, Clone)]
 pub struct MainIndexManifest {
     pub k: usize,
@@ -157,8 +157,13 @@ impl MainIndexManifest {
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != 1 && version != 2 {
-            return Err(anyhow!("Unsupported main index manifest version: {} (expected 1 or 2)", version));
+        if version != 2 {
+            return Err(anyhow!(
+                "Unsupported main index manifest version: {} (expected 2).\n\
+                 Version 1 manifests are no longer supported. Re-create the sharded index:\n  \
+                 rype index shard -i <single-file.ryidx> -o <output.ryidx> --max-shard-size <size>",
+                version
+            ));
         }
 
         reader.read_exact(&mut buf8)?;
@@ -216,22 +221,6 @@ impl MainIndexManifest {
             let mut name_buf = vec![0u8; name_len];
             reader.read_exact(&mut name_buf)?;
             let name = String::from_utf8(name_buf)?;
-
-            // v1 format has sources in manifest - skip them (now stored in shards)
-            if version == 1 {
-                reader.read_exact(&mut buf8)?;
-                let source_count = u64::from_le_bytes(buf8) as usize;
-                for _ in 0..source_count {
-                    reader.read_exact(&mut buf8)?;
-                    let src_len = u64::from_le_bytes(buf8) as usize;
-                    if src_len > MAX_STRING_LENGTH {
-                        return Err(anyhow!("Source string length {} exceeds maximum {}", src_len, MAX_STRING_LENGTH));
-                    }
-                    // Skip the source bytes
-                    let mut src_buf = vec![0u8; src_len];
-                    reader.read_exact(&mut src_buf)?;
-                }
-            }
 
             bucket_names.insert(bucket_id, name);
             bucket_minimizer_counts.insert(bucket_id, minimizer_count);
@@ -499,10 +488,7 @@ impl MainIndexShard {
         Ok(compressed_size)
     }
 
-    /// Load a shard from a file (supports RYPS v1 and v2 formats).
-    ///
-    /// v1 format: minimizers only (no sources)
-    /// v2 format: minimizers + sources with string deduplication
+    /// Load a shard from a file (RYPS v2 format).
     pub fn load(path: &Path) -> Result<Self> {
         let mut reader = BufReader::new(File::open(path)?);
         let mut buf4 = [0u8; 4];
@@ -516,8 +502,13 @@ impl MainIndexShard {
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != 1 && version != 2 {
-            return Err(anyhow!("Unsupported main index shard version: {} (expected 1 or 2)", version));
+        if version != 2 {
+            return Err(anyhow!(
+                "Unsupported main index shard version: {} (expected 2).\n\
+                 Version 1 shards are no longer supported. Re-create the sharded index:\n  \
+                 rype index shard -i <single-file.ryidx> -o <output.ryidx> --max-shard-size <size>",
+                version
+            ));
         }
 
         reader.read_exact(&mut buf8)?;
@@ -590,83 +581,77 @@ impl MainIndexShard {
             }};
         }
 
-        // For v2, read string table first
-        let filenames: Vec<String> = if version == 2 {
-            ensure_bytes!(4);
-            let num_filenames = u32::from_le_bytes(read_buf[buf_pos..buf_pos + 4].try_into().unwrap());
-            buf_pos += 4;
+        // Read string table
+        ensure_bytes!(4);
+        let num_filenames = u32::from_le_bytes(read_buf[buf_pos..buf_pos + 4].try_into().unwrap());
+        buf_pos += 4;
 
-            // Validate string table entry count
-            if num_filenames > MAX_STRING_TABLE_ENTRIES {
+        // Validate string table entry count
+        if num_filenames > MAX_STRING_TABLE_ENTRIES {
+            return Err(anyhow!(
+                "String table has {} entries, exceeds maximum {}",
+                num_filenames,
+                MAX_STRING_TABLE_ENTRIES
+            ));
+        }
+
+        let num_filenames = num_filenames as usize;
+        let mut filenames = Vec::with_capacity(num_filenames);
+        let mut total_string_bytes: usize = 0;
+
+        for filename_idx in 0..num_filenames {
+            // Decode varint with proper truncation handling
+            let (str_len, consumed) = loop {
+                refill_if_low!();
+                match decode_varint(&read_buf[buf_pos..buf_len]) {
+                    Ok((val, consumed)) => break (val, consumed),
+                    Err(VarIntError::Truncated(_)) => {
+                        // Need more data - shift and read more
+                        read_buf.copy_within(buf_pos..buf_len, 0);
+                        buf_len -= buf_pos;
+                        buf_pos = 0;
+                        let n = decoder.read(&mut read_buf[buf_len..])?;
+                        if n == 0 {
+                            return Err(anyhow!(
+                                "Truncated varint at filename {} length",
+                                filename_idx
+                            ));
+                        }
+                        buf_len += n;
+                    }
+                    Err(VarIntError::Overflow(bytes)) => {
+                        return Err(anyhow!(
+                            "Malformed varint at filename {} length: exceeded 10 bytes (consumed {})",
+                            filename_idx, bytes
+                        ));
+                    }
+                }
+            };
+            buf_pos += consumed;
+
+            // Validate string length with overflow-safe conversion
+            let str_len = usize::try_from(str_len).map_err(|_| {
+                anyhow!("Filename {} length {} overflows usize", filename_idx, str_len)
+            })?;
+
+            if str_len > MAX_STRING_LENGTH {
+                return Err(anyhow!("Filename length {} exceeds maximum {}", str_len, MAX_STRING_LENGTH));
+            }
+
+            // Track total bytes for DoS protection
+            total_string_bytes = total_string_bytes.saturating_add(str_len);
+            if total_string_bytes > MAX_STRING_TABLE_BYTES {
                 return Err(anyhow!(
-                    "String table has {} entries, exceeds maximum {}",
-                    num_filenames,
-                    MAX_STRING_TABLE_ENTRIES
+                    "String table exceeds {} bytes limit",
+                    MAX_STRING_TABLE_BYTES
                 ));
             }
 
-            let num_filenames = num_filenames as usize;
-            let mut names = Vec::with_capacity(num_filenames);
-            let mut total_string_bytes: usize = 0;
-
-            for filename_idx in 0..num_filenames {
-                // Decode varint with proper truncation handling
-                let (str_len, consumed) = loop {
-                    refill_if_low!();
-                    match decode_varint(&read_buf[buf_pos..buf_len]) {
-                        Ok((val, consumed)) => break (val, consumed),
-                        Err(VarIntError::Truncated(_)) => {
-                            // Need more data - shift and read more
-                            read_buf.copy_within(buf_pos..buf_len, 0);
-                            buf_len -= buf_pos;
-                            buf_pos = 0;
-                            let n = decoder.read(&mut read_buf[buf_len..])?;
-                            if n == 0 {
-                                return Err(anyhow!(
-                                    "Truncated varint at filename {} length",
-                                    filename_idx
-                                ));
-                            }
-                            buf_len += n;
-                        }
-                        Err(VarIntError::Overflow(bytes)) => {
-                            return Err(anyhow!(
-                                "Malformed varint at filename {} length: exceeded 10 bytes (consumed {})",
-                                filename_idx, bytes
-                            ));
-                        }
-                    }
-                };
-                buf_pos += consumed;
-
-                // Validate string length with overflow-safe conversion
-                let str_len = usize::try_from(str_len).map_err(|_| {
-                    anyhow!("Filename {} length {} overflows usize", filename_idx, str_len)
-                })?;
-
-                if str_len > MAX_STRING_LENGTH {
-                    return Err(anyhow!("Filename length {} exceeds maximum {}", str_len, MAX_STRING_LENGTH));
-                }
-
-                // Track total bytes for DoS protection
-                total_string_bytes = total_string_bytes.saturating_add(str_len);
-                if total_string_bytes > MAX_STRING_TABLE_BYTES {
-                    return Err(anyhow!(
-                        "String table exceeds {} bytes limit",
-                        MAX_STRING_TABLE_BYTES
-                    ));
-                }
-
-                ensure_bytes!(str_len);
-                let name = String::from_utf8(read_buf[buf_pos..buf_pos + str_len].to_vec())?;
-                buf_pos += str_len;
-                names.push(name);
-            }
-            names
-        } else {
-            eprintln!("Warning: Loading v1 shard format. Consider re-creating index for smaller shard files.");
-            Vec::new()
-        };
+            ensure_bytes!(str_len);
+            let name = String::from_utf8(read_buf[buf_pos..buf_pos + str_len].to_vec())?;
+            buf_pos += str_len;
+            filenames.push(name);
+        }
 
         let mut buckets = HashMap::new();
         let mut bucket_sources = HashMap::new();
@@ -690,122 +675,117 @@ impl MainIndexShard {
                 return Err(anyhow!("Bucket {} size {} exceeds maximum {}", bucket_id, minimizer_count, MAX_BUCKET_SIZE));
             }
 
-            // For v2, read source count and sources
-            let sources: Vec<String> = if version == 2 {
-                ensure_bytes!(8);
-                let source_count_u64 = u64::from_le_bytes(read_buf[buf_pos..buf_pos + 8].try_into().unwrap());
-                buf_pos += 8;
+            // Read source count and sources
+            ensure_bytes!(8);
+            let source_count_u64 = u64::from_le_bytes(read_buf[buf_pos..buf_pos + 8].try_into().unwrap());
+            buf_pos += 8;
 
-                let source_count = usize::try_from(source_count_u64).map_err(|_| {
-                    anyhow!("Bucket {} source count {} overflows usize", bucket_id, source_count_u64)
+            let source_count = usize::try_from(source_count_u64).map_err(|_| {
+                anyhow!("Bucket {} source count {} overflows usize", bucket_id, source_count_u64)
+            })?;
+
+            if source_count > MAX_SOURCES_PER_BUCKET {
+                return Err(anyhow!(
+                    "Bucket {} has {} sources, exceeds maximum {}",
+                    bucket_id,
+                    source_count,
+                    MAX_SOURCES_PER_BUCKET
+                ));
+            }
+
+            let mut sources = Vec::with_capacity(source_count);
+            for source_idx in 0..source_count {
+                // Decode filename index varint with proper truncation handling
+                let (filename_idx_raw, consumed) = loop {
+                    refill_if_low!();
+                    match decode_varint(&read_buf[buf_pos..buf_len]) {
+                        Ok((val, consumed)) => break (val, consumed),
+                        Err(VarIntError::Truncated(_)) => {
+                            read_buf.copy_within(buf_pos..buf_len, 0);
+                            buf_len -= buf_pos;
+                            buf_pos = 0;
+                            let n = decoder.read(&mut read_buf[buf_len..])?;
+                            if n == 0 {
+                                return Err(anyhow!(
+                                    "Truncated varint at bucket {} source {} filename index",
+                                    bucket_id, source_idx
+                                ));
+                            }
+                            buf_len += n;
+                        }
+                        Err(VarIntError::Overflow(bytes)) => {
+                            return Err(anyhow!(
+                                "Malformed varint at bucket {} source {} filename index: exceeded 10 bytes (consumed {})",
+                                bucket_id, source_idx, bytes
+                            ));
+                        }
+                    }
+                };
+                buf_pos += consumed;
+
+                let filename_idx = usize::try_from(filename_idx_raw).map_err(|_| {
+                    anyhow!("Bucket {} source {} filename index {} overflows usize",
+                        bucket_id, source_idx, filename_idx_raw)
                 })?;
 
-                if source_count > MAX_SOURCES_PER_BUCKET {
+                // Validate filename index is in bounds
+                if filename_idx >= filenames.len() {
                     return Err(anyhow!(
-                        "Bucket {} has {} sources, exceeds maximum {}",
-                        bucket_id,
-                        source_count,
-                        MAX_SOURCES_PER_BUCKET
+                        "Bucket {} source {} has invalid filename index {} (string table has {} entries)",
+                        bucket_id, source_idx, filename_idx, filenames.len()
                     ));
                 }
 
-                let mut srcs = Vec::with_capacity(source_count);
-                for source_idx in 0..source_count {
-                    // Decode filename index varint with proper truncation handling
-                    let (filename_idx_raw, consumed) = loop {
-                        refill_if_low!();
-                        match decode_varint(&read_buf[buf_pos..buf_len]) {
-                            Ok((val, consumed)) => break (val, consumed),
-                            Err(VarIntError::Truncated(_)) => {
-                                read_buf.copy_within(buf_pos..buf_len, 0);
-                                buf_len -= buf_pos;
-                                buf_pos = 0;
-                                let n = decoder.read(&mut read_buf[buf_len..])?;
-                                if n == 0 {
-                                    return Err(anyhow!(
-                                        "Truncated varint at bucket {} source {} filename index",
-                                        bucket_id, source_idx
-                                    ));
-                                }
-                                buf_len += n;
-                            }
-                            Err(VarIntError::Overflow(bytes)) => {
+                // Decode seqname length varint with proper truncation handling
+                let (seqname_len_raw, consumed) = loop {
+                    refill_if_low!();
+                    match decode_varint(&read_buf[buf_pos..buf_len]) {
+                        Ok((val, consumed)) => break (val, consumed),
+                        Err(VarIntError::Truncated(_)) => {
+                            read_buf.copy_within(buf_pos..buf_len, 0);
+                            buf_len -= buf_pos;
+                            buf_pos = 0;
+                            let n = decoder.read(&mut read_buf[buf_len..])?;
+                            if n == 0 {
                                 return Err(anyhow!(
-                                    "Malformed varint at bucket {} source {} filename index: exceeded 10 bytes (consumed {})",
-                                    bucket_id, source_idx, bytes
+                                    "Truncated varint at bucket {} source {} seqname length",
+                                    bucket_id, source_idx
                                 ));
                             }
+                            buf_len += n;
                         }
-                    };
-                    buf_pos += consumed;
-
-                    let filename_idx = usize::try_from(filename_idx_raw).map_err(|_| {
-                        anyhow!("Bucket {} source {} filename index {} overflows usize",
-                            bucket_id, source_idx, filename_idx_raw)
-                    })?;
-
-                    // Validate filename index is in bounds
-                    if filename_idx >= filenames.len() {
-                        return Err(anyhow!(
-                            "Bucket {} source {} has invalid filename index {} (string table has {} entries)",
-                            bucket_id, source_idx, filename_idx, filenames.len()
-                        ));
-                    }
-
-                    // Decode seqname length varint with proper truncation handling
-                    let (seqname_len_raw, consumed) = loop {
-                        refill_if_low!();
-                        match decode_varint(&read_buf[buf_pos..buf_len]) {
-                            Ok((val, consumed)) => break (val, consumed),
-                            Err(VarIntError::Truncated(_)) => {
-                                read_buf.copy_within(buf_pos..buf_len, 0);
-                                buf_len -= buf_pos;
-                                buf_pos = 0;
-                                let n = decoder.read(&mut read_buf[buf_len..])?;
-                                if n == 0 {
-                                    return Err(anyhow!(
-                                        "Truncated varint at bucket {} source {} seqname length",
-                                        bucket_id, source_idx
-                                    ));
-                                }
-                                buf_len += n;
-                            }
-                            Err(VarIntError::Overflow(bytes)) => {
-                                return Err(anyhow!(
-                                    "Malformed varint at bucket {} source {} seqname length: exceeded 10 bytes (consumed {})",
-                                    bucket_id, source_idx, bytes
-                                ));
-                            }
+                        Err(VarIntError::Overflow(bytes)) => {
+                            return Err(anyhow!(
+                                "Malformed varint at bucket {} source {} seqname length: exceeded 10 bytes (consumed {})",
+                                bucket_id, source_idx, bytes
+                            ));
                         }
-                    };
-                    buf_pos += consumed;
-
-                    let seqname_len = usize::try_from(seqname_len_raw).map_err(|_| {
-                        anyhow!("Bucket {} source {} seqname length {} overflows usize",
-                            bucket_id, source_idx, seqname_len_raw)
-                    })?;
-
-                    if seqname_len > MAX_STRING_LENGTH {
-                        return Err(anyhow!("Seqname length {} exceeds maximum {}", seqname_len, MAX_STRING_LENGTH));
                     }
+                };
+                buf_pos += consumed;
 
-                    ensure_bytes!(seqname_len);
-                    let seqname = String::from_utf8(read_buf[buf_pos..buf_pos + seqname_len].to_vec())?;
-                    buf_pos += seqname_len;
+                let seqname_len = usize::try_from(seqname_len_raw).map_err(|_| {
+                    anyhow!("Bucket {} source {} seqname length {} overflows usize",
+                        bucket_id, source_idx, seqname_len_raw)
+                })?;
 
-                    // Reconstruct full source string (bounds already validated above)
-                    let filename = &filenames[filename_idx];
-                    let source = if seqname.is_empty() {
-                        filename.clone()
-                    } else {
-                        format!("{}{}{}", filename, SOURCE_DELIM, seqname)
-                    };
-                    srcs.push(source);
+                if seqname_len > MAX_STRING_LENGTH {
+                    return Err(anyhow!("Seqname length {} exceeds maximum {}", seqname_len, MAX_STRING_LENGTH));
                 }
-                srcs
-            } else {
-                Vec::new()
-            };
+
+                ensure_bytes!(seqname_len);
+                let seqname = String::from_utf8(read_buf[buf_pos..buf_pos + seqname_len].to_vec())?;
+                buf_pos += seqname_len;
+
+                // Reconstruct full source string (bounds already validated above)
+                let filename = &filenames[filename_idx];
+                let source = if seqname.is_empty() {
+                    filename.clone()
+                } else {
+                    format!("{}{}{}", filename, SOURCE_DELIM, seqname)
+                };
+                sources.push(source);
+            }
 
             // Read minimizers
             let mut minimizers = Vec::with_capacity(minimizer_count);
@@ -1051,6 +1031,10 @@ impl ShardedMainIndex {
             shard_info.bucket_ids.retain(|&id| id != src_id);
             shard_info.compressed_size = compressed_size;
             // Adjust num_minimizers: removed src_count, dest changed from old_dest_count to new_dest_count
+            // The formula: (src + old_dest) - new_dest = minimizers removed due to dedup
+            // Use saturating_sub defensively: if counts are slightly inconsistent from prior
+            // operations, we prefer an approximate count over a panic. The shard file itself
+            // has the authoritative data; manifest counts are advisory.
             let minimizers_removed = (src_minimizer_count + old_dest_count).saturating_sub(new_dest_count);
             shard_info.num_minimizers = shard_info.num_minimizers.saturating_sub(minimizers_removed);
 
@@ -1633,6 +1617,42 @@ mod tests {
     }
 
     #[test]
+    fn test_manifest_v1_rejected_with_helpful_error() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+
+        // Write a v1 manifest (magic + version 1)
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RYPM");
+        data.extend_from_slice(&1u32.to_le_bytes());
+        std::fs::write(path, data).unwrap();
+
+        let result = MainIndexManifest::load(path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Version 1 manifests are no longer supported"), "Error should mention v1: {}", err);
+        assert!(err.contains("rype index shard"), "Error should suggest re-indexing: {}", err);
+    }
+
+    #[test]
+    fn test_shard_v1_rejected_with_helpful_error() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+
+        // Write a v1 shard (magic + version 1)
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RYPS");
+        data.extend_from_slice(&1u32.to_le_bytes());
+        std::fs::write(path, data).unwrap();
+
+        let result = MainIndexShard::load(path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Version 1 shards are no longer supported"), "Error should mention v1: {}", err);
+        assert!(err.contains("rype index shard"), "Error should suggest re-indexing: {}", err);
+    }
+
+    #[test]
     fn test_builder_basic() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let base_path = dir.path().join("test.ryidx");
@@ -1695,117 +1715,6 @@ mod tests {
         assert_eq!(shard1.buckets.len(), 2);
         assert!(shard1.buckets.contains_key(&2));
         assert!(shard1.buckets.contains_key(&3));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_v1_shard_migration() -> Result<()> {
-        use std::io::Write;
-        use zstd::stream::write::Encoder;
-
-        let file = NamedTempFile::new()?;
-        let path = file.path().to_path_buf();
-
-        // Manually create a v1 format shard (no sources, no string table)
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(&path)?);
-
-        // Header
-        writer.write_all(b"RYPS")?;
-        writer.write_all(&1u32.to_le_bytes())?; // Version 1
-        writer.write_all(&64u64.to_le_bytes())?; // k
-        writer.write_all(&50u64.to_le_bytes())?; // w
-        writer.write_all(&0x1234u64.to_le_bytes())?; // salt
-        writer.write_all(&0u32.to_le_bytes())?; // shard_id
-        writer.write_all(&1u32.to_le_bytes())?; // num_buckets
-
-        // Compressed content
-        let mut encoder = Encoder::new(writer, 3)?;
-
-        // Bucket: id, count, then minimizers (delta-encoded)
-        encoder.write_all(&1u32.to_le_bytes())?; // bucket_id
-        encoder.write_all(&3u64.to_le_bytes())?; // minimizer_count
-        encoder.write_all(&100u64.to_le_bytes())?; // first minimizer
-
-        // Delta-encoded remaining minimizers (200-100=100, 300-200=100)
-        let mut varint_buf = [0u8; 10];
-        let len = encode_varint(100, &mut varint_buf); // delta for 200
-        encoder.write_all(&varint_buf[..len])?;
-        let len = encode_varint(100, &mut varint_buf); // delta for 300
-        encoder.write_all(&varint_buf[..len])?;
-
-        encoder.finish()?;
-
-        // Load and verify v1 shard loads correctly
-        let loaded = MainIndexShard::load(&path)?;
-
-        assert_eq!(loaded.k, 64);
-        assert_eq!(loaded.w, 50);
-        assert_eq!(loaded.salt, 0x1234);
-        assert_eq!(loaded.shard_id, 0);
-        assert_eq!(loaded.buckets.len(), 1);
-        assert_eq!(loaded.buckets[&1], vec![100, 200, 300]);
-        // v1 format has no sources
-        assert!(loaded.bucket_sources.is_empty());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_v1_manifest_migration() -> Result<()> {
-        use std::io::Write;
-
-        let file = NamedTempFile::new()?;
-        let path = file.path().to_path_buf();
-
-        // Manually create a v1 format manifest (with sources)
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(&path)?);
-
-        // Header
-        writer.write_all(b"RYPM")?;
-        writer.write_all(&1u32.to_le_bytes())?; // Version 1
-        writer.write_all(&64u64.to_le_bytes())?; // k
-        writer.write_all(&50u64.to_le_bytes())?; // w
-        writer.write_all(&0x1234u64.to_le_bytes())?; // salt
-        writer.write_all(&1u32.to_le_bytes())?; // num_buckets
-        writer.write_all(&1u32.to_le_bytes())?; // num_shards
-        writer.write_all(&100u64.to_le_bytes())?; // total_minimizers
-
-        // Bucket metadata (v1 format includes sources)
-        writer.write_all(&1u32.to_le_bytes())?; // bucket_id
-        writer.write_all(&0u32.to_le_bytes())?; // shard_id
-        writer.write_all(&100u64.to_le_bytes())?; // minimizer_count
-
-        let name = b"TestBucket";
-        writer.write_all(&(name.len() as u64).to_le_bytes())?;
-        writer.write_all(name)?;
-
-        // v1 has sources in manifest
-        writer.write_all(&1u64.to_le_bytes())?; // source_count
-        let source = b"test.fa::seq1";
-        writer.write_all(&(source.len() as u64).to_le_bytes())?;
-        writer.write_all(source)?;
-
-        // Shard info
-        writer.write_all(&0u32.to_le_bytes())?; // shard_id
-        writer.write_all(&1u32.to_le_bytes())?; // num_bucket_ids
-        writer.write_all(&100u64.to_le_bytes())?; // num_minimizers
-        writer.write_all(&500u64.to_le_bytes())?; // compressed_size
-
-        writer.flush()?;
-        drop(writer);
-
-        // Load and verify v1 manifest loads correctly
-        let loaded = MainIndexManifest::load(&path)?;
-
-        assert_eq!(loaded.k, 64);
-        assert_eq!(loaded.w, 50);
-        assert_eq!(loaded.salt, 0x1234);
-        assert_eq!(loaded.total_minimizers, 100);
-        assert_eq!(loaded.bucket_names.len(), 1);
-        assert_eq!(loaded.bucket_names[&1], "TestBucket");
-        assert_eq!(loaded.bucket_to_shard[&1], 0);
-        assert_eq!(loaded.shards.len(), 1);
 
         Ok(())
     }

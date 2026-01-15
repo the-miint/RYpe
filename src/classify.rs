@@ -2,8 +2,8 @@
 //!
 //! Provides multiple classification strategies:
 //! - `classify_batch`: Direct classification against an Index
-//! - `classify_batch_inverted`: Classification using an InvertedIndex
 //! - `classify_batch_sharded_sequential`: Classification using a ShardedInvertedIndex
+//! - `classify_batch_sharded_merge_join`: Classification using merge-join algorithm
 //! - `aggregate_batch`: Aggregated classification for paired-end reads
 
 use anyhow::Result;
@@ -23,6 +23,14 @@ use crate::workspace::MinimizerWorkspace;
 ///
 /// Uses `retain()` to filter in-place, avoiding unnecessary allocations in hot paths.
 /// If `negative_mins` is None, the vectors are returned unchanged.
+///
+/// # Performance Note
+/// This iterates over the minimizer vectors after extraction. An alternative would be
+/// to filter during extraction, but that would complicate the extraction hot path with
+/// an optional parameter. Benchmarking shows the current approach is acceptable since:
+/// - HashSet lookups are O(1) amortized
+/// - Minimizer count per read is typically small (< 1000)
+/// - The extraction step (hashing, deque operations) dominates runtime
 #[inline]
 fn filter_negative_mins(
     mut fwd: Vec<u64>,
@@ -100,65 +108,6 @@ pub fn classify_batch(
         }
         bucket_results
     }).flatten().collect();
-
-    results
-}
-
-/// Classify a batch of query records using an inverted index.
-///
-/// Uses O(Q * log(U/Q)) lookups per query instead of O(B * Q * log(M)).
-///
-/// # Arguments
-/// * `inverted` - The inverted index for minimizer → bucket lookups
-/// * `negative_mins` - Optional set of minimizers to exclude from queries before scoring
-/// * `records` - Batch of query records to classify
-/// * `threshold` - Minimum score threshold for reporting hits
-///
-/// # Returns
-/// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
-pub fn classify_batch_inverted(
-    inverted: &InvertedIndex,
-    negative_mins: Option<&HashSet<u64>>,
-    records: &[QueryRecord],
-    threshold: f64
-) -> Vec<HitResult> {
-    let processed: Vec<_> = records.par_iter()
-        .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
-            let (ha, hb) = get_paired_minimizers_into(s1, *s2, inverted.k, inverted.w, inverted.salt, ws);
-            let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
-            (*id, fa, fb)
-        }).collect();
-
-    let results: Vec<HitResult> = processed.par_iter()
-        .flat_map(|(query_id, fwd_mins, rc_mins)| {
-            let fwd_hits = inverted.get_bucket_hits(fwd_mins);
-            let rc_hits = inverted.get_bucket_hits(rc_mins);
-
-            let capacity = fwd_hits.len() + rc_hits.len();
-            let mut scores: HashMap<u32, (usize, usize)> = HashMap::with_capacity(capacity);
-            for (&bucket_id, &count) in &fwd_hits {
-                scores.entry(bucket_id).or_insert((0, 0)).0 = count;
-            }
-            for (&bucket_id, &count) in &rc_hits {
-                scores.entry(bucket_id).or_insert((0, 0)).1 = count;
-            }
-
-            let fwd_total = fwd_mins.len();
-            let rc_total = rc_mins.len();
-            let mut query_results = Vec::with_capacity(scores.len());
-            for (bucket_id, (fwd_count, rc_count)) in scores {
-                let score = compute_score(fwd_count, fwd_total, rc_count, rc_total);
-                if score >= threshold {
-                    query_results.push(HitResult {
-                        query_id: *query_id,
-                        bucket_id,
-                        score,
-                    });
-                }
-            }
-            query_results
-        })
-        .collect();
 
     results
 }
@@ -526,7 +475,7 @@ fn accumulate_match(
 /// - Reads from similar genomic regions (amplicons, targeted sequencing)
 /// - Query minimizer reuse >30%
 ///
-/// **Use `classify_batch_inverted` instead when:**
+/// **Use `classify_batch` instead when:**
 /// - Small batches (<1000 reads)
 /// - Diverse read origins (low minimizer reuse)
 /// - Memory is extremely constrained (this builds an intermediate index)
@@ -693,45 +642,6 @@ fn accumulate_merge_join(
     }
 }
 
-/// Classify using merge-join with automatic query index construction.
-///
-/// This is a convenience wrapper that:
-/// 1. Extracts minimizers from all query records (parallel)
-/// 2. Builds a `QueryInvertedIndex` from the extracted minimizers
-/// 3. Performs merge-join classification against the reference index
-///
-/// Use this when you have high minimizer overlap across reads (e.g., amplicon
-/// sequencing, reads from similar regions). For diverse reads or small batches,
-/// `classify_batch_inverted` may be more efficient.
-///
-/// See `classify_batch_merge_join` for detailed performance characteristics.
-pub fn classify_batch_with_query_index(
-    ref_idx: &InvertedIndex,
-    negative_mins: Option<&HashSet<u64>>,
-    records: &[QueryRecord],
-    threshold: f64,
-) -> Vec<HitResult> {
-    if records.is_empty() {
-        return Vec::new();
-    }
-
-    // Extract minimizers in parallel, filtering negatives if provided
-    let extracted: Vec<_> = records.par_iter()
-        .map_init(MinimizerWorkspace::new, |ws, (_, s1, s2)| {
-            let (ha, hb) = get_paired_minimizers_into(s1, *s2, ref_idx.k, ref_idx.w, ref_idx.salt, ws);
-            filter_negative_mins(ha, hb, negative_mins)
-        }).collect();
-
-    // Collect query IDs
-    let query_ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
-
-    // Build query inverted index
-    let query_idx = QueryInvertedIndex::build(&extracted);
-
-    // Classify using merge-join
-    classify_batch_merge_join(&query_idx, ref_idx, &query_ids, threshold)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,39 +702,9 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_batch_inverted_matches_regular() -> anyhow::Result<()> {
-        let mut index = Index::new(64, 10, 0).unwrap();
-        let mut ws = MinimizerWorkspace::new();
+    fn test_classify_batch_sharded_sequential_matches_regular() -> anyhow::Result<()> {
+        use crate::sharded::ShardManifest;
 
-        let seq_a = vec![b'A'; 80];
-        index.add_record(1, "ref_a", &seq_a, &mut ws);
-        index.finalize_bucket(1);
-        index.bucket_names.insert(1, "BucketA".into());
-
-        let seq_b: Vec<u8> = (0..80).map(|i| if i % 2 == 0 { b'A' } else { b'T' }).collect();
-        index.add_record(2, "ref_b", &seq_b, &mut ws);
-        index.finalize_bucket(2);
-        index.bucket_names.insert(2, "BucketB".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
-
-        let query_seq = seq_a.clone();
-        let records: Vec<QueryRecord> = vec![(101, &query_seq[..], None)];
-
-        let results_regular = classify_batch(&index, None, &records, 0.5);
-        let results_inverted = classify_batch_inverted(&inverted, None, &records, 0.5);
-
-        assert_eq!(results_regular.len(), results_inverted.len());
-        if !results_regular.is_empty() {
-            assert_eq!(results_regular[0].bucket_id, results_inverted[0].bucket_id);
-            assert!((results_regular[0].score - results_inverted[0].score).abs() < 0.001);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_classify_batch_sharded_sequential_matches_inverted() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let base_path = dir.path().join("test.ryxdi");
 
@@ -844,7 +724,23 @@ mod tests {
         let inverted = InvertedIndex::build_from_index(&index);
         assert!(inverted.num_minimizers() > 0, "Inverted index should not be empty");
 
-        inverted.save_sharded(&base_path, 4)?;
+        // Save as single shard (like we do for non-sharded main index)
+        let shard_path = ShardManifest::shard_path(&base_path, 0);
+        let shard_info = inverted.save_shard(&shard_path, 0, 0, inverted.num_minimizers(), true)?;
+
+        let manifest = ShardManifest {
+            k: inverted.k,
+            w: inverted.w,
+            salt: inverted.salt,
+            source_hash: 0,
+            total_minimizers: inverted.num_minimizers(),
+            total_bucket_ids: inverted.num_bucket_entries(),
+            has_overlapping_shards: true,
+            shards: vec![shard_info],
+        };
+        let manifest_path = ShardManifest::manifest_path(&base_path);
+        manifest.save(&manifest_path)?;
+
         let sharded = ShardedInvertedIndex::open(&base_path)?;
 
         let query1: &[u8] = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
@@ -856,24 +752,24 @@ mod tests {
 
         let threshold = 0.1;
 
-        let results_inverted = classify_batch_inverted(&inverted, None, &records, threshold);
+        let results_regular = classify_batch(&index, None, &records, threshold);
         let results_sequential = classify_batch_sharded_sequential(&sharded, None, &records, threshold)?;
 
-        assert_eq!(results_inverted.len(), results_sequential.len(),
-            "Result counts should match: inverted={}, sequential={}",
-            results_inverted.len(), results_sequential.len());
+        assert_eq!(results_regular.len(), results_sequential.len(),
+            "Result counts should match: regular={}, sequential={}",
+            results_regular.len(), results_sequential.len());
 
-        let mut sorted_inverted = results_inverted.clone();
-        sorted_inverted.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
+        let mut sorted_regular = results_regular.clone();
+        sorted_regular.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
 
         let mut sorted_sequential = results_sequential.clone();
         sorted_sequential.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
 
-        for (inv, seq) in sorted_inverted.iter().zip(sorted_sequential.iter()) {
-            assert_eq!(inv.query_id, seq.query_id, "Query IDs should match");
-            assert_eq!(inv.bucket_id, seq.bucket_id, "Bucket IDs should match");
-            assert!((inv.score - seq.score).abs() < 0.001,
-                "Scores should match: {} vs {}", inv.score, seq.score);
+        for (reg, seq) in sorted_regular.iter().zip(sorted_sequential.iter()) {
+            assert_eq!(reg.query_id, seq.query_id, "Query IDs should match");
+            assert_eq!(reg.bucket_id, seq.bucket_id, "Bucket IDs should match");
+            assert!((reg.score - seq.score).abs() < 0.001,
+                "Scores should match: {} vs {}", reg.score, seq.score);
         }
 
         Ok(())
@@ -881,6 +777,8 @@ mod tests {
 
     #[test]
     fn test_classify_batch_sharded_merge_join_matches_sequential() -> anyhow::Result<()> {
+        use crate::sharded::ShardManifest;
+
         let dir = tempfile::tempdir()?;
         let base_path = dir.path().join("test.ryxdi");
 
@@ -898,7 +796,24 @@ mod tests {
         index.finalize_bucket(2);
 
         let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_sharded(&base_path, 4)?;
+
+        // Save as single shard
+        let shard_path = ShardManifest::shard_path(&base_path, 0);
+        let shard_info = inverted.save_shard(&shard_path, 0, 0, inverted.num_minimizers(), true)?;
+
+        let manifest = ShardManifest {
+            k: inverted.k,
+            w: inverted.w,
+            salt: inverted.salt,
+            source_hash: 0,
+            total_minimizers: inverted.num_minimizers(),
+            total_bucket_ids: inverted.num_bucket_entries(),
+            has_overlapping_shards: true,
+            shards: vec![shard_info],
+        };
+        let manifest_path = ShardManifest::manifest_path(&base_path);
+        manifest.save(&manifest_path)?;
+
         let sharded = ShardedInvertedIndex::open(&base_path)?;
 
         let query1: &[u8] = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
@@ -1059,101 +974,6 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_merge_join_matches_inverted() -> anyhow::Result<()> {
-        // Cross-validation: merge-join should produce same results as inverted
-        let mut index = Index::new(64, 10, 0).unwrap();
-        let mut ws = MinimizerWorkspace::new();
-
-        let seq_a = vec![b'A'; 80];
-        index.add_record(1, "ref_a", &seq_a, &mut ws);
-        index.finalize_bucket(1);
-        index.bucket_names.insert(1, "BucketA".into());
-
-        let seq_b: Vec<u8> = (0..80).map(|i| if i % 2 == 0 { b'A' } else { b'T' }).collect();
-        index.add_record(2, "ref_b", &seq_b, &mut ws);
-        index.finalize_bucket(2);
-        index.bucket_names.insert(2, "BucketB".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
-
-        let query_seq = seq_a.clone();
-        let records: Vec<QueryRecord> = vec![(101, &query_seq[..], None)];
-
-        let results_inverted = classify_batch_inverted(&inverted, None, &records, 0.5);
-        let results_merge = classify_batch_with_query_index(&inverted, None, &records, 0.5);
-
-        assert_eq!(results_inverted.len(), results_merge.len(),
-            "Result counts should match: inverted={}, merge={}",
-            results_inverted.len(), results_merge.len());
-
-        // Sort and compare
-        let mut sorted_inverted = results_inverted.clone();
-        sorted_inverted.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
-
-        let mut sorted_merge = results_merge.clone();
-        sorted_merge.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
-
-        for (inv, mrg) in sorted_inverted.iter().zip(sorted_merge.iter()) {
-            assert_eq!(inv.query_id, mrg.query_id, "Query IDs should match");
-            assert_eq!(inv.bucket_id, mrg.bucket_id, "Bucket IDs should match");
-            assert!((inv.score - mrg.score).abs() < 0.001,
-                "Scores should match: {} vs {}", inv.score, mrg.score);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_classify_merge_multiple_reads_multiple_buckets() -> anyhow::Result<()> {
-        // More comprehensive test with multiple reads and buckets
-        let mut index = Index::new(32, 10, 0x1234).unwrap();
-        let mut ws = MinimizerWorkspace::new();
-
-        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
-        let seq2 = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
-
-        index.add_record(1, "ref1", seq1, &mut ws);
-        index.add_record(2, "ref2", seq2, &mut ws);
-        index.bucket_names.insert(1, "A".into());
-        index.bucket_names.insert(2, "B".into());
-        index.finalize_bucket(1);
-        index.finalize_bucket(2);
-
-        let inverted = InvertedIndex::build_from_index(&index);
-
-        let query1: &[u8] = seq1;
-        let query2: &[u8] = seq2;
-        let records: Vec<QueryRecord> = vec![
-            (0, query1, None),
-            (1, query2, None),
-        ];
-
-        let threshold = 0.1;
-        let results_inverted = classify_batch_inverted(&inverted, None, &records, threshold);
-        let results_merge = classify_batch_with_query_index(&inverted, None, &records, threshold);
-
-        assert_eq!(results_inverted.len(), results_merge.len(),
-            "Result counts should match");
-
-        // Sort and compare all results
-        let mut sorted_inverted = results_inverted.clone();
-        sorted_inverted.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
-
-        let mut sorted_merge = results_merge.clone();
-        sorted_merge.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
-
-        for (inv, mrg) in sorted_inverted.iter().zip(sorted_merge.iter()) {
-            assert_eq!(inv.query_id, mrg.query_id);
-            assert_eq!(inv.bucket_id, mrg.bucket_id);
-            assert!((inv.score - mrg.score).abs() < 0.001,
-                "Scores differ for query {} bucket {}: {} vs {}",
-                inv.query_id, inv.bucket_id, inv.score, mrg.score);
-        }
-
-        Ok(())
-    }
-
-    #[test]
     fn test_galloping_search_small_query() {
         // Create scenario where query << ref to trigger galloping
         // Need query_len * 16 < ref_len
@@ -1273,39 +1093,9 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_batch_inverted_negative_filtering() -> anyhow::Result<()> {
-        let mut index = Index::new(64, 10, 0).unwrap();
-        let mut ws = MinimizerWorkspace::new();
-
-        let seq_a = vec![b'A'; 80];
-        index.add_record(1, "ref_a", &seq_a, &mut ws);
-        index.finalize_bucket(1);
-        index.bucket_names.insert(1, "BucketA".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
-
-        let query_seq = seq_a.clone();
-        let records: Vec<QueryRecord> = vec![(101, &query_seq[..], None)];
-
-        // Without negative filtering
-        let results_no_neg = classify_batch_inverted(&inverted, None, &records, 0.5);
-        assert!(!results_no_neg.is_empty());
-        assert_eq!(results_no_neg[0].score, 1.0);
-
-        // With full negative filtering - should produce no hits
-        let (query_mins, _) = crate::extraction::get_paired_minimizers_into(
-            &query_seq, None, inverted.k, inverted.w, inverted.salt, &mut ws
-        );
-        let full_neg: HashSet<u64> = query_mins.into_iter().collect();
-
-        let results_full_neg = classify_batch_inverted(&inverted, Some(&full_neg), &records, 0.5);
-        assert!(results_full_neg.is_empty(), "Should have no hits when all minimizers filtered");
-
-        Ok(())
-    }
-
-    #[test]
     fn test_classify_batch_sharded_sequential_negative_filtering() -> anyhow::Result<()> {
+        use crate::sharded::ShardManifest;
+
         let dir = tempfile::tempdir()?;
         let base_path = dir.path().join("test.ryxdi");
 
@@ -1318,7 +1108,24 @@ mod tests {
         index.finalize_bucket(1);
 
         let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_sharded(&base_path, 2)?;
+
+        // Save as single shard
+        let shard_path = ShardManifest::shard_path(&base_path, 0);
+        let shard_info = inverted.save_shard(&shard_path, 0, 0, inverted.num_minimizers(), true)?;
+
+        let manifest = ShardManifest {
+            k: inverted.k,
+            w: inverted.w,
+            salt: inverted.salt,
+            source_hash: 0,
+            total_minimizers: inverted.num_minimizers(),
+            total_bucket_ids: inverted.num_bucket_entries(),
+            has_overlapping_shards: true,
+            shards: vec![shard_info],
+        };
+        let manifest_path = ShardManifest::manifest_path(&base_path);
+        manifest.save(&manifest_path)?;
+
         let sharded = ShardedInvertedIndex::open(&base_path)?;
 
         let query: &[u8] = seq1;
@@ -1343,6 +1150,8 @@ mod tests {
 
     #[test]
     fn test_classify_batch_sharded_merge_join_negative_filtering() -> anyhow::Result<()> {
+        use crate::sharded::ShardManifest;
+
         let dir = tempfile::tempdir()?;
         let base_path = dir.path().join("test.ryxdi");
 
@@ -1355,7 +1164,24 @@ mod tests {
         index.finalize_bucket(1);
 
         let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_sharded(&base_path, 2)?;
+
+        // Save as single shard
+        let shard_path = ShardManifest::shard_path(&base_path, 0);
+        let shard_info = inverted.save_shard(&shard_path, 0, 0, inverted.num_minimizers(), true)?;
+
+        let manifest = ShardManifest {
+            k: inverted.k,
+            w: inverted.w,
+            salt: inverted.salt,
+            source_hash: 0,
+            total_minimizers: inverted.num_minimizers(),
+            total_bucket_ids: inverted.num_bucket_entries(),
+            has_overlapping_shards: true,
+            shards: vec![shard_info],
+        };
+        let manifest_path = ShardManifest::manifest_path(&base_path);
+        manifest.save(&manifest_path)?;
+
         let sharded = ShardedInvertedIndex::open(&base_path)?;
 
         let query: &[u8] = seq1;
@@ -1412,38 +1238,6 @@ mod tests {
 
         // With full negative filtering: no hits above threshold
         let results_full_neg = classify_batch_sharded_main(&sharded, Some(&full_neg), &records, 0.5)?;
-        assert!(results_full_neg.is_empty());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_classify_batch_with_query_index_negative_filtering() -> anyhow::Result<()> {
-        let mut index = Index::new(64, 10, 0).unwrap();
-        let mut ws = MinimizerWorkspace::new();
-
-        let seq_a = vec![b'A'; 80];
-        index.add_record(1, "ref_a", &seq_a, &mut ws);
-        index.finalize_bucket(1);
-        index.bucket_names.insert(1, "BucketA".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
-
-        let query_seq = seq_a.clone();
-        let records: Vec<QueryRecord> = vec![(101, &query_seq[..], None)];
-
-        // Without negative filtering
-        let results_no_neg = classify_batch_with_query_index(&inverted, None, &records, 0.5);
-        assert!(!results_no_neg.is_empty());
-        assert_eq!(results_no_neg[0].score, 1.0);
-
-        // With full negative filtering
-        let (query_mins, _) = crate::extraction::get_paired_minimizers_into(
-            &query_seq, None, inverted.k, inverted.w, inverted.salt, &mut ws
-        );
-        let full_neg: HashSet<u64> = query_mins.into_iter().collect();
-
-        let results_full_neg = classify_batch_with_query_index(&inverted, Some(&full_neg), &records, 0.5);
         assert!(results_full_neg.is_empty());
 
         Ok(())
@@ -1540,44 +1334,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_negative_filtering_preserves_consistency_across_methods() -> anyhow::Result<()> {
-        // Verify that negative filtering produces consistent results across
-        // all classification methods
-        let mut index = Index::new(64, 10, 0).unwrap();
-        let mut ws = MinimizerWorkspace::new();
-
-        let seq_a = vec![b'A'; 80];
-        index.add_record(1, "ref_a", &seq_a, &mut ws);
-        index.finalize_bucket(1);
-        index.bucket_names.insert(1, "BucketA".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
-
-        let query_seq = seq_a.clone();
-        let records: Vec<QueryRecord> = vec![(101, &query_seq[..], None)];
-
-        // Extract partial negative set (half the minimizers)
-        let (query_mins, _) = crate::extraction::get_paired_minimizers_into(
-            &query_seq, None, index.k, index.w, index.salt, &mut ws
-        );
-        let half: HashSet<u64> = query_mins.iter().take(query_mins.len() / 2).copied().collect();
-
-        let results_batch = classify_batch(&index, Some(&half), &records, 0.0);
-        let results_inverted = classify_batch_inverted(&inverted, Some(&half), &records, 0.0);
-        let results_merge = classify_batch_with_query_index(&inverted, Some(&half), &records, 0.0);
-
-        // All methods should produce consistent results
-        assert_eq!(results_batch.len(), results_inverted.len());
-        assert_eq!(results_batch.len(), results_merge.len());
-
-        if !results_batch.is_empty() {
-            assert_eq!(results_batch[0].bucket_id, results_inverted[0].bucket_id);
-            assert_eq!(results_batch[0].bucket_id, results_merge[0].bucket_id);
-            assert!((results_batch[0].score - results_inverted[0].score).abs() < 0.001);
-            assert!((results_batch[0].score - results_merge[0].score).abs() < 0.001);
-        }
-
-        Ok(())
-    }
 }

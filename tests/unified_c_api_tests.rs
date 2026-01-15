@@ -1,10 +1,9 @@
 //! Integration tests for the unified C API.
 //!
 //! These tests verify that the unified `RypeIndex` type works transparently
-//! with all index formats: single-file main, sharded main, single-file inverted,
-//! and sharded inverted indices.
+//! with all index formats: single-file main, sharded main, and sharded inverted indices.
 
-use rype::{Index, InvertedIndex, MinimizerWorkspace, ShardedMainIndexBuilder};
+use rype::{Index, InvertedIndex, MinimizerWorkspace, ShardedMainIndexBuilder, ShardManifest};
 use rype::c_api::{
     RypeIndex, RypeQuery,
     rype_index_load, rype_index_free,
@@ -227,72 +226,6 @@ fn test_unified_classify_sharded_main_index() -> Result<()> {
 }
 
 // =============================================================================
-// Single-file Inverted Index Tests
-// =============================================================================
-
-#[test]
-fn test_unified_load_single_inverted_index() -> Result<()> {
-    let dir = tempdir()?;
-    let main_path = dir.path().join("test.ryidx");
-    let inverted_path = dir.path().join("test.ryxdi");
-
-    // Create main index, then build inverted index from it
-    let index = create_test_index(64, 50);
-    index.save(&main_path)?;
-
-    let inverted = InvertedIndex::build_from_index(&index);
-    inverted.save(&inverted_path)?;
-
-    // Load inverted index via unified API
-    let path_cstr = CString::new(inverted_path.to_str().unwrap())?;
-    let loaded = unsafe { rype_index_load(path_cstr.as_ptr()) };
-
-    assert!(!loaded.is_null(), "Should load single-file inverted index");
-
-    // Verify accessors work
-    assert_eq!(unsafe { rype_index_k(loaded) }, 64);
-    assert_eq!(unsafe { rype_index_w(loaded) }, 50);
-    assert_eq!(unsafe { rype_index_is_sharded(loaded) }, 0);
-
-    unsafe { rype_index_free(loaded) };
-    Ok(())
-}
-
-#[test]
-fn test_unified_classify_single_inverted_index() -> Result<()> {
-    let dir = tempdir()?;
-    let main_path = dir.path().join("test.ryidx");
-    let inverted_path = dir.path().join("test.ryxdi");
-
-    let index = create_test_index(64, 50);
-    index.save(&main_path)?;
-
-    let inverted = InvertedIndex::build_from_index(&index);
-    inverted.save(&inverted_path)?;
-
-    let path_cstr = CString::new(inverted_path.to_str().unwrap())?;
-    let loaded = unsafe { rype_index_load(path_cstr.as_ptr()) };
-    assert!(!loaded.is_null());
-
-    // Query with matching sequence
-    let query_seq = generate_sequence(200, 0);
-    let (query, _seq_holder) = make_query(1, &query_seq);
-
-    let results = unsafe { rype_classify(loaded, &query, 1, 0.1) };
-
-    assert!(!results.is_null(), "Classification should succeed");
-
-    let results_ref = unsafe { &*results };
-    assert!(results_ref.len > 0, "Should have hits");
-
-    unsafe {
-        rype_results_free(results);
-        rype_index_free(loaded);
-    }
-    Ok(())
-}
-
-// =============================================================================
 // Sharded Inverted Index Tests
 // =============================================================================
 
@@ -307,21 +240,37 @@ fn test_unified_load_sharded_inverted_index() -> Result<()> {
     index.save(&main_path)?;
 
     let inverted = InvertedIndex::build_from_index(&index);
-    inverted.save_sharded(&inverted_path, 2)?; // 2 shards
+
+    // Save as single shard
+    let shard_path = ShardManifest::shard_path(&inverted_path, 0);
+    let shard_info = inverted.save_shard(&shard_path, 0, 0, inverted.num_minimizers(), true)?;
+
+    let manifest = ShardManifest {
+        k: inverted.k,
+        w: inverted.w,
+        salt: inverted.salt,
+        source_hash: 0,
+        total_minimizers: inverted.num_minimizers(),
+        total_bucket_ids: inverted.num_bucket_entries(),
+        has_overlapping_shards: true,
+        shards: vec![shard_info],
+    };
+    let manifest_path = ShardManifest::manifest_path(&inverted_path);
+    manifest.save(&manifest_path)?;
 
     // Load sharded inverted index via unified API
     let path_cstr = CString::new(inverted_path.to_str().unwrap())?;
-    let loaded = unsafe { rype_index_load(path_cstr.as_ptr()) };
+    let loaded = rype_index_load(path_cstr.as_ptr());
 
     assert!(!loaded.is_null(), "Should load sharded inverted index");
 
     // Verify accessors
-    assert_eq!(unsafe { rype_index_k(loaded) }, 64);
-    assert_eq!(unsafe { rype_index_w(loaded) }, 50);
-    assert_eq!(unsafe { rype_index_is_sharded(loaded) }, 1); // Is sharded
-    assert!(unsafe { rype_index_num_shards(loaded) } >= 1);
+    assert_eq!(rype_index_k(loaded), 64);
+    assert_eq!(rype_index_w(loaded), 50);
+    assert_eq!(rype_index_is_sharded(loaded), 1); // Is sharded
+    assert!(rype_index_num_shards(loaded) >= 1);
 
-    unsafe { rype_index_free(loaded) };
+    rype_index_free(loaded);
     Ok(())
 }
 
@@ -335,26 +284,40 @@ fn test_unified_classify_sharded_inverted_index() -> Result<()> {
     index.save(&main_path)?;
 
     let inverted = InvertedIndex::build_from_index(&index);
-    inverted.save_sharded(&inverted_path, 2)?;
+
+    // Save as single shard
+    let shard_path = ShardManifest::shard_path(&inverted_path, 0);
+    let shard_info = inverted.save_shard(&shard_path, 0, 0, inverted.num_minimizers(), true)?;
+
+    let manifest = ShardManifest {
+        k: inverted.k,
+        w: inverted.w,
+        salt: inverted.salt,
+        source_hash: 0,
+        total_minimizers: inverted.num_minimizers(),
+        total_bucket_ids: inverted.num_bucket_entries(),
+        has_overlapping_shards: true,
+        shards: vec![shard_info],
+    };
+    let manifest_path = ShardManifest::manifest_path(&inverted_path);
+    manifest.save(&manifest_path)?;
 
     let path_cstr = CString::new(inverted_path.to_str().unwrap())?;
-    let loaded = unsafe { rype_index_load(path_cstr.as_ptr()) };
+    let loaded = rype_index_load(path_cstr.as_ptr());
     assert!(!loaded.is_null());
 
     let query_seq = generate_sequence(200, 0);
     let (query, _seq_holder) = make_query(1, &query_seq);
 
-    let results = unsafe { rype_classify(loaded, &query, 1, 0.1) };
+    let results = rype_classify(loaded, &query, 1, 0.1);
 
     assert!(!results.is_null(), "Classification should succeed");
 
     let results_ref = unsafe { &*results };
     assert!(results_ref.len > 0, "Should have hits");
 
-    unsafe {
-        rype_results_free(results);
-        rype_index_free(loaded);
-    }
+    rype_results_free(results);
+    rype_index_free(loaded);
     Ok(())
 }
 
@@ -506,24 +469,37 @@ fn test_unified_results_consistent_across_formats() -> Result<()> {
 
     // Save in different formats
     let single_main_path = dir.path().join("single.ryidx");
-    let single_inv_path = dir.path().join("single.ryxdi");
     let sharded_inv_path = dir.path().join("sharded.ryxdi");
 
     index.save(&single_main_path)?;
 
     let inverted = InvertedIndex::build_from_index(&index);
-    inverted.save(&single_inv_path)?;
-    inverted.save_sharded(&sharded_inv_path, 2)?;
 
-    // Load all three via unified API
+    // Save inverted index as single shard
+    let shard_path = ShardManifest::shard_path(&sharded_inv_path, 0);
+    let shard_info = inverted.save_shard(&shard_path, 0, 0, inverted.num_minimizers(), true)?;
+
+    let manifest = ShardManifest {
+        k: inverted.k,
+        w: inverted.w,
+        salt: inverted.salt,
+        source_hash: 0,
+        total_minimizers: inverted.num_minimizers(),
+        total_bucket_ids: inverted.num_bucket_entries(),
+        has_overlapping_shards: true,
+        shards: vec![shard_info],
+    };
+    let manifest_path = ShardManifest::manifest_path(&sharded_inv_path);
+    manifest.save(&manifest_path)?;
+
+    // Load both via unified API
     let paths = [
         CString::new(single_main_path.to_str().unwrap())?,
-        CString::new(single_inv_path.to_str().unwrap())?,
         CString::new(sharded_inv_path.to_str().unwrap())?,
     ];
 
     let indices: Vec<*mut RypeIndex> = paths.iter()
-        .map(|p| unsafe { rype_index_load(p.as_ptr()) })
+        .map(|p| rype_index_load(p.as_ptr()))
         .collect();
 
     for idx in &indices {
@@ -532,9 +508,9 @@ fn test_unified_results_consistent_across_formats() -> Result<()> {
 
     // All should have same k, w, salt
     for idx in &indices {
-        assert_eq!(unsafe { rype_index_k(*idx) }, 64);
-        assert_eq!(unsafe { rype_index_w(*idx) }, 50);
-        assert_eq!(unsafe { rype_index_salt(*idx) }, 0x12345);
+        assert_eq!(rype_index_k(*idx), 64);
+        assert_eq!(rype_index_w(*idx), 50);
+        assert_eq!(rype_index_salt(*idx), 0x12345);
     }
 
     // Classify same query against all - results should be equivalent
@@ -543,10 +519,10 @@ fn test_unified_results_consistent_across_formats() -> Result<()> {
 
     let mut hit_counts = Vec::new();
     for idx in &indices {
-        let results = unsafe { rype_classify(*idx, &query, 1, 0.1) };
+        let results = rype_classify(*idx, &query, 1, 0.1);
         assert!(!results.is_null());
         hit_counts.push(unsafe { (*results).len });
-        unsafe { rype_results_free(results) };
+        rype_results_free(results);
     }
 
     // All formats should produce the same number of hits
@@ -554,7 +530,7 @@ fn test_unified_results_consistent_across_formats() -> Result<()> {
         "All index formats should produce consistent results: {:?}", hit_counts);
 
     for idx in indices {
-        unsafe { rype_index_free(idx) };
+        rype_index_free(idx);
     }
     Ok(())
 }

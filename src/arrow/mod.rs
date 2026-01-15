@@ -42,7 +42,6 @@
 //!
 //! - `ArrowClassifyError`: Safe to send across threads
 //! - `IndexStreamClassifier<'a>`: Safe to send if the referenced `Index` is `Sync`
-//! - `InvertedStreamClassifier<'a>`: Safe to send if the referenced `InvertedIndex` is `Sync`
 //!
 //! Classification functions use internal rayon parallelism. The streaming classifiers
 //! are designed for single-threaded use per stream instance, but multiple streams can
@@ -88,15 +87,15 @@ pub use schema::{
     result_schema, validate_input_schema, COL_BUCKET_ID, COL_ID, COL_PAIR_SEQUENCE, COL_QUERY_ID,
     COL_SCORE, COL_SEQUENCE,
 };
-pub use stream::{IndexStreamClassifier, InvertedStreamClassifier};
+pub use stream::IndexStreamClassifier;
 
 use std::collections::HashSet;
 
 use arrow::record_batch::RecordBatch;
 
 use crate::{
-    classify_batch, classify_batch_inverted, classify_batch_sharded_merge_join,
-    classify_batch_sharded_sequential, classify_batch_sharded_main, Index, InvertedIndex,
+    classify_batch, classify_batch_sharded_merge_join,
+    classify_batch_sharded_sequential, classify_batch_sharded_main, Index,
     ShardedInvertedIndex, ShardedMainIndex,
 };
 
@@ -137,35 +136,6 @@ pub fn classify_arrow_batch(
 ) -> Result<RecordBatch, ArrowClassifyError> {
     let records = batch_to_records(batch)?;
     let hits = classify_batch(index, negative_mins, &records, threshold);
-    hits_to_record_batch(hits)
-}
-
-/// Classify sequences from an Arrow RecordBatch using an InvertedIndex.
-///
-/// Uses the inverted index for faster lookups. Recommended for larger indices.
-///
-/// # Arguments
-///
-/// * `inverted` - The inverted index to classify against
-/// * `negative_mins` - Optional set of minimizers to exclude from queries
-/// * `batch` - Input RecordBatch with sequences (see module docs for schema)
-/// * `threshold` - Minimum score threshold for reporting hits (0.0-1.0)
-///
-/// # Returns
-///
-/// A RecordBatch containing classification results (query_id, bucket_id, score).
-///
-/// # Errors
-///
-/// Returns an error if schema validation or type conversion fails.
-pub fn classify_arrow_batch_inverted(
-    inverted: &InvertedIndex,
-    negative_mins: Option<&HashSet<u64>>,
-    batch: &RecordBatch,
-    threshold: f64,
-) -> Result<RecordBatch, ArrowClassifyError> {
-    let records = batch_to_records(batch)?;
-    let hits = classify_batch_inverted(inverted, negative_mins, &records, threshold);
     hits_to_record_batch(hits)
 }
 

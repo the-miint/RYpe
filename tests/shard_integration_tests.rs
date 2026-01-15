@@ -10,17 +10,17 @@ use tempfile::tempdir;
 
 use rype::{
     Index,
+    IndexMetadata,
     InvertedIndex,
-    ShardedInvertedIndex, ShardManifest, ShardInfo,
-    ShardedMainIndex, MainIndexManifest, MainIndexShard,
-    HitResult, QueryRecord, IndexMetadata,
+    ShardedInvertedIndex, ShardManifest,
+    ShardedMainIndex,
+    MainIndexManifest, MainIndexShard,
+    HitResult, QueryRecord,
     MinimizerWorkspace,
     classify_batch,
-    classify_batch_inverted,
     classify_batch_sharded_sequential,
     classify_batch_sharded_merge_join,
     classify_batch_sharded_main,
-    classify_batch_with_query_index,
 };
 
 /// Test helper to sort results for comparison
@@ -168,18 +168,11 @@ fn test_baseline_non_sharded_classification() -> Result<()> {
 
     let threshold = 0.1;
 
-    // Test all classification methods
+    // Test direct classification
     let results_direct = classify_batch(&index, None, &records, threshold);
-    let results_inverted = classify_batch_inverted(&inverted, None, &records, threshold);
-    let results_merge = classify_batch_with_query_index(&inverted, None, &records, threshold);
 
     eprintln!("\n=== Results ===");
     eprintln!("Direct: {} results", results_direct.len());
-    eprintln!("Inverted: {} results", results_inverted.len());
-    eprintln!("Merge-join: {} results", results_merge.len());
-
-    compare_results("Direct", &results_direct, "Inverted", &results_inverted);
-    compare_results("Direct", &results_direct, "Merge-join", &results_merge);
 
     // Verify we get at least some results
     assert!(!results_direct.is_empty(), "Should have classification results");
@@ -205,13 +198,27 @@ fn test_sharded_inverted_from_non_sharded_main() -> Result<()> {
 
     print_index_diagnostics("Main Index", &index);
 
-    // Build non-sharded inverted index
+    // Build inverted index
     let inverted = InvertedIndex::build_from_index(&index);
-    print_inverted_diagnostics("Non-sharded Inverted", &inverted);
+    print_inverted_diagnostics("Inverted", &inverted);
 
-    // Save as sharded (4 shards)
-    eprintln!("\nSaving as 4 shards...");
-    let manifest = inverted.save_sharded(&inverted_path, 4)?;
+    // Save as single shard (like we do for non-sharded main index)
+    eprintln!("\nSaving as 1 shard...");
+    let shard_path = ShardManifest::shard_path(&inverted_path, 0);
+    let shard_info = inverted.save_shard(&shard_path, 0, 0, inverted.num_minimizers(), true)?;
+
+    let manifest = ShardManifest {
+        k: inverted.k,
+        w: inverted.w,
+        salt: inverted.salt,
+        source_hash: 0,
+        total_minimizers: inverted.num_minimizers(),
+        total_bucket_ids: inverted.num_bucket_entries(),
+        has_overlapping_shards: true,
+        shards: vec![shard_info],
+    };
+    let manifest_path = ShardManifest::manifest_path(&inverted_path);
+    manifest.save(&manifest_path)?;
 
     eprintln!("Created {} shards", manifest.shards.len());
     for shard in &manifest.shards {
@@ -225,18 +232,18 @@ fn test_sharded_inverted_from_non_sharded_main() -> Result<()> {
 
     let threshold = 0.1;
 
-    // Compare results
-    let results_inverted = classify_batch_inverted(&inverted, None, &records, threshold);
+    // Compare results: direct vs sharded inverted
+    let results_direct = classify_batch(&index, None, &records, threshold);
     let results_sequential = classify_batch_sharded_sequential(&sharded, None, &records, threshold)?;
     let results_merge = classify_batch_sharded_merge_join(&sharded, None, &records, threshold)?;
 
     eprintln!("\n=== Results ===");
-    eprintln!("Non-sharded inverted: {} results", results_inverted.len());
+    eprintln!("Direct: {} results", results_direct.len());
     eprintln!("Sharded sequential: {} results", results_sequential.len());
     eprintln!("Sharded merge-join: {} results", results_merge.len());
 
-    compare_results("Non-sharded", &results_inverted, "Sharded-sequential", &results_sequential);
-    compare_results("Non-sharded", &results_inverted, "Sharded-merge", &results_merge);
+    compare_results("Direct", &results_direct, "Sharded-sequential", &results_sequential);
+    compare_results("Direct", &results_direct, "Sharded-merge", &results_merge);
 
     Ok(())
 }
@@ -395,8 +402,8 @@ fn test_inverted_from_sharded_main() -> Result<()> {
 
             let threshold = 0.1;
 
-            // Compare results
-            let results_ground_truth = classify_batch_inverted(&inverted_ground_truth, None, &records, threshold);
+            // Compare results using direct classification (ground truth)
+            let results_ground_truth = classify_batch(&index, None, &records, threshold);
 
             eprintln!("\nClassifying with sharded sequential...");
             let results_sharded_seq = classify_batch_sharded_sequential(&sharded_inv, None, &records, threshold)?;
@@ -426,57 +433,6 @@ fn test_inverted_from_sharded_main() -> Result<()> {
         Err(e) => {
             eprintln!("\n!!! FAILED TO LOAD SHARDED INVERTED INDEX !!!");
             eprintln!("Error: {}", e);
-
-            // This is the expected failure when minimizer ranges overlap
-            if e.to_string().contains("contiguous") {
-                eprintln!("\nThis is the expected validation failure for overlapping ranges.");
-                eprintln!("The manifest validation assumes range-partitioned shards,");
-                eprintln!("but bucket-partitioned shards have overlapping minimizer ranges.");
-            }
-
-            // Instead of failing, manually test classification by loading shards directly
-            eprintln!("\n=== Testing classification by loading shards directly ===");
-
-            let threshold = 0.1;
-            let results_ground_truth = classify_batch_inverted(&inverted_ground_truth, None, &records, threshold);
-
-            // Manual accumulation across shards
-            let mut all_results: HashMap<(i64, u32), f64> = HashMap::new();
-
-            for shard_info in &manifest.shards {
-                let shard_path = ShardManifest::shard_path(&inverted_path, shard_info.shard_id);
-                let shard = InvertedIndex::load_shard(&shard_path)?;
-
-                eprintln!("\nLoaded shard {}: {} minimizers", shard_info.shard_id, shard.num_minimizers());
-
-                let shard_results = classify_batch_inverted(&shard, None, &records, 0.0);
-                eprintln!("Shard {} results: {}", shard_info.shard_id, shard_results.len());
-
-                for r in shard_results {
-                    let key = (r.query_id, r.bucket_id);
-                    let entry = all_results.entry(key).or_insert(0.0);
-                    // For per-shard inverted, we need to accumulate hits, not scores
-                    // This is a simplification - actual implementation needs hit counting
-                    *entry = (*entry).max(r.score);
-                }
-            }
-
-            let manual_results: Vec<HitResult> = all_results.into_iter()
-                .filter(|(_, score)| *score >= threshold)
-                .map(|((query_id, bucket_id), score)| HitResult { query_id, bucket_id, score })
-                .collect();
-
-            eprintln!("\n=== Manual aggregation results ===");
-            eprintln!("Ground truth: {} results", results_ground_truth.len());
-            eprintln!("Manual aggregation: {} results", manual_results.len());
-
-            // This comparison may fail because the manual aggregation is wrong
-            // The actual fix needs to properly accumulate hits across shards
-            if manual_results.len() != results_ground_truth.len() {
-                eprintln!("\n!!! RESULT COUNT MISMATCH !!!");
-                eprintln!("This confirms the sharding bug exists.");
-            }
-
             return Err(e);
         }
     }
@@ -701,7 +657,7 @@ fn test_user_scenario_sharded_inverted_from_sharded_main() -> Result<()> {
             let records = create_query_records(&seqs);
             let threshold = 0.1;
 
-            let results_truth = classify_batch_inverted(&inverted_truth, None, &records, threshold);
+            let results_truth = classify_batch(&index, None, &records, threshold);
             let results_sharded = classify_batch_sharded_merge_join(&sharded, None, &records, threshold)?;
 
             eprintln!("\n=== Classification Results ===");

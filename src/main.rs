@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use anyhow::{Context, Result, anyhow};
 
-use rype::{Index, IndexMetadata, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_inverted, classify_batch_with_query_index, classify_batch_sharded_sequential, classify_batch_sharded_merge_join, classify_batch_sharded_main, aggregate_batch, ShardManifest, ShardedInvertedIndex, MainIndexManifest, MainIndexShard, ShardedMainIndex, ShardedMainIndexBuilder, extract_into, extract_with_positions, Strand};
+use rype::{Index, IndexMetadata, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_sharded_sequential, classify_batch_sharded_merge_join, classify_batch_sharded_main, aggregate_batch, ShardManifest, ShardedInvertedIndex, MainIndexManifest, MainIndexShard, ShardedMainIndex, ShardedMainIndexBuilder, extract_into, extract_with_positions, Strand};
 use rype::config::{parse_config, validate_config, resolve_path, parse_bucket_add_config, validate_bucket_add_config, AssignmentSettings, BestBinFallback};
 use rype::memory::{parse_byte_suffix, detect_available_memory, ReadMemoryProfile, MemoryConfig, calculate_batch_config, format_bytes, MemorySource};
 use std::collections::HashMap;
@@ -250,9 +250,7 @@ enum IndexCommands {
   salt = 0x5555555555555555        # Hash salt (hex)
   output = \"index.ryidx\"           # Output path
   max_shard_size = 1073741824      # Optional: shard main index (bytes)
-
-  [index.invert]                   # Optional: create inverted index
-  shards = 4                       # Number of shards (default: 1)
+  invert = true                    # Optional: create inverted index
 
   [buckets.BucketName]             # Define a bucket
   files = [\"ref1.fa\", \"ref2.fa\"]   # Files for this bucket
@@ -262,11 +260,12 @@ enum IndexCommands {
 
 CLI OPTIONS OVERRIDE CONFIG FILE:
   --max-shard-size overrides [index].max_shard_size
-  --invert enables inverted index creation (even without [index.invert])
-  --invert-shards overrides [index.invert].shards
+  --invert (-I) enables inverted index creation (even without invert = true)
 
-NOTE: Cannot combine max_shard_size with [index.invert]. When main index is
-sharded, use 'rype index invert' separately (creates 1:1 inverted shards).")]
+INVERTED INDEX SHARDING:
+  Inverted shards are automatically created with 1:1 correspondence to main shards.
+  - Sharded main index (--max-shard-size): creates N inverted shards (1:1)
+  - Single-file main index: creates 1 inverted shard")]
     FromConfig {
         /// Path to TOML config file
         #[arg(short, long)]
@@ -279,10 +278,6 @@ sharded, use 'rype index invert' separately (creates 1:1 inverted shards).")]
         /// Create inverted index after building (overrides config)
         #[arg(short = 'I', long)]
         invert: bool,
-
-        /// Number of shards for inverted index (overrides config, implies --invert)
-        #[arg(long)]
-        invert_shards: Option<u32>,
     },
 
     /// Add files to existing index using TOML config (see CONFIG FORMAT below)
@@ -309,23 +304,17 @@ sharded, use 'rype index invert' separately (creates 1:1 inverted shards).")]
     #[command(after_help = "The inverted index maps minimizers to buckets instead of buckets to
 minimizers, enabling O(Q log U) lookups instead of O(B × Q × log M).
 
-USAGE:
-  rype index invert -i index.ryidx      # Creates index.ryxdi
-  rype classify run -i index.ryidx -I   # Use inverted index
+Creates bucket-partitioned shards:
+- Sharded main index: creates 1:1 inverted shard correspondence
+- Single-file main index: creates a 1-shard inverted index
 
-SHARDING:
-  For very large indices that exceed RAM, use --shards to split the
-  inverted index into multiple files loaded on-demand during classification.")]
+USAGE:
+  rype index invert -i index.ryidx      # Creates index.ryxdi.manifest + .shard.0
+  rype classify run -i index.ryidx -I   # Use inverted index automatically")]
     Invert {
         /// Path to primary index file (.ryidx)
         #[arg(short, long)]
         index: PathBuf,
-
-        /// Number of shards (default: 1 = single file).
-        /// Use for memory-constrained classification of large indices.
-        /// Ignored if main index is already sharded (uses 1:1 correspondence).
-        #[arg(long, default_value_t = 1)]
-        shards: u32,
     },
 
     /// Show detailed minimizer statistics for compression analysis
@@ -333,6 +322,36 @@ SHARDING:
         /// Path to index file (.ryidx)
         #[arg(short, long)]
         index: PathBuf,
+    },
+
+    /// Convert single-file index to sharded format
+    #[command(after_help = "Converts an existing single-file index (.ryidx) to sharded format.
+
+This is useful for:
+- Memory-constrained classification of large indices
+- Enabling parallel I/O during classification
+- Converting legacy indices to the more efficient sharded format
+
+USAGE:
+  rype index shard -i large.ryidx -o sharded.ryidx --max-shard-size 1G
+
+The output will be:
+  sharded.ryidx.manifest     (metadata)
+  sharded.ryidx.shard.0      (first shard)
+  sharded.ryidx.shard.1      (second shard)
+  ...")]
+    Shard {
+        /// Path to input single-file index (.ryidx)
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Path to output sharded index (base path for .manifest and .shard.* files)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Maximum shard size (e.g., "1G", "512M", "100M")
+        #[arg(long, value_parser = parse_shard_size_arg)]
+        max_shard_size: usize,
     },
 }
 
@@ -711,18 +730,13 @@ fn main() -> Result<()> {
                                 shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
                         }
                     } else if inverted_path.exists() {
-                        // Single-file inverted index - use load_stats() for header only
-                        let stats = InvertedIndex::load_stats(&inverted_path)?;
-                        println!("Inverted Index Stats for {:?}", inverted_path);
-                        println!("  K: {}", stats.k);
-                        println!("  Window (w): {}", stats.w);
-                        println!("  Salt: 0x{:x}", stats.salt);
-                        println!("  Unique minimizers: {}", stats.num_minimizers);
-                        println!("  Total bucket references: {}", stats.num_bucket_ids);
-                        if stats.num_minimizers > 0 {
-                            println!("  Avg buckets per minimizer: {:.2}",
-                                stats.num_bucket_ids as f64 / stats.num_minimizers as f64);
-                        }
+                        // Legacy single-file inverted index (RYXI) no longer supported
+                        return Err(anyhow!(
+                            "Legacy single-file inverted index format (RYXI) is no longer supported.\n\
+                             Re-create the inverted index with:\n  \
+                             rype index invert -i {}",
+                            index.display()
+                        ));
                     } else {
                         return Err(anyhow!(
                             "Inverted index not found: {:?}. Create it with 'rype index invert -i {:?}'",
@@ -935,28 +949,28 @@ fn main() -> Result<()> {
                 log::info!("Merged index saved to {:?}", output);
             }
 
-            IndexCommands::FromConfig { config, max_shard_size, invert, invert_shards } => {
-                build_index_from_config(&config, max_shard_size, invert, invert_shards)?;
+            IndexCommands::FromConfig { config, max_shard_size, invert } => {
+                build_index_from_config(&config, max_shard_size, invert)?;
             }
 
             IndexCommands::BucketAddConfig { config } => {
                 bucket_add_from_config(&config)?;
             }
 
-            IndexCommands::Invert { index, shards } => {
+            IndexCommands::Invert { index } => {
                 let output_path = index.with_extension("ryxdi");
 
-                // Check if main index is sharded
-                if MainIndexManifest::is_sharded(&index) {
+                // Track files we create for cleanup on error
+                let mut created_files: Vec<PathBuf> = Vec::new();
+
+                let result: Result<ShardManifest> = if MainIndexManifest::is_sharded(&index) {
+                    // Sharded main index: create 1:1 inverted shards
                     log::info!("Detected sharded main index, creating 1:1 inverted shards");
                     let main_manifest = MainIndexManifest::load(&MainIndexManifest::manifest_path(&index))?;
                     log::info!("Main index has {} shards, {} buckets",
                         main_manifest.shards.len(), main_manifest.bucket_names.len());
 
-                    // Track files we create for cleanup on error
-                    let mut created_files: Vec<PathBuf> = Vec::new();
-
-                    let result = (|| -> Result<ShardManifest> {
+                    (|| -> Result<ShardManifest> {
                         let mut inv_shards = Vec::new();
                         let mut total_minimizers = 0usize;
                         let mut total_bucket_ids = 0usize;
@@ -994,9 +1008,6 @@ fn main() -> Result<()> {
                         }
 
                         // Create inverted manifest
-                        // Bucket-partitioned because each inverted shard corresponds to a
-                        // main index shard (which contains a subset of buckets). Minimizer
-                        // ranges may overlap between shards.
                         let inv_manifest = ShardManifest {
                             k: main_manifest.k,
                             w: main_manifest.w,
@@ -1013,29 +1024,10 @@ fn main() -> Result<()> {
                         created_files.push(manifest_path);
 
                         Ok(inv_manifest)
-                    })();
-
-                    match result {
-                        Ok(inv_manifest) => {
-                            log::info!("Created {} inverted shards with 1:1 correspondence:", inv_manifest.shards.len());
-                            for shard in &inv_manifest.shards {
-                                log::info!("  Shard {}: {} unique minimizers, {} bucket entries",
-                                    shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
-                            }
-                        }
-                        Err(e) => {
-                            // Clean up partial files on error
-                            for path in &created_files {
-                                if path.exists() {
-                                    let _ = std::fs::remove_file(path);
-                                }
-                            }
-                            return Err(e);
-                        }
-                    }
+                    })()
                 } else {
-                    // Non-sharded main index
-                    log::info!("Loading index from {:?}", index);
+                    // Non-sharded main index: treat as single shard, create 1-shard inverted
+                    log::info!("Loading single-file index from {:?}", index);
                     let idx = Index::load(&index)?;
                     log::info!("Index loaded: {} buckets", idx.buckets.len());
 
@@ -1044,20 +1036,67 @@ fn main() -> Result<()> {
                     log::info!("Inverted index built: {} unique minimizers, {} bucket entries",
                         inverted.num_minimizers(), inverted.num_bucket_entries());
 
-                    if shards > 1 {
-                        log::info!("Saving sharded inverted index ({} shards) to {:?}", shards, output_path);
-                        let manifest = inverted.save_sharded(&output_path, shards)?;
-                        log::info!("Created {} shards:", manifest.shards.len());
-                        for shard in &manifest.shards {
+                    (|| -> Result<ShardManifest> {
+                        // Save as single shard (shard_id = 0)
+                        let shard_path = ShardManifest::shard_path(&output_path, 0);
+                        let inv_shard_info = inverted.save_shard(
+                            &shard_path,
+                            0, // shard_id
+                            0, // min_start
+                            inverted.num_minimizers(),
+                            true, // is_last (and only) shard
+                        )?;
+                        created_files.push(shard_path);
+
+                        // Create manifest with single shard
+                        let metadata = IndexMetadata {
+                            k: idx.k,
+                            w: idx.w,
+                            salt: idx.salt,
+                            bucket_names: idx.bucket_names.clone(),
+                            bucket_sources: idx.bucket_sources.clone(),
+                            bucket_minimizer_counts: idx.buckets.iter()
+                                .map(|(&id, mins)| (id, mins.len()))
+                                .collect(),
+                        };
+                        let inv_manifest = ShardManifest {
+                            k: idx.k,
+                            w: idx.w,
+                            salt: idx.salt,
+                            source_hash: InvertedIndex::compute_metadata_hash(&metadata),
+                            total_minimizers: inv_shard_info.num_minimizers,
+                            total_bucket_ids: inv_shard_info.num_bucket_ids,
+                            has_overlapping_shards: true,
+                            shards: vec![inv_shard_info],
+                        };
+
+                        let manifest_path = ShardManifest::manifest_path(&output_path);
+                        inv_manifest.save(&manifest_path)?;
+                        created_files.push(manifest_path);
+
+                        Ok(inv_manifest)
+                    })()
+                };
+
+                match result {
+                    Ok(inv_manifest) => {
+                        log::info!("Created {} inverted shard(s):", inv_manifest.shards.len());
+                        for shard in &inv_manifest.shards {
                             log::info!("  Shard {}: {} unique minimizers, {} bucket entries",
                                 shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
                         }
-                    } else {
-                        log::info!("Saving inverted index to {:?}", output_path);
-                        inverted.save(&output_path)?;
+                        log::info!("Done.");
+                    }
+                    Err(e) => {
+                        // Clean up partial files on error
+                        for path in &created_files {
+                            if path.exists() {
+                                let _ = std::fs::remove_file(path);
+                            }
+                        }
+                        return Err(e);
                     }
                 }
-                log::info!("Done.");
             }
 
             IndexCommands::Summarize { index } => {
@@ -1202,6 +1241,34 @@ fn main() -> Result<()> {
                         let name = idx.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
                         println!("  Bucket {}: {} minimizers ({})", id, count, name);
                     }
+                }
+            }
+
+            IndexCommands::Shard { input, output, max_shard_size } => {
+                // Validate that input is not already sharded
+                if MainIndexManifest::is_sharded(&input) {
+                    return Err(anyhow!(
+                        "Input index is already sharded: {}\n\
+                         To re-shard with different settings, first merge shards into a single file,\n\
+                         or use the original single-file index.",
+                        input.display()
+                    ));
+                }
+
+                log::info!("Loading single-file index from {:?}", input);
+                let idx = Index::load(&input)?;
+
+                log::info!("Sharding index with max shard size {}...", format_bytes(max_shard_size));
+                let manifest = idx.save_sharded(&output, max_shard_size)?;
+
+                log::info!("Created {} shards at {}", manifest.shards.len(), output.display());
+                eprintln!("Sharded index created:");
+                eprintln!("  Manifest: {}.manifest", output.display());
+                for shard_info in manifest.shards.iter() {
+                    eprintln!("  Shard {}: {} buckets, {} minimizers",
+                        shard_info.shard_id,
+                        shard_info.bucket_ids.len(),
+                        shard_info.num_minimizers);
                 }
             }
         },
@@ -1371,47 +1438,13 @@ fn main() -> Result<()> {
                             log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
                         }
                     } else if inverted_path.exists() {
-                        // Single-file inverted index
-                        log::info!("Loading inverted index from {:?}", inverted_path);
-                        let inverted = InvertedIndex::load(&inverted_path)?;
-                        log::info!("Inverted index loaded: {} unique minimizers", inverted.num_minimizers());
-
-                        inverted.validate_against_metadata(&metadata)?;
-                        log::info!("Inverted index validated successfully");
-
-                        if merge_join {
-                            log::info!("Starting merge-join classification with inverted index (batch_size={})", effective_batch_size);
-                        } else {
-                            log::info!("Starting classification with inverted index (batch_size={})", effective_batch_size);
-                        }
-
-                        while let Some((owned_records, headers)) = io.next_batch_records(effective_batch_size)? {
-                            batch_num += 1;
-                            let batch_read_count = owned_records.len();
-                            total_reads += batch_read_count;
-
-                            let batch_refs: Vec<QueryRecord> = owned_records.iter()
-                                .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
-                                .collect();
-
-                            let results = if merge_join {
-                                classify_batch_with_query_index(&inverted, neg_mins.as_ref(), &batch_refs, threshold)
-                            } else {
-                                classify_batch_inverted(&inverted, neg_mins.as_ref(), &batch_refs, threshold)
-                            };
-
-                            let mut chunk_out = Vec::with_capacity(1024);
-                            for res in results {
-                                let header = &headers[res.query_id as usize];
-                                let bucket_name = metadata.bucket_names.get(&res.bucket_id)
-                                    .map(|s| s.as_str())
-                                    .unwrap_or("unknown");
-                                writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
-                            }
-                            io.write(chunk_out)?;
-
-                            log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
-                        }
+                        // Legacy single-file inverted index (RYXI format) no longer supported
+                        return Err(anyhow!(
+                            "Legacy single-file inverted index format (RYXI) is no longer supported.\n\
+                             Re-create the inverted index with:\n  \
+                             rype index invert -i {}",
+                            index.display()
+                        ));
                     } else {
                         return Err(anyhow!(
                             "Inverted index not found: {:?}. Create it with 'rype index invert -i {:?}'",
@@ -1692,7 +1725,6 @@ fn build_index_from_config(
     config_path: &Path,
     cli_max_shard_size: Option<usize>,
     cli_invert: bool,
-    cli_invert_shards: Option<u32>,
 ) -> Result<()> {
     log::info!("Building index from config: {}", config_path.display());
 
@@ -1709,24 +1741,8 @@ fn build_index_from_config(
     // CLI takes precedence over config file
     let max_shard_size = cli_max_shard_size.or(cfg.index.max_shard_size);
 
-    // Determine if we should create inverted index and how many shards
-    // --invert-shards implies --invert
-    let should_invert = cli_invert || cli_invert_shards.is_some() || cfg.index.invert.is_some();
-    let invert_shards = cli_invert_shards
-        .or_else(|| cfg.index.invert.as_ref().map(|i| i.shards))
-        .unwrap_or(1);
-
-    // Disallow combining main index sharding with inverted index creation
-    // When main index is sharded, inverted shards must be 1:1 with main shards,
-    // which requires loading each shard separately. Use 'index invert' for this.
-    if max_shard_size.is_some() && should_invert {
-        return Err(anyhow!(
-            "Cannot create inverted index when sharding main index.\n\
-             When --max-shard-size is used, inverted shards must be 1:1 with main shards.\n\
-             Run 'rype index invert -i {}' after building to create the inverted index.",
-            cfg.index.output.display()
-        ));
-    }
+    // Determine if we should create inverted index
+    let should_invert = cli_invert || cfg.index.invert.unwrap_or(false);
 
     // 2. Sort bucket names for deterministic ordering (critical for bucket ID consistency)
     let mut bucket_names: Vec<_> = cfg.buckets.keys().cloned().collect();
@@ -1800,6 +1816,67 @@ fn build_index_from_config(
         log::info!("  Buckets: {}", bucket_id - 1);
         log::info!("  Shards: {}", manifest.shards.len());
         log::info!("  Total minimizers: {}", manifest.total_minimizers);
+
+        // Optionally create inverted index with 1:1 shard correspondence
+        if should_invert {
+            let inverted_path = cfg.index.output.with_extension("ryxdi");
+            log::info!("Creating inverted index with 1:1 shard correspondence...");
+
+            let mut inv_shards = Vec::new();
+            let mut total_inv_minimizers = 0usize;
+            let mut total_inv_bucket_ids = 0usize;
+            let num_shards = manifest.shards.len();
+
+            for (idx, shard_info) in manifest.shards.iter().enumerate() {
+                let shard_path = MainIndexManifest::shard_path(&cfg.index.output, shard_info.shard_id);
+                log::info!("Processing main shard {} for inversion...", shard_info.shard_id);
+
+                // Build inverted index from shard
+                let inverted = {
+                    let main_shard = MainIndexShard::load(&shard_path)?;
+                    InvertedIndex::build_from_shard(&main_shard)
+                };
+
+                log::info!("  Built inverted: {} unique minimizers, {} bucket entries",
+                    inverted.num_minimizers(), inverted.num_bucket_entries());
+
+                // Save as inverted shard with same ID
+                let inv_shard_path = ShardManifest::shard_path(&inverted_path, shard_info.shard_id);
+                let is_last = idx == num_shards - 1;
+                let inv_shard_info = inverted.save_shard(
+                    &inv_shard_path,
+                    shard_info.shard_id,
+                    0,
+                    inverted.num_minimizers(),
+                    is_last,
+                )?;
+
+                total_inv_minimizers += inv_shard_info.num_minimizers;
+                total_inv_bucket_ids += inv_shard_info.num_bucket_ids;
+                inv_shards.push(inv_shard_info);
+            }
+
+            // Create inverted manifest
+            let inv_manifest = ShardManifest {
+                k: manifest.k,
+                w: manifest.w,
+                salt: manifest.salt,
+                source_hash: InvertedIndex::compute_metadata_hash(&manifest.to_metadata()),
+                total_minimizers: total_inv_minimizers,
+                total_bucket_ids: total_inv_bucket_ids,
+                has_overlapping_shards: true,
+                shards: inv_shards,
+            };
+
+            let manifest_path = ShardManifest::manifest_path(&inverted_path);
+            inv_manifest.save(&manifest_path)?;
+
+            log::info!("Created {} inverted shards (1:1 correspondence):", inv_manifest.shards.len());
+            for shard in &inv_manifest.shards {
+                log::info!("  Shard {}: {} unique minimizers, {} bucket entries",
+                    shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
+            }
+        }
     } else {
         // NON-SHARDED: Build all buckets in parallel (memory not constrained)
         log::info!("Building {} buckets in parallel...", bucket_names.len());
@@ -1837,7 +1914,7 @@ fn build_index_from_config(
         let total_minimizers: usize = final_index.buckets.values().map(|v| v.len()).sum();
         log::info!("  Total minimizers: {}", total_minimizers);
 
-        // Optionally create inverted index (only for non-sharded path)
+        // Optionally create inverted index (1-shard for non-sharded main)
         if should_invert {
             let inverted_path = cfg.index.output.with_extension("ryxdi");
             log::info!("Building inverted index...");
@@ -1845,18 +1922,44 @@ fn build_index_from_config(
             log::info!("Inverted index built: {} unique minimizers, {} bucket entries",
                 inverted.num_minimizers(), inverted.num_bucket_entries());
 
-            if invert_shards > 1 {
-                log::info!("Saving sharded inverted index ({} shards) to {:?}", invert_shards, inverted_path);
-                let manifest = inverted.save_sharded(&inverted_path, invert_shards)?;
-                log::info!("Created {} inverted shards:", manifest.shards.len());
-                for shard in &manifest.shards {
-                    log::info!("  Shard {}: {} unique minimizers, {} bucket entries",
-                        shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
-                }
-            } else {
-                log::info!("Saving inverted index to {:?}", inverted_path);
-                inverted.save(&inverted_path)?;
-            }
+            // Save as single shard (shard_id = 0)
+            let shard_path = ShardManifest::shard_path(&inverted_path, 0);
+            let inv_shard_info = inverted.save_shard(
+                &shard_path,
+                0, // shard_id
+                0, // min_start
+                inverted.num_minimizers(),
+                true, // is_last (and only) shard
+            )?;
+
+            // Create manifest with single shard
+            let metadata = IndexMetadata {
+                k: final_index.k,
+                w: final_index.w,
+                salt: final_index.salt,
+                bucket_names: final_index.bucket_names.clone(),
+                bucket_sources: final_index.bucket_sources.clone(),
+                bucket_minimizer_counts: final_index.buckets.iter()
+                    .map(|(&id, mins)| (id, mins.len()))
+                    .collect(),
+            };
+            let inv_manifest = ShardManifest {
+                k: final_index.k,
+                w: final_index.w,
+                salt: final_index.salt,
+                source_hash: InvertedIndex::compute_metadata_hash(&metadata),
+                total_minimizers: inv_shard_info.num_minimizers,
+                total_bucket_ids: inv_shard_info.num_bucket_ids,
+                has_overlapping_shards: true,
+                shards: vec![inv_shard_info],
+            };
+
+            let manifest_path = ShardManifest::manifest_path(&inverted_path);
+            inv_manifest.save(&manifest_path)?;
+
+            log::info!("Created 1 inverted shard:");
+            log::info!("  Shard 0: {} unique minimizers, {} bucket entries",
+                inv_manifest.shards[0].num_minimizers, inv_manifest.shards[0].num_bucket_ids);
         }
     }
 

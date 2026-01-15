@@ -23,7 +23,7 @@ use super::error::ArrowClassifyError;
 use super::input::batch_to_records;
 use super::output::hits_to_record_batch;
 use super::schema::result_schema;
-use crate::{classify_batch, classify_batch_inverted, Index, InvertedIndex};
+use crate::{classify_batch, Index};
 
 /// Streaming classifier for Index-based classification.
 ///
@@ -90,73 +90,6 @@ impl<'a> IndexStreamClassifier<'a> {
     /// # Returns
     ///
     /// An iterator yielding result RecordBatches
-    pub fn classify_iter<I>(
-        &self,
-        input: I,
-    ) -> impl Iterator<Item = Result<RecordBatch, ArrowClassifyError>> + '_
-    where
-        I: Iterator<Item = Result<RecordBatch, arrow::error::ArrowError>> + 'a,
-    {
-        input.map(move |batch_result| {
-            let batch = batch_result.map_err(ArrowClassifyError::from)?;
-            self.classify_batch(&batch)
-        })
-    }
-}
-
-/// Streaming classifier for InvertedIndex-based classification.
-///
-/// Processes input batches one at a time and yields result batches.
-/// Uses the inverted index for faster lookups compared to Index.
-pub struct InvertedStreamClassifier<'a> {
-    inverted: &'a InvertedIndex,
-    negative_mins: Option<&'a HashSet<u64>>,
-    threshold: f64,
-    output_schema: SchemaRef,
-}
-
-impl<'a> InvertedStreamClassifier<'a> {
-    /// Create a new streaming classifier with inverted index.
-    ///
-    /// # Arguments
-    ///
-    /// * `inverted` - The inverted index to classify against
-    /// * `negative_mins` - Optional set of minimizers to exclude
-    /// * `threshold` - Minimum score threshold for reporting hits
-    pub fn new(
-        inverted: &'a InvertedIndex,
-        negative_mins: Option<&'a HashSet<u64>>,
-        threshold: f64,
-    ) -> Self {
-        Self {
-            inverted,
-            negative_mins,
-            threshold,
-            output_schema: result_schema(),
-        }
-    }
-
-    /// Get the output schema for result batches.
-    pub fn output_schema(&self) -> SchemaRef {
-        self.output_schema.clone()
-    }
-
-    /// Classify a single batch and return results.
-    pub fn classify_batch(
-        &self,
-        batch: &RecordBatch,
-    ) -> Result<RecordBatch, ArrowClassifyError> {
-        let records = batch_to_records(batch)?;
-        let hits = classify_batch_inverted(
-            self.inverted,
-            self.negative_mins,
-            &records,
-            self.threshold,
-        );
-        hits_to_record_batch(hits)
-    }
-
-    /// Create an iterator that classifies batches from the input iterator.
     pub fn classify_iter<I>(
         &self,
         input: I,
