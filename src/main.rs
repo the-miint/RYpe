@@ -2143,6 +2143,18 @@ fn build_index_from_config(
         );
     }
 
+    // Warn if bucket count is less than available threads (parallelism is over buckets)
+    let num_threads = rayon::current_num_threads();
+    if bucket_names.len() < num_threads {
+        log::warn!(
+            "Only {} bucket(s) but {} threads available. \
+             Parallelism is over buckets, not files within a bucket. \
+             Consider splitting large buckets for better CPU utilization.",
+            bucket_names.len(),
+            num_threads
+        );
+    }
+
     // 3. Build and save index - use batched approach for sharded, parallel for non-sharded
     if let Some(max_bytes) = max_shard_size {
         // BATCHED PARALLEL: Process buckets in batches to bound memory usage.
