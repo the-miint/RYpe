@@ -1,0 +1,38 @@
+#!/bin/bash
+# Pre-commit hook for rype: runs fmt, clippy, tests, and doc checks
+
+set -e
+
+echo "=== Running cargo fmt --check ==="
+if ! cargo fmt --check; then
+    echo ""
+    echo "ERROR: Code is not formatted. Run 'cargo fmt' to fix."
+    exit 1
+fi
+
+echo ""
+echo "=== Running cargo clippy ==="
+if ! cargo clippy --all-features -- -D warnings; then
+    echo ""
+    echo "ERROR: Clippy found issues. Fix them before committing."
+    exit 1
+fi
+
+echo ""
+echo "=== Running cargo test ==="
+if ! cargo test --all-features; then
+    echo ""
+    echo "ERROR: Tests failed. Fix them before committing."
+    exit 1
+fi
+
+echo ""
+echo "=== Running cargo doc ==="
+if ! RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features; then
+    echo ""
+    echo "ERROR: Documentation has warnings. Fix them before committing."
+    exit 1
+fi
+
+echo ""
+echo "=== Pre-commit checks passed ==="

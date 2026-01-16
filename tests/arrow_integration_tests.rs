@@ -13,11 +13,13 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 use rype::arrow::{
-    batch_to_records, classify_arrow_batch, classify_arrow_batch_inverted, hits_to_record_batch,
+    batch_to_records, classify_arrow_batch, classify_arrow_batch_sharded, hits_to_record_batch,
     result_schema, validate_input_schema, IndexStreamClassifier, COL_ID, COL_PAIR_SEQUENCE,
     COL_SEQUENCE,
 };
-use rype::{classify_batch, Index, InvertedIndex, MinimizerWorkspace};
+use rype::{
+    classify_batch, Index, InvertedIndex, MinimizerWorkspace, ShardManifest, ShardedInvertedIndex,
+};
 
 /// Generate a DNA sequence of given length with a deterministic pattern.
 fn generate_sequence(len: usize, seed: u8) -> Vec<u8> {
@@ -285,19 +287,40 @@ fn test_arrow_with_inverted_index() -> Result<()> {
     let dir = tempdir()?;
     let index = create_test_index();
 
-    // Save and create inverted index
+    // Save main index
     let index_path = dir.path().join("test.ryidx");
     index.save(&index_path)?;
 
+    // Build and save inverted index as sharded format
     let inverted_path = dir.path().join("test.ryxdi");
     let inverted = InvertedIndex::build_from_index(&index);
-    inverted.save(&inverted_path)?;
+
+    // Save as single shard
+    let shard_path = ShardManifest::shard_path(&inverted_path, 0);
+    let shard_info = inverted.save_shard(&shard_path, 0, 0, inverted.num_minimizers(), true)?;
+
+    // Create and save manifest
+    let manifest = ShardManifest {
+        k: inverted.k,
+        w: inverted.w,
+        salt: inverted.salt,
+        source_hash: 0,
+        total_minimizers: inverted.num_minimizers(),
+        total_bucket_ids: inverted.num_bucket_entries(),
+        has_overlapping_shards: true,
+        shards: vec![shard_info],
+    };
+    let manifest_path = ShardManifest::manifest_path(&inverted_path);
+    manifest.save(&manifest_path)?;
+
+    // Open sharded inverted index
+    let sharded = ShardedInvertedIndex::open(&inverted_path)?;
 
     // Test classification
     let query_seq = generate_sequence(100, 0);
     let batch = make_test_batch(&[1], &[&query_seq]);
 
-    let result = classify_arrow_batch_inverted(&inverted, None, &batch, 0.0)?;
+    let result = classify_arrow_batch_sharded(&sharded, None, &batch, 0.0, false)?;
 
     assert!(result.num_rows() > 0);
 

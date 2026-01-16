@@ -126,22 +126,52 @@ sources = ["ref_b.fasta"]
 ## Library Usage
 
 ```rust
-use rype::{Index, MinimizerWorkspace};
+use needletail::parse_fastx_file;
+use rype::{classify_batch, Index, MinimizerWorkspace};
 
-// Create an index
-let mut index = Index::new(64, 50, 0); // k=64, w=50, salt=0
+fn main() -> anyhow::Result<()> {
+    // Create an index with k=32, window=10, salt=0
+    let mut index = Index::new(32, 10, 0)?;
+    let mut workspace = MinimizerWorkspace::new();
 
-// Add sequences to buckets
-let mut workspace = MinimizerWorkspace::new();
-index.add_record(1, b"ACGTACGT...", &mut workspace);
-index.finalize_bucket(1);
+    // Add phiX174 genome (bucket 1) from examples/phiX174.fasta
+    let mut reader = parse_fastx_file("examples/phiX174.fasta")?;
+    while let Some(record) = reader.next() {
+        let record = record?;
+        index.add_record(1, std::str::from_utf8(record.id())?, &record.seq(), &mut workspace);
+    }
+    index.finalize_bucket(1);
+    index.bucket_names.insert(1, "phiX174".to_string());
 
-// Save and load
-index.save("index.ryidx")?;
-let loaded = Index::load("index.ryidx")?;
+    // Add pUC19 plasmid (bucket 2) from examples/pUC19.fasta
+    let mut reader = parse_fastx_file("examples/pUC19.fasta")?;
+    while let Some(record) = reader.next() {
+        let record = record?;
+        index.add_record(2, std::str::from_utf8(record.id())?, &record.seq(), &mut workspace);
+    }
+    index.finalize_bucket(2);
+    index.bucket_names.insert(2, "pUC19".to_string());
 
-// Classify sequences
-let results = loaded.classify_batch(&queries, threshold, num_threads);
+    // Save index (using tempfile to avoid side effects in doc tests)
+    let temp_dir = tempfile::tempdir()?;
+    let index_path = temp_dir.path().join("example.ryidx");
+    index.save(&index_path)?;
+
+    // Load and classify
+    let loaded = Index::load(&index_path)?;
+
+    // Create query from first 100bp of phiX174 - should match bucket 1
+    let query_seq = b"GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTTGATAAAGCAGGAATTACTACTGCTTGTTT";
+    let queries = vec![(1_i64, query_seq.as_slice(), None)];
+
+    let results = classify_batch(&loaded, None, &queries, 0.1);
+    for hit in &results {
+        let name = loaded.bucket_names.get(&hit.bucket_id).unwrap();
+        println!("Query {} -> {} (score: {:.2})", hit.query_id, name, hit.score);
+    }
+
+    Ok(())
+}
 ```
 
 ## C API
@@ -149,31 +179,62 @@ let results = loaded.classify_batch(&queries, threshold, num_threads);
 Rype provides a C API for FFI integration:
 
 ```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "rype.h"
 
-// Load index
-RypeIndex* index = rype_index_load("index.ryidx");
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <index.ryidx>\n", argv[0]);
+        return 1;
+    }
 
-// Classify sequences
-RypeResultArray* results = rype_classify(index, queries, num_queries, threshold);
+    // Load index
+    RypeIndex* index = rype_index_load(argv[1]);
+    if (!index) {
+        fprintf(stderr, "Failed to load index: %s\n", rype_get_last_error());
+        return 1;
+    }
 
-// Process results
-for (size_t i = 0; i < results->len; i++) {
-    printf("Query %u -> Bucket %u (score: %f)\n",
-           results->data[i].query_id,
-           results->data[i].bucket_id,
-           results->data[i].score);
+    // Create a query (70bp from phiX174)
+    const char* seq = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT";
+    RypeQuery queries[1];
+    queries[0].seq = (const uint8_t*)seq;
+    queries[0].seq_len = strlen(seq);
+    queries[0].pair_seq = NULL;
+    queries[0].pair_len = 0;
+
+    // Classify sequences
+    RypeResultArray* results = rype_classify(index, queries, 1, 0.1);
+    if (!results) {
+        fprintf(stderr, "Classification failed: %s\n", rype_get_last_error());
+        rype_index_free(index);
+        return 1;
+    }
+
+    // Process results
+    printf("Found %zu hits:\n", results->len);
+    for (size_t i = 0; i < results->len; i++) {
+        const char* name = rype_bucket_name(index, results->data[i].bucket_id);
+        printf("  Query %ld -> %s (bucket %u, score: %.2f)\n",
+               results->data[i].query_id,
+               name ? name : "unknown",
+               results->data[i].bucket_id,
+               results->data[i].score);
+    }
+
+    // Cleanup
+    rype_results_free(results);
+    rype_index_free(index);
+    return 0;
 }
-
-// Cleanup
-rype_results_free(results);
-rype_index_free(index);
 ```
 
-Build with:
+Build and run:
 ```bash
 gcc example.c -L target/release -lrype -o example
-LD_LIBRARY_PATH=target/release ./example
+LD_LIBRARY_PATH=target/release ./example index.ryidx
 ```
 
 ### Thread Safety
@@ -215,7 +276,7 @@ Binary format with zstd-compressed, delta-encoded minimizers. Achieves ~65% comp
 ### Sharded Index
 
 For large datasets that exceed available RAM:
-```
+```text
 index.ryidx.manifest     # Manifest file
 index.ryidx.shard.0      # Shard 0
 index.ryidx.shard.1      # Shard 1
@@ -225,7 +286,7 @@ index.ryidx.shard.1      # Shard 1
 ### Inverted Index (`.ryxdi`)
 
 Memory-efficient format for classification:
-```
+```text
 index.ryxdi.manifest     # Manifest file
 index.ryxdi.shard.0      # Shard 0 (1:1 with main shards)
 ...
@@ -250,6 +311,21 @@ cargo test -- --nocapture
 # Run specific test
 cargo test test_name
 ```
+
+## Development Setup
+
+```bash
+# Enable pre-commit hooks (runs fmt, clippy, tests, doc checks)
+git config core.hooksPath .githooks
+
+# Manually run checks
+cargo fmt --check
+cargo clippy --all-features -- -D warnings
+cargo test --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+```
+
+The test suite includes automated verification that README examples compile and run correctly (`readme_example_test.rs` and `cli_integration_tests.rs::test_readme_bash_examples`).
 
 ## License
 

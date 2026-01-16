@@ -498,7 +498,7 @@ const MEMORY_FUDGE_FACTOR: f64 = 1.3;
 ///
 /// Memory components:
 /// - Input records: batch_size * (72 + avg_query_length) for OwnedRecord
-/// - Minimizers: batch_size * minimizers_per_query * 16 bytes (Vec<u64> for fwd + rc)
+/// - Minimizers: batch_size * minimizers_per_query * 16 bytes (`Vec<u64>` for fwd + rc)
 /// - QueryInvertedIndex CSR: batch_size * minimizers_per_query * 12 bytes
 /// - Accumulators: batch_size * estimated_buckets_per_read * 12 bytes (HashMap overhead)
 pub fn estimate_batch_memory(

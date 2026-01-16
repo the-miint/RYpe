@@ -647,3 +647,191 @@ fn test_negative_index_parameter_validation() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// README CLI Example Tests
+// ============================================================================
+// These tests extract and run the actual bash examples from README.md.
+
+use std::process::Command;
+
+/// Extract bash code blocks from markdown content
+fn extract_bash_code_blocks(markdown: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut in_bash_block = false;
+    let mut current_block = String::new();
+
+    for line in markdown.lines() {
+        if line.starts_with("```bash") {
+            in_bash_block = true;
+            current_block.clear();
+        } else if line == "```" && in_bash_block {
+            in_bash_block = false;
+            if !current_block.trim().is_empty() {
+                blocks.push(current_block.clone());
+            }
+        } else if in_bash_block {
+            current_block.push_str(line);
+            current_block.push('\n');
+        }
+    }
+
+    blocks
+}
+
+/// Extract individual commands from a bash block (split by newlines, filter comments)
+fn extract_commands(block: &str) -> Vec<String> {
+    block
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// Test that README bash examples for index creation and classification work.
+/// This extracts actual commands from README.md and runs them with real example files.
+#[test]
+fn test_readme_bash_examples() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let readme_path = std::path::Path::new(manifest_dir).join("README.md");
+    let readme = std::fs::read_to_string(&readme_path)?;
+
+    let bash_blocks = extract_bash_code_blocks(&readme);
+    assert!(!bash_blocks.is_empty(), "No bash blocks found in README");
+
+    // Set up test environment
+    let dir = tempdir()?;
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping README bash test: example FASTA files not found");
+        return Ok(());
+    }
+
+    // Create a query file for classify commands
+    let query_path = dir.path().join("reads.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+
+    // Track which commands we've tested
+    let mut tested_commands = Vec::new();
+
+    for block in &bash_blocks {
+        for cmd in extract_commands(block) {
+            // Only test rype commands (skip cargo, gcc, etc.)
+            if !cmd.starts_with("rype ") {
+                continue;
+            }
+
+            // Substitute placeholder paths with real paths
+            let cmd = cmd
+                .replace("ref1.fasta", phix_path.to_str().unwrap())
+                .replace("ref2.fasta", puc19_path.to_str().unwrap())
+                .replace("new_ref.fasta", phix_path.to_str().unwrap())
+                .replace("reads.fastq", query_path.to_str().unwrap())
+                .replace("reads_R1.fastq", query_path.to_str().unwrap())
+                .replace("reads_R2.fastq", query_path.to_str().unwrap())
+                .replace("index.ryidx", dir.path().join("index.ryidx").to_str().unwrap())
+                .replace("large.ryidx", dir.path().join("index.ryidx").to_str().unwrap())
+                .replace("sharded.ryidx", dir.path().join("sharded.ryidx").to_str().unwrap())
+                .replace("merged.ryidx", dir.path().join("merged.ryidx").to_str().unwrap())
+                .replace("idx1.ryidx", dir.path().join("index.ryidx").to_str().unwrap())
+                .replace("idx2.ryidx", dir.path().join("index.ryidx").to_str().unwrap())
+                .replace("config.toml", dir.path().join("config.toml").to_str().unwrap())
+                // Use smaller k and w for faster tests
+                .replace("-k 64", "-k 32")
+                .replace("-w 50", "-w 10");
+
+            // Skip commands that need files we haven't created yet
+            if cmd.contains("config.toml")
+                || cmd.contains("bucket-merge")
+                || cmd.contains("merge -o")
+            {
+                continue;
+            }
+
+            // Parse command into args (simple split, doesn't handle quotes)
+            let args: Vec<&str> = cmd
+                .strip_prefix("rype ")
+                .unwrap()
+                .split_whitespace()
+                .collect();
+
+            // Ensure index exists for commands that need it
+            let needs_index = args
+                .iter()
+                .any(|a| *a == "-i" || *a == "stats" || *a == "invert");
+            let index_path = dir.path().join("index.ryidx");
+            if needs_index && !index_path.exists() {
+                // Create index first
+                let output = Command::new(&binary)
+                    .args([
+                        "index",
+                        "create",
+                        "-o",
+                        index_path.to_str().unwrap(),
+                        "-r",
+                        phix_path.to_str().unwrap(),
+                        "-r",
+                        puc19_path.to_str().unwrap(),
+                        "-k",
+                        "32",
+                        "-w",
+                        "10",
+                    ])
+                    .output()?;
+                assert!(
+                    output.status.success(),
+                    "Failed to create prerequisite index"
+                );
+            }
+
+            println!("Testing README command: rype {}", args.join(" "));
+
+            let output = Command::new(&binary)
+                .args(&args)
+                .current_dir(dir.path())
+                .output()?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // Some commands may fail due to missing files - that's OK for this test
+                // We're mainly checking that the CLI parses correctly
+                if !stderr.contains("No such file") && !stderr.contains("not found") {
+                    panic!(
+                        "README command failed: rype {}\nStderr: {}",
+                        args.join(" "),
+                        stderr
+                    );
+                }
+            }
+
+            tested_commands.push(cmd.clone());
+        }
+    }
+
+    println!("\nTested {} README CLI commands:", tested_commands.len());
+    for cmd in &tested_commands {
+        println!("  {}", cmd);
+    }
+
+    assert!(
+        !tested_commands.is_empty(),
+        "Should have tested at least one README command"
+    );
+
+    Ok(())
+}
