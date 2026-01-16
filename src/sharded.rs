@@ -8,12 +8,12 @@
 //! read. For large indices, sharding enables memory-efficient classification by loading
 //! one shard at a time.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::constants::{MAX_INVERTED_MINIMIZERS, MAX_INVERTED_BUCKET_IDS};
+use crate::constants::{MAX_INVERTED_BUCKET_IDS, MAX_INVERTED_MINIMIZERS};
 use crate::inverted::InvertedIndex;
 use crate::types::IndexMetadata;
 
@@ -94,7 +94,11 @@ impl ShardManifest {
         writer.write_all(&(self.total_minimizers as u64).to_le_bytes())?;
         writer.write_all(&(self.total_bucket_ids as u64).to_le_bytes())?;
 
-        writer.write_all(&[if self.has_overlapping_shards { 1u8 } else { 0u8 }])?;
+        writer.write_all(&[if self.has_overlapping_shards {
+            1u8
+        } else {
+            0u8
+        }])?;
         writer.write_all(&(self.shards.len() as u32).to_le_bytes())?;
 
         for shard in &self.shards {
@@ -136,7 +140,10 @@ impl ShardManifest {
         reader.read_exact(&mut buf8)?;
         let k = u64::from_le_bytes(buf8) as usize;
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!("Invalid K value in manifest: {} (must be 16, 32, or 64)", k));
+            return Err(anyhow!(
+                "Invalid K value in manifest: {} (must be 16, 32, or 64)",
+                k
+            ));
         }
 
         reader.read_exact(&mut buf8)?;
@@ -152,8 +159,9 @@ impl ShardManifest {
         let total_minimizers = u64::from_le_bytes(buf8) as usize;
         if total_minimizers > MAX_INVERTED_MINIMIZERS {
             return Err(anyhow!(
-                "Invalid total_minimizers in manifest: {} (max {})",
-                total_minimizers, MAX_INVERTED_MINIMIZERS
+                "Invalid total_minimizers in manifest: {} (hard-coded limit: {} as defensive sanity check)",
+                total_minimizers,
+                MAX_INVERTED_MINIMIZERS
             ));
         }
 
@@ -162,7 +170,8 @@ impl ShardManifest {
         if total_bucket_ids > MAX_INVERTED_BUCKET_IDS {
             return Err(anyhow!(
                 "Invalid total_bucket_ids in manifest: {} (max {})",
-                total_bucket_ids, MAX_INVERTED_BUCKET_IDS
+                total_bucket_ids,
+                MAX_INVERTED_BUCKET_IDS
             ));
         }
 
@@ -173,7 +182,11 @@ impl ShardManifest {
         let num_shards = u32::from_le_bytes(buf4);
 
         if num_shards > Self::MAX_SHARDS {
-            return Err(anyhow!("Too many shards: {} (max {})", num_shards, Self::MAX_SHARDS));
+            return Err(anyhow!(
+                "Too many shards: {} (max {})",
+                num_shards,
+                Self::MAX_SHARDS
+            ));
         }
 
         let mut shards = Vec::with_capacity(num_shards as usize);
@@ -213,7 +226,8 @@ impl ShardManifest {
                 if shards[i].shard_id != shards[i - 1].shard_id + 1 {
                     return Err(anyhow!(
                         "Invalid manifest: shard IDs not sequential (shard {} followed by {})",
-                        shards[i - 1].shard_id, shards[i].shard_id
+                        shards[i - 1].shard_id,
+                        shards[i].shard_id
                     ));
                 }
             }
@@ -224,13 +238,15 @@ impl ShardManifest {
             if sum_minimizers != total_minimizers {
                 return Err(anyhow!(
                     "Invalid manifest: shard minimizer counts sum to {}, expected {}",
-                    sum_minimizers, total_minimizers
+                    sum_minimizers,
+                    total_minimizers
                 ));
             }
             if sum_bucket_ids != total_bucket_ids {
                 return Err(anyhow!(
                     "Invalid manifest: shard bucket_id counts sum to {}, expected {}",
-                    sum_bucket_ids, total_bucket_ids
+                    sum_bucket_ids,
+                    total_bucket_ids
                 ));
             }
         }
@@ -334,21 +350,32 @@ impl ShardedInvertedIndex {
     /// Validate against Index metadata.
     pub fn validate_against_metadata(&self, metadata: &IndexMetadata) -> Result<()> {
         if self.manifest.k != metadata.k {
-            return Err(anyhow!("K mismatch: sharded index has K={}, metadata has K={}",
-                self.manifest.k, metadata.k));
+            return Err(anyhow!(
+                "K mismatch: sharded index has K={}, metadata has K={}",
+                self.manifest.k,
+                metadata.k
+            ));
         }
         if self.manifest.w != metadata.w {
-            return Err(anyhow!("W mismatch: sharded index has W={}, metadata has W={}",
-                self.manifest.w, metadata.w));
+            return Err(anyhow!(
+                "W mismatch: sharded index has W={}, metadata has W={}",
+                self.manifest.w,
+                metadata.w
+            ));
         }
         if self.manifest.salt != metadata.salt {
-            return Err(anyhow!("Salt mismatch: sharded index has salt={:#x}, metadata has salt={:#x}",
-                self.manifest.salt, metadata.salt));
+            return Err(anyhow!(
+                "Salt mismatch: sharded index has salt={:#x}, metadata has salt={:#x}",
+                self.manifest.salt,
+                metadata.salt
+            ));
         }
 
         let expected_hash = InvertedIndex::compute_metadata_hash(metadata);
         if self.manifest.source_hash != expected_hash {
-            return Err(anyhow!("Source hash mismatch: sharded index is stale or was built from different source"));
+            return Err(anyhow!(
+                "Source hash mismatch: sharded index is stale or was built from different source"
+            ));
         }
 
         Ok(())
@@ -442,7 +469,7 @@ mod tests {
             shards: vec![
                 ShardInfo {
                     shard_id: 0,
-                    min_start: 100,  // Overlaps with shard 1
+                    min_start: 100, // Overlaps with shard 1
                     min_end: 0,
                     is_last_shard: false,
                     num_minimizers: 50,
@@ -450,7 +477,7 @@ mod tests {
                 },
                 ShardInfo {
                     shard_id: 1,
-                    min_start: 100,  // Same min_start as shard 0 (overlapping)
+                    min_start: 100, // Same min_start as shard 0 (overlapping)
                     min_end: 0,
                     is_last_shard: false,
                     num_minimizers: 50,
@@ -458,7 +485,7 @@ mod tests {
                 },
                 ShardInfo {
                     shard_id: 2,
-                    min_start: 50,   // Lower than previous shards (not sorted)
+                    min_start: 50, // Lower than previous shards (not sorted)
                     min_end: 0,
                     is_last_shard: true,
                     num_minimizers: 50,
@@ -483,7 +510,7 @@ mod tests {
         // Verify shard info preserved (including "invalid" range data)
         assert_eq!(loaded.shards[0].min_start, 100);
         assert_eq!(loaded.shards[1].min_start, 100); // Same as shard 0
-        assert_eq!(loaded.shards[2].min_start, 50);  // Lower than previous
+        assert_eq!(loaded.shards[2].min_start, 50); // Lower than previous
 
         Ok(())
     }
@@ -496,7 +523,10 @@ mod tests {
 
         let result = ShardManifest::load(path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid shard manifest format"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid shard manifest format"));
     }
 
     #[test]
@@ -511,7 +541,10 @@ mod tests {
 
         let result = ShardManifest::load(path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unsupported inverted index manifest version"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported inverted index manifest version"));
     }
 
     #[test]
@@ -528,8 +561,16 @@ mod tests {
         let result = ShardManifest::load(path);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Unsupported inverted index manifest version"), "Error should mention version: {}", err);
-        assert!(err.contains("rype index invert"), "Error should suggest regenerating: {}", err);
+        assert!(
+            err.contains("Unsupported inverted index manifest version"),
+            "Error should mention version: {}",
+            err
+        );
+        assert!(
+            err.contains("rype index invert"),
+            "Error should suggest regenerating: {}",
+            err
+        );
     }
 
     #[test]

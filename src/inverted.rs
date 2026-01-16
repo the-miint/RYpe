@@ -4,7 +4,10 @@
 //! that contain it, using a CSR (Compressed Sparse Row) format. This enables
 //! O(Q * log(U)) lookups where Q = query minimizers and U = unique minimizers.
 
-use anyhow::{Result, anyhow};
+// The k-way merge heap type is complex but clear in context
+#![allow(clippy::type_complexity)]
+
+use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -12,8 +15,8 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::constants::{MAX_INVERTED_MINIMIZERS, MAX_INVERTED_BUCKET_IDS};
-use crate::encoding::{encode_varint, decode_varint, VarIntError, MAX_VARINT_BYTES};
+use crate::constants::{MAX_INVERTED_BUCKET_IDS, MAX_INVERTED_MINIMIZERS};
+use crate::encoding::{decode_varint, encode_varint, VarIntError, MAX_VARINT_BYTES};
 use crate::index::Index;
 use crate::sharded::ShardInfo;
 use crate::sharded_main::MainIndexShard;
@@ -49,7 +52,8 @@ impl InvertedIndex {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        let mut pairs: Vec<(u32, usize)> = metadata.bucket_minimizer_counts
+        let mut pairs: Vec<(u32, usize)> = metadata
+            .bucket_minimizer_counts
             .iter()
             .map(|(&id, &count)| (id, count))
             .collect();
@@ -82,9 +86,7 @@ impl InvertedIndex {
             salt: index.salt,
             bucket_names: index.bucket_names.clone(),
             bucket_sources: index.bucket_sources.clone(),
-            bucket_minimizer_counts: index.buckets.iter()
-                .map(|(&id, v)| (id, v.len()))
-                .collect(),
+            bucket_minimizer_counts: index.buckets.iter().map(|(&id, v)| (id, v.len())).collect(),
         };
 
         Self::build_from_bucket_map(index.k, index.w, index.salt, &index.buckets, &metadata)
@@ -103,9 +105,7 @@ impl InvertedIndex {
             salt: shard.salt,
             bucket_names: HashMap::new(),
             bucket_sources: HashMap::new(),
-            bucket_minimizer_counts: shard.buckets.iter()
-                .map(|(&id, v)| (id, v.len()))
-                .collect(),
+            bucket_minimizer_counts: shard.buckets.iter().map(|(&id, v)| (id, v.len())).collect(),
         };
 
         Self::build_from_bucket_map(shard.k, shard.w, shard.salt, &shard.buckets, &metadata)
@@ -177,8 +177,10 @@ impl InvertedIndex {
                     current_bucket_ids.sort_unstable();
                     current_bucket_ids.dedup();
                     bucket_ids_out.extend_from_slice(&current_bucket_ids);
-                    offsets.push(u32::try_from(bucket_ids_out.len())
-                        .expect("CSR offset overflow: bucket_ids exceeded u32::MAX"));
+                    offsets.push(
+                        u32::try_from(bucket_ids_out.len())
+                            .expect("CSR offset overflow: bucket_ids exceeded u32::MAX"),
+                    );
                     current_bucket_ids.clear();
                 }
                 minimizers.push(min_val);
@@ -190,7 +192,11 @@ impl InvertedIndex {
             // Push next element from this bucket if available
             let next_pos = pos + 1;
             if next_pos < bucket_mins.len() {
-                heap.push((Reverse((bucket_mins[next_pos], bucket_id)), data_idx, next_pos));
+                heap.push((
+                    Reverse((bucket_mins[next_pos], bucket_id)),
+                    data_idx,
+                    next_pos,
+                ));
             }
         }
 
@@ -199,8 +205,10 @@ impl InvertedIndex {
             current_bucket_ids.sort_unstable();
             current_bucket_ids.dedup();
             bucket_ids_out.extend_from_slice(&current_bucket_ids);
-            offsets.push(u32::try_from(bucket_ids_out.len())
-                .expect("CSR offset overflow: bucket_ids exceeded u32::MAX"));
+            offsets.push(
+                u32::try_from(bucket_ids_out.len())
+                    .expect("CSR offset overflow: bucket_ids exceeded u32::MAX"),
+            );
         }
 
         minimizers.shrink_to_fit();
@@ -225,8 +233,12 @@ impl InvertedIndex {
                 "Inverted index parameters don't match source index.\n  \
                  Inverted: K={}, W={}, salt=0x{:x}\n  \
                  Source:   K={}, W={}, salt=0x{:x}",
-                self.k, self.w, self.salt,
-                metadata.k, metadata.w, metadata.salt
+                self.k,
+                self.w,
+                self.salt,
+                metadata.k,
+                metadata.w,
+                metadata.salt
             ));
         }
 
@@ -298,10 +310,21 @@ impl InvertedIndex {
     }
 
     /// Save a subset of this inverted index as a shard file (RYXS format v1).
-    pub fn save_shard(&self, path: &Path, shard_id: u32, start_idx: usize, end_idx: usize, is_last_shard: bool) -> Result<ShardInfo> {
+    pub fn save_shard(
+        &self,
+        path: &Path,
+        shard_id: u32,
+        start_idx: usize,
+        end_idx: usize,
+        is_last_shard: bool,
+    ) -> Result<ShardInfo> {
         let end_idx = end_idx.min(self.minimizers.len());
         if start_idx >= end_idx {
-            return Err(anyhow!("Invalid shard range: start {} >= end {}", start_idx, end_idx));
+            return Err(anyhow!(
+                "Invalid shard range: start {} >= end {}",
+                start_idx,
+                end_idx
+            ));
         }
 
         let shard_minimizers = &self.minimizers[start_idx..end_idx];
@@ -346,7 +369,9 @@ impl InvertedIndex {
         const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024;
         let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
 
-        let flush_buf = |buf: &mut Vec<u8>, encoder: &mut zstd::stream::write::Encoder<BufWriter<File>>| -> Result<()> {
+        let flush_buf = |buf: &mut Vec<u8>,
+                         encoder: &mut zstd::stream::write::Encoder<BufWriter<File>>|
+         -> Result<()> {
             if !buf.is_empty() {
                 encoder.write_all(buf)?;
                 buf.clear();
@@ -432,13 +457,19 @@ impl InvertedIndex {
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
         if version != 1 {
-            return Err(anyhow!("Unsupported shard version: {} (expected 1)", version));
+            return Err(anyhow!(
+                "Unsupported shard version: {} (expected 1)",
+                version
+            ));
         }
 
         reader.read_exact(&mut buf8)?;
         let k = u64::from_le_bytes(buf8) as usize;
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!("Invalid K value in shard: {} (must be 16, 32, or 64)", k));
+            return Err(anyhow!(
+                "Invalid K value in shard: {} (must be 16, 32, or 64)",
+                k
+            ));
         }
 
         reader.read_exact(&mut buf8)?;
@@ -464,7 +495,11 @@ impl InvertedIndex {
         let num_bucket_ids = u64::from_le_bytes(buf8) as usize;
 
         if num_minimizers > MAX_INVERTED_MINIMIZERS {
-            return Err(anyhow!("Shard has too many minimizers: {}", num_minimizers));
+            return Err(anyhow!(
+                "Shard has too many minimizers: {} (hard-coded limit: {} as defensive sanity check)",
+                num_minimizers,
+                MAX_INVERTED_MINIMIZERS
+            ));
         }
         if num_bucket_ids > MAX_INVERTED_BUCKET_IDS {
             return Err(anyhow!("Shard has too many bucket IDs: {}", num_bucket_ids));
@@ -511,10 +546,14 @@ impl InvertedIndex {
             return Err(anyhow!("Invalid shard: first offset must be 0"));
         }
         if offsets.windows(2).any(|w| w[0] > w[1]) {
-            return Err(anyhow!("Invalid shard: offsets not monotonically increasing"));
+            return Err(anyhow!(
+                "Invalid shard: offsets not monotonically increasing"
+            ));
         }
         if !offsets.is_empty() && *offsets.last().unwrap() as usize != num_bucket_ids {
-            return Err(anyhow!("Invalid shard: final offset doesn't match bucket_ids count"));
+            return Err(anyhow!(
+                "Invalid shard: final offset doesn't match bucket_ids count"
+            ));
         }
 
         let mut minimizers = Vec::with_capacity(num_minimizers);
@@ -551,23 +590,29 @@ impl InvertedIndex {
                         Err(VarIntError::Overflow(bytes)) => {
                             return Err(anyhow!(
                                 "Malformed varint at minimizer {}: exceeded 10 bytes (consumed {})",
-                                i, bytes
+                                i,
+                                bytes
                             ));
                         }
                     }
                 };
                 buf_pos += consumed;
 
-                let val = prev.checked_add(delta)
-                    .ok_or_else(|| anyhow!(
+                let val = prev.checked_add(delta).ok_or_else(|| {
+                    anyhow!(
                         "Minimizer overflow at index {} (prev={}, delta={})",
-                        i, prev, delta
-                    ))?;
+                        i,
+                        prev,
+                        delta
+                    )
+                })?;
 
                 if val <= prev && i > 0 {
                     return Err(anyhow!(
                         "Minimizers not strictly increasing at index {} (prev={}, val={})",
-                        i, prev, val
+                        i,
+                        prev,
+                        val
                     ));
                 }
 
@@ -712,7 +757,8 @@ impl QueryInvertedIndex {
         assert!(
             queries.len() <= Self::MAX_READS,
             "Batch size {} exceeds maximum {} reads (31-bit limit)",
-            queries.len(), Self::MAX_READS
+            queries.len(),
+            Self::MAX_READS
         );
 
         if queries.is_empty() {
@@ -1031,7 +1077,10 @@ mod tests {
 
         let result = InvertedIndex::load_shard(path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid shard format"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid shard format"));
     }
 
     #[test]
@@ -1179,8 +1228,14 @@ mod tests {
         assert_eq!(inv_from_index.k, inv_from_shard.k);
         assert_eq!(inv_from_index.w, inv_from_shard.w);
         assert_eq!(inv_from_index.salt, inv_from_shard.salt);
-        assert_eq!(inv_from_index.num_minimizers(), inv_from_shard.num_minimizers());
-        assert_eq!(inv_from_index.num_bucket_entries(), inv_from_shard.num_bucket_entries());
+        assert_eq!(
+            inv_from_index.num_minimizers(),
+            inv_from_shard.num_minimizers()
+        );
+        assert_eq!(
+            inv_from_index.num_bucket_entries(),
+            inv_from_shard.num_bucket_entries()
+        );
 
         // Minimizer arrays should be identical
         assert_eq!(inv_from_index.minimizers, inv_from_shard.minimizers);
@@ -1268,8 +1323,8 @@ mod tests {
     fn test_query_inverted_overlapping_minimizers() {
         // Two reads with overlapping minimizers
         let queries = vec![
-            (vec![100, 200], vec![150]),      // read 0: fwd=[100,200], rc=[150]
-            (vec![100, 300], vec![150]),      // read 1: fwd=[100,300], rc=[150]
+            (vec![100, 200], vec![150]), // read 0: fwd=[100,200], rc=[150]
+            (vec![100, 300], vec![150]), // read 1: fwd=[100,300], rc=[150]
         ];
         let qidx = QueryInvertedIndex::build(&queries);
 
@@ -1293,7 +1348,8 @@ mod tests {
         assert_eq!(end - start, 2); // 150 appears in 2 reads
 
         // Verify the read IDs for minimizer 100 are reads 0 and 1 (forward)
-        let reads_for_100: Vec<(u32, bool)> = qidx.read_ids[qidx.offsets[0] as usize..qidx.offsets[1] as usize]
+        let reads_for_100: Vec<(u32, bool)> = qidx.read_ids
+            [qidx.offsets[0] as usize..qidx.offsets[1] as usize]
             .iter()
             .map(|&p| QueryInvertedIndex::unpack_read_id(p))
             .collect();
@@ -1301,7 +1357,8 @@ mod tests {
         assert!(reads_for_100.contains(&(1, false)));
 
         // Verify the read IDs for minimizer 150 are reads 0 and 1 (RC)
-        let reads_for_150: Vec<(u32, bool)> = qidx.read_ids[qidx.offsets[1] as usize..qidx.offsets[2] as usize]
+        let reads_for_150: Vec<(u32, bool)> = qidx.read_ids
+            [qidx.offsets[1] as usize..qidx.offsets[2] as usize]
             .iter()
             .map(|&p| QueryInvertedIndex::unpack_read_id(p))
             .collect();
@@ -1312,9 +1369,9 @@ mod tests {
     #[test]
     fn test_query_inverted_fwd_rc_counts() {
         let queries = vec![
-            (vec![100, 200, 300], vec![150, 250]),       // 3 fwd, 2 rc
-            (vec![100], vec![150, 250, 350, 450]),       // 1 fwd, 4 rc
-            (vec![], vec![500, 600]),                     // 0 fwd, 2 rc
+            (vec![100, 200, 300], vec![150, 250]), // 3 fwd, 2 rc
+            (vec![100], vec![150, 250, 350, 450]), // 1 fwd, 4 rc
+            (vec![], vec![500, 600]),              // 0 fwd, 2 rc
         ];
         let qidx = QueryInvertedIndex::build(&queries);
 
@@ -1332,10 +1389,7 @@ mod tests {
     #[test]
     fn test_query_inverted_all_empty_reads() {
         // Reads with no minimizers
-        let queries = vec![
-            (vec![], vec![]),
-            (vec![], vec![]),
-        ];
+        let queries = vec![(vec![], vec![]), (vec![], vec![])];
         let qidx = QueryInvertedIndex::build(&queries);
 
         assert_eq!(qidx.num_minimizers(), 0);
@@ -1372,7 +1426,8 @@ mod tests {
         assert!(
             fake_len <= QueryInvertedIndex::MAX_READS,
             "Batch size {} exceeds maximum {} reads (31-bit limit)",
-            fake_len, QueryInvertedIndex::MAX_READS
+            fake_len,
+            QueryInvertedIndex::MAX_READS
         );
 
         // This line won't be reached due to the panic above
@@ -1382,8 +1437,8 @@ mod tests {
     #[test]
     fn test_query_inverted_accessor_methods() {
         let queries = vec![
-            (vec![100, 200, 300], vec![150, 250]),  // 3 fwd, 2 rc
-            (vec![100], vec![150, 250, 350]),       // 1 fwd, 3 rc
+            (vec![100, 200, 300], vec![150, 250]), // 3 fwd, 2 rc
+            (vec![100], vec![150, 250, 350]),      // 1 fwd, 3 rc
         ];
         let qidx = QueryInvertedIndex::build(&queries);
 
@@ -1470,9 +1525,11 @@ mod tests {
 
         // Verify all minimizers were preserved
         assert_eq!(
-            loaded.num_minimizers(), original_count,
+            loaded.num_minimizers(),
+            original_count,
             "Minimizer count changed after save/load: {} -> {}",
-            original_count, loaded.num_minimizers()
+            original_count,
+            loaded.num_minimizers()
         );
 
         // Verify specific high-value minimizers weren't truncated
@@ -1487,7 +1544,8 @@ mod tests {
 
         // Verify the actual minimizer values match exactly
         assert_eq!(
-            loaded.minimizers(), inverted.minimizers(),
+            loaded.minimizers(),
+            inverted.minimizers(),
             "Minimizer arrays differ after save/load"
         );
 
@@ -1512,7 +1570,7 @@ mod tests {
             12297829382473034408,
             12297829382473034409,
             12297829382473034410,
-            14168481312020516,  // The actual problematic minimizer from the bug report
+            14168481312020516, // The actual problematic minimizer from the bug report
             u64::MAX - 1000,
             u64::MAX - 100,
             u64::MAX - 10,

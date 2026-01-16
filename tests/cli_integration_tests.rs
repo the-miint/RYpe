@@ -1,9 +1,12 @@
-use rype::{Index, MinimizerWorkspace, extract_with_positions, Strand, classify_batch, get_paired_minimizers_into};
-use rype::QueryRecord;
-use std::fs;
-use std::collections::HashSet;
-use tempfile::tempdir;
 use anyhow::Result;
+use rype::QueryRecord;
+use rype::{
+    classify_batch, extract_with_positions, get_paired_minimizers_into, Index, MinimizerWorkspace,
+    Strand,
+};
+use std::collections::HashSet;
+use std::fs;
+use tempfile::tempdir;
 
 /// Test that index creation with multiple records creates single bucket (Issue #1)
 #[test]
@@ -12,13 +15,14 @@ fn test_index_multi_record_single_bucket() -> Result<()> {
     let ref_file = dir.path().join("reference.fa");
 
     // Create FASTA with multiple records
-    fs::write(&ref_file,
+    fs::write(
+        &ref_file,
         ">seq1\n\
          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n\
          >seq2\n\
          TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT\n\
          >seq3\n\
-         GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\n"
+         GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\n",
     )?;
 
     let index_file = dir.path().join("test.ryidx");
@@ -78,11 +82,12 @@ fn test_index_bucket_add_multi_record_single_bucket() -> Result<()> {
 
     // Create new reference file with multiple records
     let new_ref = dir.path().join("new_reference.fa");
-    fs::write(&new_ref,
+    fs::write(
+        &new_ref,
         ">seq1\n\
          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n\
          >seq2\n\
-         CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\n"
+         CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\n",
     )?;
 
     // Simulate: cargo run -- index-bucket-add -i test.ryidx -r new_reference.fa
@@ -113,7 +118,11 @@ fn test_index_bucket_add_multi_record_single_bucket() -> Result<()> {
 
     // Verify the new bucket (ID=2) has both records
     let sources = &loaded.bucket_sources[&next_id];
-    assert_eq!(sources.len(), 2, "New bucket should have 2 source sequences");
+    assert_eq!(
+        sources.len(),
+        2,
+        "New bucket should have 2 source sequences"
+    );
     assert!(sources[0].contains("seq1"));
     assert!(sources[1].contains("seq2"));
 
@@ -126,11 +135,12 @@ fn test_bucket_naming_consistency() -> Result<()> {
     let dir = tempdir()?;
     let ref_file = dir.path().join("myfile.fasta");
 
-    fs::write(&ref_file,
+    fs::write(
+        &ref_file,
         ">record1\n\
          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n\
          >record2\n\
-         TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT\n"
+         TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT\n",
     )?;
 
     let index_file = dir.path().join("test.ryidx");
@@ -158,8 +168,10 @@ fn test_bucket_naming_consistency() -> Result<()> {
 
     // Verify: Bucket name should be filename, not record name
     let loaded = Index::load(&index_file)?;
-    assert_eq!(loaded.bucket_names[&1], filename,
-               "Bucket name should be filename, not record name");
+    assert_eq!(
+        loaded.bucket_names[&1], filename,
+        "Bucket name should be filename, not record name"
+    );
 
     // But sources should include record names
     assert!(loaded.bucket_sources[&1][0].contains("record1"));
@@ -201,12 +213,17 @@ fn test_merge_buckets_minimizer_count() -> Result<()> {
     // Verify: Minimizer count should be updated
     let loaded = Index::load(&index_file)?;
     assert_eq!(loaded.buckets.len(), 1, "Should have 1 bucket after merge");
-    assert!(!loaded.buckets.contains_key(&1), "Source bucket should be removed");
+    assert!(
+        !loaded.buckets.contains_key(&1),
+        "Source bucket should be removed"
+    );
     assert!(loaded.buckets.contains_key(&2), "Dest bucket should exist");
 
     let count_after = loaded.buckets[&2].len();
-    assert!(count_after >= count_before,
-            "Minimizer count should be >= original count after merge");
+    assert!(
+        count_after >= count_before,
+        "Minimizer count should be >= original count after merge"
+    );
 
     // Verify sources were merged
     assert_eq!(loaded.bucket_sources[&2].len(), 2, "Should have 2 sources");
@@ -229,8 +246,12 @@ fn test_extract_with_positions_correctness() -> Result<()> {
 
     // All positions should be valid
     for m in &results {
-        assert!(m.position + 16 <= seq.len(),
-            "Position {} invalid for seq len {}", m.position, seq.len());
+        assert!(
+            m.position + 16 <= seq.len(),
+            "Position {} invalid for seq len {}",
+            m.position,
+            seq.len()
+        );
 
         // Strand should be either Forward or ReverseComplement
         match m.strand {
@@ -240,7 +261,9 @@ fn test_extract_with_positions_correctness() -> Result<()> {
 
     // Should have both forward and reverse complement minimizers
     let has_fwd = results.iter().any(|m| m.strand == Strand::Forward);
-    let has_rc = results.iter().any(|m| m.strand == Strand::ReverseComplement);
+    let has_rc = results
+        .iter()
+        .any(|m| m.strand == Strand::ReverseComplement);
 
     assert!(has_fwd, "Should have forward strand minimizers");
     assert!(has_rc, "Should have reverse complement minimizers");
@@ -256,7 +279,10 @@ fn test_minimizer_matching_with_positions() -> Result<()> {
     // Create reference sequence (long enough for minimizers)
     let ref_seq = b"AAAATTTTGGGGCCCCAAAATTTTGGGGCCCCAAAATTTTGGGGCCCCAAAATTTTGGGGCCCC";
     let ref_file = dir.path().join("reference.fa");
-    fs::write(&ref_file, format!(">ref1\n{}\n", String::from_utf8_lossy(ref_seq)))?;
+    fs::write(
+        &ref_file,
+        format!(">ref1\n{}\n", String::from_utf8_lossy(ref_seq)),
+    )?;
 
     // Create index
     let index_file = dir.path().join("test.ryidx");
@@ -290,11 +316,15 @@ fn test_minimizer_matching_with_positions() -> Result<()> {
     let bucket = &loaded.buckets[&1];
 
     // At least some query minimizers should match the bucket
-    let matches: Vec<_> = query_mins.iter()
+    let matches: Vec<_> = query_mins
+        .iter()
         .filter(|m| bucket.binary_search(&m.hash).is_ok())
         .collect();
 
-    assert!(!matches.is_empty(), "Query should have minimizers matching the reference");
+    assert!(
+        !matches.is_empty(),
+        "Query should have minimizers matching the reference"
+    );
 
     // All matched positions should be valid
     for m in &matches {
@@ -356,7 +386,9 @@ fn test_negative_index_filters_query_minimizers() -> Result<()> {
     let negative_index_file = dir.path().join("negative.ryidx");
     let mut negative_index = Index::new(k, w, salt)?;
 
-    negative_index.bucket_names.insert(1, "contaminant".to_string());
+    negative_index
+        .bucket_names
+        .insert(1, "contaminant".to_string());
     negative_index.add_record(1, "contaminant::seq1", contaminant_seq, &mut ws);
     negative_index.finalize_bucket(1);
     negative_index.save(&negative_index_file)?;
@@ -366,31 +398,46 @@ fn test_negative_index_filters_query_minimizers() -> Result<()> {
     let neg_idx = Index::load(&negative_index_file)?;
 
     // Verify parameters match (this is a requirement)
-    assert_eq!(pos_idx.k, neg_idx.k, "K must match between positive and negative index");
-    assert_eq!(pos_idx.w, neg_idx.w, "W must match between positive and negative index");
-    assert_eq!(pos_idx.salt, neg_idx.salt, "Salt must match between positive and negative index");
-
-    // Extract minimizers from query
-    let (fwd_mins, rc_mins) = get_paired_minimizers_into(
-        &query_seq, None, k, w, salt, &mut ws
+    assert_eq!(
+        pos_idx.k, neg_idx.k,
+        "K must match between positive and negative index"
+    );
+    assert_eq!(
+        pos_idx.w, neg_idx.w,
+        "W must match between positive and negative index"
+    );
+    assert_eq!(
+        pos_idx.salt, neg_idx.salt,
+        "Salt must match between positive and negative index"
     );
 
+    // Extract minimizers from query
+    let (fwd_mins, rc_mins) = get_paired_minimizers_into(&query_seq, None, k, w, salt, &mut ws);
+
     // Collect all negative minimizers into a set for filtering
-    let negative_minimizers: HashSet<u64> = neg_idx.buckets
+    let negative_minimizers: HashSet<u64> = neg_idx
+        .buckets
         .values()
         .flat_map(|v| v.iter().copied())
         .collect();
 
     // Count how many query minimizers match the negative index
-    let fwd_negative_matches = fwd_mins.iter().filter(|m| negative_minimizers.contains(m)).count();
-    let rc_negative_matches = rc_mins.iter().filter(|m| negative_minimizers.contains(m)).count();
+    let fwd_negative_matches = fwd_mins
+        .iter()
+        .filter(|m| negative_minimizers.contains(m))
+        .count();
+    let rc_negative_matches = rc_mins
+        .iter()
+        .filter(|m| negative_minimizers.contains(m))
+        .count();
 
     // We need at least some negative matches for this test to be meaningful
     assert!(
         fwd_negative_matches > 0 || rc_negative_matches > 0,
         "Test requires query to have minimizers matching negative index. \
          fwd_negative_matches={}, rc_negative_matches={}",
-        fwd_negative_matches, rc_negative_matches
+        fwd_negative_matches,
+        rc_negative_matches
     );
 
     // Classify WITHOUT negative index (current behavior)
@@ -406,11 +453,13 @@ fn test_negative_index_filters_query_minimizers() -> Result<()> {
 
     // Now test WITH negative index filtering
     // Filter out minimizers that match the negative index
-    let filtered_fwd: Vec<u64> = fwd_mins.iter()
+    let filtered_fwd: Vec<u64> = fwd_mins
+        .iter()
         .copied()
         .filter(|m| !negative_minimizers.contains(m))
         .collect();
-    let filtered_rc: Vec<u64> = rc_mins.iter()
+    let filtered_rc: Vec<u64> = rc_mins
+        .iter()
         .copied()
         .filter(|m| !negative_minimizers.contains(m))
         .collect();
@@ -419,10 +468,12 @@ fn test_negative_index_filters_query_minimizers() -> Result<()> {
     // (This is what classify_batch_with_negative should do internally)
     let pos_bucket = &pos_idx.buckets[&1];
 
-    let fwd_hits = filtered_fwd.iter()
+    let fwd_hits = filtered_fwd
+        .iter()
         .filter(|m| pos_bucket.binary_search(m).is_ok())
         .count();
-    let rc_hits = filtered_rc.iter()
+    let rc_hits = filtered_rc
+        .iter()
         .filter(|m| pos_bucket.binary_search(m).is_ok())
         .count();
 
@@ -441,16 +492,27 @@ fn test_negative_index_filters_query_minimizers() -> Result<()> {
     // The score with negative filtering should be different (typically lower or equal)
     // because we removed some minimizers
     println!("Score without negative filtering: {}", score_without_neg);
-    println!("Expected score with negative filtering: {}", expected_score_with_neg);
-    println!("Query fwd minimizers: {} -> {} after filtering", fwd_mins.len(), filtered_fwd.len());
-    println!("Query rc minimizers: {} -> {} after filtering", rc_mins.len(), filtered_rc.len());
+    println!(
+        "Expected score with negative filtering: {}",
+        expected_score_with_neg
+    );
+    println!(
+        "Query fwd minimizers: {} -> {} after filtering",
+        fwd_mins.len(),
+        filtered_fwd.len()
+    );
+    println!(
+        "Query rc minimizers: {} -> {} after filtering",
+        rc_mins.len(),
+        filtered_rc.len()
+    );
 
     // Classify WITH negative index filtering
     let results_with_neg = classify_batch(
         &pos_idx,
         Some(&negative_minimizers),
         &records_without_neg,
-        0.0
+        0.0,
     );
 
     // The score with negative filtering should match our manual calculation
@@ -465,7 +527,8 @@ fn test_negative_index_filters_query_minimizers() -> Result<()> {
     assert!(
         (score_with_neg - expected_score_with_neg).abs() < 0.001,
         "Score with negative filtering ({}) should match expected ({})",
-        score_with_neg, expected_score_with_neg
+        score_with_neg,
+        expected_score_with_neg
     );
 
     // The key assertion: negative filtering should reduce or eliminate the score
@@ -473,13 +536,16 @@ fn test_negative_index_filters_query_minimizers() -> Result<()> {
     assert!(
         score_with_neg <= score_without_neg,
         "Score with negative filtering ({}) should be <= score without ({})",
-        score_with_neg, score_without_neg
+        score_with_neg,
+        score_without_neg
     );
 
     // Since we verified negative matches exist, score should actually be different
     // (either lower, or same if negative minimizers didn't affect positive matches)
-    println!("Test passed: negative filtering reduced score from {} to {}",
-             score_without_neg, score_with_neg);
+    println!(
+        "Test passed: negative filtering reduced score from {} to {}",
+        score_without_neg, score_with_neg
+    );
 
     Ok(())
 }
@@ -517,10 +583,8 @@ fn test_negative_index_none_matches_current_behavior() -> Result<()> {
     // With negative=None should produce identical results - this is the same call
     // but we test both paths explicitly for clarity
     let results_with_none = classify_batch(
-        &idx,
-        None, // No negative index - should behave identically
-        &records,
-        0.0
+        &idx, None, // No negative index - should behave identically
+        &records, 0.0,
     );
 
     assert_eq!(results_current.len(), results_with_none.len());
@@ -562,7 +626,10 @@ fn test_negative_index_parameter_validation() -> Result<()> {
 
     // Without negative filtering, should get a hit
     let results_without_neg = classify_batch(&pos_idx, None, &records, 0.0);
-    assert!(!results_without_neg.is_empty(), "Should have hits without negative filtering");
+    assert!(
+        !results_without_neg.is_empty(),
+        "Should have hits without negative filtering"
+    );
 
     // With negative filtering (all minimizers filtered), should get no hits or 0 score
     let results_with_neg = classify_batch(&pos_idx, Some(&neg_mins), &records, 0.0);

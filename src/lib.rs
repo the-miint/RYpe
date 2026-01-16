@@ -24,6 +24,7 @@
 //! - [`aggregate_batch`]: Aggregated paired-end classification
 
 // Internal modules
+mod classify;
 mod constants;
 mod encoding;
 mod extraction;
@@ -31,21 +32,20 @@ mod index;
 mod inverted;
 mod sharded;
 mod sharded_main;
-mod classify;
 mod types;
 mod workspace;
 
 // Public modules
-pub mod memory;
 pub mod c_api;
 pub mod config;
+pub mod memory;
 
 // Arrow integration (optional feature)
 #[cfg(feature = "arrow")]
 pub mod arrow;
 
 // Re-export types
-pub use types::{QueryRecord, HitResult, IndexMetadata};
+pub use types::{HitResult, IndexMetadata, QueryRecord};
 
 // Re-export workspace
 pub use workspace::MinimizerWorkspace;
@@ -55,13 +55,8 @@ pub use encoding::base_to_bit;
 
 // Re-export extraction functions and types
 pub use extraction::{
-    extract_into,
-    extract_dual_strand_into,
-    get_paired_minimizers_into,
-    extract_with_positions,
-    count_hits,
-    Strand,
-    MinimizerWithPosition,
+    count_hits, extract_dual_strand_into, extract_into, extract_with_positions,
+    get_paired_minimizers_into, MinimizerWithPosition, Strand,
 };
 
 // Re-export index
@@ -75,21 +70,12 @@ pub use sharded::{ShardInfo, ShardManifest, ShardedInvertedIndex};
 
 // Re-export sharded main index types
 pub use sharded_main::{
-    MainIndexShardInfo,
-    MainIndexManifest,
-    MainIndexShard,
-    ShardedMainIndex,
-    ShardedMainIndexBuilder,
-    estimate_bucket_bytes,
-    plan_shards,
+    estimate_bucket_bytes, plan_shards, MainIndexManifest, MainIndexShard, MainIndexShardInfo,
+    ShardedMainIndex, ShardedMainIndexBuilder,
 };
 
 // Re-export classification functions
 pub use classify::{
-    classify_batch,
-    classify_batch_sharded_sequential,
-    classify_batch_sharded_merge_join,
-    classify_batch_sharded_main,
-    classify_batch_merge_join,
-    aggregate_batch,
+    aggregate_batch, classify_batch, classify_batch_merge_join, classify_batch_sharded_main,
+    classify_batch_sharded_merge_join, classify_batch_sharded_sequential,
 };

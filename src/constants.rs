@@ -5,8 +5,8 @@ pub(crate) const MAX_BUCKET_SIZE: usize = 1_000_000_000; // 1B minimizers (~8GB)
 pub(crate) const MAX_STRING_LENGTH: usize = 10_000; // 10KB for names/sources
 pub(crate) const MAX_NUM_BUCKETS: u32 = 100_000; // Reasonable upper limit
 
-// Maximum sizes for inverted index
-pub(crate) const MAX_INVERTED_MINIMIZERS: usize = usize::MAX; // Allow system memory to be the limit
+// Maximum sizes for inverted index (defensive sanity checks against corrupt files)
+pub(crate) const MAX_INVERTED_MINIMIZERS: usize = 1_000_000_000_000; // 1T minimizers
 pub(crate) const MAX_INVERTED_BUCKET_IDS: usize = 4_000_000_000; // 4B total bucket ID entries
 
 // Default capacities for workspace (document the reasoning)

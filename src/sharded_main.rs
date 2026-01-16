@@ -10,14 +10,14 @@
 //! - Sharding is by memory budget, not by minimizer count
 //! - 1:1 correspondence possible with inverted index shards
 
-use anyhow::{Result, anyhow, Context};
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::constants::{MAX_BUCKET_SIZE, MAX_STRING_LENGTH, MAX_NUM_BUCKETS};
-use crate::encoding::{encode_varint, decode_varint, VarIntError};
+use crate::constants::{MAX_BUCKET_SIZE, MAX_NUM_BUCKETS, MAX_STRING_LENGTH};
+use crate::encoding::{decode_varint, encode_varint, VarIntError};
 use crate::types::IndexMetadata;
 
 /// Maximum number of shards allowed (DoS protection)
@@ -107,11 +107,19 @@ impl MainIndexManifest {
             let shard_id = self.bucket_to_shard.get(bucket_id).copied().unwrap_or(0);
             writer.write_all(&shard_id.to_le_bytes())?;
 
-            let minimizer_count = self.bucket_minimizer_counts.get(bucket_id).copied().unwrap_or(0);
+            let minimizer_count = self
+                .bucket_minimizer_counts
+                .get(bucket_id)
+                .copied()
+                .unwrap_or(0);
             writer.write_all(&(minimizer_count as u64).to_le_bytes())?;
 
             // Name
-            let name = self.bucket_names.get(bucket_id).map(|s| s.as_str()).unwrap_or("");
+            let name = self
+                .bucket_names
+                .get(bucket_id)
+                .map(|s| s.as_str())
+                .unwrap_or("");
             let name_bytes = name.as_bytes();
             writer.write_all(&(name_bytes.len() as u64).to_le_bytes())?;
             writer.write_all(name_bytes)?;
@@ -152,7 +160,9 @@ impl MainIndexManifest {
         // Header
         reader.read_exact(&mut buf4)?;
         if &buf4 != b"RYPM" {
-            return Err(anyhow!("Invalid main index manifest format (expected RYPM)"));
+            return Err(anyhow!(
+                "Invalid main index manifest format (expected RYPM)"
+            ));
         }
 
         reader.read_exact(&mut buf4)?;
@@ -169,7 +179,10 @@ impl MainIndexManifest {
         reader.read_exact(&mut buf8)?;
         let k = u64::from_le_bytes(buf8) as usize;
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!("Invalid K value in manifest: {} (must be 16, 32, or 64)", k));
+            return Err(anyhow!(
+                "Invalid K value in manifest: {} (must be 16, 32, or 64)",
+                k
+            ));
         }
 
         reader.read_exact(&mut buf8)?;
@@ -181,13 +194,21 @@ impl MainIndexManifest {
         reader.read_exact(&mut buf4)?;
         let num_buckets = u32::from_le_bytes(buf4);
         if num_buckets > MAX_NUM_BUCKETS {
-            return Err(anyhow!("Number of buckets {} exceeds maximum {}", num_buckets, MAX_NUM_BUCKETS));
+            return Err(anyhow!(
+                "Number of buckets {} exceeds maximum {}",
+                num_buckets,
+                MAX_NUM_BUCKETS
+            ));
         }
 
         reader.read_exact(&mut buf4)?;
         let num_shards = u32::from_le_bytes(buf4);
         if num_shards > MAX_MAIN_SHARDS {
-            return Err(anyhow!("Number of shards {} exceeds maximum {}", num_shards, MAX_MAIN_SHARDS));
+            return Err(anyhow!(
+                "Number of shards {} exceeds maximum {}",
+                num_shards,
+                MAX_MAIN_SHARDS
+            ));
         }
 
         reader.read_exact(&mut buf8)?;
@@ -208,15 +229,23 @@ impl MainIndexManifest {
             reader.read_exact(&mut buf8)?;
             let minimizer_count = u64::from_le_bytes(buf8) as usize;
             if minimizer_count > MAX_BUCKET_SIZE {
-                return Err(anyhow!("Bucket {} minimizer count {} exceeds maximum {}",
-                    bucket_id, minimizer_count, MAX_BUCKET_SIZE));
+                return Err(anyhow!(
+                    "Bucket {} minimizer count {} exceeds maximum {}",
+                    bucket_id,
+                    minimizer_count,
+                    MAX_BUCKET_SIZE
+                ));
             }
 
             // Name
             reader.read_exact(&mut buf8)?;
             let name_len = u64::from_le_bytes(buf8) as usize;
             if name_len > MAX_STRING_LENGTH {
-                return Err(anyhow!("Bucket name length {} exceeds maximum {}", name_len, MAX_STRING_LENGTH));
+                return Err(anyhow!(
+                    "Bucket name length {} exceeds maximum {}",
+                    name_len,
+                    MAX_STRING_LENGTH
+                ));
             }
             let mut name_buf = vec![0u8; name_len];
             reader.read_exact(&mut name_buf)?;
@@ -243,14 +272,19 @@ impl MainIndexManifest {
             let compressed_size = u64::from_le_bytes(buf8);
 
             // Reconstruct bucket_ids from bucket_to_shard
-            let bucket_ids: Vec<u32> = bucket_to_shard.iter()
+            let bucket_ids: Vec<u32> = bucket_to_shard
+                .iter()
                 .filter(|(_, &s)| s == shard_id)
                 .map(|(&b, _)| b)
                 .collect();
 
             if bucket_ids.len() != bucket_count as usize {
-                return Err(anyhow!("Shard {} bucket count mismatch: expected {}, found {}",
-                    shard_id, bucket_count, bucket_ids.len()));
+                return Err(anyhow!(
+                    "Shard {} bucket count mismatch: expected {}, found {}",
+                    shard_id,
+                    bucket_count,
+                    bucket_ids.len()
+                ));
             }
 
             shards.push(MainIndexShardInfo {
@@ -264,16 +298,22 @@ impl MainIndexManifest {
         // Validate shard IDs are sequential
         for (i, shard) in shards.iter().enumerate() {
             if shard.shard_id != i as u32 {
-                return Err(anyhow!("Invalid manifest: shard IDs not sequential (expected {}, found {})",
-                    i, shard.shard_id));
+                return Err(anyhow!(
+                    "Invalid manifest: shard IDs not sequential (expected {}, found {})",
+                    i,
+                    shard.shard_id
+                ));
             }
         }
 
         // Validate total minimizers
         let sum_minimizers: usize = shards.iter().map(|s| s.num_minimizers).sum();
         if sum_minimizers != total_minimizers {
-            return Err(anyhow!("Invalid manifest: shard minimizer counts sum to {}, expected {}",
-                sum_minimizers, total_minimizers));
+            return Err(anyhow!(
+                "Invalid manifest: shard minimizer counts sum to {}, expected {}",
+                sum_minimizers,
+                total_minimizers
+            ));
         }
 
         Ok(MainIndexManifest {
@@ -377,10 +417,17 @@ impl MainIndexShard {
                 let filename = source.split(SOURCE_DELIM).next().unwrap_or(source);
                 if !filename_to_idx.contains_key(filename) {
                     // Check for string table overflow
-                    let idx = u32::try_from(filenames.len())
-                        .map_err(|_| anyhow!("String table overflow: more than {} unique filenames", u32::MAX))?;
+                    let idx = u32::try_from(filenames.len()).map_err(|_| {
+                        anyhow!(
+                            "String table overflow: more than {} unique filenames",
+                            u32::MAX
+                        )
+                    })?;
                     if idx >= MAX_STRING_TABLE_ENTRIES {
-                        return Err(anyhow!("String table overflow: more than {} unique filenames", MAX_STRING_TABLE_ENTRIES));
+                        return Err(anyhow!(
+                            "String table overflow: more than {} unique filenames",
+                            MAX_STRING_TABLE_ENTRIES
+                        ));
                     }
                     filename_to_idx.insert(filename.to_string(), idx);
                     filenames.push(filename.to_string());
@@ -395,7 +442,9 @@ impl MainIndexShard {
         let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
         let mut varint_buf = [0u8; 10];
 
-        let flush_buf = |buf: &mut Vec<u8>, encoder: &mut zstd::stream::write::Encoder<BufWriter<File>>| -> Result<()> {
+        let flush_buf = |buf: &mut Vec<u8>,
+                         encoder: &mut zstd::stream::write::Encoder<BufWriter<File>>|
+         -> Result<()> {
             if !buf.is_empty() {
                 encoder.write_all(buf)?;
                 buf.clear();
@@ -404,8 +453,12 @@ impl MainIndexShard {
         };
 
         // Write string table (with overflow check)
-        let num_filenames = u32::try_from(filenames.len())
-            .map_err(|_| anyhow!("String table overflow: more than {} unique filenames", u32::MAX))?;
+        let num_filenames = u32::try_from(filenames.len()).map_err(|_| {
+            anyhow!(
+                "String table overflow: more than {} unique filenames",
+                u32::MAX
+            )
+        })?;
         write_buf.extend_from_slice(&num_filenames.to_le_bytes());
         for filename in &filenames {
             let bytes = filename.as_bytes();
@@ -514,7 +567,10 @@ impl MainIndexShard {
         reader.read_exact(&mut buf8)?;
         let k = u64::from_le_bytes(buf8) as usize;
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!("Invalid K value in shard: {} (must be 16, 32, or 64)", k));
+            return Err(anyhow!(
+                "Invalid K value in shard: {} (must be 16, 32, or 64)",
+                k
+            ));
         }
 
         reader.read_exact(&mut buf8)?;
@@ -529,7 +585,11 @@ impl MainIndexShard {
         reader.read_exact(&mut buf4)?;
         let num_buckets = u32::from_le_bytes(buf4);
         if num_buckets > MAX_NUM_BUCKETS {
-            return Err(anyhow!("Number of buckets {} exceeds maximum {}", num_buckets, MAX_NUM_BUCKETS));
+            return Err(anyhow!(
+                "Number of buckets {} exceeds maximum {}",
+                num_buckets,
+                MAX_NUM_BUCKETS
+            ));
         }
 
         // Compressed stream
@@ -631,11 +691,19 @@ impl MainIndexShard {
 
             // Validate string length with overflow-safe conversion
             let str_len = usize::try_from(str_len).map_err(|_| {
-                anyhow!("Filename {} length {} overflows usize", filename_idx, str_len)
+                anyhow!(
+                    "Filename {} length {} overflows usize",
+                    filename_idx,
+                    str_len
+                )
             })?;
 
             if str_len > MAX_STRING_LENGTH {
-                return Err(anyhow!("Filename length {} exceeds maximum {}", str_len, MAX_STRING_LENGTH));
+                return Err(anyhow!(
+                    "Filename length {} exceeds maximum {}",
+                    str_len,
+                    MAX_STRING_LENGTH
+                ));
             }
 
             // Track total bytes for DoS protection
@@ -664,24 +732,39 @@ impl MainIndexShard {
 
             // Read minimizer count with overflow-safe conversion
             ensure_bytes!(8);
-            let minimizer_count_u64 = u64::from_le_bytes(read_buf[buf_pos..buf_pos + 8].try_into().unwrap());
+            let minimizer_count_u64 =
+                u64::from_le_bytes(read_buf[buf_pos..buf_pos + 8].try_into().unwrap());
             buf_pos += 8;
 
             let minimizer_count = usize::try_from(minimizer_count_u64).map_err(|_| {
-                anyhow!("Bucket {} minimizer count {} overflows usize", bucket_id, minimizer_count_u64)
+                anyhow!(
+                    "Bucket {} minimizer count {} overflows usize",
+                    bucket_id,
+                    minimizer_count_u64
+                )
             })?;
 
             if minimizer_count > MAX_BUCKET_SIZE {
-                return Err(anyhow!("Bucket {} size {} exceeds maximum {}", bucket_id, minimizer_count, MAX_BUCKET_SIZE));
+                return Err(anyhow!(
+                    "Bucket {} size {} exceeds maximum {}",
+                    bucket_id,
+                    minimizer_count,
+                    MAX_BUCKET_SIZE
+                ));
             }
 
             // Read source count and sources
             ensure_bytes!(8);
-            let source_count_u64 = u64::from_le_bytes(read_buf[buf_pos..buf_pos + 8].try_into().unwrap());
+            let source_count_u64 =
+                u64::from_le_bytes(read_buf[buf_pos..buf_pos + 8].try_into().unwrap());
             buf_pos += 8;
 
             let source_count = usize::try_from(source_count_u64).map_err(|_| {
-                anyhow!("Bucket {} source count {} overflows usize", bucket_id, source_count_u64)
+                anyhow!(
+                    "Bucket {} source count {} overflows usize",
+                    bucket_id,
+                    source_count_u64
+                )
             })?;
 
             if source_count > MAX_SOURCES_PER_BUCKET {
@@ -708,7 +791,8 @@ impl MainIndexShard {
                             if n == 0 {
                                 return Err(anyhow!(
                                     "Truncated varint at bucket {} source {} filename index",
-                                    bucket_id, source_idx
+                                    bucket_id,
+                                    source_idx
                                 ));
                             }
                             buf_len += n;
@@ -724,8 +808,12 @@ impl MainIndexShard {
                 buf_pos += consumed;
 
                 let filename_idx = usize::try_from(filename_idx_raw).map_err(|_| {
-                    anyhow!("Bucket {} source {} filename index {} overflows usize",
-                        bucket_id, source_idx, filename_idx_raw)
+                    anyhow!(
+                        "Bucket {} source {} filename index {} overflows usize",
+                        bucket_id,
+                        source_idx,
+                        filename_idx_raw
+                    )
                 })?;
 
                 // Validate filename index is in bounds
@@ -749,7 +837,8 @@ impl MainIndexShard {
                             if n == 0 {
                                 return Err(anyhow!(
                                     "Truncated varint at bucket {} source {} seqname length",
-                                    bucket_id, source_idx
+                                    bucket_id,
+                                    source_idx
                                 ));
                             }
                             buf_len += n;
@@ -765,12 +854,20 @@ impl MainIndexShard {
                 buf_pos += consumed;
 
                 let seqname_len = usize::try_from(seqname_len_raw).map_err(|_| {
-                    anyhow!("Bucket {} source {} seqname length {} overflows usize",
-                        bucket_id, source_idx, seqname_len_raw)
+                    anyhow!(
+                        "Bucket {} source {} seqname length {} overflows usize",
+                        bucket_id,
+                        source_idx,
+                        seqname_len_raw
+                    )
                 })?;
 
                 if seqname_len > MAX_STRING_LENGTH {
-                    return Err(anyhow!("Seqname length {} exceeds maximum {}", seqname_len, MAX_STRING_LENGTH));
+                    return Err(anyhow!(
+                        "Seqname length {} exceeds maximum {}",
+                        seqname_len,
+                        MAX_STRING_LENGTH
+                    ));
                 }
 
                 ensure_bytes!(seqname_len);
@@ -810,7 +907,8 @@ impl MainIndexShard {
                                 if n == 0 {
                                     return Err(anyhow!(
                                         "Truncated varint at bucket {} minimizer {}",
-                                        bucket_id, i
+                                        bucket_id,
+                                        i
                                     ));
                                 }
                                 buf_len += n;
@@ -825,11 +923,15 @@ impl MainIndexShard {
                     };
                     buf_pos += consumed;
 
-                    let val = prev.checked_add(delta)
-                        .ok_or_else(|| anyhow!(
+                    let val = prev.checked_add(delta).ok_or_else(|| {
+                        anyhow!(
                             "Minimizer overflow at bucket {} index {} (prev={}, delta={})",
-                            bucket_id, i, prev, delta
-                        ))?;
+                            bucket_id,
+                            i,
+                            prev,
+                            delta
+                        )
+                    })?;
                     minimizers.push(val);
                     prev = val;
                 }
@@ -912,8 +1014,11 @@ impl ShardedMainIndex {
     /// Load a specific shard by ID.
     pub fn load_shard(&self, shard_id: u32) -> Result<MainIndexShard> {
         if shard_id as usize >= self.manifest.shards.len() {
-            return Err(anyhow!("Shard ID {} out of range (max {})",
-                shard_id, self.manifest.shards.len() - 1));
+            return Err(anyhow!(
+                "Shard ID {} out of range (max {})",
+                shard_id,
+                self.manifest.shards.len() - 1
+            ));
         }
         let shard_path = MainIndexManifest::shard_path(&self.base_path, shard_id);
         MainIndexShard::load(&shard_path)
@@ -964,9 +1069,15 @@ impl ShardedMainIndex {
         let compressed_size = shard.save(&shard_path)?;
 
         // Update manifest (sources stored in shard, not manifest)
-        self.manifest.bucket_names.insert(bucket_id, name.to_string());
-        self.manifest.bucket_minimizer_counts.insert(bucket_id, minimizer_count);
-        self.manifest.bucket_to_shard.insert(bucket_id, new_shard_id);
+        self.manifest
+            .bucket_names
+            .insert(bucket_id, name.to_string());
+        self.manifest
+            .bucket_minimizer_counts
+            .insert(bucket_id, minimizer_count);
+        self.manifest
+            .bucket_to_shard
+            .insert(bucket_id, new_shard_id);
         self.manifest.total_minimizers += minimizer_count;
 
         self.manifest.shards.push(MainIndexShardInfo {
@@ -995,19 +1106,32 @@ impl ShardedMainIndex {
             return Err(anyhow!("Destination bucket {} does not exist", dest_id));
         }
 
-        let src_shard_id = *self.manifest.bucket_to_shard.get(&src_id)
+        let src_shard_id = *self
+            .manifest
+            .bucket_to_shard
+            .get(&src_id)
             .ok_or_else(|| anyhow!("Source bucket {} not mapped to any shard", src_id))?;
-        let dest_shard_id = *self.manifest.bucket_to_shard.get(&dest_id)
+        let dest_shard_id = *self
+            .manifest
+            .bucket_to_shard
+            .get(&dest_id)
             .ok_or_else(|| anyhow!("Destination bucket {} not mapped to any shard", dest_id))?;
 
-        let src_minimizer_count = self.manifest.bucket_minimizer_counts.get(&src_id).copied().unwrap_or(0);
+        let src_minimizer_count = self
+            .manifest
+            .bucket_minimizer_counts
+            .get(&src_id)
+            .copied()
+            .unwrap_or(0);
 
         if src_shard_id == dest_shard_id {
             // Same shard - load, merge minimizers and sources, save
             let shard_path = MainIndexManifest::shard_path(&self.base_path, src_shard_id);
             let mut shard = MainIndexShard::load(&shard_path)?;
 
-            let src_minimizers = shard.buckets.remove(&src_id)
+            let src_minimizers = shard
+                .buckets
+                .remove(&src_id)
                 .ok_or_else(|| anyhow!("Source bucket {} not found in shard", src_id))?;
             let src_sources = shard.bucket_sources.remove(&src_id).unwrap_or_default();
 
@@ -1035,11 +1159,15 @@ impl ShardedMainIndex {
             // Use saturating_sub defensively: if counts are slightly inconsistent from prior
             // operations, we prefer an approximate count over a panic. The shard file itself
             // has the authoritative data; manifest counts are advisory.
-            let minimizers_removed = (src_minimizer_count + old_dest_count).saturating_sub(new_dest_count);
-            shard_info.num_minimizers = shard_info.num_minimizers.saturating_sub(minimizers_removed);
+            let minimizers_removed =
+                (src_minimizer_count + old_dest_count).saturating_sub(new_dest_count);
+            shard_info.num_minimizers =
+                shard_info.num_minimizers.saturating_sub(minimizers_removed);
 
             // Update bucket_minimizer_counts with actual count after dedup
-            self.manifest.bucket_minimizer_counts.insert(dest_id, new_dest_count);
+            self.manifest
+                .bucket_minimizer_counts
+                .insert(dest_id, new_dest_count);
         } else {
             // Different shards - load both, move minimizers and sources, save both
             let src_shard_path = MainIndexManifest::shard_path(&self.base_path, src_shard_id);
@@ -1048,7 +1176,9 @@ impl ShardedMainIndex {
             let mut src_shard = MainIndexShard::load(&src_shard_path)?;
             let mut dest_shard = MainIndexShard::load(&dest_shard_path)?;
 
-            let src_minimizers = src_shard.buckets.remove(&src_id)
+            let src_minimizers = src_shard
+                .buckets
+                .remove(&src_id)
                 .ok_or_else(|| anyhow!("Source bucket {} not found in source shard", src_id))?;
             let src_sources = src_shard.bucket_sources.remove(&src_id).unwrap_or_default();
 
@@ -1071,17 +1201,22 @@ impl ShardedMainIndex {
             // Update shard infos with actual counts after dedup
             let src_shard_info = &mut self.manifest.shards[src_shard_id as usize];
             src_shard_info.bucket_ids.retain(|&id| id != src_id);
-            src_shard_info.num_minimizers = src_shard_info.num_minimizers.saturating_sub(src_minimizer_count);
+            src_shard_info.num_minimizers = src_shard_info
+                .num_minimizers
+                .saturating_sub(src_minimizer_count);
             src_shard_info.compressed_size = src_compressed_size;
 
             // Calculate actual change in dest shard: added new_dest_count - old_dest_count minimizers
             let dest_shard_info = &mut self.manifest.shards[dest_shard_id as usize];
             let dest_delta = new_dest_count.saturating_sub(old_dest_count);
-            dest_shard_info.num_minimizers = dest_shard_info.num_minimizers.saturating_add(dest_delta);
+            dest_shard_info.num_minimizers =
+                dest_shard_info.num_minimizers.saturating_add(dest_delta);
             dest_shard_info.compressed_size = dest_compressed_size;
 
             // Update bucket_minimizer_counts with actual count after dedup
-            self.manifest.bucket_minimizer_counts.insert(dest_id, new_dest_count);
+            self.manifest
+                .bucket_minimizer_counts
+                .insert(dest_id, new_dest_count);
         }
 
         // Update manifest metadata (no sources in manifest)
@@ -1111,7 +1246,10 @@ impl ShardedMainIndex {
             return Err(anyhow!("Bucket {} does not exist in the index", bucket_id));
         }
 
-        let shard_id = *self.manifest.bucket_to_shard.get(&bucket_id)
+        let shard_id = *self
+            .manifest
+            .bucket_to_shard
+            .get(&bucket_id)
             .ok_or_else(|| anyhow!("Bucket {} not mapped to any shard", bucket_id))?;
 
         // Load the shard
@@ -1137,12 +1275,20 @@ impl ShardedMainIndex {
 
         // Update manifest - minimizer count only (no sources in manifest)
         let added_minimizers = new_count.saturating_sub(old_count);
-        self.manifest.bucket_minimizer_counts.insert(bucket_id, new_count);
+        self.manifest
+            .bucket_minimizer_counts
+            .insert(bucket_id, new_count);
         self.manifest.total_minimizers += added_minimizers;
 
         // Update shard info
-        if let Some(shard_info) = self.manifest.shards.iter_mut().find(|s| s.shard_id == shard_id) {
-            shard_info.num_minimizers = shard_info.num_minimizers.saturating_sub(old_count) + new_count;
+        if let Some(shard_info) = self
+            .manifest
+            .shards
+            .iter_mut()
+            .find(|s| s.shard_id == shard_id)
+        {
+            shard_info.num_minimizers =
+                shard_info.num_minimizers.saturating_sub(old_count) + new_count;
             shard_info.compressed_size = compressed_size;
         }
 
@@ -1157,17 +1303,31 @@ impl ShardedMainIndex {
     ///
     /// Returns the sources or an empty Vec if the bucket has no sources.
     pub fn get_bucket_sources(&self, bucket_id: u32) -> Result<Vec<String>> {
-        let shard_id = *self.manifest.bucket_to_shard.get(&bucket_id)
+        let shard_id = *self
+            .manifest
+            .bucket_to_shard
+            .get(&bucket_id)
             .ok_or_else(|| anyhow!("Bucket {} not found in index", bucket_id))?;
 
         let shard = self.load_shard(shard_id)?;
-        Ok(shard.bucket_sources.get(&bucket_id).cloned().unwrap_or_default())
+        Ok(shard
+            .bucket_sources
+            .get(&bucket_id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// Get the next available bucket ID.
     pub fn next_id(&self) -> Result<u32> {
-        let max_id = self.manifest.bucket_names.keys().max().copied().unwrap_or(0);
-        max_id.checked_add(1)
+        let max_id = self
+            .manifest
+            .bucket_names
+            .keys()
+            .max()
+            .copied()
+            .unwrap_or(0);
+        max_id
+            .checked_add(1)
             .ok_or_else(|| anyhow!("Bucket ID overflow: maximum ID {} reached", max_id))
     }
 }
@@ -1193,7 +1353,8 @@ pub fn plan_shards(
     max_shard_bytes: usize,
 ) -> Vec<(u32, Vec<u32>)> {
     // Sort buckets by estimated size (largest first) for best-fit packing
-    let mut sorted: Vec<_> = bucket_minimizer_counts.iter()
+    let mut sorted: Vec<_> = bucket_minimizer_counts
+        .iter()
         .map(|(&id, &count)| (id, estimate_bucket_bytes(count)))
         .collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1)); // Descending by size
@@ -1218,7 +1379,8 @@ pub fn plan_shards(
     }
 
     // Assign sequential shard IDs and sort bucket IDs within each shard
-    shards.into_iter()
+    shards
+        .into_iter()
         .enumerate()
         .map(|(i, (_, mut buckets))| {
             buckets.sort_unstable();
@@ -1276,7 +1438,13 @@ impl ShardedMainIndexBuilder {
     /// * `salt` - XOR salt applied to k-mer hashes
     /// * `base_path` - Base path for output files (e.g., "index.ryidx")
     /// * `max_shard_bytes` - Maximum estimated bytes per shard
-    pub fn new(k: usize, w: usize, salt: u64, base_path: &Path, max_shard_bytes: usize) -> Result<Self> {
+    pub fn new(
+        k: usize,
+        w: usize,
+        salt: u64,
+        base_path: &Path,
+        max_shard_bytes: usize,
+    ) -> Result<Self> {
         if !matches!(k, 16 | 32 | 64) {
             return Err(anyhow!("K must be 16, 32, or 64 (got {})", k));
         }
@@ -1419,20 +1587,33 @@ impl ShardedMainIndexBuilder {
         // Atomically commit: rename all temp files to final paths
         // Shards first, then manifest (manifest signals completion)
         for (temp_path, final_path) in &self.pending_shard_renames {
-            std::fs::rename(temp_path, final_path)
-                .with_context(|| format!("Failed to rename {} to {}",
-                    temp_path.display(), final_path.display()))?;
+            std::fs::rename(temp_path, final_path).with_context(|| {
+                format!(
+                    "Failed to rename {} to {}",
+                    temp_path.display(),
+                    final_path.display()
+                )
+            })?;
         }
-        std::fs::rename(&manifest_temp, &manifest_path)
-            .with_context(|| format!("Failed to rename manifest {} to {}",
-                manifest_temp.display(), manifest_path.display()))?;
+        std::fs::rename(&manifest_temp, &manifest_path).with_context(|| {
+            format!(
+                "Failed to rename manifest {} to {}",
+                manifest_temp.display(),
+                manifest_path.display()
+            )
+        })?;
 
         Ok(manifest)
     }
 
     /// Get the current number of shards (including the one being built).
     pub fn num_shards(&self) -> usize {
-        self.shards.len() + if self.current_shard_buckets.is_empty() { 0 } else { 1 }
+        self.shards.len()
+            + if self.current_shard_buckets.is_empty() {
+                0
+            } else {
+                1
+            }
     }
 
     /// Get the current shard's estimated byte size.
@@ -1516,8 +1697,12 @@ mod tests {
         };
         shard.buckets.insert(1, vec![100, 200, 300]);
         shard.buckets.insert(2, vec![400, 500]);
-        shard.bucket_sources.insert(1, vec!["file1.fa::seq1".into(), "file1.fa::seq2".into()]);
-        shard.bucket_sources.insert(2, vec!["file2.fa::seq1".into()]);
+        shard
+            .bucket_sources
+            .insert(1, vec!["file1.fa::seq1".into(), "file1.fa::seq2".into()]);
+        shard
+            .bucket_sources
+            .insert(2, vec!["file2.fa::seq1".into()]);
 
         shard.save(&path)?;
         let loaded = MainIndexShard::load(&path)?;
@@ -1542,9 +1727,9 @@ mod tests {
     #[test]
     fn test_plan_shards_basic() {
         let mut counts = HashMap::new();
-        counts.insert(1, 100);  // 400 bytes
-        counts.insert(2, 200);  // 800 bytes
-        counts.insert(3, 150);  // 600 bytes
+        counts.insert(1, 100); // 400 bytes
+        counts.insert(2, 200); // 800 bytes
+        counts.insert(3, 150); // 600 bytes
 
         // Budget of 1000 bytes should create 2 shards
         let shards = plan_shards(&counts, 1000);
@@ -1558,7 +1743,7 @@ mod tests {
     #[test]
     fn test_plan_shards_single_large_bucket() {
         let mut counts = HashMap::new();
-        counts.insert(1, 1000);  // 4000 bytes - exceeds budget
+        counts.insert(1, 1000); // 4000 bytes - exceeds budget
 
         let shards = plan_shards(&counts, 1000);
 
@@ -1602,7 +1787,10 @@ mod tests {
 
         let result = MainIndexManifest::load(path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid main index manifest"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid main index manifest"));
     }
 
     #[test]
@@ -1613,7 +1801,10 @@ mod tests {
 
         let result = MainIndexShard::load(path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid main index shard"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid main index shard"));
     }
 
     #[test]
@@ -1630,8 +1821,16 @@ mod tests {
         let result = MainIndexManifest::load(path);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Version 1 manifests are no longer supported"), "Error should mention v1: {}", err);
-        assert!(err.contains("rype index shard"), "Error should suggest re-indexing: {}", err);
+        assert!(
+            err.contains("Version 1 manifests are no longer supported"),
+            "Error should mention v1: {}",
+            err
+        );
+        assert!(
+            err.contains("rype index shard"),
+            "Error should suggest re-indexing: {}",
+            err
+        );
     }
 
     #[test]
@@ -1648,8 +1847,16 @@ mod tests {
         let result = MainIndexShard::load(path);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Version 1 shards are no longer supported"), "Error should mention v1: {}", err);
-        assert!(err.contains("rype index shard"), "Error should suggest re-indexing: {}", err);
+        assert!(
+            err.contains("Version 1 shards are no longer supported"),
+            "Error should mention v1: {}",
+            err
+        );
+        assert!(
+            err.contains("rype index shard"),
+            "Error should suggest re-indexing: {}",
+            err
+        );
     }
 
     #[test]
@@ -1738,10 +1945,25 @@ mod tests {
 
         // Create test data: 5 buckets with varying minimizers
         let bucket_data: Vec<(u32, &str, Vec<String>, Vec<u64>)> = vec![
-            (1, "BucketA", vec!["src1".into()], vec![100, 200, 300, 400, 500]),
+            (
+                1,
+                "BucketA",
+                vec!["src1".into()],
+                vec![100, 200, 300, 400, 500],
+            ),
             (2, "BucketB", vec!["src2".into()], vec![150, 250, 350]),
-            (3, "BucketC", vec!["src3a".into(), "src3b".into()], vec![600, 700, 800, 900]),
-            (4, "BucketD", vec!["src4".into()], vec![50, 60, 70, 80, 90, 110]),
+            (
+                3,
+                "BucketC",
+                vec!["src3a".into(), "src3b".into()],
+                vec![600, 700, 800, 900],
+            ),
+            (
+                4,
+                "BucketD",
+                vec!["src4".into()],
+                vec![50, 60, 70, 80, 90, 110],
+            ),
             (5, "BucketE", vec!["src5".into()], vec![1000, 2000, 3000]),
         ];
 
@@ -1765,10 +1987,23 @@ mod tests {
         assert_eq!(manifest_a.k, manifest_b.k, "k mismatch");
         assert_eq!(manifest_a.w, manifest_b.w, "w mismatch");
         assert_eq!(manifest_a.salt, manifest_b.salt, "salt mismatch");
-        assert_eq!(manifest_a.total_minimizers, manifest_b.total_minimizers, "total_minimizers mismatch");
-        assert_eq!(manifest_a.shards.len(), manifest_b.shards.len(), "shard count mismatch");
-        assert_eq!(manifest_a.bucket_names, manifest_b.bucket_names, "bucket_names mismatch");
-        assert_eq!(manifest_a.bucket_to_shard, manifest_b.bucket_to_shard, "bucket_to_shard mismatch");
+        assert_eq!(
+            manifest_a.total_minimizers, manifest_b.total_minimizers,
+            "total_minimizers mismatch"
+        );
+        assert_eq!(
+            manifest_a.shards.len(),
+            manifest_b.shards.len(),
+            "shard count mismatch"
+        );
+        assert_eq!(
+            manifest_a.bucket_names, manifest_b.bucket_names,
+            "bucket_names mismatch"
+        );
+        assert_eq!(
+            manifest_a.bucket_to_shard, manifest_b.bucket_to_shard,
+            "bucket_to_shard mismatch"
+        );
 
         // Verify each shard has same buckets and minimizers
         // Note: bucket_ids order may differ (HashMap vs insertion order) - sort for comparison
@@ -1778,8 +2013,16 @@ mod tests {
             let mut ids_b = shard_b.bucket_ids.clone();
             ids_a.sort();
             ids_b.sort();
-            assert_eq!(ids_a, ids_b, "bucket_ids mismatch for shard {}", shard_a.shard_id);
-            assert_eq!(shard_a.num_minimizers, shard_b.num_minimizers, "num_minimizers mismatch for shard {}", shard_a.shard_id);
+            assert_eq!(
+                ids_a, ids_b,
+                "bucket_ids mismatch for shard {}",
+                shard_a.shard_id
+            );
+            assert_eq!(
+                shard_a.num_minimizers, shard_b.num_minimizers,
+                "num_minimizers mismatch for shard {}",
+                shard_a.shard_id
+            );
         }
 
         // Load and verify actual shard contents match
@@ -1790,8 +2033,16 @@ mod tests {
             let shard_a = MainIndexShard::load(&shard_path_a)?;
             let shard_b = MainIndexShard::load(&shard_path_b)?;
 
-            assert_eq!(shard_a.buckets, shard_b.buckets, "buckets mismatch in shard {}", shard_info.shard_id);
-            assert_eq!(shard_a.bucket_sources, shard_b.bucket_sources, "sources mismatch in shard {}", shard_info.shard_id);
+            assert_eq!(
+                shard_a.buckets, shard_b.buckets,
+                "buckets mismatch in shard {}",
+                shard_info.shard_id
+            );
+            assert_eq!(
+                shard_a.bucket_sources, shard_b.bucket_sources,
+                "sources mismatch in shard {}",
+                shard_info.shard_id
+            );
         }
 
         Ok(())
@@ -1861,7 +2112,8 @@ mod tests {
 
         for chunk in names.chunks(batch_size) {
             // Simulate build_single_bucket with par_iter (just returns name and dummy data)
-            let batch_results: Vec<_> = chunk.par_iter()
+            let batch_results: Vec<_> = chunk
+                .par_iter()
                 .map(|name| {
                     // Simulate some work
                     let minimizers = vec![bucket_id as u64 * 100];
@@ -1884,12 +2136,9 @@ mod tests {
             let expected_name = format!("Bucket_{:02}", i);
             let expected_id = (i + 1) as u32;
             assert_eq!(
-                manifest.bucket_names[&expected_id],
-                expected_name,
+                manifest.bucket_names[&expected_id], expected_name,
                 "Bucket ID {} should be '{}', got '{}'",
-                expected_id,
-                expected_name,
-                manifest.bucket_names[&expected_id]
+                expected_id, expected_name, manifest.bucket_names[&expected_id]
             );
         }
 

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -37,15 +37,17 @@ pub fn parse_config(path: &Path) -> Result<ConfigFile> {
     let contents = fs::read_to_string(path)
         .context(format!("Failed to read config file: {}", path.display()))?;
 
-    let config: ConfigFile = toml::from_str(&contents)
-        .context("Failed to parse TOML config")?;
+    let config: ConfigFile = toml::from_str(&contents).context("Failed to parse TOML config")?;
 
     if config.buckets.is_empty() {
         return Err(anyhow!("Config must define at least one bucket"));
     }
 
     if !matches!(config.index.k, 16 | 32 | 64) {
-        return Err(anyhow!("Config error: k must be 16, 32, or 64 (got {})", config.index.k));
+        return Err(anyhow!(
+            "Config error: k must be 16, 32, or 64 (got {})",
+            config.index.k
+        ));
     }
 
     Ok(config)
@@ -140,8 +142,8 @@ pub fn parse_bucket_add_config(path: &Path) -> Result<BucketAddConfig> {
     let contents = fs::read_to_string(path)
         .context(format!("Failed to read config file: {}", path.display()))?;
 
-    let config: BucketAddConfig = toml::from_str(&contents)
-        .context("Failed to parse TOML config")?;
+    let config: BucketAddConfig =
+        toml::from_str(&contents).context("Failed to parse TOML config")?;
 
     // Validate threshold for best_bin mode
     if let AssignmentSettings::BestBin { threshold, .. } = &config.assignment {
@@ -154,7 +156,9 @@ pub fn parse_bucket_add_config(path: &Path) -> Result<BucketAddConfig> {
     }
 
     if config.files.paths.is_empty() {
-        return Err(anyhow!("Config must specify at least one file in [files].paths"));
+        return Err(anyhow!(
+            "Config must specify at least one file in [files].paths"
+        ));
     }
 
     Ok(config)
@@ -164,20 +168,14 @@ pub fn validate_bucket_add_config(config: &BucketAddConfig, config_dir: &Path) -
     // Check target index exists
     let index_path = resolve_path(config_dir, &config.target.index);
     if !index_path.exists() {
-        return Err(anyhow!(
-            "Target index not found: {}",
-            index_path.display()
-        ));
+        return Err(anyhow!("Target index not found: {}", index_path.display()));
     }
 
     // Check all file paths exist
     for file_path in &config.files.paths {
         let abs_path = resolve_path(config_dir, file_path);
         if !abs_path.exists() {
-            return Err(anyhow!(
-                "File not found: {}",
-                abs_path.display()
-            ));
+            return Err(anyhow!("File not found: {}", abs_path.display()));
         }
     }
 
@@ -243,7 +241,10 @@ output = "test.ryidx"
 
         // Relative path
         let relative = Path::new("file.txt");
-        assert_eq!(resolve_path(base, relative), PathBuf::from("/home/user/file.txt"));
+        assert_eq!(
+            resolve_path(base, relative),
+            PathBuf::from("/home/user/file.txt")
+        );
 
         // Absolute path
         let absolute = Path::new("/tmp/file.txt");

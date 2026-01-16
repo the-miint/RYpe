@@ -9,25 +9,15 @@ use anyhow::Result;
 use tempfile::tempdir;
 
 use rype::{
-    Index,
-    IndexMetadata,
-    InvertedIndex,
-    ShardedInvertedIndex, ShardManifest,
-    ShardedMainIndex,
-    MainIndexManifest, MainIndexShard,
-    HitResult, QueryRecord,
-    MinimizerWorkspace,
-    classify_batch,
-    classify_batch_sharded_sequential,
-    classify_batch_sharded_merge_join,
-    classify_batch_sharded_main,
+    classify_batch, classify_batch_sharded_main, classify_batch_sharded_merge_join,
+    classify_batch_sharded_sequential, HitResult, Index, IndexMetadata, InvertedIndex,
+    MainIndexManifest, MainIndexShard, MinimizerWorkspace, QueryRecord, ShardManifest,
+    ShardedInvertedIndex, ShardedMainIndex,
 };
 
 /// Test helper to sort results for comparison
 fn sort_results(mut results: Vec<HitResult>) -> Vec<HitResult> {
-    results.sort_by(|a, b| {
-        (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id))
-    });
+    results.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
     results
 }
 
@@ -43,29 +33,54 @@ fn compare_results(name_a: &str, results_a: &[HitResult], name_b: &str, results_
 
         // Show what's different
         for r in &a {
-            if !b.iter().any(|br| br.query_id == r.query_id && br.bucket_id == r.bucket_id) {
-                eprintln!("  In {} only: query={}, bucket={}, score={:.4}",
-                    name_a, r.query_id, r.bucket_id, r.score);
+            if !b
+                .iter()
+                .any(|br| br.query_id == r.query_id && br.bucket_id == r.bucket_id)
+            {
+                eprintln!(
+                    "  In {} only: query={}, bucket={}, score={:.4}",
+                    name_a, r.query_id, r.bucket_id, r.score
+                );
             }
         }
         for r in &b {
-            if !a.iter().any(|ar| ar.query_id == r.query_id && ar.bucket_id == r.bucket_id) {
-                eprintln!("  In {} only: query={}, bucket={}, score={:.4}",
-                    name_b, r.query_id, r.bucket_id, r.score);
+            if !a
+                .iter()
+                .any(|ar| ar.query_id == r.query_id && ar.bucket_id == r.bucket_id)
+            {
+                eprintln!(
+                    "  In {} only: query={}, bucket={}, score={:.4}",
+                    name_b, r.query_id, r.bucket_id, r.score
+                );
             }
         }
     }
 
-    assert_eq!(a.len(), b.len(),
-        "{} has {} results, {} has {} results", name_a, a.len(), name_b, b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "{} has {} results, {} has {} results",
+        name_a,
+        a.len(),
+        name_b,
+        b.len()
+    );
 
     for (ra, rb) in a.iter().zip(b.iter()) {
         assert_eq!(ra.query_id, rb.query_id, "Query ID mismatch");
         assert_eq!(ra.bucket_id, rb.bucket_id, "Bucket ID mismatch");
         let diff = (ra.score - rb.score).abs();
-        assert!(diff < 0.001,
+        assert!(
+            diff < 0.001,
             "Score mismatch for query {} bucket {}: {} ({}) vs {} ({}) diff={}",
-            ra.query_id, ra.bucket_id, ra.score, name_a, rb.score, name_b, diff);
+            ra.query_id,
+            ra.bucket_id,
+            ra.score,
+            name_a,
+            rb.score,
+            name_b,
+            diff
+        );
     }
 }
 
@@ -74,21 +89,41 @@ fn create_test_sequences() -> Vec<Vec<u8>> {
     // Create sequences with different patterns that will hash to different minimizers
     vec![
         // Sequence 0: ACGT repeat
-        (0..200).map(|i| match i % 4 {
-            0 => b'A', 1 => b'C', 2 => b'G', _ => b'T'
-        }).collect(),
+        (0..200)
+            .map(|i| match i % 4 {
+                0 => b'A',
+                1 => b'C',
+                2 => b'G',
+                _ => b'T',
+            })
+            .collect(),
         // Sequence 1: AT repeat
-        (0..200).map(|i| if i % 2 == 0 { b'A' } else { b'T' }).collect(),
+        (0..200)
+            .map(|i| if i % 2 == 0 { b'A' } else { b'T' })
+            .collect(),
         // Sequence 2: GC repeat
-        (0..200).map(|i| if i % 2 == 0 { b'G' } else { b'C' }).collect(),
+        (0..200)
+            .map(|i| if i % 2 == 0 { b'G' } else { b'C' })
+            .collect(),
         // Sequence 3: Different pattern
-        (0..200).map(|i| match i % 6 {
-            0 => b'A', 1 => b'A', 2 => b'C', 3 => b'G', 4 => b'T', _ => b'T'
-        }).collect(),
+        (0..200)
+            .map(|i| match i % 6 {
+                0 => b'A',
+                1 => b'A',
+                2 => b'C',
+                3 => b'G',
+                4 => b'T',
+                _ => b'T',
+            })
+            .collect(),
         // Sequence 4: Yet another pattern
-        (0..200).map(|i| match i % 3 {
-            0 => b'A', 1 => b'C', _ => b'T'
-        }).collect(),
+        (0..200)
+            .map(|i| match i % 3 {
+                0 => b'A',
+                1 => b'C',
+                _ => b'T',
+            })
+            .collect(),
     ]
 }
 
@@ -123,10 +158,13 @@ fn print_index_diagnostics(name: &str, index: &Index) {
     eprintln!("K={}, W={}, salt={:#x}", index.k, index.w, index.salt);
     eprintln!("Buckets: {}", index.buckets.len());
     for (id, mins) in &index.buckets {
-        eprintln!("  Bucket {}: {} minimizers, range [{:#x}, {:#x}]",
-            id, mins.len(),
+        eprintln!(
+            "  Bucket {}: {} minimizers, range [{:#x}, {:#x}]",
+            id,
+            mins.len(),
             mins.first().copied().unwrap_or(0),
-            mins.last().copied().unwrap_or(0));
+            mins.last().copied().unwrap_or(0)
+        );
     }
 }
 
@@ -142,14 +180,23 @@ fn print_inverted_diagnostics(name: &str, inv: &InvertedIndex) {
 fn print_sharded_inverted_diagnostics(name: &str, sharded: &ShardedInvertedIndex) {
     let manifest = sharded.manifest();
     eprintln!("\n=== {} ===", name);
-    eprintln!("K={}, W={}, salt={:#x}", manifest.k, manifest.w, manifest.salt);
+    eprintln!(
+        "K={}, W={}, salt={:#x}",
+        manifest.k, manifest.w, manifest.salt
+    );
     eprintln!("Total shards: {}", manifest.shards.len());
     eprintln!("Total minimizers: {}", manifest.total_minimizers);
     eprintln!("Total bucket entries: {}", manifest.total_bucket_ids);
     for shard in &manifest.shards {
-        eprintln!("  Shard {}: {} minimizers, {} bucket entries, range [{:#x}, {:#x}], is_last={}",
-            shard.shard_id, shard.num_minimizers, shard.num_bucket_ids,
-            shard.min_start, shard.min_end, shard.is_last_shard);
+        eprintln!(
+            "  Shard {}: {} minimizers, {} bucket entries, range [{:#x}, {:#x}], is_last={}",
+            shard.shard_id,
+            shard.num_minimizers,
+            shard.num_bucket_ids,
+            shard.min_start,
+            shard.min_end,
+            shard.is_last_shard
+        );
     }
 }
 
@@ -175,11 +222,17 @@ fn test_baseline_non_sharded_classification() -> Result<()> {
     eprintln!("Direct: {} results", results_direct.len());
 
     // Verify we get at least some results
-    assert!(!results_direct.is_empty(), "Should have classification results");
+    assert!(
+        !results_direct.is_empty(),
+        "Should have classification results"
+    );
 
     // Each query sequence should match its own bucket with high score
     for r in &results_direct {
-        eprintln!("  Query {} -> Bucket {}: {:.4}", r.query_id, r.bucket_id, r.score);
+        eprintln!(
+            "  Query {} -> Bucket {}: {:.4}",
+            r.query_id, r.bucket_id, r.score
+        );
     }
 
     Ok(())
@@ -222,8 +275,14 @@ fn test_sharded_inverted_from_non_sharded_main() -> Result<()> {
 
     eprintln!("Created {} shards", manifest.shards.len());
     for shard in &manifest.shards {
-        eprintln!("  Shard {}: {} minimizers, range [{:#x}, {:#x}], is_last={}",
-            shard.shard_id, shard.num_minimizers, shard.min_start, shard.min_end, shard.is_last_shard);
+        eprintln!(
+            "  Shard {}: {} minimizers, range [{:#x}, {:#x}], is_last={}",
+            shard.shard_id,
+            shard.num_minimizers,
+            shard.min_start,
+            shard.min_end,
+            shard.is_last_shard
+        );
     }
 
     // Load sharded index
@@ -234,7 +293,8 @@ fn test_sharded_inverted_from_non_sharded_main() -> Result<()> {
 
     // Compare results: direct vs sharded inverted
     let results_direct = classify_batch(&index, None, &records, threshold);
-    let results_sequential = classify_batch_sharded_sequential(&sharded, None, &records, threshold)?;
+    let results_sequential =
+        classify_batch_sharded_sequential(&sharded, None, &records, threshold)?;
     let results_merge = classify_batch_sharded_merge_join(&sharded, None, &records, threshold)?;
 
     eprintln!("\n=== Results ===");
@@ -242,7 +302,12 @@ fn test_sharded_inverted_from_non_sharded_main() -> Result<()> {
     eprintln!("Sharded sequential: {} results", results_sequential.len());
     eprintln!("Sharded merge-join: {} results", results_merge.len());
 
-    compare_results("Direct", &results_direct, "Sharded-sequential", &results_sequential);
+    compare_results(
+        "Direct",
+        &results_direct,
+        "Sharded-sequential",
+        &results_sequential,
+    );
     compare_results("Direct", &results_direct, "Sharded-merge", &results_merge);
 
     Ok(())
@@ -269,8 +334,12 @@ fn test_sharded_main_index_classification() -> Result<()> {
     let sharded_main = ShardedMainIndex::open(&main_path)?;
     eprintln!("Loaded sharded main: {} shards", sharded_main.num_shards());
     for shard_info in &sharded_main.manifest().shards {
-        eprintln!("  Shard {}: {} buckets, {} minimizers",
-            shard_info.shard_id, shard_info.bucket_ids.len(), shard_info.num_minimizers);
+        eprintln!(
+            "  Shard {}: {} buckets, {} minimizers",
+            shard_info.shard_id,
+            shard_info.bucket_ids.len(),
+            shard_info.num_minimizers
+        );
     }
 
     let threshold = 0.1;
@@ -313,9 +382,7 @@ fn test_inverted_from_sharded_main() -> Result<()> {
         salt: index.salt,
         bucket_names: index.bucket_names.clone(),
         bucket_sources: index.bucket_sources.clone(),
-        bucket_minimizer_counts: index.buckets.iter()
-            .map(|(&id, v)| (id, v.len()))
-            .collect(),
+        bucket_minimizer_counts: index.buckets.iter().map(|(&id, v)| (id, v.len())).collect(),
     };
     let source_hash = InvertedIndex::compute_metadata_hash(&metadata);
 
@@ -336,15 +403,22 @@ fn test_inverted_from_sharded_main() -> Result<()> {
         let shard_path = MainIndexManifest::shard_path(&main_path, shard_info.shard_id);
         let main_shard = MainIndexShard::load(&shard_path)?;
 
-        eprintln!("\nMain shard {}: {} buckets", shard_info.shard_id, main_shard.buckets.len());
+        eprintln!(
+            "\nMain shard {}: {} buckets",
+            shard_info.shard_id,
+            main_shard.buckets.len()
+        );
         for (bid, mins) in &main_shard.buckets {
             eprintln!("  Bucket {}: {} minimizers", bid, mins.len());
         }
 
         // Build inverted from this shard
         let inverted = InvertedIndex::build_from_shard(&main_shard);
-        eprintln!("Inverted shard: {} unique minimizers, {} bucket entries",
-            inverted.num_minimizers(), inverted.num_bucket_entries());
+        eprintln!(
+            "Inverted shard: {} unique minimizers, {} bucket entries",
+            inverted.num_minimizers(),
+            inverted.num_bucket_entries()
+        );
 
         // Save as inverted shard
         let inv_shard_path = ShardManifest::shard_path(&inverted_path, shard_info.shard_id);
@@ -357,8 +431,10 @@ fn test_inverted_from_sharded_main() -> Result<()> {
             is_last,
         )?;
 
-        eprintln!("Saved shard: min_start={:#x}, min_end={:#x}, is_last={}",
-            inv_shard_info.min_start, inv_shard_info.min_end, inv_shard_info.is_last_shard);
+        eprintln!(
+            "Saved shard: min_start={:#x}, min_end={:#x}, is_last={}",
+            inv_shard_info.min_start, inv_shard_info.min_end, inv_shard_info.is_last_shard
+        );
 
         total_minimizers += inv_shard_info.num_minimizers;
         total_bucket_ids += inv_shard_info.num_bucket_ids;
@@ -381,9 +457,15 @@ fn test_inverted_from_sharded_main() -> Result<()> {
     eprintln!("Total minimizers: {}", manifest.total_minimizers);
     eprintln!("Total bucket IDs: {}", manifest.total_bucket_ids);
     for shard in &manifest.shards {
-        eprintln!("  Shard {}: min_start={:#x}, min_end={:#x}, is_last={}, minimizers={}, bucket_ids={}",
-            shard.shard_id, shard.min_start, shard.min_end, shard.is_last_shard,
-            shard.num_minimizers, shard.num_bucket_ids);
+        eprintln!(
+            "  Shard {}: min_start={:#x}, min_end={:#x}, is_last={}, minimizers={}, bucket_ids={}",
+            shard.shard_id,
+            shard.min_start,
+            shard.min_end,
+            shard.is_last_shard,
+            shard.num_minimizers,
+            shard.num_bucket_ids
+        );
     }
 
     // Save manifest
@@ -406,29 +488,50 @@ fn test_inverted_from_sharded_main() -> Result<()> {
             let results_ground_truth = classify_batch(&index, None, &records, threshold);
 
             eprintln!("\nClassifying with sharded sequential...");
-            let results_sharded_seq = classify_batch_sharded_sequential(&sharded_inv, None, &records, threshold)?;
+            let results_sharded_seq =
+                classify_batch_sharded_sequential(&sharded_inv, None, &records, threshold)?;
 
             eprintln!("Classifying with sharded merge-join...");
-            let results_sharded_merge = classify_batch_sharded_merge_join(&sharded_inv, None, &records, threshold)?;
+            let results_sharded_merge =
+                classify_batch_sharded_merge_join(&sharded_inv, None, &records, threshold)?;
 
             eprintln!("\n=== Results ===");
             eprintln!("Ground truth: {} results", results_ground_truth.len());
             eprintln!("Sharded sequential: {} results", results_sharded_seq.len());
-            eprintln!("Sharded merge-join: {} results", results_sharded_merge.len());
+            eprintln!(
+                "Sharded merge-join: {} results",
+                results_sharded_merge.len()
+            );
 
             // Print detailed results
             eprintln!("\nGround truth results:");
             for r in &results_ground_truth {
-                eprintln!("  Query {} -> Bucket {}: {:.4}", r.query_id, r.bucket_id, r.score);
+                eprintln!(
+                    "  Query {} -> Bucket {}: {:.4}",
+                    r.query_id, r.bucket_id, r.score
+                );
             }
 
             eprintln!("\nSharded sequential results:");
             for r in &results_sharded_seq {
-                eprintln!("  Query {} -> Bucket {}: {:.4}", r.query_id, r.bucket_id, r.score);
+                eprintln!(
+                    "  Query {} -> Bucket {}: {:.4}",
+                    r.query_id, r.bucket_id, r.score
+                );
             }
 
-            compare_results("Ground-truth", &results_ground_truth, "Sharded-sequential", &results_sharded_seq);
-            compare_results("Ground-truth", &results_ground_truth, "Sharded-merge", &results_sharded_merge);
+            compare_results(
+                "Ground-truth",
+                &results_ground_truth,
+                "Sharded-sequential",
+                &results_sharded_seq,
+            );
+            compare_results(
+                "Ground-truth",
+                &results_ground_truth,
+                "Sharded-merge",
+                &results_sharded_merge,
+            );
         }
         Err(e) => {
             eprintln!("\n!!! FAILED TO LOAD SHARDED INVERTED INDEX !!!");
@@ -467,7 +570,8 @@ fn test_minimizer_distribution_across_shards() -> Result<()> {
     // Analyze each main shard
     let main_manifest = MainIndexManifest::load(&MainIndexManifest::manifest_path(&main_path))?;
 
-    let mut all_inverted_minimizers: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut all_inverted_minimizers: std::collections::HashSet<u64> =
+        std::collections::HashSet::new();
     let mut minimizers_in_multiple_shards: Vec<u64> = Vec::new();
     let mut minimizers_per_shard: Vec<std::collections::HashSet<u64>> = Vec::new();
 
@@ -481,12 +585,22 @@ fn test_minimizer_distribution_across_shards() -> Result<()> {
             shard_mins.extend(bucket_mins.iter().copied());
         }
 
-        eprintln!("\nShard {}: {} unique minimizers", shard_info.shard_id, shard_mins.len());
+        eprintln!(
+            "\nShard {}: {} unique minimizers",
+            shard_info.shard_id,
+            shard_mins.len()
+        );
 
         // Check for overlap with existing minimizers
-        let overlap: Vec<u64> = shard_mins.intersection(&all_inverted_minimizers).copied().collect();
+        let overlap: Vec<u64> = shard_mins
+            .intersection(&all_inverted_minimizers)
+            .copied()
+            .collect();
         if !overlap.is_empty() {
-            eprintln!("  !!! {} minimizers overlap with previous shards !!!", overlap.len());
+            eprintln!(
+                "  !!! {} minimizers overlap with previous shards !!!",
+                overlap.len()
+            );
             minimizers_in_multiple_shards.extend(overlap);
         }
 
@@ -495,11 +609,22 @@ fn test_minimizer_distribution_across_shards() -> Result<()> {
     }
 
     eprintln!("\n=== Analysis Summary ===");
-    eprintln!("Full inverted index: {} unique minimizers", inverted_full.num_minimizers());
-    eprintln!("Sum across shards: {} minimizers (with duplication)",
-        minimizers_per_shard.iter().map(|s| s.len()).sum::<usize>());
-    eprintln!("Union across shards: {} unique minimizers", all_inverted_minimizers.len());
-    eprintln!("Minimizers in multiple shards: {}", minimizers_in_multiple_shards.len());
+    eprintln!(
+        "Full inverted index: {} unique minimizers",
+        inverted_full.num_minimizers()
+    );
+    eprintln!(
+        "Sum across shards: {} minimizers (with duplication)",
+        minimizers_per_shard.iter().map(|s| s.len()).sum::<usize>()
+    );
+    eprintln!(
+        "Union across shards: {} unique minimizers",
+        all_inverted_minimizers.len()
+    );
+    eprintln!(
+        "Minimizers in multiple shards: {}",
+        minimizers_in_multiple_shards.len()
+    );
 
     if !minimizers_in_multiple_shards.is_empty() {
         eprintln!("\n!!! OVERLAPPING MINIMIZERS DETECTED !!!");
@@ -510,7 +635,8 @@ fn test_minimizer_distribution_across_shards() -> Result<()> {
 
         eprintln!("\nFirst 10 overlapping minimizers:");
         for (i, &min) in minimizers_in_multiple_shards.iter().take(10).enumerate() {
-            let in_shards: Vec<usize> = minimizers_per_shard.iter()
+            let in_shards: Vec<usize> = minimizers_per_shard
+                .iter()
                 .enumerate()
                 .filter(|(_, s)| s.contains(&min))
                 .map(|(i, _)| i)
@@ -540,17 +666,19 @@ fn test_user_scenario_sharded_inverted_from_sharded_main() -> Result<()> {
     let w = 20;
     let salt = 0x5555555555555555u64;
 
-    let seqs: Vec<Vec<u8>> = (0..10).map(|i| {
-        // Create unique sequences
-        let pattern = match i % 5 {
-            0 => vec![b'A', b'C', b'G', b'T'],
-            1 => vec![b'T', b'A', b'T', b'A'],
-            2 => vec![b'G', b'C', b'G', b'C'],
-            3 => vec![b'A', b'A', b'C', b'C'],
-            _ => vec![b'G', b'G', b'T', b'T'],
-        };
-        (0..300).map(|j| pattern[j % pattern.len()]).collect()
-    }).collect();
+    let seqs: Vec<Vec<u8>> = (0..10)
+        .map(|i| {
+            // Create unique sequences
+            let pattern = match i % 5 {
+                0 => vec![b'A', b'C', b'G', b'T'],
+                1 => vec![b'T', b'A', b'T', b'A'],
+                2 => vec![b'G', b'C', b'G', b'C'],
+                3 => vec![b'A', b'A', b'C', b'C'],
+                _ => vec![b'G', b'G', b'T', b'T'],
+            };
+            (0..300).map(|j| pattern[j % pattern.len()]).collect()
+        })
+        .collect();
 
     let index = create_main_index(&seqs, k, w, salt);
 
@@ -564,8 +692,11 @@ fn test_user_scenario_sharded_inverted_from_sharded_main() -> Result<()> {
 
     // Build ground truth
     let inverted_truth = InvertedIndex::build_from_index(&index);
-    eprintln!("\nGround truth inverted: {} unique minimizers, {} bucket entries",
-        inverted_truth.num_minimizers(), inverted_truth.num_bucket_entries());
+    eprintln!(
+        "\nGround truth inverted: {} unique minimizers, {} bucket entries",
+        inverted_truth.num_minimizers(),
+        inverted_truth.num_bucket_entries()
+    );
 
     // Save as sharded main index
     eprintln!("\nSaving as sharded main index (budget=500 bytes)...");
@@ -574,8 +705,10 @@ fn test_user_scenario_sharded_inverted_from_sharded_main() -> Result<()> {
     let main_manifest = MainIndexManifest::load(&MainIndexManifest::manifest_path(&main_path))?;
     eprintln!("Created {} main shards:", main_manifest.shards.len());
     for shard in &main_manifest.shards {
-        eprintln!("  Shard {}: buckets {:?}, {} minimizers",
-            shard.shard_id, shard.bucket_ids, shard.num_minimizers);
+        eprintln!(
+            "  Shard {}: buckets {:?}, {} minimizers",
+            shard.shard_id, shard.bucket_ids, shard.num_minimizers
+        );
     }
 
     // Compute source hash for manifest
@@ -585,9 +718,7 @@ fn test_user_scenario_sharded_inverted_from_sharded_main() -> Result<()> {
         salt: index.salt,
         bucket_names: index.bucket_names.clone(),
         bucket_sources: index.bucket_sources.clone(),
-        bucket_minimizer_counts: index.buckets.iter()
-            .map(|(&id, v)| (id, v.len()))
-            .collect(),
+        bucket_minimizer_counts: index.buckets.iter().map(|(&id, v)| (id, v.len())).collect(),
     };
     let source_hash = InvertedIndex::compute_metadata_hash(&metadata);
 
@@ -603,8 +734,12 @@ fn test_user_scenario_sharded_inverted_from_sharded_main() -> Result<()> {
         let main_shard = MainIndexShard::load(&shard_path)?;
         let inverted = InvertedIndex::build_from_shard(&main_shard);
 
-        eprintln!("  Shard {}: {} minimizers, {} bucket entries",
-            shard_info.shard_id, inverted.num_minimizers(), inverted.num_bucket_entries());
+        eprintln!(
+            "  Shard {}: {} minimizers, {} bucket entries",
+            shard_info.shard_id,
+            inverted.num_minimizers(),
+            inverted.num_bucket_entries()
+        );
 
         let inv_shard_path = ShardManifest::shard_path(&inverted_path, shard_info.shard_id);
         let is_last = idx == num_shards - 1;
@@ -621,15 +756,23 @@ fn test_user_scenario_sharded_inverted_from_sharded_main() -> Result<()> {
         inv_shards.push(inv_shard_info);
     }
 
-    eprintln!("\nTotal across inverted shards: {} minimizers, {} bucket entries",
-        total_minimizers, total_bucket_ids);
-    eprintln!("Ground truth: {} minimizers, {} bucket entries",
-        inverted_truth.num_minimizers(), inverted_truth.num_bucket_entries());
+    eprintln!(
+        "\nTotal across inverted shards: {} minimizers, {} bucket entries",
+        total_minimizers, total_bucket_ids
+    );
+    eprintln!(
+        "Ground truth: {} minimizers, {} bucket entries",
+        inverted_truth.num_minimizers(),
+        inverted_truth.num_bucket_entries()
+    );
 
     if total_minimizers != inverted_truth.num_minimizers() {
         eprintln!("\n!!! MINIMIZER COUNT MISMATCH !!!");
-        eprintln!("Sum of shard minimizers ({}) != ground truth ({})",
-            total_minimizers, inverted_truth.num_minimizers());
+        eprintln!(
+            "Sum of shard minimizers ({}) != ground truth ({})",
+            total_minimizers,
+            inverted_truth.num_minimizers()
+        );
         eprintln!("This indicates overlapping minimizers across shards.");
     }
 
@@ -658,7 +801,8 @@ fn test_user_scenario_sharded_inverted_from_sharded_main() -> Result<()> {
             let threshold = 0.1;
 
             let results_truth = classify_batch(&index, None, &records, threshold);
-            let results_sharded = classify_batch_sharded_merge_join(&sharded, None, &records, threshold)?;
+            let results_sharded =
+                classify_batch_sharded_merge_join(&sharded, None, &records, threshold)?;
 
             eprintln!("\n=== Classification Results ===");
             eprintln!("Ground truth: {} results", results_truth.len());
@@ -666,9 +810,12 @@ fn test_user_scenario_sharded_inverted_from_sharded_main() -> Result<()> {
 
             if results_truth.len() != results_sharded.len() {
                 eprintln!("\n!!! CLASSIFICATION RESULT MISMATCH !!!");
-                eprintln!("Missing {} results ({:.2}%)",
+                eprintln!(
+                    "Missing {} results ({:.2}%)",
                     results_truth.len() - results_sharded.len(),
-                    100.0 * (results_truth.len() - results_sharded.len()) as f64 / results_truth.len() as f64);
+                    100.0 * (results_truth.len() - results_sharded.len()) as f64
+                        / results_truth.len() as f64
+                );
             }
 
             compare_results("Ground-truth", &results_truth, "Sharded", &results_sharded);

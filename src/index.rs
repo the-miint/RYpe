@@ -4,16 +4,16 @@
 //! a set of minimizers extracted from reference sequences. It supports
 //! incremental building, merging, and serialization in the v5 format.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::constants::{MAX_BUCKET_SIZE, MAX_STRING_LENGTH, MAX_NUM_BUCKETS};
-use crate::encoding::{encode_varint, decode_varint, VarIntError};
+use crate::constants::{MAX_BUCKET_SIZE, MAX_NUM_BUCKETS, MAX_STRING_LENGTH};
+use crate::encoding::{decode_varint, encode_varint, VarIntError};
 use crate::extraction::extract_into;
-use crate::sharded_main::{MainIndexManifest, ShardedMainIndexBuilder, plan_shards};
+use crate::sharded_main::{plan_shards, MainIndexManifest, ShardedMainIndexBuilder};
 use crate::types::IndexMetadata;
 use crate::workspace::MinimizerWorkspace;
 
@@ -60,7 +60,7 @@ impl Index {
             salt,
             buckets: HashMap::new(),
             bucket_names: HashMap::new(),
-            bucket_sources: HashMap::new()
+            bucket_sources: HashMap::new(),
         })
     }
 
@@ -74,7 +74,13 @@ impl Index {
     /// * `source_name` - Name of the source sequence
     /// * `sequence` - DNA sequence bytes
     /// * `ws` - Workspace for minimizer extraction
-    pub fn add_record(&mut self, id: u32, source_name: &str, sequence: &[u8], ws: &mut MinimizerWorkspace) {
+    pub fn add_record(
+        &mut self,
+        id: u32,
+        source_name: &str,
+        sequence: &[u8],
+        ws: &mut MinimizerWorkspace,
+    ) {
         let sources = self.bucket_sources.entry(id).or_default();
         sources.push(source_name.to_string());
 
@@ -110,7 +116,9 @@ impl Index {
     /// # Errors
     /// Returns an error if the source bucket does not exist.
     pub fn merge_buckets(&mut self, src_id: u32, dest_id: u32) -> Result<()> {
-        let src_vec = self.buckets.remove(&src_id)
+        let src_vec = self
+            .buckets
+            .remove(&src_id)
             .ok_or_else(|| anyhow!("Source bucket {} does not exist", src_id))?;
         self.bucket_names.remove(&src_id);
 
@@ -137,7 +145,8 @@ impl Index {
     /// Returns an error if the maximum bucket ID would overflow.
     pub fn next_id(&self) -> Result<u32> {
         let max_id = self.buckets.keys().max().copied().unwrap_or(0);
-        max_id.checked_add(1)
+        max_id
+            .checked_add(1)
             .ok_or_else(|| anyhow!("Bucket ID overflow: maximum ID {} reached", max_id))
     }
 
@@ -176,7 +185,11 @@ impl Index {
             writer.write_all(&id.to_le_bytes())?;
 
             // Write name
-            let name_str = self.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
+            let name_str = self
+                .bucket_names
+                .get(id)
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
             let name_bytes = name_str.as_bytes();
             writer.write_all(&(name_bytes.len() as u64).to_le_bytes())?;
             writer.write_all(name_bytes)?;
@@ -201,7 +214,9 @@ impl Index {
         let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
         let mut varint_buf = [0u8; 10]; // Max 10 bytes for u64 varint
 
-        let flush_buf = |buf: &mut Vec<u8>, encoder: &mut zstd::stream::write::Encoder<BufWriter<File>>| -> Result<()> {
+        let flush_buf = |buf: &mut Vec<u8>,
+                         encoder: &mut zstd::stream::write::Encoder<BufWriter<File>>|
+         -> Result<()> {
             if !buf.is_empty() {
                 encoder.write_all(buf)?;
                 buf.clear();
@@ -254,35 +269,35 @@ impl Index {
     /// # File Layout
     /// - `base_path.manifest` - Manifest file with metadata
     /// - `base_path.shard.0`, `base_path.shard.1`, ... - Shard files with minimizers
-    pub fn save_sharded(&self, base_path: &Path, max_shard_bytes: usize) -> Result<MainIndexManifest> {
+    pub fn save_sharded(
+        &self,
+        base_path: &Path,
+        max_shard_bytes: usize,
+    ) -> Result<MainIndexManifest> {
         // Plan which buckets go to which shards
-        let bucket_counts: HashMap<u32, usize> = self.buckets.iter()
-            .map(|(&id, v)| (id, v.len()))
-            .collect();
+        let bucket_counts: HashMap<u32, usize> =
+            self.buckets.iter().map(|(&id, v)| (id, v.len())).collect();
 
         let shard_plan = plan_shards(&bucket_counts, max_shard_bytes);
 
         // Use the builder to write shards
-        let mut builder = ShardedMainIndexBuilder::new(
-            self.k,
-            self.w,
-            self.salt,
-            base_path,
-            max_shard_bytes,
-        )?;
+        let mut builder =
+            ShardedMainIndexBuilder::new(self.k, self.w, self.salt, base_path, max_shard_bytes)?;
 
         // Add buckets in shard order for efficient writing
         for (_shard_id, bucket_ids) in &shard_plan {
             for &bucket_id in bucket_ids {
-                let name = self.bucket_names.get(&bucket_id)
+                let name = self
+                    .bucket_names
+                    .get(&bucket_id)
                     .map(|s| s.as_str())
                     .unwrap_or("unknown");
-                let sources = self.bucket_sources.get(&bucket_id)
+                let sources = self
+                    .bucket_sources
+                    .get(&bucket_id)
                     .cloned()
                     .unwrap_or_default();
-                let minimizers = self.buckets.get(&bucket_id)
-                    .cloned()
-                    .unwrap_or_default();
+                let minimizers = self.buckets.get(&bucket_id).cloned().unwrap_or_default();
 
                 builder.add_bucket(bucket_id, name, sources, minimizers)?;
             }
@@ -298,25 +313,41 @@ impl Index {
         let mut buf8 = [0u8; 8];
 
         reader.read_exact(&mut buf4)?;
-        if &buf4 != b"RYP5" { return Err(anyhow!("Invalid Index Format (Expected RYP5)")); }
+        if &buf4 != b"RYP5" {
+            return Err(anyhow!("Invalid Index Format (Expected RYP5)"));
+        }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
         const SUPPORTED_VERSION: u32 = 5;
         if version != SUPPORTED_VERSION {
-            return Err(anyhow!("Unsupported index version: {} (expected {})", version, SUPPORTED_VERSION));
+            return Err(anyhow!(
+                "Unsupported index version: {} (expected {})",
+                version,
+                SUPPORTED_VERSION
+            ));
         }
 
         reader.read_exact(&mut buf8)?;
         let k = u64::from_le_bytes(buf8) as usize;
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!("Invalid K value in index: {} (must be 16, 32, or 64)", k));
+            return Err(anyhow!(
+                "Invalid K value in index: {} (must be 16, 32, or 64)",
+                k
+            ));
         }
-        reader.read_exact(&mut buf8)?; let w = u64::from_le_bytes(buf8) as usize;
-        reader.read_exact(&mut buf8)?; let salt = u64::from_le_bytes(buf8);
-        reader.read_exact(&mut buf4)?; let num = u32::from_le_bytes(buf4);
+        reader.read_exact(&mut buf8)?;
+        let w = u64::from_le_bytes(buf8) as usize;
+        reader.read_exact(&mut buf8)?;
+        let salt = u64::from_le_bytes(buf8);
+        reader.read_exact(&mut buf4)?;
+        let num = u32::from_le_bytes(buf4);
         if num > MAX_NUM_BUCKETS {
-            return Err(anyhow!("Number of buckets {} exceeds maximum {}", num, MAX_NUM_BUCKETS));
+            return Err(anyhow!(
+                "Number of buckets {} exceeds maximum {}",
+                num,
+                MAX_NUM_BUCKETS
+            ));
         }
 
         let mut buckets = HashMap::new();
@@ -329,25 +360,41 @@ impl Index {
             reader.read_exact(&mut buf8)?;
             let vec_len = u64::from_le_bytes(buf8) as usize;
             if vec_len > MAX_BUCKET_SIZE {
-                return Err(anyhow!("Bucket size {} exceeds maximum {}", vec_len, MAX_BUCKET_SIZE));
+                return Err(anyhow!(
+                    "Bucket size {} exceeds maximum {}",
+                    vec_len,
+                    MAX_BUCKET_SIZE
+                ));
             }
 
-            reader.read_exact(&mut buf4)?; let id = u32::from_le_bytes(buf4);
+            reader.read_exact(&mut buf4)?;
+            let id = u32::from_le_bytes(buf4);
 
-            reader.read_exact(&mut buf8)?; let name_len = u64::from_le_bytes(buf8) as usize;
+            reader.read_exact(&mut buf8)?;
+            let name_len = u64::from_le_bytes(buf8) as usize;
             if name_len > MAX_STRING_LENGTH {
-                return Err(anyhow!("Bucket name length {} exceeds maximum {}", name_len, MAX_STRING_LENGTH));
+                return Err(anyhow!(
+                    "Bucket name length {} exceeds maximum {}",
+                    name_len,
+                    MAX_STRING_LENGTH
+                ));
             }
             let mut nbuf = vec![0u8; name_len];
             reader.read_exact(&mut nbuf)?;
             names.insert(id, String::from_utf8(nbuf)?);
 
-            reader.read_exact(&mut buf8)?; let src_count = u64::from_le_bytes(buf8) as usize;
+            reader.read_exact(&mut buf8)?;
+            let src_count = u64::from_le_bytes(buf8) as usize;
             let mut src_list = Vec::with_capacity(src_count);
             for _ in 0..src_count {
-                reader.read_exact(&mut buf8)?; let slen = u64::from_le_bytes(buf8) as usize;
+                reader.read_exact(&mut buf8)?;
+                let slen = u64::from_le_bytes(buf8) as usize;
                 if slen > MAX_STRING_LENGTH {
-                    return Err(anyhow!("Source string length {} exceeds maximum {}", slen, MAX_STRING_LENGTH));
+                    return Err(anyhow!(
+                        "Source string length {} exceeds maximum {}",
+                        slen,
+                        MAX_STRING_LENGTH
+                    ));
                 }
                 let mut sbuf = vec![0u8; slen];
                 reader.read_exact(&mut sbuf)?;
@@ -462,11 +509,15 @@ impl Index {
                 };
                 buf_pos += consumed;
 
-                let val = prev.checked_add(delta)
-                    .ok_or_else(|| anyhow!(
+                let val = prev.checked_add(delta).ok_or_else(|| {
+                    anyhow!(
                         "Minimizer overflow at bucket {} index {} (prev={}, delta={})",
-                        id, i, prev, delta
-                    ))?;
+                        id,
+                        i,
+                        prev,
+                        delta
+                    )
+                })?;
                 vec.push(val);
                 prev = val;
             }
@@ -474,7 +525,14 @@ impl Index {
             buckets.insert(id, vec);
         }
 
-        Ok(Index { k, w, salt, buckets, bucket_names: names, bucket_sources: sources })
+        Ok(Index {
+            k,
+            w,
+            salt,
+            buckets,
+            bucket_names: names,
+            bucket_sources: sources,
+        })
     }
 
     /// Load only metadata from an index file (v5 format).
@@ -488,25 +546,41 @@ impl Index {
         let mut buf8 = [0u8; 8];
 
         reader.read_exact(&mut buf4)?;
-        if &buf4 != b"RYP5" { return Err(anyhow!("Invalid Index Format (Expected RYP5)")); }
+        if &buf4 != b"RYP5" {
+            return Err(anyhow!("Invalid Index Format (Expected RYP5)"));
+        }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
         const SUPPORTED_VERSION: u32 = 5;
         if version != SUPPORTED_VERSION {
-            return Err(anyhow!("Unsupported index version: {} (expected {})", version, SUPPORTED_VERSION));
+            return Err(anyhow!(
+                "Unsupported index version: {} (expected {})",
+                version,
+                SUPPORTED_VERSION
+            ));
         }
 
         reader.read_exact(&mut buf8)?;
         let k = u64::from_le_bytes(buf8) as usize;
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!("Invalid K value in index: {} (must be 16, 32, or 64)", k));
+            return Err(anyhow!(
+                "Invalid K value in index: {} (must be 16, 32, or 64)",
+                k
+            ));
         }
-        reader.read_exact(&mut buf8)?; let w = u64::from_le_bytes(buf8) as usize;
-        reader.read_exact(&mut buf8)?; let salt = u64::from_le_bytes(buf8);
-        reader.read_exact(&mut buf4)?; let num = u32::from_le_bytes(buf4);
+        reader.read_exact(&mut buf8)?;
+        let w = u64::from_le_bytes(buf8) as usize;
+        reader.read_exact(&mut buf8)?;
+        let salt = u64::from_le_bytes(buf8);
+        reader.read_exact(&mut buf4)?;
+        let num = u32::from_le_bytes(buf4);
         if num > MAX_NUM_BUCKETS {
-            return Err(anyhow!("Number of buckets {} exceeds maximum {}", num, MAX_NUM_BUCKETS));
+            return Err(anyhow!(
+                "Number of buckets {} exceeds maximum {}",
+                num,
+                MAX_NUM_BUCKETS
+            ));
         }
 
         let mut names = HashMap::new();
@@ -519,25 +593,41 @@ impl Index {
             reader.read_exact(&mut buf8)?;
             let vec_len = u64::from_le_bytes(buf8) as usize;
             if vec_len > MAX_BUCKET_SIZE {
-                return Err(anyhow!("Bucket size {} exceeds maximum {}", vec_len, MAX_BUCKET_SIZE));
+                return Err(anyhow!(
+                    "Bucket size {} exceeds maximum {}",
+                    vec_len,
+                    MAX_BUCKET_SIZE
+                ));
             }
 
-            reader.read_exact(&mut buf4)?; let id = u32::from_le_bytes(buf4);
+            reader.read_exact(&mut buf4)?;
+            let id = u32::from_le_bytes(buf4);
 
-            reader.read_exact(&mut buf8)?; let name_len = u64::from_le_bytes(buf8) as usize;
+            reader.read_exact(&mut buf8)?;
+            let name_len = u64::from_le_bytes(buf8) as usize;
             if name_len > MAX_STRING_LENGTH {
-                return Err(anyhow!("Bucket name length {} exceeds maximum {}", name_len, MAX_STRING_LENGTH));
+                return Err(anyhow!(
+                    "Bucket name length {} exceeds maximum {}",
+                    name_len,
+                    MAX_STRING_LENGTH
+                ));
             }
             let mut nbuf = vec![0u8; name_len];
             reader.read_exact(&mut nbuf)?;
             names.insert(id, String::from_utf8(nbuf)?);
 
-            reader.read_exact(&mut buf8)?; let src_count = u64::from_le_bytes(buf8) as usize;
+            reader.read_exact(&mut buf8)?;
+            let src_count = u64::from_le_bytes(buf8) as usize;
             let mut src_list = Vec::with_capacity(src_count);
             for _ in 0..src_count {
-                reader.read_exact(&mut buf8)?; let slen = u64::from_le_bytes(buf8) as usize;
+                reader.read_exact(&mut buf8)?;
+                let slen = u64::from_le_bytes(buf8) as usize;
                 if slen > MAX_STRING_LENGTH {
-                    return Err(anyhow!("Source string length {} exceeds maximum {}", slen, MAX_STRING_LENGTH));
+                    return Err(anyhow!(
+                        "Source string length {} exceeds maximum {}",
+                        slen,
+                        MAX_STRING_LENGTH
+                    ));
                 }
                 let mut sbuf = vec![0u8; slen];
                 reader.read_exact(&mut sbuf)?;
@@ -589,7 +679,9 @@ mod tests {
         index.buckets.insert(2, vec![300, 400]);
         index.bucket_names.insert(1, "BucketA".into());
         index.bucket_names.insert(2, "BucketB".into());
-        index.bucket_sources.insert(1, vec!["file1.fa::seq1".into()]);
+        index
+            .bucket_sources
+            .insert(1, vec!["file1.fa::seq1".into()]);
 
         index.save(&path)?;
         let loaded = Index::load(&path)?;
@@ -650,7 +742,10 @@ mod tests {
 
         let result = Index::load(path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid Index Format"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid Index Format"));
     }
 
     #[test]
@@ -664,7 +759,10 @@ mod tests {
 
         let result = Index::load(path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unsupported index version"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported index version"));
     }
 
     #[test]
@@ -787,15 +885,26 @@ mod tests {
 
         index.buckets.insert(1, vec![100, 200, 300]);
         index.bucket_names.insert(1, "BucketA".into());
-        index.bucket_sources.insert(1, vec!["file1.fa::seq1".into(), "file1.fa::seq2".into()]);
+        index
+            .bucket_sources
+            .insert(1, vec!["file1.fa::seq1".into(), "file1.fa::seq2".into()]);
 
         index.buckets.insert(2, vec![400, 500]);
         index.bucket_names.insert(2, "BucketB".into());
-        index.bucket_sources.insert(2, vec!["file2.fa::seq1".into()]);
+        index
+            .bucket_sources
+            .insert(2, vec!["file2.fa::seq1".into()]);
 
         index.buckets.insert(3, vec![600, 700, 800, 900]);
         index.bucket_names.insert(3, "BucketC".into());
-        index.bucket_sources.insert(3, vec!["file3.fa::seq1".into(), "file3.fa::seq2".into(), "file3.fa::seq3".into()]);
+        index.bucket_sources.insert(
+            3,
+            vec![
+                "file3.fa::seq1".into(),
+                "file3.fa::seq2".into(),
+                "file3.fa::seq3".into(),
+            ],
+        );
 
         index.save(&path)?;
 
@@ -827,7 +936,9 @@ mod tests {
 
         index.buckets.insert(10, vec![1, 2, 3, 4, 5]);
         index.bucket_names.insert(10, "Test".into());
-        index.bucket_sources.insert(10, vec!["src1".into(), "src2".into()]);
+        index
+            .bucket_sources
+            .insert(10, vec!["src1".into(), "src2".into()]);
 
         index.save(&path)?;
 
@@ -838,7 +949,10 @@ mod tests {
         assert_eq!(metadata.salt, full_index.salt);
         assert_eq!(metadata.bucket_names, full_index.bucket_names);
         assert_eq!(metadata.bucket_sources, full_index.bucket_sources);
-        assert_eq!(metadata.bucket_minimizer_counts[&10], full_index.buckets[&10].len());
+        assert_eq!(
+            metadata.bucket_minimizer_counts[&10],
+            full_index.buckets[&10].len()
+        );
 
         Ok(())
     }
@@ -871,8 +985,12 @@ mod tests {
         index.buckets.insert(2, vec![300, 400, 500]);
         index.bucket_names.insert(1, "BucketA".into());
         index.bucket_names.insert(2, "BucketB".into());
-        index.bucket_sources.insert(1, vec!["file1.fa::seq1".into()]);
-        index.bucket_sources.insert(2, vec!["file2.fa::seq1".into(), "file2.fa::seq2".into()]);
+        index
+            .bucket_sources
+            .insert(1, vec!["file1.fa::seq1".into()]);
+        index
+            .bucket_sources
+            .insert(2, vec!["file2.fa::seq1".into(), "file2.fa::seq2".into()]);
 
         index.save(&path)?;
         let loaded = Index::load(&path)?;

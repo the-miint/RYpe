@@ -64,50 +64,76 @@ pub fn classify_batch(
     engine: &Index,
     negative_mins: Option<&HashSet<u64>>,
     records: &[QueryRecord],
-    threshold: f64
+    threshold: f64,
 ) -> Vec<HitResult> {
-    let processed: Vec<_> = records.par_iter()
+    let processed: Vec<_> = records
+        .par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
             let (ha, hb) = get_paired_minimizers_into(s1, *s2, engine.k, engine.w, engine.salt, ws);
             let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
             (*id, fa, fb)
-        }).collect();
+        })
+        .collect();
 
     let mut map_a: HashMap<u64, Vec<usize>> = HashMap::new();
     let mut map_b: HashMap<u64, Vec<usize>> = HashMap::new();
     let mut uniq_mins = HashSet::new();
 
     for (idx, (_, ma, mb)) in processed.iter().enumerate() {
-        for &m in ma { map_a.entry(m).or_default().push(idx); uniq_mins.insert(m); }
-        for &m in mb { map_b.entry(m).or_default().push(idx); uniq_mins.insert(m); }
+        for &m in ma {
+            map_a.entry(m).or_default().push(idx);
+            uniq_mins.insert(m);
+        }
+        for &m in mb {
+            map_b.entry(m).or_default().push(idx);
+            uniq_mins.insert(m);
+        }
     }
     let uniq_vec: Vec<u64> = uniq_mins.into_iter().collect();
 
-    let results: Vec<HitResult> = engine.buckets.par_iter().map(|(b_id, bucket)| {
-        let mut hits = HashMap::new();
+    let results: Vec<HitResult> =
+        engine
+            .buckets
+            .par_iter()
+            .map(|(b_id, bucket)| {
+                let mut hits = HashMap::new();
 
-        for &m in &uniq_vec {
-            if bucket.binary_search(&m).is_ok() {
-                if let Some(rs) = map_a.get(&m) { for &r in rs { hits.entry(r).or_insert((0,0)).0 += 1; } }
-                if let Some(rs) = map_b.get(&m) { for &r in rs { hits.entry(r).or_insert((0,0)).1 += 1; } }
-            }
-        }
+                for &m in &uniq_vec {
+                    if bucket.binary_search(&m).is_ok() {
+                        if let Some(rs) = map_a.get(&m) {
+                            for &r in rs {
+                                hits.entry(r).or_insert((0, 0)).0 += 1;
+                            }
+                        }
+                        if let Some(rs) = map_b.get(&m) {
+                            for &r in rs {
+                                hits.entry(r).or_insert((0, 0)).1 += 1;
+                            }
+                        }
+                    }
+                }
 
-        let mut bucket_results = Vec::new();
-        for (r_idx, (hits_a, hits_b)) in hits {
-            let (qid, ha, hb) = &processed[r_idx];
-            let la = ha.len() as f64;
-            let lb = hb.len() as f64;
+                let mut bucket_results = Vec::new();
+                for (r_idx, (hits_a, hits_b)) in hits {
+                    let (qid, ha, hb) = &processed[r_idx];
+                    let la = ha.len() as f64;
+                    let lb = hb.len() as f64;
 
-            let score = (if la > 0.0 { hits_a as f64 / la } else { 0.0 })
-                .max(if lb > 0.0 { hits_b as f64 / lb } else { 0.0 });
+                    let score = (if la > 0.0 { hits_a as f64 / la } else { 0.0 })
+                        .max(if lb > 0.0 { hits_b as f64 / lb } else { 0.0 });
 
-            if score >= threshold {
-                bucket_results.push(HitResult { query_id: *qid, bucket_id: *b_id, score });
-            }
-        }
-        bucket_results
-    }).flatten().collect();
+                    if score >= threshold {
+                        bucket_results.push(HitResult {
+                            query_id: *qid,
+                            bucket_id: *b_id,
+                            score,
+                        });
+                    }
+                }
+                bucket_results
+            })
+            .flatten()
+            .collect();
 
     results
 }
@@ -129,54 +155,69 @@ pub fn classify_batch_sharded_sequential(
     sharded: &ShardedInvertedIndex,
     negative_mins: Option<&HashSet<u64>>,
     records: &[QueryRecord],
-    threshold: f64
+    threshold: f64,
 ) -> Result<Vec<HitResult>> {
     let manifest = sharded.manifest();
     let base_path = sharded.base_path();
 
-    let processed: Vec<_> = records.par_iter()
+    let processed: Vec<_> = records
+        .par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
-            let (ha, hb) = get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
+            let (ha, hb) =
+                get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
             let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
             (*id, fa, fb)
-        }).collect();
+        })
+        .collect();
 
-    let all_hits: Vec<Mutex<HashMap<u32, (usize, usize)>>> =
-        (0..processed.len()).map(|_| Mutex::new(HashMap::new())).collect();
+    let all_hits: Vec<Mutex<HashMap<u32, (usize, usize)>>> = (0..processed.len())
+        .map(|_| Mutex::new(HashMap::new()))
+        .collect();
 
     for shard_info in &manifest.shards {
         let shard_path = ShardManifest::shard_path(base_path, shard_info.shard_id);
         let shard = InvertedIndex::load_shard(&shard_path)?;
 
-        processed.par_iter().enumerate().for_each(|(idx, (_, fwd_mins, rc_mins))| {
-            let fwd_hits = shard.get_bucket_hits(fwd_mins);
-            let rc_hits = shard.get_bucket_hits(rc_mins);
+        processed
+            .par_iter()
+            .enumerate()
+            .for_each(|(idx, (_, fwd_mins, rc_mins))| {
+                let fwd_hits = shard.get_bucket_hits(fwd_mins);
+                let rc_hits = shard.get_bucket_hits(rc_mins);
 
-            let mut hits = all_hits[idx].lock().unwrap();
-            for (bucket_id, count) in fwd_hits {
-                hits.entry(bucket_id).or_insert((0, 0)).0 += count;
-            }
-            for (bucket_id, count) in rc_hits {
-                hits.entry(bucket_id).or_insert((0, 0)).1 += count;
-            }
-        });
+                let mut hits = all_hits[idx].lock().unwrap();
+                for (bucket_id, count) in fwd_hits {
+                    hits.entry(bucket_id).or_insert((0, 0)).0 += count;
+                }
+                for (bucket_id, count) in rc_hits {
+                    hits.entry(bucket_id).or_insert((0, 0)).1 += count;
+                }
+            });
         // shard dropped here, freeing memory before loading next
     }
 
-    let results: Vec<HitResult> = processed.iter().enumerate()
+    let results: Vec<HitResult> = processed
+        .iter()
+        .enumerate()
         .flat_map(|(idx, (query_id, fwd_mins, rc_mins))| {
             let fwd_total = fwd_mins.len();
             let rc_total = rc_mins.len();
             let hits = all_hits[idx].lock().unwrap();
 
-            hits.iter().filter_map(|(&bucket_id, &(fwd_count, rc_count))| {
-                let score = compute_score(fwd_count, fwd_total, rc_count, rc_total);
-                if score >= threshold {
-                    Some(HitResult { query_id: *query_id, bucket_id, score })
-                } else {
-                    None
-                }
-            }).collect::<Vec<_>>()
+            hits.iter()
+                .filter_map(|(&bucket_id, &(fwd_count, rc_count))| {
+                    let score = compute_score(fwd_count, fwd_total, rc_count, rc_total);
+                    if score >= threshold {
+                        Some(HitResult {
+                            query_id: *query_id,
+                            bucket_id,
+                            score,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -213,11 +254,14 @@ pub fn classify_batch_sharded_merge_join(
     let base_path = sharded.base_path();
 
     // Extract minimizers in parallel, filtering negatives if provided
-    let extracted: Vec<_> = records.par_iter()
+    let extracted: Vec<_> = records
+        .par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (_, s1, s2)| {
-            let (ha, hb) = get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
+            let (ha, hb) =
+                get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
             filter_negative_mins(ha, hb, negative_mins)
-        }).collect();
+        })
+        .collect();
 
     // Collect query IDs
     let query_ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
@@ -255,7 +299,11 @@ pub fn classify_batch_sharded_merge_join(
         for (bucket_id, (fwd_hits, rc_hits)) in buckets {
             let score = compute_score(fwd_hits as usize, fwd_total, rc_hits as usize, rc_total);
             if score >= threshold {
-                results.push(HitResult { query_id, bucket_id, score });
+                results.push(HitResult {
+                    query_id,
+                    bucket_id,
+                    score,
+                });
             }
         }
     }
@@ -282,17 +330,20 @@ pub fn classify_batch_sharded_main(
     sharded: &ShardedMainIndex,
     negative_mins: Option<&HashSet<u64>>,
     records: &[QueryRecord],
-    threshold: f64
+    threshold: f64,
 ) -> Result<Vec<HitResult>> {
     let manifest = sharded.manifest();
 
     // Extract minimizers for all queries (parallel), filtering negatives if provided
-    let processed: Vec<_> = records.par_iter()
+    let processed: Vec<_> = records
+        .par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
-            let (ha, hb) = get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
+            let (ha, hb) =
+                get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
             let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
             (*id, fa, fb)
-        }).collect();
+        })
+        .collect();
 
     // Build inverted maps: minimizer → query indices
     let mut map_a: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -300,61 +351,83 @@ pub fn classify_batch_sharded_main(
     let mut uniq_mins = HashSet::new();
 
     for (idx, (_, ma, mb)) in processed.iter().enumerate() {
-        for &m in ma { map_a.entry(m).or_default().push(idx); uniq_mins.insert(m); }
-        for &m in mb { map_b.entry(m).or_default().push(idx); uniq_mins.insert(m); }
+        for &m in ma {
+            map_a.entry(m).or_default().push(idx);
+            uniq_mins.insert(m);
+        }
+        for &m in mb {
+            map_b.entry(m).or_default().push(idx);
+            uniq_mins.insert(m);
+        }
     }
     let uniq_vec: Vec<u64> = uniq_mins.into_iter().collect();
 
     // Accumulator: query_idx → bucket_id → (fwd_hits, rc_hits)
-    let all_hits: Vec<Mutex<HashMap<u32, (usize, usize)>>> =
-        (0..processed.len()).map(|_| Mutex::new(HashMap::new())).collect();
+    let all_hits: Vec<Mutex<HashMap<u32, (usize, usize)>>> = (0..processed.len())
+        .map(|_| Mutex::new(HashMap::new()))
+        .collect();
 
     // Process each shard sequentially (load one at a time)
     for shard_info in &manifest.shards {
         let shard = sharded.load_shard(shard_info.shard_id)?;
 
         // Process all buckets in this shard in parallel
-        shard.buckets.par_iter().for_each(|(bucket_id, bucket_minimizers)| {
-            let mut bucket_hits: HashMap<usize, (usize, usize)> = HashMap::new();
+        shard
+            .buckets
+            .par_iter()
+            .for_each(|(bucket_id, bucket_minimizers)| {
+                let mut bucket_hits: HashMap<usize, (usize, usize)> = HashMap::new();
 
-            // Binary search each unique query minimizer against this bucket
-            for &m in &uniq_vec {
-                if bucket_minimizers.binary_search(&m).is_ok() {
-                    if let Some(rs) = map_a.get(&m) {
-                        for &r in rs { bucket_hits.entry(r).or_insert((0, 0)).0 += 1; }
-                    }
-                    if let Some(rs) = map_b.get(&m) {
-                        for &r in rs { bucket_hits.entry(r).or_insert((0, 0)).1 += 1; }
+                // Binary search each unique query minimizer against this bucket
+                for &m in &uniq_vec {
+                    if bucket_minimizers.binary_search(&m).is_ok() {
+                        if let Some(rs) = map_a.get(&m) {
+                            for &r in rs {
+                                bucket_hits.entry(r).or_insert((0, 0)).0 += 1;
+                            }
+                        }
+                        if let Some(rs) = map_b.get(&m) {
+                            for &r in rs {
+                                bucket_hits.entry(r).or_insert((0, 0)).1 += 1;
+                            }
+                        }
                     }
                 }
-            }
 
-            // Merge hits into per-query accumulators
-            for (r_idx, (fwd_count, rc_count)) in bucket_hits {
-                let mut hits = all_hits[r_idx].lock().unwrap();
-                let entry = hits.entry(*bucket_id).or_insert((0, 0));
-                entry.0 += fwd_count;
-                entry.1 += rc_count;
-            }
-        });
+                // Merge hits into per-query accumulators
+                for (r_idx, (fwd_count, rc_count)) in bucket_hits {
+                    let mut hits = all_hits[r_idx].lock().unwrap();
+                    let entry = hits.entry(*bucket_id).or_insert((0, 0));
+                    entry.0 += fwd_count;
+                    entry.1 += rc_count;
+                }
+            });
         // shard dropped here, freeing memory before loading next
     }
 
     // Score and filter
-    let results: Vec<HitResult> = processed.iter().enumerate()
+    let results: Vec<HitResult> = processed
+        .iter()
+        .enumerate()
         .flat_map(|(idx, (query_id, fwd_mins, rc_mins))| {
             let fwd_total = fwd_mins.len();
             let rc_total = rc_mins.len();
             let hits = all_hits[idx].lock().unwrap();
 
-            hits.iter().filter_map(|(&bucket_id, &(fwd_count, rc_count))| {
-                let score = compute_score(fwd_count, fwd_total, rc_count, rc_total);
-                if score >= threshold {
-                    Some(HitResult { query_id: *query_id, bucket_id, score })
-                } else {
-                    None
-                }
-            }).collect::<Vec<_>>()
+            hits.iter()
+                .filter_map(|(&bucket_id, &(fwd_count, rc_count))| {
+                    let score = compute_score(fwd_count, fwd_total, rc_count, rc_total);
+                    if score >= threshold {
+                        Some(HitResult {
+                            query_id: *query_id,
+                            bucket_id,
+                            score,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -377,35 +450,52 @@ pub fn aggregate_batch(
     engine: &Index,
     negative_mins: Option<&HashSet<u64>>,
     records: &[QueryRecord],
-    threshold: f64
+    threshold: f64,
 ) -> Vec<HitResult> {
     let mut global = HashSet::new();
 
-    let batch_mins: Vec<Vec<u64>> = records.par_iter()
+    let batch_mins: Vec<Vec<u64>> = records
+        .par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (_, s1, s2)| {
-            let (mut a, b) = get_paired_minimizers_into(s1, *s2, engine.k, engine.w, engine.salt, ws);
+            let (mut a, b) =
+                get_paired_minimizers_into(s1, *s2, engine.k, engine.w, engine.salt, ws);
             a.extend(b);
             if let Some(neg_set) = negative_mins {
                 a.retain(|m| !neg_set.contains(m));
             }
             a
-        }).collect();
+        })
+        .collect();
 
-    for v in batch_mins { for m in v { global.insert(m); } }
+    for v in batch_mins {
+        for m in v {
+            global.insert(m);
+        }
+    }
 
     let total = global.len() as f64;
-    if total == 0.0 { return Vec::new(); }
+    if total == 0.0 {
+        return Vec::new();
+    }
 
     let g_vec: Vec<u64> = global.into_iter().collect();
 
-    engine.buckets.par_iter().filter_map(|(id, b)| {
-        let s = count_hits(&g_vec, b) / total;
-        if s >= threshold {
-            Some(HitResult { query_id: -1, bucket_id: *id, score: s })
-        } else {
-            None
-        }
-    }).collect()
+    engine
+        .buckets
+        .par_iter()
+        .filter_map(|(id, b)| {
+            let s = count_hits(&g_vec, b) / total;
+            if s >= threshold {
+                Some(HitResult {
+                    query_id: -1,
+                    bucket_id: *id,
+                    score: s,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Threshold for switching from merge-join to galloping search.
@@ -429,8 +519,16 @@ const ESTIMATED_BUCKETS_PER_READ: usize = 4;
 /// Score is the maximum of forward and reverse-complement hit ratios.
 #[inline]
 fn compute_score(fwd_hits: usize, fwd_total: usize, rc_hits: usize, rc_total: usize) -> f64 {
-    let fwd_score = if fwd_total > 0 { fwd_hits as f64 / fwd_total as f64 } else { 0.0 };
-    let rc_score = if rc_total > 0 { rc_hits as f64 / rc_total as f64 } else { 0.0 };
+    let fwd_score = if fwd_total > 0 {
+        fwd_hits as f64 / fwd_total as f64
+    } else {
+        0.0
+    };
+    let rc_score = if rc_total > 0 {
+        rc_hits as f64 / rc_total as f64
+    } else {
+        0.0
+    };
     fwd_score.max(rc_score)
 }
 
@@ -451,7 +549,9 @@ fn accumulate_match(
     for &packed in &query_idx.read_ids[q_start..q_end] {
         let (read_idx, is_rc) = QueryInvertedIndex::unpack_read_id(packed);
         for &bucket_id in &ref_idx.bucket_ids[r_start..r_end] {
-            let entry = accumulators[read_idx as usize].entry(bucket_id).or_insert((0, 0));
+            let entry = accumulators[read_idx as usize]
+                .entry(bucket_id)
+                .or_insert((0, 0));
             if is_rc {
                 entry.1 += 1;
             } else {
@@ -520,7 +620,11 @@ pub fn classify_batch_merge_join(
         for (bucket_id, (fwd_hits, rc_hits)) in buckets {
             let score = compute_score(fwd_hits as usize, fwd_total, rc_hits as usize, rc_total);
             if score >= threshold {
-                results.push(HitResult { query_id, bucket_id, score });
+                results.push(HitResult {
+                    query_id,
+                    bucket_id,
+                    score,
+                });
             }
         }
     }
@@ -660,9 +764,7 @@ mod tests {
         index.finalize_bucket(1);
 
         let query_seq = seq_a.clone();
-        let records: Vec<QueryRecord> = vec![
-            (101, &query_seq, None)
-        ];
+        let records: Vec<QueryRecord> = vec![(101, &query_seq, None)];
 
         let results = classify_batch(&index, None, &records, 0.5);
 
@@ -682,17 +784,16 @@ mod tests {
         index.add_record(1, "ref_a", &seq_a, &mut ws);
         index.finalize_bucket(1);
 
-        let seq_at: Vec<u8> = (0..200).map(|i| if i % 2 == 0 { b'A' } else { b'T' }).collect();
+        let seq_at: Vec<u8> = (0..200)
+            .map(|i| if i % 2 == 0 { b'A' } else { b'T' })
+            .collect();
         index.add_record(2, "ref_at", &seq_at, &mut ws);
         index.finalize_bucket(2);
 
         let q1 = &seq_at[0..100];
         let q2 = &seq_at[100..200];
 
-        let records: Vec<QueryRecord> = vec![
-            (1, q1, None),
-            (2, q2, None),
-        ];
+        let records: Vec<QueryRecord> = vec![(1, q1, None), (2, q2, None)];
 
         let results = aggregate_batch(&index, None, &records, 0.5);
 
@@ -722,7 +823,10 @@ mod tests {
         index.finalize_bucket(2);
 
         let inverted = InvertedIndex::build_from_index(&index);
-        assert!(inverted.num_minimizers() > 0, "Inverted index should not be empty");
+        assert!(
+            inverted.num_minimizers() > 0,
+            "Inverted index should not be empty"
+        );
 
         // Save as single shard (like we do for non-sharded main index)
         let shard_path = ShardManifest::shard_path(&base_path, 0);
@@ -745,19 +849,21 @@ mod tests {
 
         let query1: &[u8] = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
         let query2: &[u8] = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
-        let records: Vec<QueryRecord> = vec![
-            (0, query1, None),
-            (1, query2, None),
-        ];
+        let records: Vec<QueryRecord> = vec![(0, query1, None), (1, query2, None)];
 
         let threshold = 0.1;
 
         let results_regular = classify_batch(&index, None, &records, threshold);
-        let results_sequential = classify_batch_sharded_sequential(&sharded, None, &records, threshold)?;
+        let results_sequential =
+            classify_batch_sharded_sequential(&sharded, None, &records, threshold)?;
 
-        assert_eq!(results_regular.len(), results_sequential.len(),
+        assert_eq!(
+            results_regular.len(),
+            results_sequential.len(),
             "Result counts should match: regular={}, sequential={}",
-            results_regular.len(), results_sequential.len());
+            results_regular.len(),
+            results_sequential.len()
+        );
 
         let mut sorted_regular = results_regular.clone();
         sorted_regular.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
@@ -768,8 +874,12 @@ mod tests {
         for (reg, seq) in sorted_regular.iter().zip(sorted_sequential.iter()) {
             assert_eq!(reg.query_id, seq.query_id, "Query IDs should match");
             assert_eq!(reg.bucket_id, seq.bucket_id, "Bucket IDs should match");
-            assert!((reg.score - seq.score).abs() < 0.001,
-                "Scores should match: {} vs {}", reg.score, seq.score);
+            assert!(
+                (reg.score - seq.score).abs() < 0.001,
+                "Scores should match: {} vs {}",
+                reg.score,
+                seq.score
+            );
         }
 
         Ok(())
@@ -818,19 +928,22 @@ mod tests {
 
         let query1: &[u8] = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
         let query2: &[u8] = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
-        let records: Vec<QueryRecord> = vec![
-            (0, query1, None),
-            (1, query2, None),
-        ];
+        let records: Vec<QueryRecord> = vec![(0, query1, None), (1, query2, None)];
 
         let threshold = 0.1;
 
-        let results_sequential = classify_batch_sharded_sequential(&sharded, None, &records, threshold)?;
-        let results_merge_join = classify_batch_sharded_merge_join(&sharded, None, &records, threshold)?;
+        let results_sequential =
+            classify_batch_sharded_sequential(&sharded, None, &records, threshold)?;
+        let results_merge_join =
+            classify_batch_sharded_merge_join(&sharded, None, &records, threshold)?;
 
-        assert_eq!(results_sequential.len(), results_merge_join.len(),
+        assert_eq!(
+            results_sequential.len(),
+            results_merge_join.len(),
             "Result counts should match: sequential={}, merge_join={}",
-            results_sequential.len(), results_merge_join.len());
+            results_sequential.len(),
+            results_merge_join.len()
+        );
 
         let mut sorted_sequential = results_sequential.clone();
         sorted_sequential.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
@@ -841,8 +954,12 @@ mod tests {
         for (seq, mj) in sorted_sequential.iter().zip(sorted_merge_join.iter()) {
             assert_eq!(seq.query_id, mj.query_id, "Query IDs should match");
             assert_eq!(seq.bucket_id, mj.bucket_id, "Bucket IDs should match");
-            assert!((seq.score - mj.score).abs() < 0.001,
-                "Scores should match: {} vs {}", seq.score, mj.score);
+            assert!(
+                (seq.score - mj.score).abs() < 0.001,
+                "Scores should match: {} vs {}",
+                seq.score,
+                mj.score
+            );
         }
 
         Ok(())
@@ -874,19 +991,20 @@ mod tests {
 
         let query1: &[u8] = seq1;
         let query2: &[u8] = seq2;
-        let records: Vec<QueryRecord> = vec![
-            (0, query1, None),
-            (1, query2, None),
-        ];
+        let records: Vec<QueryRecord> = vec![(0, query1, None), (1, query2, None)];
 
         let threshold = 0.1;
 
         let results_regular = classify_batch(&index, None, &records, threshold);
         let results_sharded = classify_batch_sharded_main(&sharded, None, &records, threshold)?;
 
-        assert_eq!(results_regular.len(), results_sharded.len(),
+        assert_eq!(
+            results_regular.len(),
+            results_sharded.len(),
             "Result counts should match: regular={}, sharded={}",
-            results_regular.len(), results_sharded.len());
+            results_regular.len(),
+            results_sharded.len()
+        );
 
         let mut sorted_regular = results_regular.clone();
         sorted_regular.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
@@ -897,8 +1015,12 @@ mod tests {
         for (reg, shr) in sorted_regular.iter().zip(sorted_sharded.iter()) {
             assert_eq!(reg.query_id, shr.query_id, "Query IDs should match");
             assert_eq!(reg.bucket_id, shr.bucket_id, "Bucket IDs should match");
-            assert!((reg.score - shr.score).abs() < 0.001,
-                "Scores should match: {} vs {}", reg.score, shr.score);
+            assert!(
+                (reg.score - shr.score).abs() < 0.001,
+                "Scores should match: {} vs {}",
+                reg.score,
+                shr.score
+            );
         }
 
         Ok(())
@@ -910,14 +1032,14 @@ mod tests {
     fn test_merge_join_basic() {
         // Simple test with known minimizers
         let queries = vec![
-            (vec![100, 200, 300], vec![150, 250]),  // read 0
+            (vec![100, 200, 300], vec![150, 250]), // read 0
         ];
         let query_idx = QueryInvertedIndex::build(&queries);
 
         // Build reference with overlapping minimizers
         let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 400]);  // shares 100, 200
-        index.buckets.insert(2, vec![150, 250, 500]);  // shares 150, 250
+        index.buckets.insert(1, vec![100, 200, 400]); // shares 100, 200
+        index.buckets.insert(2, vec![150, 250, 500]); // shares 150, 250
         index.bucket_names.insert(1, "A".into());
         index.bucket_names.insert(2, "B".into());
 
@@ -933,20 +1055,18 @@ mod tests {
         let bucket2_hit = results.iter().find(|r| r.bucket_id == 2).unwrap();
 
         // Bucket 1: 2 fwd hits (100, 200) out of 3 fwd minimizers = 0.667
-        assert!((bucket1_hit.score - 2.0/3.0).abs() < 0.001);
+        assert!((bucket1_hit.score - 2.0 / 3.0).abs() < 0.001);
         // Bucket 2: 2 rc hits (150, 250) out of 2 rc minimizers = 1.0
         assert!((bucket2_hit.score - 1.0).abs() < 0.001);
     }
 
     #[test]
     fn test_merge_join_no_overlap() {
-        let queries = vec![
-            (vec![100, 200], vec![150]),
-        ];
+        let queries = vec![(vec![100, 200], vec![150])];
         let query_idx = QueryInvertedIndex::build(&queries);
 
         let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![500, 600, 700]);  // no overlap
+        index.buckets.insert(1, vec![500, 600, 700]); // no overlap
         index.bucket_names.insert(1, "A".into());
 
         let ref_idx = InvertedIndex::build_from_index(&index);
@@ -954,7 +1074,10 @@ mod tests {
 
         let results = classify_batch_merge_join(&query_idx, &ref_idx, &query_ids, 0.0);
 
-        assert!(results.is_empty(), "Should have no hits when no minimizers overlap");
+        assert!(
+            results.is_empty(),
+            "Should have no hits when no minimizers overlap"
+        );
     }
 
     #[test]
@@ -978,7 +1101,7 @@ mod tests {
         // Create scenario where query << ref to trigger galloping
         // Need query_len * 16 < ref_len
         let queries = vec![
-            (vec![500], vec![]),  // Single minimizer
+            (vec![500], vec![]), // Single minimizer
         ];
         let query_idx = QueryInvertedIndex::build(&queries);
 
@@ -996,7 +1119,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].bucket_id, 1);
-        assert_eq!(results[0].score, 1.0);  // 1/1 fwd minimizers matched
+        assert_eq!(results[0].score, 1.0); // 1/1 fwd minimizers matched
     }
 
     #[test]
@@ -1011,7 +1134,7 @@ mod tests {
         //
         // The match at position 1 is excluded from the search range.
         let queries = vec![
-            (vec![10], vec![]),  // Single minimizer at boundary position
+            (vec![10], vec![]), // Single minimizer at boundary position
         ];
         let query_idx = QueryInvertedIndex::build(&queries);
 
@@ -1029,7 +1152,11 @@ mod tests {
 
         // This assertion will FAIL with the bug (results.len() == 0)
         // and PASS after the fix (results.len() == 1)
-        assert_eq!(results.len(), 1, "Minimizer at boundary position should be found");
+        assert_eq!(
+            results.len(),
+            1,
+            "Minimizer at boundary position should be found"
+        );
         assert_eq!(results[0].bucket_id, 1);
         assert_eq!(results[0].score, 1.0);
     }
@@ -1040,13 +1167,13 @@ mod tests {
         // Need ref_len * 16 < query_len
         let minimizers: Vec<u64> = (0..100).map(|i| i * 10).collect();
         let queries = vec![
-            (minimizers.clone(), vec![]),  // 100 minimizers
+            (minimizers.clone(), vec![]), // 100 minimizers
         ];
         let query_idx = QueryInvertedIndex::build(&queries);
 
         // Small reference (< 100/16 = 6 minimizers)
         let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![500]);  // Single minimizer at position 50
+        index.buckets.insert(1, vec![500]); // Single minimizer at position 50
         index.bucket_names.insert(1, "A".into());
 
         let ref_idx = InvertedIndex::build_from_index(&index);
@@ -1076,12 +1203,15 @@ mod tests {
 
         // Without negative filtering: should match bucket 1
         let results_no_neg = classify_batch(&index, None, &records, 0.5);
-        assert!(!results_no_neg.is_empty(), "Should have hits without negative filtering");
+        assert!(
+            !results_no_neg.is_empty(),
+            "Should have hits without negative filtering"
+        );
         assert_eq!(results_no_neg[0].score, 1.0);
 
         // Extract the minimizers that would be in the query
         let (query_mins, _) = crate::extraction::get_paired_minimizers_into(
-            &query_seq, None, index.k, index.w, index.salt, &mut ws
+            &query_seq, None, index.k, index.w, index.salt, &mut ws,
         );
 
         // Create negative set containing all query minimizers
@@ -1089,7 +1219,10 @@ mod tests {
 
         // With full negative filtering: should have no hits (score = 0)
         let results_with_neg = classify_batch(&index, Some(&neg_set), &records, 0.5);
-        assert!(results_with_neg.is_empty(), "Should have no hits above threshold when all minimizers filtered");
+        assert!(
+            results_with_neg.is_empty(),
+            "Should have no hits above threshold when all minimizers filtered"
+        );
     }
 
     #[test]
@@ -1137,12 +1270,18 @@ mod tests {
 
         // Extract query minimizers for filtering
         let (query_mins, _) = crate::extraction::get_paired_minimizers_into(
-            query, None, sharded.manifest().k, sharded.manifest().w, sharded.manifest().salt, &mut ws
+            query,
+            None,
+            sharded.manifest().k,
+            sharded.manifest().w,
+            sharded.manifest().salt,
+            &mut ws,
         );
         let full_neg: HashSet<u64> = query_mins.into_iter().collect();
 
         // With full negative filtering: no hits above threshold
-        let results_full_neg = classify_batch_sharded_sequential(&sharded, Some(&full_neg), &records, 0.5)?;
+        let results_full_neg =
+            classify_batch_sharded_sequential(&sharded, Some(&full_neg), &records, 0.5)?;
         assert!(results_full_neg.is_empty());
 
         Ok(())
@@ -1193,12 +1332,18 @@ mod tests {
 
         // Extract query minimizers for filtering
         let (query_mins, _) = crate::extraction::get_paired_minimizers_into(
-            query, None, sharded.manifest().k, sharded.manifest().w, sharded.manifest().salt, &mut ws
+            query,
+            None,
+            sharded.manifest().k,
+            sharded.manifest().w,
+            sharded.manifest().salt,
+            &mut ws,
         );
         let full_neg: HashSet<u64> = query_mins.into_iter().collect();
 
         // With full negative filtering: no hits above threshold
-        let results_full_neg = classify_batch_sharded_merge_join(&sharded, Some(&full_neg), &records, 0.5)?;
+        let results_full_neg =
+            classify_batch_sharded_merge_join(&sharded, Some(&full_neg), &records, 0.5)?;
         assert!(results_full_neg.is_empty());
 
         Ok(())
@@ -1232,12 +1377,18 @@ mod tests {
 
         // Extract query minimizers for filtering
         let (query_mins, _) = crate::extraction::get_paired_minimizers_into(
-            query, None, sharded.manifest().k, sharded.manifest().w, sharded.manifest().salt, &mut ws
+            query,
+            None,
+            sharded.manifest().k,
+            sharded.manifest().w,
+            sharded.manifest().salt,
+            &mut ws,
         );
         let full_neg: HashSet<u64> = query_mins.into_iter().collect();
 
         // With full negative filtering: no hits above threshold
-        let results_full_neg = classify_batch_sharded_main(&sharded, Some(&full_neg), &records, 0.5)?;
+        let results_full_neg =
+            classify_batch_sharded_main(&sharded, Some(&full_neg), &records, 0.5)?;
         assert!(results_full_neg.is_empty());
 
         Ok(())
@@ -1253,28 +1404,41 @@ mod tests {
         index.add_record(1, "ref_a", &seq_a, &mut ws);
         index.finalize_bucket(1);
 
-        let records: Vec<QueryRecord> = vec![
-            (1, &seq_a[0..50], None),
-            (2, &seq_a[50..100], None),
-        ];
+        let records: Vec<QueryRecord> = vec![(1, &seq_a[0..50], None), (2, &seq_a[50..100], None)];
 
         // Without negative filtering
         let results_no_neg = aggregate_batch(&index, None, &records, 0.5);
-        assert!(!results_no_neg.is_empty(), "Should have results without negative filtering");
+        assert!(
+            !results_no_neg.is_empty(),
+            "Should have results without negative filtering"
+        );
 
         // Get all minimizers from the queries
         let (mins1, _) = crate::extraction::get_paired_minimizers_into(
-            &seq_a[0..50], None, index.k, index.w, index.salt, &mut ws
+            &seq_a[0..50],
+            None,
+            index.k,
+            index.w,
+            index.salt,
+            &mut ws,
         );
         let (mins2, _) = crate::extraction::get_paired_minimizers_into(
-            &seq_a[50..100], None, index.k, index.w, index.salt, &mut ws
+            &seq_a[50..100],
+            None,
+            index.k,
+            index.w,
+            index.salt,
+            &mut ws,
         );
         let mut full_neg: HashSet<u64> = mins1.into_iter().collect();
         full_neg.extend(mins2);
 
         // With full negative filtering
         let results_full_neg = aggregate_batch(&index, Some(&full_neg), &records, 0.5);
-        assert!(results_full_neg.is_empty(), "Should have no hits when all minimizers filtered");
+        assert!(
+            results_full_neg.is_empty(),
+            "Should have no hits when all minimizers filtered"
+        );
     }
 
     // ==================== Edge Case Tests ====================
@@ -1312,7 +1476,9 @@ mod tests {
         let mut ws = MinimizerWorkspace::new();
 
         // Use alternating sequence to get non-trivial minimizers
-        let seq_at: Vec<u8> = (0..80).map(|i| if i % 2 == 0 { b'A' } else { b'T' }).collect();
+        let seq_at: Vec<u8> = (0..80)
+            .map(|i| if i % 2 == 0 { b'A' } else { b'T' })
+            .collect();
         index.add_record(1, "ref_at", &seq_at, &mut ws);
         index.finalize_bucket(1);
 
@@ -1326,12 +1492,14 @@ mod tests {
         let results_none = classify_batch(&index, None, &records, 0.5);
         let results_no_overlap = classify_batch(&index, Some(&no_overlap_neg), &records, 0.5);
 
-        assert_eq!(results_none.len(), results_no_overlap.len(),
-            "No-overlap negative filtering should not change result count");
+        assert_eq!(
+            results_none.len(),
+            results_no_overlap.len(),
+            "No-overlap negative filtering should not change result count"
+        );
         if !results_none.is_empty() {
             assert_eq!(results_none[0].bucket_id, results_no_overlap[0].bucket_id);
             assert!((results_none[0].score - results_no_overlap[0].score).abs() < 0.001);
         }
     }
-
 }

@@ -11,10 +11,14 @@
 /// - Other bases → u64::MAX (invalid)
 pub(crate) const BASE_TO_BIT_LUT: [u64; 256] = {
     let mut lut = [u64::MAX; 256];
-    lut[b'A' as usize] = 1; lut[b'a' as usize] = 1;
-    lut[b'G' as usize] = 1; lut[b'g' as usize] = 1;
-    lut[b'T' as usize] = 0; lut[b't' as usize] = 0;
-    lut[b'C' as usize] = 0; lut[b'c' as usize] = 0;
+    lut[b'A' as usize] = 1;
+    lut[b'a' as usize] = 1;
+    lut[b'G' as usize] = 1;
+    lut[b'g' as usize] = 1;
+    lut[b'T' as usize] = 0;
+    lut[b't' as usize] = 0;
+    lut[b'C' as usize] = 0;
+    lut[b'c' as usize] = 0;
     lut
 };
 
@@ -73,10 +77,18 @@ impl std::fmt::Display for VarIntError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VarIntError::Truncated(bytes) => {
-                write!(f, "Truncated varint: buffer ended after {} bytes with continuation bit set", bytes)
+                write!(
+                    f,
+                    "Truncated varint: buffer ended after {} bytes with continuation bit set",
+                    bytes
+                )
             }
             VarIntError::Overflow(bytes) => {
-                write!(f, "Malformed varint: exceeded 10 bytes at {} bytes consumed", bytes)
+                write!(
+                    f,
+                    "Malformed varint: exceeded 10 bytes at {} bytes consumed",
+                    bytes
+                )
             }
         }
     }
@@ -153,7 +165,6 @@ pub(crate) fn decode_varint(buf: &[u8]) -> Result<(u64, usize), VarIntError> {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -261,14 +272,14 @@ mod tests {
 
         // Values at byte boundaries (where encoding length changes)
         let boundary_values = [
-            127u64,           // max 1-byte
-            128u64,           // min 2-byte
-            16383u64,         // max 2-byte
-            16384u64,         // min 3-byte
-            2097151u64,       // max 3-byte
-            2097152u64,       // min 4-byte
-            268435455u64,     // max 4-byte
-            268435456u64,     // min 5-byte
+            127u64,       // max 1-byte
+            128u64,       // min 2-byte
+            16383u64,     // max 2-byte
+            16384u64,     // min 3-byte
+            2097151u64,   // max 3-byte
+            2097152u64,   // min 4-byte
+            268435455u64, // max 4-byte
+            268435456u64, // min 5-byte
         ];
 
         for val in boundary_values {
@@ -282,7 +293,9 @@ mod tests {
                 assert!(
                     result.is_err(),
                     "Truncation at byte {} of {} should fail for value {}",
-                    truncate_at, len, val
+                    truncate_at,
+                    len,
+                    val
                 );
                 assert_eq!(
                     result,

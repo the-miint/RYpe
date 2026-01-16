@@ -5,7 +5,7 @@
 //! - Platform-specific memory detection
 //! - Batch size calculation based on memory constraints
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 /// Parse a byte size string with optional suffix.
 ///
@@ -55,12 +55,20 @@ pub fn parse_byte_suffix(s: &str) -> Result<Option<usize>> {
         "M" | "MB" => 1024 * 1024,
         "G" | "GB" => 1024 * 1024 * 1024,
         "T" | "TB" => 1024 * 1024 * 1024 * 1024,
-        _ => return Err(anyhow!("Unknown byte suffix: '{}' (use B, K, M, G, or T)", suffix_part)),
+        _ => {
+            return Err(anyhow!(
+                "Unknown byte suffix: '{}' (use B, K, M, G, or T)",
+                suffix_part
+            ))
+        }
     };
 
     let result = value * multiplier as f64;
     if !result.is_finite() || result < 0.0 || result > usize::MAX as f64 {
-        return Err(anyhow!("Byte size overflow: '{}' exceeds maximum representable value", s));
+        return Err(anyhow!(
+            "Byte size overflow: '{}' exceeds maximum representable value",
+            s
+        ));
     }
     let bytes = result.round() as usize;
     Ok(Some(bytes))
@@ -110,29 +118,44 @@ pub fn detect_available_memory() -> AvailableMemory {
     {
         // Try cgroups v2 first
         if let Some(bytes) = read_cgroups_v2_limit() {
-            return AvailableMemory { bytes, source: MemorySource::CgroupsV2 };
+            return AvailableMemory {
+                bytes,
+                source: MemorySource::CgroupsV2,
+            };
         }
 
         // Try cgroups v1
         if let Some(bytes) = read_cgroups_v1_limit() {
-            return AvailableMemory { bytes, source: MemorySource::CgroupsV1 };
+            return AvailableMemory {
+                bytes,
+                source: MemorySource::CgroupsV1,
+            };
         }
 
         // Try SLURM job info
         if let Some(bytes) = read_slurm_job_memory() {
-            return AvailableMemory { bytes, source: MemorySource::Slurm };
+            return AvailableMemory {
+                bytes,
+                source: MemorySource::Slurm,
+            };
         }
 
         // Try /proc/meminfo
         if let Some(bytes) = read_proc_meminfo_available() {
-            return AvailableMemory { bytes, source: MemorySource::ProcMeminfo };
+            return AvailableMemory {
+                bytes,
+                source: MemorySource::ProcMeminfo,
+            };
         }
     }
 
     #[cfg(target_os = "macos")]
     {
         if let Some(bytes) = read_macos_memsize() {
-            return AvailableMemory { bytes, source: MemorySource::MacOsSysctl };
+            return AvailableMemory {
+                bytes,
+                source: MemorySource::MacOsSysctl,
+            };
         }
     }
 
@@ -255,7 +278,7 @@ fn parse_slurm_memory(s: &str) -> Option<usize> {
     let suffix = &s[numeric_end..];
 
     let multiplier: usize = match suffix.to_ascii_uppercase().as_str() {
-        "" | "M" => 1024 * 1024,           // Default is MB
+        "" | "M" => 1024 * 1024, // Default is MB
         "G" => 1024 * 1024 * 1024,
         "T" => 1024 * 1024 * 1024 * 1024,
         "K" => 1024,
@@ -478,7 +501,11 @@ const MEMORY_FUDGE_FACTOR: f64 = 1.3;
 /// - Minimizers: batch_size * minimizers_per_query * 16 bytes (Vec<u64> for fwd + rc)
 /// - QueryInvertedIndex CSR: batch_size * minimizers_per_query * 12 bytes
 /// - Accumulators: batch_size * estimated_buckets_per_read * 12 bytes (HashMap overhead)
-pub fn estimate_batch_memory(batch_size: usize, profile: &ReadMemoryProfile, num_buckets: usize) -> usize {
+pub fn estimate_batch_memory(
+    batch_size: usize,
+    profile: &ReadMemoryProfile,
+    num_buckets: usize,
+) -> usize {
     // OwnedRecord: (i64, Vec<u8>, Option<Vec<u8>>) ≈ 72 bytes + sequence data
     let record_overhead = 72;
     let input_records = batch_size * (record_overhead + profile.avg_query_length);
@@ -527,8 +554,13 @@ pub fn calculate_batch_config(config: &MemoryConfig) -> BatchConfig {
         return BatchConfig {
             batch_size: MIN_BATCH_SIZE,
             batch_count: 1,
-            per_batch_memory: estimate_batch_memory(MIN_BATCH_SIZE, &config.read_profile, config.num_buckets),
-            peak_memory: reserved + estimate_batch_memory(MIN_BATCH_SIZE, &config.read_profile, config.num_buckets),
+            per_batch_memory: estimate_batch_memory(
+                MIN_BATCH_SIZE,
+                &config.read_profile,
+                config.num_buckets,
+            ),
+            peak_memory: reserved
+                + estimate_batch_memory(MIN_BATCH_SIZE, &config.read_profile, config.num_buckets),
         };
     }
 
@@ -537,14 +569,12 @@ pub fn calculate_batch_config(config: &MemoryConfig) -> BatchConfig {
         let memory_per_batch = available / batch_count;
 
         // Binary search for batch_size
-        let batch_size = binary_search_batch_size(
-            memory_per_batch,
-            &config.read_profile,
-            config.num_buckets,
-        );
+        let batch_size =
+            binary_search_batch_size(memory_per_batch, &config.read_profile, config.num_buckets);
 
         if batch_size >= MIN_BATCH_SIZE {
-            let per_batch_memory = estimate_batch_memory(batch_size, &config.read_profile, config.num_buckets);
+            let per_batch_memory =
+                estimate_batch_memory(batch_size, &config.read_profile, config.num_buckets);
             let peak_memory = reserved + (per_batch_memory * batch_count);
 
             return BatchConfig {
@@ -557,7 +587,8 @@ pub fn calculate_batch_config(config: &MemoryConfig) -> BatchConfig {
     }
 
     // Fallback to minimum
-    let per_batch_memory = estimate_batch_memory(MIN_BATCH_SIZE, &config.read_profile, config.num_buckets);
+    let per_batch_memory =
+        estimate_batch_memory(MIN_BATCH_SIZE, &config.read_profile, config.num_buckets);
     BatchConfig {
         batch_size: MIN_BATCH_SIZE,
         batch_count: 1,
@@ -620,10 +651,22 @@ mod tests {
 
     #[test]
     fn test_parse_byte_suffix_gigabytes() {
-        assert_eq!(parse_byte_suffix("4G").unwrap(), Some(4 * 1024 * 1024 * 1024));
-        assert_eq!(parse_byte_suffix("4GB").unwrap(), Some(4 * 1024 * 1024 * 1024));
-        assert_eq!(parse_byte_suffix("4g").unwrap(), Some(4 * 1024 * 1024 * 1024));
-        assert_eq!(parse_byte_suffix("4gb").unwrap(), Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(
+            parse_byte_suffix("4G").unwrap(),
+            Some(4 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_byte_suffix("4GB").unwrap(),
+            Some(4 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_byte_suffix("4g").unwrap(),
+            Some(4 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_byte_suffix("4gb").unwrap(),
+            Some(4 * 1024 * 1024 * 1024)
+        );
     }
 
     #[test]
@@ -647,14 +690,26 @@ mod tests {
 
     #[test]
     fn test_parse_byte_suffix_terabytes() {
-        assert_eq!(parse_byte_suffix("1T").unwrap(), Some(1024 * 1024 * 1024 * 1024));
-        assert_eq!(parse_byte_suffix("1TB").unwrap(), Some(1024 * 1024 * 1024 * 1024));
+        assert_eq!(
+            parse_byte_suffix("1T").unwrap(),
+            Some(1024 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_byte_suffix("1TB").unwrap(),
+            Some(1024 * 1024 * 1024 * 1024)
+        );
     }
 
     #[test]
     fn test_parse_byte_suffix_decimal() {
-        assert_eq!(parse_byte_suffix("1.5G").unwrap(), Some((1.5 * 1024.0 * 1024.0 * 1024.0) as usize));
-        assert_eq!(parse_byte_suffix("2.5M").unwrap(), Some((2.5 * 1024.0 * 1024.0) as usize));
+        assert_eq!(
+            parse_byte_suffix("1.5G").unwrap(),
+            Some((1.5 * 1024.0 * 1024.0 * 1024.0) as usize)
+        );
+        assert_eq!(
+            parse_byte_suffix("2.5M").unwrap(),
+            Some((2.5 * 1024.0 * 1024.0) as usize)
+        );
     }
 
     #[test]
@@ -666,8 +721,14 @@ mod tests {
 
     #[test]
     fn test_parse_byte_suffix_whitespace() {
-        assert_eq!(parse_byte_suffix("  4G  ").unwrap(), Some(4 * 1024 * 1024 * 1024));
-        assert_eq!(parse_byte_suffix("4 G").unwrap(), Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(
+            parse_byte_suffix("  4G  ").unwrap(),
+            Some(4 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_byte_suffix("4 G").unwrap(),
+            Some(4 * 1024 * 1024 * 1024)
+        );
     }
 
     #[test]
@@ -712,7 +773,11 @@ mod tests {
 
         // Should roughly double (within 10% tolerance for fixed overheads)
         let ratio = mem_2k as f64 / mem_1k as f64;
-        assert!(ratio > 1.8 && ratio < 2.2, "Expected ~2x scaling, got {}", ratio);
+        assert!(
+            ratio > 1.8 && ratio < 2.2,
+            "Expected ~2x scaling, got {}",
+            ratio
+        );
     }
 
     #[test]
@@ -734,7 +799,7 @@ mod tests {
         let config = MemoryConfig {
             max_memory: 1024 * 1024 * 1024, // 1GB
             num_threads: 4,
-            index_memory: 100 * 1024 * 1024, // 100MB
+            index_memory: 100 * 1024 * 1024,     // 100MB
             shard_reservation: 50 * 1024 * 1024, // 50MB
             read_profile: profile,
             num_buckets: 100,
@@ -743,8 +808,12 @@ mod tests {
         let batch_config = calculate_batch_config(&config);
 
         // Peak memory should not exceed max_memory
-        assert!(batch_config.peak_memory <= config.max_memory,
-            "Peak memory {} exceeds max {}", batch_config.peak_memory, config.max_memory);
+        assert!(
+            batch_config.peak_memory <= config.max_memory,
+            "Peak memory {} exceeds max {}",
+            batch_config.peak_memory,
+            config.max_memory
+        );
     }
 
     #[test]
@@ -774,9 +843,12 @@ mod tests {
         let batch_large = calculate_batch_config(&config_large_index);
 
         // Larger index should result in smaller batches
-        assert!(batch_small.batch_size >= batch_large.batch_size,
+        assert!(
+            batch_small.batch_size >= batch_large.batch_size,
             "Small index batch {} should be >= large index batch {}",
-            batch_small.batch_size, batch_large.batch_size);
+            batch_small.batch_size,
+            batch_large.batch_size
+        );
     }
 
     #[test]
@@ -871,9 +943,9 @@ mod tests {
         let profile = ReadMemoryProfile::from_files(
             file.path(),
             None,
-            10,  // sample size
-            64,  // k
-            50,  // w
+            10, // sample size
+            64, // k
+            50, // w
         );
 
         assert!(profile.is_some());
@@ -907,13 +979,7 @@ mod tests {
         }
         r2.flush().unwrap();
 
-        let profile = ReadMemoryProfile::from_files(
-            r1.path(),
-            Some(r2.path()),
-            10,
-            64,
-            50,
-        );
+        let profile = ReadMemoryProfile::from_files(r1.path(), Some(r2.path()), 10, 64, 50);
 
         assert!(profile.is_some());
         let profile = profile.unwrap();

@@ -53,11 +53,7 @@ impl<'a> IndexStreamClassifier<'a> {
     /// * `index` - The index to classify against
     /// * `negative_mins` - Optional set of minimizers to exclude
     /// * `threshold` - Minimum score threshold for reporting hits
-    pub fn new(
-        index: &'a Index,
-        negative_mins: Option<&'a HashSet<u64>>,
-        threshold: f64,
-    ) -> Self {
+    pub fn new(index: &'a Index, negative_mins: Option<&'a HashSet<u64>>, threshold: f64) -> Self {
         Self {
             index,
             negative_mins,
@@ -72,10 +68,7 @@ impl<'a> IndexStreamClassifier<'a> {
     }
 
     /// Classify a single batch and return results.
-    pub fn classify_batch(
-        &self,
-        batch: &RecordBatch,
-    ) -> Result<RecordBatch, ArrowClassifyError> {
+    pub fn classify_batch(&self, batch: &RecordBatch) -> Result<RecordBatch, ArrowClassifyError> {
         let records = batch_to_records(batch)?;
         let hits = classify_batch(self.index, self.negative_mins, &records, self.threshold);
         hits_to_record_batch(hits)
@@ -117,9 +110,7 @@ mod tests {
     /// Helper to generate a DNA sequence of given length.
     fn generate_sequence(len: usize, seed: u8) -> Vec<u8> {
         let bases = [b'A', b'C', b'G', b'T'];
-        (0..len)
-            .map(|i| bases[(i + seed as usize) % 4])
-            .collect()
+        (0..len).map(|i| bases[(i + seed as usize) % 4]).collect()
     }
 
     /// Helper to create a test batch.
@@ -178,7 +169,9 @@ mod tests {
         let input_batches: Vec<Result<RecordBatch, arrow::error::ArrowError>> =
             vec![Ok(batch1), Ok(batch2)];
 
-        let results: Vec<_> = classifier.classify_iter(input_batches.into_iter()).collect();
+        let results: Vec<_> = classifier
+            .classify_iter(input_batches.into_iter())
+            .collect();
 
         assert_eq!(results.len(), 2);
         assert!(results[0].is_ok());
@@ -192,7 +185,9 @@ mod tests {
 
         let input_batches: Vec<Result<RecordBatch, arrow::error::ArrowError>> = vec![];
 
-        let results: Vec<_> = classifier.classify_iter(input_batches.into_iter()).collect();
+        let results: Vec<_> = classifier
+            .classify_iter(input_batches.into_iter())
+            .collect();
 
         assert!(results.is_empty());
     }
@@ -235,7 +230,11 @@ mod tests {
         let batch = make_test_batch(&[1], &[&query_seq]);
 
         let result_high = classifier_high.classify_batch(&batch).unwrap();
-        assert_eq!(result_high.num_rows(), 0, "High threshold should filter all");
+        assert_eq!(
+            result_high.num_rows(),
+            0,
+            "High threshold should filter all"
+        );
 
         // With zero threshold, should get results
         let classifier_low = IndexStreamClassifier::new(&index, None, 0.0);
@@ -252,7 +251,9 @@ mod tests {
         let error = arrow::error::ArrowError::InvalidArgumentError("test error".into());
         let input_batches: Vec<Result<RecordBatch, arrow::error::ArrowError>> = vec![Err(error)];
 
-        let results: Vec<_> = classifier.classify_iter(input_batches.into_iter()).collect();
+        let results: Vec<_> = classifier
+            .classify_iter(input_batches.into_iter())
+            .collect();
 
         assert_eq!(results.len(), 1);
         assert!(results[0].is_err());

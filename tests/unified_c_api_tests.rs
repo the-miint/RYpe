@@ -3,29 +3,22 @@
 //! These tests verify that the unified `RypeIndex` type works transparently
 //! with all index formats: single-file main, sharded main, and sharded inverted indices.
 
-use rype::{Index, InvertedIndex, MinimizerWorkspace, ShardedMainIndexBuilder, ShardManifest};
+use anyhow::Result;
 use rype::c_api::{
-    RypeIndex, RypeQuery,
-    rype_index_load, rype_index_free,
-    rype_index_k, rype_index_w, rype_index_salt, rype_index_num_buckets,
-    rype_index_is_sharded, rype_index_num_shards,
-    rype_bucket_name,
-    rype_classify, rype_classify_with_negative,
-    rype_negative_set_create, rype_negative_set_free, rype_negative_set_size,
-    rype_results_free,
-    rype_get_last_error,
+    rype_bucket_name, rype_classify, rype_classify_with_negative, rype_get_last_error,
+    rype_index_free, rype_index_is_sharded, rype_index_k, rype_index_load, rype_index_num_buckets,
+    rype_index_num_shards, rype_index_salt, rype_index_w, rype_negative_set_create,
+    rype_negative_set_free, rype_negative_set_size, rype_results_free, RypeIndex, RypeQuery,
 };
+use rype::{Index, InvertedIndex, MinimizerWorkspace, ShardManifest, ShardedMainIndexBuilder};
 use std::ffi::CString;
 use std::ptr;
 use tempfile::tempdir;
-use anyhow::Result;
 
 /// Helper to generate a DNA sequence with a deterministic pattern.
 fn generate_sequence(len: usize, seed: u8) -> Vec<u8> {
     let bases = [b'A', b'C', b'G', b'T'];
-    (0..len)
-        .map(|i| bases[(i + seed as usize) % 4])
-        .collect()
+    (0..len).map(|i| bases[(i + seed as usize) % 4]).collect()
 }
 
 /// Helper to create a test index with known content.
@@ -114,9 +107,7 @@ fn test_unified_classify_single_main_index() -> Result<()> {
     let query_seq = generate_sequence(200, 0);
     let (query, _seq_holder) = make_query(1, &query_seq);
 
-    let results = unsafe {
-        rype_classify(loaded, &query, 1, 0.1)
-    };
+    let results = unsafe { rype_classify(loaded, &query, 1, 0.1) };
 
     assert!(!results.is_null(), "Classification should succeed");
 
@@ -216,7 +207,10 @@ fn test_unified_classify_sharded_main_index() -> Result<()> {
     assert!(!results.is_null(), "Classification should succeed");
 
     let results_ref = unsafe { &*results };
-    assert!(results_ref.len > 0, "Should have hits for matching sequence");
+    assert!(
+        results_ref.len > 0,
+        "Should have hits for matching sequence"
+    );
 
     unsafe {
         rype_results_free(results);
@@ -391,22 +385,21 @@ fn test_unified_classify_with_negative_filtering() -> Result<()> {
     let (query, _seq_holder) = make_query(1, &seq1);
 
     // Classify without negative filtering - should have hits
-    let results_no_neg = unsafe {
-        rype_classify(pos_loaded, &query, 1, 0.1)
-    };
+    let results_no_neg = unsafe { rype_classify(pos_loaded, &query, 1, 0.1) };
     assert!(!results_no_neg.is_null());
     let no_neg_len = unsafe { (*results_no_neg).len };
 
     // Classify with negative filtering - should have fewer/no hits
-    let results_with_neg = unsafe {
-        rype_classify_with_negative(pos_loaded, neg_set, &query, 1, 0.5)
-    };
+    let results_with_neg =
+        unsafe { rype_classify_with_negative(pos_loaded, neg_set, &query, 1, 0.5) };
     assert!(!results_with_neg.is_null());
     let with_neg_len = unsafe { (*results_with_neg).len };
 
     // With full negative filtering at high threshold, should filter out matches
-    assert!(with_neg_len <= no_neg_len,
-        "Negative filtering should reduce or eliminate hits");
+    assert!(
+        with_neg_len <= no_neg_len,
+        "Negative filtering should reduce or eliminate hits"
+    );
 
     unsafe {
         rype_results_free(results_no_neg);
@@ -498,9 +491,7 @@ fn test_unified_results_consistent_across_formats() -> Result<()> {
         CString::new(sharded_inv_path.to_str().unwrap())?,
     ];
 
-    let indices: Vec<*mut RypeIndex> = paths.iter()
-        .map(|p| rype_index_load(p.as_ptr()))
-        .collect();
+    let indices: Vec<*mut RypeIndex> = paths.iter().map(|p| rype_index_load(p.as_ptr())).collect();
 
     for idx in &indices {
         assert!(!idx.is_null());
@@ -526,8 +517,11 @@ fn test_unified_results_consistent_across_formats() -> Result<()> {
     }
 
     // All formats should produce the same number of hits
-    assert!(hit_counts.iter().all(|&c| c == hit_counts[0]),
-        "All index formats should produce consistent results: {:?}", hit_counts);
+    assert!(
+        hit_counts.iter().all(|&c| c == hit_counts[0]),
+        "All index formats should produce consistent results: {:?}",
+        hit_counts
+    );
 
     for idx in indices {
         rype_index_free(idx);

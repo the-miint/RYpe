@@ -94,7 +94,10 @@ impl<'a> BinaryColumnRef<'a> {
 }
 
 /// Extract a binary column from a RecordBatch by index.
-fn get_binary_column(batch: &RecordBatch, col_idx: usize) -> Result<BinaryColumnRef<'_>, ArrowClassifyError> {
+fn get_binary_column(
+    batch: &RecordBatch,
+    col_idx: usize,
+) -> Result<BinaryColumnRef<'_>, ArrowClassifyError> {
     let column = batch.column(col_idx);
 
     if let Some(arr) = column.as_any().downcast_ref::<BinaryArray>() {
@@ -168,7 +171,9 @@ pub fn batch_to_records(batch: &RecordBatch) -> Result<Vec<QueryRecord<'_>>, Arr
         })?;
 
     let seqs = get_binary_column(batch, seq_idx)?;
-    let pairs = pair_idx.map(|idx| get_binary_column(batch, idx)).transpose()?;
+    let pairs = pair_idx
+        .map(|idx| get_binary_column(batch, idx))
+        .transpose()?;
 
     // Build records with zero-copy references
     let mut records = Vec::with_capacity(num_rows);
@@ -246,11 +251,7 @@ mod tests {
     }
 
     /// Helper to create a test batch with paired sequences.
-    fn make_test_batch_paired(
-        ids: &[i64],
-        seqs: &[&[u8]],
-        pairs: &[Option<&[u8]>],
-    ) -> RecordBatch {
+    fn make_test_batch_paired(ids: &[i64], seqs: &[&[u8]], pairs: &[Option<&[u8]>]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new(COL_ID, DataType::Int64, false),
             Field::new(COL_SEQUENCE, DataType::Binary, false),

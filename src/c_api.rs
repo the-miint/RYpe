@@ -1,22 +1,26 @@
+//! C API for rype - FFI bindings for external language integration.
+//!
+//! # Safety
+//! All functions that take raw pointers perform null checks and validation internally.
+//! These `extern "C"` functions cannot be marked `unsafe` in Rust since they are
+//! designed to be called from C code.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
+use crate::memory::{detect_available_memory, parse_byte_suffix};
 use crate::{
-    Index, QueryRecord,
-    classify_batch,
-    classify_batch_sharded_sequential, classify_batch_sharded_main,
-    ShardedMainIndex, ShardedInvertedIndex,
-    MainIndexManifest, ShardManifest,
+    classify_batch, classify_batch_sharded_main, classify_batch_sharded_sequential, Index,
+    MainIndexManifest, QueryRecord, ShardManifest, ShardedInvertedIndex, ShardedMainIndex,
 };
-use crate::memory::{parse_byte_suffix, detect_available_memory};
-use std::ffi::{CStr, CString};
-use std::slice;
-use std::path::Path;
+use libc::{c_char, c_double, size_t};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use libc::{c_char, size_t, c_double};
+use std::ffi::{CStr, CString};
+use std::path::Path;
+use std::slice;
 
 #[cfg(feature = "arrow")]
 use crate::arrow::{
-    classify_arrow_batch,
-    classify_arrow_batch_sharded, classify_arrow_batch_sharded_main,
+    classify_arrow_batch, classify_arrow_batch_sharded, classify_arrow_batch_sharded_main,
 };
 #[cfg(feature = "arrow")]
 use arrow::ffi::FFI_ArrowSchema;
@@ -88,14 +92,21 @@ impl RypeIndex {
     pub fn bucket_name(&self, bucket_id: u32) -> Option<&str> {
         match self {
             RypeIndex::Single(idx) => idx.bucket_names.get(&bucket_id).map(|s| s.as_str()),
-            RypeIndex::ShardedMain(idx) => idx.manifest().bucket_names.get(&bucket_id).map(|s| s.as_str()),
+            RypeIndex::ShardedMain(idx) => idx
+                .manifest()
+                .bucket_names
+                .get(&bucket_id)
+                .map(|s| s.as_str()),
             RypeIndex::ShardedInverted(_) => None,
         }
     }
 
     /// Returns whether this is a sharded index.
     pub fn is_sharded(&self) -> bool {
-        matches!(self, RypeIndex::ShardedMain(_) | RypeIndex::ShardedInverted(_))
+        matches!(
+            self,
+            RypeIndex::ShardedMain(_) | RypeIndex::ShardedInverted(_)
+        )
     }
 
     /// Returns the number of shards (1 for single-file indices).
@@ -120,16 +131,18 @@ impl RypeIndex {
         match self {
             RypeIndex::Single(idx) => {
                 // HashMap overhead: ~56 bytes per entry + Vec<u64> data
-                let bucket_mem: usize = idx.buckets.iter()
-                    .map(|(_, v)| 56 + v.len() * 8 + v.capacity() * 8)
+                let bucket_mem: usize = idx
+                    .buckets
+                    .values()
+                    .map(|v| 56 + v.len() * 8 + v.capacity() * 8)
                     .sum();
                 // bucket_names: ~56 bytes per entry + String data
-                let names_mem: usize = idx.bucket_names.iter()
-                    .map(|(_, s)| 56 + s.len())
-                    .sum();
+                let names_mem: usize = idx.bucket_names.values().map(|s| 56 + s.len()).sum();
                 // bucket_sources: ~56 bytes per entry + Vec + Strings
-                let sources_mem: usize = idx.bucket_sources.iter()
-                    .map(|(_, v)| 56 + v.iter().map(|s| 24 + s.len()).sum::<usize>())
+                let sources_mem: usize = idx
+                    .bucket_sources
+                    .values()
+                    .map(|v| 56 + v.iter().map(|s| 24 + s.len()).sum::<usize>())
                     .sum();
                 bucket_mem + names_mem + sources_mem
             }
@@ -159,7 +172,9 @@ impl RypeIndex {
             RypeIndex::ShardedMain(idx) => {
                 // Estimate: 8 bytes per minimizer + HashMap overhead
                 let manifest = idx.manifest();
-                manifest.shards.iter()
+                manifest
+                    .shards
+                    .iter()
                     .map(|s| s.num_minimizers * 8 + s.bucket_ids.len() * 100)
                     .max()
                     .unwrap_or(0)
@@ -167,7 +182,9 @@ impl RypeIndex {
             RypeIndex::ShardedInverted(idx) => {
                 // CSR format: minimizers (8 bytes) + offsets (4 bytes) + bucket_ids (4 bytes)
                 let manifest = idx.manifest();
-                manifest.shards.iter()
+                manifest
+                    .shards
+                    .iter()
                     .map(|s| s.num_minimizers * 8 + s.num_minimizers * 4 + s.num_bucket_ids * 4)
                     .max()
                     .unwrap_or(0)
@@ -202,16 +219,15 @@ impl RypeIndex {
 // --- Error Reporting ---
 
 thread_local! {
-    static LAST_ERROR: RefCell<Option<CString>> = RefCell::new(None);
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 fn set_last_error(err: String) {
     LAST_ERROR.with(|e| {
         // Sanitize null bytes to prevent silent error suppression
         let sanitized = err.replace('\0', "\\0");
-        *e.borrow_mut() = Some(
-            CString::new(sanitized).expect("sanitized string should not contain null bytes")
-        );
+        *e.borrow_mut() =
+            Some(CString::new(sanitized).expect("sanitized string should not contain null bytes"));
     });
 }
 
@@ -347,10 +363,11 @@ pub extern "C" fn rype_index_load(path: *const c_char) -> *mut RypeIndex {
             }
         } else {
             // Legacy single-file inverted index not supported
-            set_last_error(format!(
+            set_last_error(
                 "Legacy single-file inverted index format (RYXI) is no longer supported. \
                  Re-create the inverted index with: rype index invert -i <main_index>"
-            ));
+                    .to_string(),
+            );
             std::ptr::null_mut()
         }
     } else {
@@ -387,7 +404,9 @@ pub extern "C" fn rype_index_load(path: *const c_char) -> *mut RypeIndex {
 #[no_mangle]
 pub extern "C" fn rype_index_free(ptr: *mut RypeIndex) {
     if !ptr.is_null() {
-        unsafe { let _ = Box::from_raw(ptr); }
+        unsafe {
+            let _ = Box::from_raw(ptr);
+        }
     }
 }
 
@@ -454,7 +473,11 @@ pub extern "C" fn rype_index_is_inverted(index_ptr: *const RypeIndex) -> i32 {
         return 0;
     }
     let index = unsafe { &*index_ptr };
-    if index.is_inverted() { 1 } else { 0 }
+    if index.is_inverted() {
+        1
+    } else {
+        0
+    }
 }
 
 /// Returns whether the index is sharded.
@@ -464,7 +487,11 @@ pub extern "C" fn rype_index_is_sharded(index_ptr: *const RypeIndex) -> i32 {
         return 0;
     }
     let index = unsafe { &*index_ptr };
-    if index.is_sharded() { 1 } else { 0 }
+    if index.is_sharded() {
+        1
+    } else {
+        0
+    }
 }
 
 /// Returns the number of shards in the index (1 for single-file indices).
@@ -603,7 +630,10 @@ pub extern "C" fn rype_bucket_name(index_ptr: *const RypeIndex, bucket_id: u32) 
                 };
                 cache.insert(key, cstring);
                 // Return pointer to the cached CString
-                cache.get(&key).map(|s| s.as_ptr()).unwrap_or(std::ptr::null())
+                cache
+                    .get(&key)
+                    .map(|s| s.as_ptr())
+                    .unwrap_or(std::ptr::null())
             })
         }
         None => std::ptr::null(),
@@ -628,7 +658,9 @@ pub struct RypeNegativeSet {
 /// WARNING: For sharded indices, this loads all shards to collect minimizers,
 /// which may use significant memory.
 #[no_mangle]
-pub extern "C" fn rype_negative_set_create(negative_index_ptr: *const RypeIndex) -> *mut RypeNegativeSet {
+pub extern "C" fn rype_negative_set_create(
+    negative_index_ptr: *const RypeIndex,
+) -> *mut RypeNegativeSet {
     if negative_index_ptr.is_null() {
         set_last_error("negative_index is NULL".to_string());
         return std::ptr::null_mut();
@@ -652,7 +684,9 @@ pub extern "C" fn rype_negative_set_create(negative_index_ptr: *const RypeIndex)
 #[no_mangle]
 pub extern "C" fn rype_negative_set_free(ptr: *mut RypeNegativeSet) {
     if !ptr.is_null() {
-        unsafe { let _ = Box::from_raw(ptr); }
+        unsafe {
+            let _ = Box::from_raw(ptr);
+        }
     }
 }
 
@@ -665,7 +699,6 @@ pub extern "C" fn rype_negative_set_size(ptr: *const RypeNegativeSet) -> size_t 
     let neg_set = unsafe { &*ptr };
     neg_set.minimizers.len()
 }
-
 
 // --- Primary Index Classification ---
 
@@ -680,10 +713,16 @@ pub extern "C" fn rype_classify(
     index_ptr: *const RypeIndex,
     queries_ptr: *const RypeQuery,
     num_queries: size_t,
-    threshold: c_double
+    threshold: c_double,
 ) -> *mut RypeResultArray {
     // Delegate to the full version with NULL negative set
-    rype_classify_with_negative(index_ptr, std::ptr::null(), queries_ptr, num_queries, threshold)
+    rype_classify_with_negative(
+        index_ptr,
+        std::ptr::null(),
+        queries_ptr,
+        num_queries,
+        threshold,
+    )
 }
 
 /// Classifies queries using any index type with optional negative filtering.
@@ -715,7 +754,7 @@ pub extern "C" fn rype_classify_with_negative(
     negative_set_ptr: *const RypeNegativeSet,
     queries_ptr: *const RypeQuery,
     num_queries: size_t,
-    threshold: c_double
+    threshold: c_double,
 ) -> *mut RypeResultArray {
     // Validate pointers with alignment checks
     if !is_valid_ptr(index_ptr) {
@@ -740,8 +779,11 @@ pub extern "C" fn rype_classify_with_negative(
         set_last_error("Invalid threshold: must be finite".to_string());
         return std::ptr::null_mut();
     }
-    if threshold < 0.0 || threshold > 1.0 {
-        set_last_error(format!("Invalid threshold: {} (expected 0.0-1.0)", threshold));
+    if !(0.0..=1.0).contains(&threshold) {
+        set_last_error(format!(
+            "Invalid threshold: {} (expected 0.0-1.0)",
+            threshold
+        ));
         return std::ptr::null_mut();
     }
 
@@ -774,22 +816,23 @@ pub extern "C" fn rype_classify_with_negative(
         };
 
         // Build query records (validation already done above)
-        let rust_queries: Vec<QueryRecord> = c_queries.iter().map(|q| {
-            let s1 = unsafe { slice::from_raw_parts(q.seq as *const u8, q.seq_len) };
-            let s2 = if !q.pair_seq.is_null() {
-                Some(unsafe { slice::from_raw_parts(q.pair_seq as *const u8, q.pair_len) })
-            } else {
-                None
-            };
-            (q.id, s1, s2)
-        }).collect();
+        let rust_queries: Vec<QueryRecord> = c_queries
+            .iter()
+            .map(|q| {
+                let s1 = unsafe { slice::from_raw_parts(q.seq as *const u8, q.seq_len) };
+                let s2 = if !q.pair_seq.is_null() {
+                    Some(unsafe { slice::from_raw_parts(q.pair_seq as *const u8, q.pair_len) })
+                } else {
+                    None
+                };
+                (q.id, s1, s2)
+            })
+            .collect();
 
         // Dispatch to appropriate classification function based on index type
         // Return Result to handle errors uniformly
         let hits_result: Result<Vec<crate::HitResult>, String> = match index {
-            RypeIndex::Single(idx) => {
-                Ok(classify_batch(idx, neg_mins, &rust_queries, threshold))
-            }
+            RypeIndex::Single(idx) => Ok(classify_batch(idx, neg_mins, &rust_queries, threshold)),
             RypeIndex::ShardedMain(idx) => {
                 classify_batch_sharded_main(idx, neg_mins, &rust_queries, threshold)
                     .map_err(|e| format!("Sharded main classification failed: {}", e))
@@ -807,11 +850,14 @@ pub extern "C" fn rype_classify_with_negative(
     match result {
         Ok(Ok(hits)) => {
             // Success - convert hits to C array
-            let mut c_hits: Vec<RypeHit> = hits.into_iter().map(|h| RypeHit {
-                query_id: h.query_id,
-                bucket_id: h.bucket_id,
-                score: h.score,
-            }).collect();
+            let mut c_hits: Vec<RypeHit> = hits
+                .into_iter()
+                .map(|h| RypeHit {
+                    query_id: h.query_id,
+                    bucket_id: h.bucket_id,
+                    score: h.score,
+                })
+                .collect();
 
             let len = c_hits.len();
             let capacity = c_hits.capacity();
@@ -823,7 +869,11 @@ pub extern "C" fn rype_classify_with_negative(
                 ptr
             };
 
-            let result_array = Box::new(RypeResultArray { data, len, capacity });
+            let result_array = Box::new(RypeResultArray {
+                data,
+                len,
+                capacity,
+            });
             clear_last_error();
             Box::into_raw(result_array)
         }
@@ -888,7 +938,7 @@ mod layout_tests {
 
     #[test]
     fn test_rype_query_layout() {
-        use std::mem::{size_of, align_of};
+        use std::mem::{align_of, size_of};
 
         // Expected sizes (on 64-bit systems)
         assert_eq!(size_of::<RypeQuery>(), 40);
@@ -904,7 +954,7 @@ mod layout_tests {
 
     #[test]
     fn test_rype_hit_layout() {
-        use std::mem::{size_of, align_of};
+        use std::mem::{align_of, size_of};
         // i64 (8) + u32 (4) + padding (4) + f64 (8) = 24 bytes
         assert_eq!(size_of::<RypeHit>(), 24);
         assert_eq!(align_of::<RypeHit>(), 8);
@@ -912,7 +962,7 @@ mod layout_tests {
 
     #[test]
     fn test_rype_result_array_layout() {
-        use std::mem::{size_of, align_of};
+        use std::mem::{align_of, size_of};
         assert_eq!(size_of::<RypeResultArray>(), 24);
         assert_eq!(align_of::<RypeResultArray>(), 8);
     }
@@ -944,7 +994,7 @@ mod arrow_ffi {
     // -------------------------------------------------------------------------
 
     fn validate_threshold(threshold: c_double) -> Result<(), String> {
-        if !threshold.is_finite() || threshold < 0.0 || threshold > 1.0 {
+        if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
             Err(format!(
                 "Invalid threshold: {} (expected finite value 0.0-1.0)",
                 threshold
@@ -1186,9 +1236,7 @@ mod arrow_ffi {
 
             // Dispatch to appropriate classification function based on index type
             let result = match index {
-                RypeIndex::Single(idx) => {
-                    classify_arrow_batch(idx, neg_mins, batch, threshold)
-                }
+                RypeIndex::Single(idx) => classify_arrow_batch(idx, neg_mins, batch, threshold),
                 RypeIndex::ShardedMain(idx) => {
                     classify_arrow_batch_sharded_main(idx, neg_mins, batch, threshold)
                 }
@@ -1200,8 +1248,14 @@ mod arrow_ffi {
         };
 
         match create_streaming_output(input_stream, out_stream, classify_fn) {
-            Ok(()) => { clear_last_error(); 0 }
-            Err(e) => { set_last_error(e); -1 }
+            Ok(()) => {
+                clear_last_error();
+                0
+            }
+            Err(e) => {
+                set_last_error(e);
+                -1
+            }
         }
     }
 
@@ -1209,6 +1263,11 @@ mod arrow_ffi {
     ///
     /// This allows callers to pre-allocate memory or validate expected output format.
     /// The caller takes ownership and must release the schema.
+    ///
+    /// # Safety
+    ///
+    /// - `out_schema` must be a valid, non-null pointer to writable memory for an `FFI_ArrowSchema`.
+    /// - The caller is responsible for releasing the schema according to the Arrow C Data Interface.
     ///
     /// # Returns
     ///
@@ -1299,12 +1358,14 @@ mod c_api_tests {
             seq: seq.as_ptr(),
             seq_len: 4,
             pair_seq: std::ptr::null(),
-            pair_len: 100,  // Non-zero with null pointer!
+            pair_len: 100, // Non-zero with null pointer!
         };
 
         let result = validate_query(&query);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("NULL but pair_len is non-zero"));
+        assert!(result
+            .unwrap_err()
+            .contains("NULL but pair_len is non-zero"));
     }
 
     #[test]
@@ -1342,7 +1403,6 @@ mod c_api_tests {
         // Shard bytes should be 0 for single index
         assert_eq!(rype_index.largest_shard_bytes(), 0);
     }
-
 }
 
 // Arrow FFI tests
@@ -1359,9 +1419,7 @@ mod arrow_ffi_tests {
     /// Generate a DNA sequence with a deterministic pattern.
     fn generate_sequence(len: usize, seed: u8) -> Vec<u8> {
         let bases = [b'A', b'C', b'G', b'T'];
-        (0..len)
-            .map(|i| bases[(i + seed as usize) % 4])
-            .collect()
+        (0..len).map(|i| bases[(i + seed as usize) % 4]).collect()
     }
 
     /// Create a test batch with the expected schema.
@@ -1405,9 +1463,7 @@ mod arrow_ffi_tests {
     }
 
     /// Read all batches from an FFI stream.
-    unsafe fn read_all_from_ffi_stream(
-        stream: &mut FFI_ArrowArrayStream,
-    ) -> Vec<RecordBatch> {
+    unsafe fn read_all_from_ffi_stream(stream: &mut FFI_ArrowArrayStream) -> Vec<RecordBatch> {
         let reader = ArrowArrayStreamReader::from_raw(stream as *mut _).unwrap();
         reader.collect::<Result<Vec<_>, _>>().unwrap()
     }
@@ -1441,7 +1497,10 @@ mod arrow_ffi_tests {
         assert_eq!(result_batches.len(), 1, "Should have one result batch");
 
         let result_batch = &result_batches[0];
-        assert!(result_batch.num_rows() > 0, "Should have classification hits");
+        assert!(
+            result_batch.num_rows() > 0,
+            "Should have classification hits"
+        );
 
         // Verify schema
         assert_eq!(result_batch.num_columns(), 3);
@@ -1463,8 +1522,14 @@ mod arrow_ffi_tests {
         let index_ptr = &rype_index as *const RypeIndex;
 
         // Create multiple input batches
-        let batch1 = make_test_batch(&[1, 2], &[&generate_sequence(100, 0), &generate_sequence(100, 1)]);
-        let batch2 = make_test_batch(&[3, 4], &[&generate_sequence(100, 0), &generate_sequence(100, 2)]);
+        let batch1 = make_test_batch(
+            &[1, 2],
+            &[&generate_sequence(100, 0), &generate_sequence(100, 1)],
+        );
+        let batch2 = make_test_batch(
+            &[3, 4],
+            &[&generate_sequence(100, 0), &generate_sequence(100, 2)],
+        );
         let batch3 = make_test_batch(&[5], &[&generate_sequence(100, 0)]);
 
         let mut input_stream = batches_to_ffi_stream(vec![batch1, batch2, batch3]);
@@ -1504,9 +1569,18 @@ mod arrow_ffi_tests {
         }
 
         // All queries with seed 0 should match (IDs 1, 3, 5)
-        assert!(seen_query_ids.contains(&1), "Should have result for query 1");
-        assert!(seen_query_ids.contains(&3), "Should have result for query 3");
-        assert!(seen_query_ids.contains(&5), "Should have result for query 5");
+        assert!(
+            seen_query_ids.contains(&1),
+            "Should have result for query 1"
+        );
+        assert!(
+            seen_query_ids.contains(&3),
+            "Should have result for query 3"
+        );
+        assert!(
+            seen_query_ids.contains(&5),
+            "Should have result for query 5"
+        );
 
         // Release output stream
         unsafe {
@@ -1698,4 +1772,3 @@ mod arrow_ffi_tests {
         assert_eq!(result, -1, "Should fail with null pointer");
     }
 }
-

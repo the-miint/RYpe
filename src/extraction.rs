@@ -4,6 +4,9 @@
 //! using the RY (purine/pyrimidine) encoding scheme. Minimizers are selected
 //! using a sliding window approach with a monotonic deque for O(n) complexity.
 
+// Hot path: index-based iteration avoids iterator overhead in inner loops
+#![allow(clippy::needless_range_loop)]
+
 use crate::constants::ESTIMATED_MINIMIZERS_PER_SEQUENCE;
 use crate::encoding::{base_to_bit, reverse_complement};
 use crate::workspace::MinimizerWorkspace;
@@ -87,19 +90,35 @@ pub fn extract_with_positions(
 
             // Forward strand deque
             while let Some(&(p, _)) = ws.q_fwd.front() {
-                if p + w <= pos { ws.q_fwd.pop_front(); } else { break; }
+                if p + w <= pos {
+                    ws.q_fwd.pop_front();
+                } else {
+                    break;
+                }
             }
             while let Some(&(_, v)) = ws.q_fwd.back() {
-                if v >= h_fwd { ws.q_fwd.pop_back(); } else { break; }
+                if v >= h_fwd {
+                    ws.q_fwd.pop_back();
+                } else {
+                    break;
+                }
             }
             ws.q_fwd.push_back((pos, h_fwd));
 
             // Reverse complement deque
             while let Some(&(p, _)) = ws.q_rc.front() {
-                if p + w <= pos { ws.q_rc.pop_front(); } else { break; }
+                if p + w <= pos {
+                    ws.q_rc.pop_front();
+                } else {
+                    break;
+                }
             }
             while let Some(&(_, v)) = ws.q_rc.back() {
-                if v >= h_rc { ws.q_rc.pop_back(); } else { break; }
+                if v >= h_rc {
+                    ws.q_rc.pop_back();
+                } else {
+                    break;
+                }
             }
             ws.q_rc.push_back((pos, h_rc));
 
@@ -153,7 +172,9 @@ pub fn extract_into(seq: &[u8], k: usize, w: usize, salt: u64, ws: &mut Minimize
     ws.q_fwd.clear();
 
     let len = seq.len();
-    if len < k { return; }
+    if len < k {
+        return;
+    }
 
     let mut current_val: u64 = 0;
     let mut last_min: Option<u64> = None;
@@ -180,11 +201,19 @@ pub fn extract_into(seq: &[u8], k: usize, w: usize, salt: u64, ws: &mut Minimize
 
             // Maintain monotonic deque - remove old entries outside window
             while let Some(&(p, _)) = ws.q_fwd.front() {
-                if p + w <= pos { ws.q_fwd.pop_front(); } else { break; }
+                if p + w <= pos {
+                    ws.q_fwd.pop_front();
+                } else {
+                    break;
+                }
             }
             // Remove entries with larger hash values
             while let Some(&(_, v)) = ws.q_fwd.back() {
-                if v >= hash { ws.q_fwd.pop_back(); } else { break; }
+                if v >= hash {
+                    ws.q_fwd.pop_back();
+                } else {
+                    break;
+                }
             }
             ws.q_fwd.push_back((pos, hash));
 
@@ -220,13 +249,15 @@ pub fn extract_dual_strand_into(
     k: usize,
     w: usize,
     salt: u64,
-    ws: &mut MinimizerWorkspace
+    ws: &mut MinimizerWorkspace,
 ) -> (Vec<u64>, Vec<u64>) {
     ws.q_fwd.clear();
     ws.q_rc.clear();
 
     let len = seq.len();
-    if len < k { return (vec![], vec![]); }
+    if len < k {
+        return (vec![], vec![]);
+    }
 
     let mut fwd_mins = Vec::with_capacity(ESTIMATED_MINIMIZERS_PER_SEQUENCE);
     let mut rc_mins = Vec::with_capacity(ESTIMATED_MINIMIZERS_PER_SEQUENCE);
@@ -259,21 +290,51 @@ pub fn extract_dual_strand_into(
             let h_rc = reverse_complement(current_val, k) ^ salt;
 
             // Forward strand deque
-            while let Some(&(p, _)) = ws.q_fwd.front() { if p + w <= pos { ws.q_fwd.pop_front(); } else { break; } }
-            while let Some(&(_, v)) = ws.q_fwd.back() { if v >= h_fwd { ws.q_fwd.pop_back(); } else { break; } }
+            while let Some(&(p, _)) = ws.q_fwd.front() {
+                if p + w <= pos {
+                    ws.q_fwd.pop_front();
+                } else {
+                    break;
+                }
+            }
+            while let Some(&(_, v)) = ws.q_fwd.back() {
+                if v >= h_fwd {
+                    ws.q_fwd.pop_back();
+                } else {
+                    break;
+                }
+            }
             ws.q_fwd.push_back((pos, h_fwd));
 
             // Reverse complement deque
-            while let Some(&(p, _)) = ws.q_rc.front() { if p + w <= pos { ws.q_rc.pop_front(); } else { break; } }
-            while let Some(&(_, v)) = ws.q_rc.back() { if v >= h_rc { ws.q_rc.pop_back(); } else { break; } }
+            while let Some(&(p, _)) = ws.q_rc.front() {
+                if p + w <= pos {
+                    ws.q_rc.pop_front();
+                } else {
+                    break;
+                }
+            }
+            while let Some(&(_, v)) = ws.q_rc.back() {
+                if v >= h_rc {
+                    ws.q_rc.pop_back();
+                } else {
+                    break;
+                }
+            }
             ws.q_rc.push_back((pos, h_rc));
 
             if valid_bases_count >= k + w - 1 {
                 if let Some(&(_, min)) = ws.q_fwd.front() {
-                    if Some(min) != last_fwd { fwd_mins.push(min); last_fwd = Some(min); }
+                    if Some(min) != last_fwd {
+                        fwd_mins.push(min);
+                        last_fwd = Some(min);
+                    }
                 }
                 if let Some(&(_, min)) = ws.q_rc.front() {
-                    if Some(min) != last_rc { rc_mins.push(min); last_rc = Some(min); }
+                    if Some(min) != last_rc {
+                        rc_mins.push(min);
+                        last_rc = Some(min);
+                    }
                 }
             }
         }
@@ -299,7 +360,12 @@ pub fn extract_dual_strand_into(
 /// A tuple of (forward_minimizers, reverse_complement_minimizers),
 /// both sorted and deduplicated.
 pub fn get_paired_minimizers_into(
-    s1: &[u8], s2: Option<&[u8]>, k: usize, w: usize, salt: u64, ws: &mut MinimizerWorkspace
+    s1: &[u8],
+    s2: Option<&[u8]>,
+    k: usize,
+    w: usize,
+    salt: u64,
+    ws: &mut MinimizerWorkspace,
 ) -> (Vec<u64>, Vec<u64>) {
     let (mut fwd, mut rc) = extract_dual_strand_into(s1, k, w, salt, ws);
     if let Some(seq2) = s2 {
@@ -308,8 +374,10 @@ pub fn get_paired_minimizers_into(
         fwd.append(&mut r2_rc);
         rc.append(&mut r2_f);
     }
-    fwd.sort_unstable(); fwd.dedup();
-    rc.sort_unstable(); rc.dedup();
+    fwd.sort_unstable();
+    fwd.dedup();
+    rc.sort_unstable();
+    rc.dedup();
     (fwd, rc)
 }
 
@@ -379,7 +447,10 @@ mod tests {
         let mut ws = MinimizerWorkspace::new();
         let seq = vec![b'A'; 70];
         extract_into(&seq, 64, 5, 0, &mut ws);
-        assert!(!ws.buffer.is_empty(), "Should extract minimizers from valid long seq");
+        assert!(
+            !ws.buffer.is_empty(),
+            "Should extract minimizers from valid long seq"
+        );
     }
 
     #[test]
@@ -387,14 +458,21 @@ mod tests {
         let mut ws = MinimizerWorkspace::new();
         let seq = vec![b'A'; 60];
         extract_into(&seq, 64, 5, 0, &mut ws);
-        assert!(ws.buffer.is_empty(), "Should not extract minimizers from seq < K");
+        assert!(
+            ws.buffer.is_empty(),
+            "Should not extract minimizers from seq < K"
+        );
     }
 
     #[test]
     fn test_n_handling_separator() {
         let mut ws = MinimizerWorkspace::new();
-        let seq_a: Vec<u8> = (0..80).map(|i| if i % 2 == 0 { b'A' } else { b'T' }).collect();
-        let seq_b: Vec<u8> = (0..80).map(|i| if i % 3 == 0 { b'G' } else { b'C' }).collect();
+        let seq_a: Vec<u8> = (0..80)
+            .map(|i| if i % 2 == 0 { b'A' } else { b'T' })
+            .collect();
+        let seq_b: Vec<u8> = (0..80)
+            .map(|i| if i % 3 == 0 { b'G' } else { b'C' })
+            .collect();
 
         extract_into(&seq_a, 64, 5, 0, &mut ws);
         let mins_a = ws.buffer.clone();
@@ -412,7 +490,10 @@ mod tests {
         let mut expected = mins_a;
         expected.extend(mins_b);
 
-        assert_eq!(mins_combined, expected, "N should act as a perfect separator");
+        assert_eq!(
+            mins_combined, expected,
+            "N should act as a perfect separator"
+        );
     }
 
     #[test]
@@ -466,7 +547,10 @@ mod tests {
         let results = extract_with_positions(seq, 16, 4, 0, &mut ws);
 
         // Should have some minimizers with positions
-        assert!(!results.is_empty(), "Should extract minimizers with positions");
+        assert!(
+            !results.is_empty(),
+            "Should extract minimizers with positions"
+        );
 
         // All positions should be valid (< seq.len() - k + 1)
         for m in &results {
@@ -480,7 +564,10 @@ mod tests {
         let mut ws = MinimizerWorkspace::new();
         let seq = b"ACGT"; // 4 bases, too short for k=16
         let results = extract_with_positions(seq, 16, 4, 0, &mut ws);
-        assert!(results.is_empty(), "Short sequence should produce no minimizers");
+        assert!(
+            results.is_empty(),
+            "Short sequence should produce no minimizers"
+        );
     }
 
     #[test]
@@ -491,7 +578,9 @@ mod tests {
         let results = extract_with_positions(seq, 64, 5, 0, &mut ws);
 
         let has_forward = results.iter().any(|m| m.strand == Strand::Forward);
-        let has_rc = results.iter().any(|m| m.strand == Strand::ReverseComplement);
+        let has_rc = results
+            .iter()
+            .any(|m| m.strand == Strand::ReverseComplement);
 
         assert!(has_forward, "Should have forward strand minimizers");
         assert!(has_rc, "Should have reverse complement minimizers");
@@ -507,11 +596,13 @@ mod tests {
         let (fwd_hashes, rc_hashes) = extract_dual_strand_into(seq, 64, 5, 0, &mut ws);
 
         // Collect hashes by strand from extract_with_positions
-        let fwd_pos_hashes: Vec<u64> = with_pos.iter()
+        let fwd_pos_hashes: Vec<u64> = with_pos
+            .iter()
             .filter(|m| m.strand == Strand::Forward)
             .map(|m| m.hash)
             .collect();
-        let rc_pos_hashes: Vec<u64> = with_pos.iter()
+        let rc_pos_hashes: Vec<u64> = with_pos
+            .iter()
             .filter(|m| m.strand == Strand::ReverseComplement)
             .map(|m| m.hash)
             .collect();
@@ -523,7 +614,10 @@ mod tests {
         let fwd_set: std::collections::HashSet<_> = fwd_hashes.iter().collect();
         let rc_set: std::collections::HashSet<_> = rc_hashes.iter().collect();
 
-        let fwd_matches = fwd_pos_hashes.iter().filter(|h| fwd_set.contains(h)).count();
+        let fwd_matches = fwd_pos_hashes
+            .iter()
+            .filter(|h| fwd_set.contains(h))
+            .count();
         let rc_matches = rc_pos_hashes.iter().filter(|h| rc_set.contains(h)).count();
 
         assert!(fwd_matches > 0, "Forward hashes should match");
@@ -543,8 +637,11 @@ mod tests {
             // K-mer either ends before N (pos + k <= 20) or starts after N (pos > 20)
             let ends_before_n = m.position + 16 <= 20;
             let starts_after_n = m.position > 20;
-            assert!(ends_before_n || starts_after_n,
-                "Minimizer at position {} should not span the N at position 20", m.position);
+            assert!(
+                ends_before_n || starts_after_n,
+                "Minimizer at position {} should not span the N at position 20",
+                m.position
+            );
         }
     }
 

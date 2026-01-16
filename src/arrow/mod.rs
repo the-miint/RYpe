@@ -94,9 +94,8 @@ use std::collections::HashSet;
 use arrow::record_batch::RecordBatch;
 
 use crate::{
-    classify_batch, classify_batch_sharded_merge_join,
-    classify_batch_sharded_sequential, classify_batch_sharded_main, Index,
-    ShardedInvertedIndex, ShardedMainIndex,
+    classify_batch, classify_batch_sharded_main, classify_batch_sharded_merge_join,
+    classify_batch_sharded_sequential, Index, ShardedInvertedIndex, ShardedMainIndex,
 };
 
 /// Classify sequences from an Arrow RecordBatch using an Index.
@@ -236,9 +235,7 @@ mod tests {
     /// Helper to generate a DNA sequence.
     fn generate_sequence(len: usize, seed: u8) -> Vec<u8> {
         let bases = [b'A', b'C', b'G', b'T'];
-        (0..len)
-            .map(|i| bases[(i + seed as usize) % 4])
-            .collect()
+        (0..len).map(|i| bases[(i + seed as usize) % 4]).collect()
     }
 
     /// Helper to create a test batch.
@@ -376,10 +373,8 @@ mod tests {
         let threshold = 0.1;
 
         // Regular API
-        let records: Vec<crate::QueryRecord> = vec![
-            (1, query1.as_slice(), None),
-            (2, query2.as_slice(), None),
-        ];
+        let records: Vec<crate::QueryRecord> =
+            vec![(1, query1.as_slice(), None), (2, query2.as_slice(), None)];
         let regular_hits = classify_batch(&index, None, &records, threshold);
 
         // Arrow API

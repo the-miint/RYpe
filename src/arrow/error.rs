@@ -122,10 +122,7 @@ mod tests {
     #[test]
     fn test_error_display_column_not_found() {
         let err = ArrowClassifyError::ColumnNotFound("pair_sequence".into());
-        assert_eq!(
-            err.to_string(),
-            "Required column 'pair_sequence' not found"
-        );
+        assert_eq!(err.to_string(), "Required column 'pair_sequence' not found");
     }
 
     #[test]

@@ -1,15 +1,27 @@
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use needletail::{parse_fastx_file, FastxReader};
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::collections::HashSet;
-use anyhow::{Context, Result, anyhow};
 
-use rype::{Index, IndexMetadata, InvertedIndex, MinimizerWorkspace, QueryRecord, classify_batch, classify_batch_sharded_sequential, classify_batch_sharded_merge_join, classify_batch_sharded_main, aggregate_batch, ShardManifest, ShardedInvertedIndex, MainIndexManifest, MainIndexShard, ShardedMainIndex, ShardedMainIndexBuilder, extract_into, extract_with_positions, Strand};
-use rype::config::{parse_config, validate_config, resolve_path, parse_bucket_add_config, validate_bucket_add_config, AssignmentSettings, BestBinFallback};
-use rype::memory::{parse_byte_suffix, detect_available_memory, ReadMemoryProfile, MemoryConfig, calculate_batch_config, format_bytes, MemorySource};
+use rype::config::{
+    parse_bucket_add_config, parse_config, resolve_path, validate_bucket_add_config,
+    validate_config, AssignmentSettings, BestBinFallback,
+};
+use rype::memory::{
+    calculate_batch_config, detect_available_memory, format_bytes, parse_byte_suffix, MemoryConfig,
+    MemorySource, ReadMemoryProfile,
+};
+use rype::{
+    aggregate_batch, classify_batch, classify_batch_sharded_main,
+    classify_batch_sharded_merge_join, classify_batch_sharded_sequential, extract_into,
+    extract_with_positions, Index, IndexMetadata, InvertedIndex, MainIndexManifest, MainIndexShard,
+    MinimizerWorkspace, QueryRecord, ShardManifest, ShardedInvertedIndex, ShardedMainIndex,
+    ShardedMainIndexBuilder, Strand,
+};
 use std::collections::HashMap;
 use std::io::BufRead;
 
@@ -37,10 +49,12 @@ fn parse_shard_size_arg(s: &str) -> Result<usize, String> {
 /// Sanitize bucket names by replacing nonprintable characters with "_"
 fn sanitize_bucket_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_control() || !c.is_ascii_graphic() && !c.is_whitespace() {
-            '_'
-        } else {
-            c
+        .map(|c| {
+            if c.is_control() || !c.is_ascii_graphic() && !c.is_whitespace() {
+                '_'
+            } else {
+                c
+            }
         })
         .collect()
 }
@@ -61,7 +75,8 @@ fn load_index_metadata(path: &Path) -> Result<IndexMetadata> {
 #[derive(Parser)]
 #[command(name = "rype")]
 #[command(about = "High-performance Read Partitioning Engine (RY-Space, K=16/32/64)")]
-#[command(long_about = "Rype: High-performance genomic sequence classification using minimizer-based k-mer sketching in RY (purine/pyrimidine) space.
+#[command(
+    long_about = "Rype: High-performance genomic sequence classification using minimizer-based k-mer sketching in RY (purine/pyrimidine) space.
 
 WORKFLOW:
   1. Create an index:     rype index create -o index.ryidx -r refs.fasta
@@ -76,7 +91,8 @@ OUTPUT FORMAT (classify):
   Tab-separated: read_id<TAB>bucket_name<TAB>score
   - read_id: Sequence header (first whitespace-delimited token)
   - bucket_name: Human-readable name from index
-  - score: Fraction of query minimizers matching (0.0-1.0)")]
+  - score: Fraction of query minimizers matching (0.0-1.0)"
+)]
 #[command(after_help = "EXAMPLES:
   # Create index from reference genomes
   rype index create -o bacteria.ryidx -r genome1.fna -r genome2.fna -k 64 -w 50
@@ -301,7 +317,8 @@ INVERTED INDEX SHARDING:
     },
 
     /// Create inverted index for faster classification (2-10x speedup)
-    #[command(after_help = "The inverted index maps minimizers to buckets instead of buckets to
+    #[command(
+        after_help = "The inverted index maps minimizers to buckets instead of buckets to
 minimizers, enabling O(Q log U) lookups instead of O(B × Q × log M).
 
 Creates bucket-partitioned shards:
@@ -310,7 +327,8 @@ Creates bucket-partitioned shards:
 
 USAGE:
   rype index invert -i index.ryidx      # Creates index.ryxdi.manifest + .shard.0
-  rype classify run -i index.ryidx -I   # Use inverted index automatically")]
+  rype classify run -i index.ryidx -I   # Use inverted index automatically"
+    )]
     Invert {
         /// Path to primary index file (.ryidx)
         #[arg(short, long)]
@@ -325,7 +343,8 @@ USAGE:
     },
 
     /// Convert single-file index to sharded format
-    #[command(after_help = "Converts an existing single-file index (.ryidx) to sharded format.
+    #[command(
+        after_help = "Converts an existing single-file index (.ryidx) to sharded format.
 
 This is useful for:
 - Memory-constrained classification of large indices
@@ -339,7 +358,8 @@ The output will be:
   sharded.ryidx.manifest     (metadata)
   sharded.ryidx.shard.0      (first shard)
   sharded.ryidx.shard.1      (second shard)
-  ...")]
+  ..."
+    )]
     Shard {
         /// Path to input single-file index (.ryidx)
         #[arg(short, long)]
@@ -544,7 +564,7 @@ fn add_reference_file_to_index(
     index: &mut Index,
     path: &Path,
     separate_buckets: bool,
-    next_id: &mut u32
+    next_id: &mut u32,
 ) -> Result<()> {
     log::info!("Adding reference: {}", path.display());
     let mut reader = parse_fastx_file(path).context("Failed to open reference file")?;
@@ -567,8 +587,11 @@ fn add_reference_file_to_index(
         };
 
         if !separate_buckets {
-             // Just use bucket 1 and label it with the filename if not set
-             index.bucket_names.entry(1).or_insert_with(|| sanitize_bucket_name(&filename));
+            // Just use bucket 1 and label it with the filename if not set
+            index
+                .bucket_names
+                .entry(1)
+                .or_insert_with(|| sanitize_bucket_name(&filename));
         }
 
         let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
@@ -580,8 +603,12 @@ fn add_reference_file_to_index(
         }
     }
 
-    log::info!("Finalized bucket processing for {}: {} total records", path.display(), record_count);
-    
+    log::info!(
+        "Finalized bucket processing for {}: {} total records",
+        path.display(),
+        record_count
+    );
+
     // Finalize relevant buckets
     if separate_buckets {
         // FIX: Collect keys into a Vec first to avoid immutable borrow during mutable iteration
@@ -592,7 +619,7 @@ fn add_reference_file_to_index(
     } else {
         index.finalize_bucket(1);
     }
-    
+
     Ok(())
 }
 
@@ -609,7 +636,7 @@ struct IoHandler {
 impl IoHandler {
     fn new(r1_path: &Path, r2_path: Option<&PathBuf>, out_path: Option<PathBuf>) -> Result<Self> {
         let r1 = parse_fastx_file(r1_path).context("Failed to open R1")?;
-        
+
         let r2 = if let Some(p) = r2_path {
             Some(parse_fastx_file(p).context("Failed to open R2")?)
         } else {
@@ -629,10 +656,13 @@ impl IoHandler {
         })
     }
 
-    fn next_batch_records(&mut self, size: usize) -> Result<Option<(Vec<OwnedRecord>, Vec<String>)>> {
+    fn next_batch_records(
+        &mut self,
+        size: usize,
+    ) -> Result<Option<(Vec<OwnedRecord>, Vec<String>)>> {
         let mut records = Vec::with_capacity(size);
         let mut headers = Vec::with_capacity(size);
-        
+
         for i in 0..size {
             let s1_rec = match self.r1.next() {
                 Some(Ok(rec)) => rec,
@@ -656,7 +686,9 @@ impl IoHandler {
             headers.push(header);
         }
 
-        if records.is_empty() { return Ok(None); }
+        if records.is_empty() {
+            return Ok(None);
+        }
         Ok(Some((records, headers)))
     }
 
@@ -681,7 +713,15 @@ fn main() -> Result<()> {
 
     match args.command {
         Commands::Index(index_cmd) => match index_cmd {
-            IndexCommands::Create { output, reference, kmer_size, window, salt, separate_buckets, max_shard_size } => {
+            IndexCommands::Create {
+                output,
+                reference,
+                kmer_size,
+                window,
+                salt,
+                separate_buckets,
+                max_shard_size,
+            } => {
                 if !matches!(kmer_size, 16 | 32 | 64) {
                     return Err(anyhow!("K must be 16, 32, or 64 (got {})", kmer_size));
                 }
@@ -689,13 +729,26 @@ fn main() -> Result<()> {
                 let mut next_id = 1;
 
                 for ref_file in reference {
-                    add_reference_file_to_index(&mut index, &ref_file, separate_buckets, &mut next_id)?;
+                    add_reference_file_to_index(
+                        &mut index,
+                        &ref_file,
+                        separate_buckets,
+                        &mut next_id,
+                    )?;
                 }
 
                 if let Some(max_bytes) = max_shard_size {
-                    log::info!("Saving sharded index to {:?} (max {} bytes/shard)...", output, max_bytes);
+                    log::info!(
+                        "Saving sharded index to {:?} (max {} bytes/shard)...",
+                        output,
+                        max_bytes
+                    );
                     let manifest = index.save_sharded(&output, max_bytes)?;
-                    log::info!("Created {} shards with {} total minimizers.", manifest.shards.len(), manifest.total_minimizers);
+                    log::info!(
+                        "Created {} shards with {} total minimizers.",
+                        manifest.shards.len(),
+                        manifest.total_minimizers
+                    );
                 } else {
                     log::info!("Saving index to {:?}...", output);
                     index.save(&output)?;
@@ -720,14 +773,18 @@ fn main() -> Result<()> {
                         println!("  Unique minimizers: {}", manifest.total_minimizers);
                         println!("  Total bucket references: {}", manifest.total_bucket_ids);
                         if manifest.total_minimizers > 0 {
-                            println!("  Avg buckets per minimizer: {:.2}",
-                                manifest.total_bucket_ids as f64 / manifest.total_minimizers as f64);
+                            println!(
+                                "  Avg buckets per minimizer: {:.2}",
+                                manifest.total_bucket_ids as f64 / manifest.total_minimizers as f64
+                            );
                         }
                         println!("  ------------------------------------------------");
                         println!("  Shard distribution:");
                         for shard in &manifest.shards {
-                            println!("    Shard {}: {} minimizers, {} bucket refs",
-                                shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
+                            println!(
+                                "    Shard {}: {} minimizers, {} bucket refs",
+                                shard.shard_id, shard.num_minimizers, shard.num_bucket_ids
+                            );
                         }
                     } else if inverted_path.exists() {
                         // Legacy single-file inverted index (RYXI) no longer supported
@@ -761,8 +818,13 @@ fn main() -> Result<()> {
                         println!("  ------------------------------------------------");
                         println!("  Shard distribution:");
                         for shard in &manifest.shards {
-                            println!("    Shard {}: {} buckets, {} minimizers, {} bytes",
-                                shard.shard_id, shard.bucket_ids.len(), shard.num_minimizers, shard.compressed_size);
+                            println!(
+                                "    Shard {}: {} buckets, {} minimizers, {} bytes",
+                                shard.shard_id,
+                                shard.bucket_ids.len(),
+                                shard.num_minimizers,
+                                shard.compressed_size
+                            );
                         }
 
                         manifest.to_metadata()
@@ -780,22 +842,45 @@ fn main() -> Result<()> {
                     // Check if inverted index exists
                     let inverted_path = index.with_extension("ryxdi");
                     if inverted_path.exists() {
-                        println!("  Inverted index: {:?} (use -I to show stats)", inverted_path);
+                        println!(
+                            "  Inverted index: {:?} (use -I to show stats)",
+                            inverted_path
+                        );
                     }
 
                     println!("------------------------------------------------");
                     let mut sorted_ids: Vec<_> = metadata.bucket_names.keys().collect();
                     sorted_ids.sort();
                     for id in sorted_ids {
-                        let name = metadata.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
-                        let count = metadata.bucket_minimizer_counts.get(id).copied().unwrap_or(0);
-                        let sources = metadata.bucket_sources.get(id).map(|v| v.len()).unwrap_or(0);
-                        println!("  Bucket {}: '{}' ({} minimizers, {} sources)", id, name, count, sources);
+                        let name = metadata
+                            .bucket_names
+                            .get(id)
+                            .map(|s| s.as_str())
+                            .unwrap_or("unknown");
+                        let count = metadata
+                            .bucket_minimizer_counts
+                            .get(id)
+                            .copied()
+                            .unwrap_or(0);
+                        let sources = metadata
+                            .bucket_sources
+                            .get(id)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        println!(
+                            "  Bucket {}: '{}' ({} minimizers, {} sources)",
+                            id, name, count, sources
+                        );
                     }
                 }
             }
 
-            IndexCommands::BucketSourceDetail { index, bucket, paths, ids } => {
+            IndexCommands::BucketSourceDetail {
+                index,
+                bucket,
+                paths,
+                ids,
+            } => {
                 let metadata = load_index_metadata(&index)?;
                 let sources = metadata.bucket_sources.get(&bucket).unwrap();
 
@@ -834,12 +919,21 @@ fn main() -> Result<()> {
                     // Sharded main index - add as new shard
                     let mut sharded = ShardedMainIndex::open(&index)?;
                     let next_id = sharded.next_id()?;
-                    log::info!("Adding {:?} as new bucket ID {} (sharded)", reference, next_id);
+                    log::info!(
+                        "Adding {:?} as new bucket ID {} (sharded)",
+                        reference,
+                        next_id
+                    );
 
                     // Extract minimizers from reference file
-                    let mut reader = parse_fastx_file(&reference).context("Failed to open reference file")?;
+                    let mut reader =
+                        parse_fastx_file(&reference).context("Failed to open reference file")?;
                     let mut ws = MinimizerWorkspace::new();
-                    let filename = reference.canonicalize().unwrap().to_string_lossy().to_string();
+                    let filename = reference
+                        .canonicalize()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
                     let mut sources = Vec::new();
                     let mut all_minimizers = Vec::new();
 
@@ -847,7 +941,8 @@ fn main() -> Result<()> {
                         let rec = record.context("Invalid record")?;
                         let seq = rec.seq();
                         let name = String::from_utf8_lossy(rec.id()).to_string();
-                        let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
+                        let source_label =
+                            format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
                         sources.push(source_label);
 
                         extract_into(&seq, sharded.k(), sharded.w(), sharded.salt(), &mut ws);
@@ -861,34 +956,53 @@ fn main() -> Result<()> {
                     sources.dedup();
 
                     let minimizer_count = all_minimizers.len();
-                    sharded.add_bucket(next_id, &sanitize_bucket_name(&filename), sources, all_minimizers)?;
+                    sharded.add_bucket(
+                        next_id,
+                        &sanitize_bucket_name(&filename),
+                        sources,
+                        all_minimizers,
+                    )?;
 
-                    log::info!("Done. Added {} minimizers to bucket {} (new shard {}).",
-                        minimizer_count, next_id, sharded.num_shards() - 1);
+                    log::info!(
+                        "Done. Added {} minimizers to bucket {} (new shard {}).",
+                        minimizer_count,
+                        next_id,
+                        sharded.num_shards() - 1
+                    );
                 } else {
                     // Single-file main index
                     let mut idx = Index::load(&index)?;
                     let next_id = idx.next_id()?;
                     log::info!("Adding {:?} as new bucket ID {}", reference, next_id);
 
-                    let mut reader = parse_fastx_file(&reference).context("Failed to open reference file")?;
+                    let mut reader =
+                        parse_fastx_file(&reference).context("Failed to open reference file")?;
                     let mut ws = MinimizerWorkspace::new();
-                    let filename = reference.canonicalize().unwrap().to_string_lossy().to_string();
+                    let filename = reference
+                        .canonicalize()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
 
-                    idx.bucket_names.insert(next_id, sanitize_bucket_name(&filename));
+                    idx.bucket_names
+                        .insert(next_id, sanitize_bucket_name(&filename));
 
                     while let Some(record) = reader.next() {
                         let rec = record.context("Invalid record")?;
                         let seq = rec.seq();
                         let name = String::from_utf8_lossy(rec.id()).to_string();
-                        let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
+                        let source_label =
+                            format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
                         idx.add_record(next_id, &source_label, &seq, &mut ws);
                     }
 
                     idx.finalize_bucket(next_id);
                     idx.save(&index)?;
-                    log::info!("Done. Added {} minimizers to bucket {}.",
-                             idx.buckets.get(&next_id).map(|v| v.len()).unwrap_or(0), next_id);
+                    log::info!(
+                        "Done. Added {} minimizers to bucket {}.",
+                        idx.buckets.get(&next_id).map(|v| v.len()).unwrap_or(0),
+                        next_id
+                    );
                 }
             }
 
@@ -914,7 +1028,9 @@ fn main() -> Result<()> {
             IndexCommands::Merge { output, inputs } => {
                 // Logic: Load first index, then merge others into it.
                 // Warning: Salt/W must match.
-                if inputs.is_empty() { return Err(anyhow!("No input indexes provided")); }
+                if inputs.is_empty() {
+                    return Err(anyhow!("No input indexes provided"));
+                }
 
                 log::info!("Loading base index: {:?}", inputs[0]);
                 let mut base_idx = Index::load(&inputs[0])?;
@@ -923,7 +1039,10 @@ fn main() -> Result<()> {
                     log::info!("Merging index: {:?}", path);
                     let other_idx = Index::load(path)?;
 
-                    if other_idx.k != base_idx.k || other_idx.w != base_idx.w || other_idx.salt != base_idx.salt {
+                    if other_idx.k != base_idx.k
+                        || other_idx.w != base_idx.w
+                        || other_idx.salt != base_idx.salt
+                    {
                         return Err(anyhow!(
                             "Index parameters mismatch: expected K={}, W={}, Salt=0x{:x}, got K={}, W={}, Salt=0x{:x}",
                             base_idx.k, base_idx.w, base_idx.salt,
@@ -938,7 +1057,9 @@ fn main() -> Result<()> {
                         base_idx.buckets.insert(new_id, vec);
 
                         if let Some(name) = other_idx.bucket_names.get(&old_id) {
-                            base_idx.bucket_names.insert(new_id, sanitize_bucket_name(name));
+                            base_idx
+                                .bucket_names
+                                .insert(new_id, sanitize_bucket_name(name));
                         }
                         if let Some(srcs) = other_idx.bucket_sources.get(&old_id) {
                             base_idx.bucket_sources.insert(new_id, srcs.clone());
@@ -949,7 +1070,11 @@ fn main() -> Result<()> {
                 log::info!("Merged index saved to {:?}", output);
             }
 
-            IndexCommands::FromConfig { config, max_shard_size, invert } => {
+            IndexCommands::FromConfig {
+                config,
+                max_shard_size,
+                invert,
+            } => {
                 build_index_from_config(&config, max_shard_size, invert)?;
             }
 
@@ -966,9 +1091,13 @@ fn main() -> Result<()> {
                 let result: Result<ShardManifest> = if MainIndexManifest::is_sharded(&index) {
                     // Sharded main index: create 1:1 inverted shards
                     log::info!("Detected sharded main index, creating 1:1 inverted shards");
-                    let main_manifest = MainIndexManifest::load(&MainIndexManifest::manifest_path(&index))?;
-                    log::info!("Main index has {} shards, {} buckets",
-                        main_manifest.shards.len(), main_manifest.bucket_names.len());
+                    let main_manifest =
+                        MainIndexManifest::load(&MainIndexManifest::manifest_path(&index))?;
+                    log::info!(
+                        "Main index has {} shards, {} buckets",
+                        main_manifest.shards.len(),
+                        main_manifest.bucket_names.len()
+                    );
 
                     (|| -> Result<ShardManifest> {
                         let mut inv_shards = Vec::new();
@@ -977,9 +1106,14 @@ fn main() -> Result<()> {
                         let num_shards = main_manifest.shards.len();
 
                         for (idx, shard_info) in main_manifest.shards.iter().enumerate() {
-                            let shard_path = MainIndexManifest::shard_path(&index, shard_info.shard_id);
-                            log::info!("Processing main shard {}: {} buckets, {} minimizers (raw)",
-                                shard_info.shard_id, shard_info.bucket_ids.len(), shard_info.num_minimizers);
+                            let shard_path =
+                                MainIndexManifest::shard_path(&index, shard_info.shard_id);
+                            log::info!(
+                                "Processing main shard {}: {} buckets, {} minimizers (raw)",
+                                shard_info.shard_id,
+                                shard_info.bucket_ids.len(),
+                                shard_info.num_minimizers
+                            );
 
                             // Build inverted index from shard, dropping main shard immediately after
                             let inverted = {
@@ -987,11 +1121,15 @@ fn main() -> Result<()> {
                                 InvertedIndex::build_from_shard(&main_shard)
                             };
 
-                            log::info!("  Built inverted: {} unique minimizers, {} bucket entries",
-                                inverted.num_minimizers(), inverted.num_bucket_entries());
+                            log::info!(
+                                "  Built inverted: {} unique minimizers, {} bucket entries",
+                                inverted.num_minimizers(),
+                                inverted.num_bucket_entries()
+                            );
 
                             // Save as inverted shard with same ID
-                            let inv_shard_path = ShardManifest::shard_path(&output_path, shard_info.shard_id);
+                            let inv_shard_path =
+                                ShardManifest::shard_path(&output_path, shard_info.shard_id);
                             let is_last = idx == num_shards - 1;
                             let inv_shard_info = inverted.save_shard(
                                 &inv_shard_path,
@@ -1012,7 +1150,9 @@ fn main() -> Result<()> {
                             k: main_manifest.k,
                             w: main_manifest.w,
                             salt: main_manifest.salt,
-                            source_hash: InvertedIndex::compute_metadata_hash(&main_manifest.to_metadata()),
+                            source_hash: InvertedIndex::compute_metadata_hash(
+                                &main_manifest.to_metadata(),
+                            ),
                             total_minimizers,
                             total_bucket_ids,
                             has_overlapping_shards: true,
@@ -1033,8 +1173,11 @@ fn main() -> Result<()> {
 
                     log::info!("Building inverted index...");
                     let inverted = InvertedIndex::build_from_index(&idx);
-                    log::info!("Inverted index built: {} unique minimizers, {} bucket entries",
-                        inverted.num_minimizers(), inverted.num_bucket_entries());
+                    log::info!(
+                        "Inverted index built: {} unique minimizers, {} bucket entries",
+                        inverted.num_minimizers(),
+                        inverted.num_bucket_entries()
+                    );
 
                     (|| -> Result<ShardManifest> {
                         // Save as single shard (shard_id = 0)
@@ -1055,7 +1198,9 @@ fn main() -> Result<()> {
                             salt: idx.salt,
                             bucket_names: idx.bucket_names.clone(),
                             bucket_sources: idx.bucket_sources.clone(),
-                            bucket_minimizer_counts: idx.buckets.iter()
+                            bucket_minimizer_counts: idx
+                                .buckets
+                                .iter()
                                 .map(|(&id, mins)| (id, mins.len()))
                                 .collect(),
                         };
@@ -1082,8 +1227,12 @@ fn main() -> Result<()> {
                     Ok(inv_manifest) => {
                         log::info!("Created {} inverted shard(s):", inv_manifest.shards.len());
                         for shard in &inv_manifest.shards {
-                            log::info!("  Shard {}: {} unique minimizers, {} bucket entries",
-                                shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
+                            log::info!(
+                                "  Shard {}: {} unique minimizers, {} bucket entries",
+                                shard.shard_id,
+                                shard.num_minimizers,
+                                shard.num_bucket_ids
+                            );
                         }
                         log::info!("Done.");
                     }
@@ -1121,7 +1270,10 @@ fn main() -> Result<()> {
                 }
 
                 let total_minimizers = all_minimizers.len();
-                println!("Total minimizers (with duplicates across buckets): {}", total_minimizers);
+                println!(
+                    "Total minimizers (with duplicates across buckets): {}",
+                    total_minimizers
+                );
 
                 if total_minimizers == 0 {
                     println!("No minimizers to analyze.");
@@ -1135,7 +1287,10 @@ fn main() -> Result<()> {
                 all_minimizers.dedup();
                 let unique_minimizers = all_minimizers.len();
                 println!("Unique minimizers: {}", unique_minimizers);
-                println!("Duplication ratio: {:.2}x", total_minimizers as f64 / unique_minimizers as f64);
+                println!(
+                    "Duplication ratio: {:.2}x",
+                    total_minimizers as f64 / unique_minimizers as f64
+                );
 
                 // Value range
                 let min_val = *all_minimizers.first().unwrap();
@@ -1146,7 +1301,11 @@ fn main() -> Result<()> {
                 println!("Value range: {}", max_val - min_val);
 
                 // Bits needed for raw values
-                let bits_for_max = if max_val == 0 { 1 } else { 64 - max_val.leading_zeros() };
+                let bits_for_max = if max_val == 0 {
+                    1
+                } else {
+                    64 - max_val.leading_zeros()
+                };
                 println!("Bits needed for max value: {}", bits_for_max);
 
                 // Compute deltas
@@ -1174,7 +1333,11 @@ fn main() -> Result<()> {
                     println!("Median delta: {}", median_delta);
 
                     // Bits needed for deltas
-                    let bits_for_max_delta = if max_delta == 0 { 1 } else { 64 - max_delta.leading_zeros() };
+                    let bits_for_max_delta = if max_delta == 0 {
+                        1
+                    } else {
+                        64 - max_delta.leading_zeros()
+                    };
                     println!("Bits needed for max delta: {}", bits_for_max_delta);
 
                     // Distribution of bits needed per delta
@@ -1186,20 +1349,26 @@ fn main() -> Result<()> {
 
                     println!("\nDelta bit-width distribution:");
                     let mut cumulative = 0usize;
+                    #[allow(clippy::needless_range_loop)]
                     for bits in 1..=64 {
                         if bit_distribution[bits] > 0 {
                             cumulative += bit_distribution[bits];
                             let pct = 100.0 * cumulative as f64 / deltas.len() as f64;
-                            println!("  <= {} bits: {} deltas ({:.1}% cumulative)",
-                                bits, bit_distribution[bits], pct);
+                            println!(
+                                "  <= {} bits: {} deltas ({:.1}% cumulative)",
+                                bits, bit_distribution[bits], pct
+                            );
                         }
                     }
 
                     // Estimate compression potential
                     println!("\n=== Compression Estimates ===");
                     let raw_bytes = unique_minimizers * 8;
-                    println!("Raw storage (8 bytes/minimizer): {} bytes ({:.2} GB)",
-                        raw_bytes, raw_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+                    println!(
+                        "Raw storage (8 bytes/minimizer): {} bytes ({:.2} GB)",
+                        raw_bytes,
+                        raw_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                    );
 
                     // Estimate varint-encoded delta size
                     // Varint uses 1 byte per 7 bits, roughly
@@ -1209,14 +1378,20 @@ fn main() -> Result<()> {
                         estimated_varint_bytes += (bits + 6) / 7; // ceil(bits/7)
                     }
                     let varint_ratio = estimated_varint_bytes as f64 / raw_bytes as f64;
-                    println!("Estimated delta+varint: {} bytes ({:.1}% of raw)",
-                        estimated_varint_bytes, varint_ratio * 100.0);
+                    println!(
+                        "Estimated delta+varint: {} bytes ({:.1}% of raw)",
+                        estimated_varint_bytes,
+                        varint_ratio * 100.0
+                    );
 
                     // With zstd on top (rough estimate: 50-70% of varint size for sorted data)
                     let estimated_zstd = (estimated_varint_bytes as f64 * 0.6) as usize;
                     let zstd_ratio = estimated_zstd as f64 / raw_bytes as f64;
-                    println!("Estimated delta+varint+zstd: ~{} bytes (~{:.1}% of raw)",
-                        estimated_zstd, zstd_ratio * 100.0);
+                    println!(
+                        "Estimated delta+varint+zstd: ~{} bytes (~{:.1}% of raw)",
+                        estimated_zstd,
+                        zstd_ratio * 100.0
+                    );
                 }
 
                 // Per-bucket summary
@@ -1227,24 +1402,50 @@ fn main() -> Result<()> {
 
                 if per_bucket_counts.len() <= 20 {
                     for (id, count) in &per_bucket_counts {
-                        let name = idx.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
+                        let name = idx
+                            .bucket_names
+                            .get(id)
+                            .map(|s| s.as_str())
+                            .unwrap_or("unknown");
                         println!("  Bucket {}: {} minimizers ({})", id, count, name);
                     }
                 } else {
-                    println!("  (showing first 10 and last 10 of {} buckets)", per_bucket_counts.len());
+                    println!(
+                        "  (showing first 10 and last 10 of {} buckets)",
+                        per_bucket_counts.len()
+                    );
                     for (id, count) in per_bucket_counts.iter().take(10) {
-                        let name = idx.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
+                        let name = idx
+                            .bucket_names
+                            .get(id)
+                            .map(|s| s.as_str())
+                            .unwrap_or("unknown");
                         println!("  Bucket {}: {} minimizers ({})", id, count, name);
                     }
                     println!("  ...");
-                    for (id, count) in per_bucket_counts.iter().rev().take(10).collect::<Vec<_>>().into_iter().rev() {
-                        let name = idx.bucket_names.get(id).map(|s| s.as_str()).unwrap_or("unknown");
+                    for (id, count) in per_bucket_counts
+                        .iter()
+                        .rev()
+                        .take(10)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                    {
+                        let name = idx
+                            .bucket_names
+                            .get(id)
+                            .map(|s| s.as_str())
+                            .unwrap_or("unknown");
                         println!("  Bucket {}: {} minimizers ({})", id, count, name);
                     }
                 }
             }
 
-            IndexCommands::Shard { input, output, max_shard_size } => {
+            IndexCommands::Shard {
+                input,
+                output,
+                max_shard_size,
+            } => {
                 // Validate that input is not already sharded
                 if MainIndexManifest::is_sharded(&input) {
                     return Err(anyhow!(
@@ -1258,24 +1459,55 @@ fn main() -> Result<()> {
                 log::info!("Loading single-file index from {:?}", input);
                 let idx = Index::load(&input)?;
 
-                log::info!("Sharding index with max shard size {}...", format_bytes(max_shard_size));
+                log::info!(
+                    "Sharding index with max shard size {}...",
+                    format_bytes(max_shard_size)
+                );
                 let manifest = idx.save_sharded(&output, max_shard_size)?;
 
-                log::info!("Created {} shards at {}", manifest.shards.len(), output.display());
+                log::info!(
+                    "Created {} shards at {}",
+                    manifest.shards.len(),
+                    output.display()
+                );
                 eprintln!("Sharded index created:");
                 eprintln!("  Manifest: {}.manifest", output.display());
                 for shard_info in manifest.shards.iter() {
-                    eprintln!("  Shard {}: {} buckets, {} minimizers",
+                    eprintln!(
+                        "  Shard {}: {} buckets, {} minimizers",
                         shard_info.shard_id,
                         shard_info.bucket_ids.len(),
-                        shard_info.num_minimizers);
+                        shard_info.num_minimizers
+                    );
                 }
             }
         },
 
         Commands::Classify(classify_cmd) => match classify_cmd {
-            ClassifyCommands::Run { index, negative_index, r1, r2, threshold, max_memory, batch_size, output, use_inverted, merge_join } |
-            ClassifyCommands::Batch { index, negative_index, r1, r2, threshold, max_memory, batch_size, output, use_inverted, merge_join } => {
+            ClassifyCommands::Run {
+                index,
+                negative_index,
+                r1,
+                r2,
+                threshold,
+                max_memory,
+                batch_size,
+                output,
+                use_inverted,
+                merge_join,
+            }
+            | ClassifyCommands::Batch {
+                index,
+                negative_index,
+                r1,
+                r2,
+                threshold,
+                max_memory,
+                batch_size,
+                output,
+                use_inverted,
+                merge_join,
+            } => {
                 if merge_join && !use_inverted {
                     return Err(anyhow!("--merge-join requires --use-inverted"));
                 }
@@ -1292,11 +1524,16 @@ fn main() -> Result<()> {
                     let mem_limit = if max_memory == 0 {
                         let detected = detect_available_memory();
                         if detected.source == MemorySource::Fallback {
-                            log::warn!("Could not detect available memory, using 8GB fallback. \
-                                Consider specifying --max-memory explicitly.");
+                            log::warn!(
+                                "Could not detect available memory, using 8GB fallback. \
+                                Consider specifying --max-memory explicitly."
+                            );
                         } else {
-                            log::info!("Auto-detected available memory: {} (source: {:?})",
-                                format_bytes(detected.bytes), detected.source);
+                            log::info!(
+                                "Auto-detected available memory: {} (source: {:?})",
+                                format_bytes(detected.bytes),
+                                detected.source
+                            );
                         }
                         detected.bytes
                     } else {
@@ -1308,10 +1545,11 @@ fn main() -> Result<()> {
                     let read_profile = ReadMemoryProfile::from_files(
                         &r1,
                         r2.as_deref(),
-                        1000,  // sample size
+                        1000, // sample size
                         metadata.k,
                         metadata.w,
-                    ).unwrap_or_else(|| {
+                    )
+                    .unwrap_or_else(|| {
                         log::warn!("Could not sample read lengths, using default profile");
                         ReadMemoryProfile::default_profile(is_paired, metadata.k, metadata.w)
                     });
@@ -1321,7 +1559,8 @@ fn main() -> Result<()> {
 
                     // For now, use a simple heuristic since we don't have index loaded yet
                     // We'll estimate index memory from metadata
-                    let estimated_index_mem = metadata.bucket_minimizer_counts.values().sum::<usize>() * 8;
+                    let estimated_index_mem =
+                        metadata.bucket_minimizer_counts.values().sum::<usize>() * 8;
                     let num_buckets = metadata.bucket_names.len();
 
                     let mem_config = MemoryConfig {
@@ -1351,13 +1590,15 @@ fn main() -> Result<()> {
                         if neg.k != pos_metadata.k {
                             return Err(anyhow!(
                                 "Negative index K ({}) does not match positive index K ({})",
-                                neg.k, pos_metadata.k
+                                neg.k,
+                                pos_metadata.k
                             ));
                         }
                         if neg.w != pos_metadata.w {
                             return Err(anyhow!(
                                 "Negative index W ({}) does not match positive index W ({})",
-                                neg.w, pos_metadata.w
+                                neg.w,
+                                pos_metadata.w
                             ));
                         }
                         if neg.salt != pos_metadata.salt {
@@ -1368,12 +1609,20 @@ fn main() -> Result<()> {
                         }
 
                         let total_mins: usize = neg.buckets.values().map(|v| v.len()).sum();
-                        log::info!("Negative index loaded: {} buckets, {} minimizers",
-                            neg.buckets.len(), total_mins);
-                        let neg_set: HashSet<u64> = neg.buckets.values()
+                        log::info!(
+                            "Negative index loaded: {} buckets, {} minimizers",
+                            neg.buckets.len(),
+                            total_mins
+                        );
+                        let neg_set: HashSet<u64> = neg
+                            .buckets
+                            .values()
                             .flat_map(|v| v.iter().copied())
                             .collect();
-                        log::info!("Built negative minimizer set: {} unique minimizers", neg_set.len());
+                        log::info!(
+                            "Built negative minimizer set: {} unique minimizers",
+                            neg_set.len()
+                        );
                         Some(neg_set)
                     }
                 };
@@ -1396,10 +1645,16 @@ fn main() -> Result<()> {
 
                     if manifest_path.exists() {
                         // Sharded inverted index - use sequential loading to minimize memory
-                        log::info!("Loading sharded inverted index manifest from {:?}", inverted_path);
+                        log::info!(
+                            "Loading sharded inverted index manifest from {:?}",
+                            inverted_path
+                        );
                         let sharded = ShardedInvertedIndex::open(&inverted_path)?;
-                        log::info!("Sharded index: {} shards, {} total minimizers",
-                            sharded.num_shards(), sharded.total_minimizers());
+                        log::info!(
+                            "Sharded index: {} shards, {} total minimizers",
+                            sharded.num_shards(),
+                            sharded.total_minimizers()
+                        );
 
                         sharded.validate_against_metadata(&metadata)?;
                         log::info!("Sharded index validated successfully");
@@ -1410,32 +1665,57 @@ fn main() -> Result<()> {
                             log::info!("Starting classification with sequential shard loading (batch_size={})", effective_batch_size);
                         }
 
-                        while let Some((owned_records, headers)) = io.next_batch_records(effective_batch_size)? {
+                        while let Some((owned_records, headers)) =
+                            io.next_batch_records(effective_batch_size)?
+                        {
                             batch_num += 1;
                             let batch_read_count = owned_records.len();
                             total_reads += batch_read_count;
 
-                            let batch_refs: Vec<QueryRecord> = owned_records.iter()
+                            let batch_refs: Vec<QueryRecord> = owned_records
+                                .iter()
                                 .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                                 .collect();
 
                             let results = if merge_join {
-                                classify_batch_sharded_merge_join(&sharded, neg_mins.as_ref(), &batch_refs, threshold)?
+                                classify_batch_sharded_merge_join(
+                                    &sharded,
+                                    neg_mins.as_ref(),
+                                    &batch_refs,
+                                    threshold,
+                                )?
                             } else {
-                                classify_batch_sharded_sequential(&sharded, neg_mins.as_ref(), &batch_refs, threshold)?
+                                classify_batch_sharded_sequential(
+                                    &sharded,
+                                    neg_mins.as_ref(),
+                                    &batch_refs,
+                                    threshold,
+                                )?
                             };
 
                             let mut chunk_out = Vec::with_capacity(1024);
                             for res in results {
                                 let header = &headers[res.query_id as usize];
-                                let bucket_name = metadata.bucket_names.get(&res.bucket_id)
+                                let bucket_name = metadata
+                                    .bucket_names
+                                    .get(&res.bucket_id)
                                     .map(|s| s.as_str())
                                     .unwrap_or("unknown");
-                                writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
+                                writeln!(
+                                    chunk_out,
+                                    "{}\t{}\t{:.4}",
+                                    header, bucket_name, res.score
+                                )
+                                .unwrap();
                             }
                             io.write(chunk_out)?;
 
-                            log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+                            log::info!(
+                                "Processed batch {}: {} reads ({} total)",
+                                batch_num,
+                                batch_read_count,
+                                total_reads
+                            );
                         }
                     } else if inverted_path.exists() {
                         // Legacy single-file inverted index (RYXI format) no longer supported
@@ -1468,35 +1748,59 @@ fn main() -> Result<()> {
                         // Sharded main index - use sequential shard loading
                         log::info!("Loading sharded main index from {:?}", index);
                         let sharded = ShardedMainIndex::open(&index)?;
-                        log::info!("Sharded main index: {} shards, {} buckets, {} total minimizers",
-                            sharded.num_shards(), sharded.manifest().bucket_names.len(), sharded.total_minimizers());
+                        log::info!(
+                            "Sharded main index: {} shards, {} buckets, {} total minimizers",
+                            sharded.num_shards(),
+                            sharded.manifest().bucket_names.len(),
+                            sharded.total_minimizers()
+                        );
 
                         let metadata = sharded.metadata();
 
                         log::info!("Starting classification with sequential main shard loading (batch_size={})", effective_batch_size);
 
-                        while let Some((owned_records, headers)) = io.next_batch_records(effective_batch_size)? {
+                        while let Some((owned_records, headers)) =
+                            io.next_batch_records(effective_batch_size)?
+                        {
                             batch_num += 1;
                             let batch_read_count = owned_records.len();
                             total_reads += batch_read_count;
 
-                            let batch_refs: Vec<QueryRecord> = owned_records.iter()
+                            let batch_refs: Vec<QueryRecord> = owned_records
+                                .iter()
                                 .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                                 .collect();
 
-                            let results = classify_batch_sharded_main(&sharded, neg_mins.as_ref(), &batch_refs, threshold)?;
+                            let results = classify_batch_sharded_main(
+                                &sharded,
+                                neg_mins.as_ref(),
+                                &batch_refs,
+                                threshold,
+                            )?;
 
                             let mut chunk_out = Vec::with_capacity(1024);
                             for res in results {
                                 let header = &headers[res.query_id as usize];
-                                let bucket_name = metadata.bucket_names.get(&res.bucket_id)
+                                let bucket_name = metadata
+                                    .bucket_names
+                                    .get(&res.bucket_id)
                                     .map(|s| s.as_str())
                                     .unwrap_or("unknown");
-                                writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
+                                writeln!(
+                                    chunk_out,
+                                    "{}\t{}\t{:.4}",
+                                    header, bucket_name, res.score
+                                )
+                                .unwrap();
                             }
                             io.write(chunk_out)?;
 
-                            log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+                            log::info!(
+                                "Processed batch {}: {} reads ({} total)",
+                                batch_num,
+                                batch_read_count,
+                                total_reads
+                            );
                         }
                     } else {
                         // Single-file main index
@@ -1504,30 +1808,49 @@ fn main() -> Result<()> {
                         let engine = Index::load(&index)?;
                         log::info!("Index loaded: {} buckets", engine.buckets.len());
 
-                        log::info!("Starting classification (batch_size={})", effective_batch_size);
+                        log::info!(
+                            "Starting classification (batch_size={})",
+                            effective_batch_size
+                        );
 
-                        while let Some((owned_records, headers)) = io.next_batch_records(effective_batch_size)? {
+                        while let Some((owned_records, headers)) =
+                            io.next_batch_records(effective_batch_size)?
+                        {
                             batch_num += 1;
                             let batch_read_count = owned_records.len();
                             total_reads += batch_read_count;
 
-                            let batch_refs: Vec<QueryRecord> = owned_records.iter()
+                            let batch_refs: Vec<QueryRecord> = owned_records
+                                .iter()
                                 .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                                 .collect();
 
-                            let results = classify_batch(&engine, neg_mins.as_ref(), &batch_refs, threshold);
+                            let results =
+                                classify_batch(&engine, neg_mins.as_ref(), &batch_refs, threshold);
 
                             let mut chunk_out = Vec::with_capacity(1024);
                             for res in results {
                                 let header = &headers[res.query_id as usize];
-                                let bucket_name = engine.bucket_names.get(&res.bucket_id)
+                                let bucket_name = engine
+                                    .bucket_names
+                                    .get(&res.bucket_id)
                                     .map(|s| s.as_str())
                                     .unwrap_or("unknown");
-                                writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score).unwrap();
+                                writeln!(
+                                    chunk_out,
+                                    "{}\t{}\t{:.4}",
+                                    header, bucket_name, res.score
+                                )
+                                .unwrap();
                             }
                             io.write(chunk_out)?;
 
-                            log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+                            log::info!(
+                                "Processed batch {}: {} reads ({} total)",
+                                batch_num,
+                                batch_read_count,
+                                total_reads
+                            );
                         }
                     }
 
@@ -1536,7 +1859,16 @@ fn main() -> Result<()> {
                 }
             }
 
-            ClassifyCommands::Aggregate { index, negative_index, r1, r2, threshold, max_memory, batch_size, output } => {
+            ClassifyCommands::Aggregate {
+                index,
+                negative_index,
+                r1,
+                r2,
+                threshold,
+                max_memory,
+                batch_size,
+                output,
+            } => {
                 log::info!("Loading index from {:?}", index);
                 let engine = Index::load(&index)?;
                 log::info!("Index loaded: {} buckets", engine.buckets.len());
@@ -1550,11 +1882,16 @@ fn main() -> Result<()> {
                     let mem_limit = if max_memory == 0 {
                         let detected = detect_available_memory();
                         if detected.source == MemorySource::Fallback {
-                            log::warn!("Could not detect available memory, using 8GB fallback. \
-                                Consider specifying --max-memory explicitly.");
+                            log::warn!(
+                                "Could not detect available memory, using 8GB fallback. \
+                                Consider specifying --max-memory explicitly."
+                            );
                         } else {
-                            log::info!("Auto-detected available memory: {} (source: {:?})",
-                                format_bytes(detected.bytes), detected.source);
+                            log::info!(
+                                "Auto-detected available memory: {} (source: {:?})",
+                                format_bytes(detected.bytes),
+                                detected.source
+                            );
                         }
                         detected.bytes
                     } else {
@@ -1562,18 +1899,15 @@ fn main() -> Result<()> {
                     };
 
                     let is_paired = r2.is_some();
-                    let read_profile = ReadMemoryProfile::from_files(
-                        &r1,
-                        r2.as_deref(),
-                        1000,
-                        engine.k,
-                        engine.w,
-                    ).unwrap_or_else(|| {
-                        log::warn!("Could not sample read lengths, using default profile");
-                        ReadMemoryProfile::default_profile(is_paired, engine.k, engine.w)
-                    });
+                    let read_profile =
+                        ReadMemoryProfile::from_files(&r1, r2.as_deref(), 1000, engine.k, engine.w)
+                            .unwrap_or_else(|| {
+                                log::warn!("Could not sample read lengths, using default profile");
+                                ReadMemoryProfile::default_profile(is_paired, engine.k, engine.w)
+                            });
 
-                    let estimated_index_mem = engine.buckets.values().map(|v| v.len() * 8).sum::<usize>();
+                    let estimated_index_mem =
+                        engine.buckets.values().map(|v| v.len() * 8).sum::<usize>();
                     let num_buckets = engine.buckets.len();
 
                     let mem_config = MemoryConfig {
@@ -1602,13 +1936,15 @@ fn main() -> Result<()> {
                         if neg.k != engine.k {
                             return Err(anyhow!(
                                 "Negative index K ({}) does not match positive index K ({})",
-                                neg.k, engine.k
+                                neg.k,
+                                engine.k
                             ));
                         }
                         if neg.w != engine.w {
                             return Err(anyhow!(
                                 "Negative index W ({}) does not match positive index W ({})",
-                                neg.w, engine.w
+                                neg.w,
+                                engine.w
                             ));
                         }
                         if neg.salt != engine.salt {
@@ -1619,12 +1955,20 @@ fn main() -> Result<()> {
                         }
 
                         let total_mins: usize = neg.buckets.values().map(|v| v.len()).sum();
-                        log::info!("Negative index loaded: {} buckets, {} minimizers",
-                            neg.buckets.len(), total_mins);
-                        let neg_set: HashSet<u64> = neg.buckets.values()
+                        log::info!(
+                            "Negative index loaded: {} buckets, {} minimizers",
+                            neg.buckets.len(),
+                            total_mins
+                        );
+                        let neg_set: HashSet<u64> = neg
+                            .buckets
+                            .values()
                             .flat_map(|v| v.iter().copied())
                             .collect();
-                        log::info!("Built negative minimizer set: {} unique minimizers", neg_set.len());
+                        log::info!(
+                            "Built negative minimizer set: {} unique minimizers",
+                            neg_set.len()
+                        );
                         Some(neg_set)
                     }
                 };
@@ -1635,38 +1979,58 @@ fn main() -> Result<()> {
                 let mut total_reads = 0;
                 let mut batch_num = 0;
 
-                log::info!("Starting aggregate classification (batch_size={})", effective_batch_size);
+                log::info!(
+                    "Starting aggregate classification (batch_size={})",
+                    effective_batch_size
+                );
 
                 while let Some((owned_records, _)) = io.next_batch_records(effective_batch_size)? {
                     batch_num += 1;
                     let batch_read_count = owned_records.len();
                     total_reads += batch_read_count;
 
-                    let batch_refs: Vec<QueryRecord> = owned_records.iter()
+                    let batch_refs: Vec<QueryRecord> = owned_records
+                        .iter()
                         .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                         .collect();
 
-                    let results = aggregate_batch(&engine, neg_mins.as_ref(), &batch_refs, threshold);
+                    let results =
+                        aggregate_batch(&engine, neg_mins.as_ref(), &batch_refs, threshold);
 
                     let mut chunk_out = Vec::with_capacity(1024);
                     for res in results {
-                        let bucket_name = engine.bucket_names.get(&res.bucket_id)
+                        let bucket_name = engine
+                            .bucket_names
+                            .get(&res.bucket_id)
                             .map(|s| s.as_str())
                             .unwrap_or("unknown");
                         writeln!(chunk_out, "global\t{}\t{:.4}", bucket_name, res.score).unwrap();
                     }
                     io.write(chunk_out)?;
 
-                    log::info!("Processed batch {}: {} reads ({} total)", batch_num, batch_read_count, total_reads);
+                    log::info!(
+                        "Processed batch {}: {} reads ({} total)",
+                        batch_num,
+                        batch_read_count,
+                        total_reads
+                    );
                 }
 
-                log::info!("Aggregate classification complete: {} reads processed", total_reads);
+                log::info!(
+                    "Aggregate classification complete: {} reads processed",
+                    total_reads
+                );
                 io.finish()?;
             }
         },
 
         Commands::Inspect(inspect_cmd) => match inspect_cmd {
-            InspectCommands::Matches { index, queries, ids, buckets } => {
+            InspectCommands::Matches {
+                index,
+                queries,
+                ids,
+                buckets,
+            } => {
                 inspect_matches(&index, &queries, &ids, &buckets)?;
             }
         },
@@ -1693,18 +2057,24 @@ fn build_single_bucket(
 
     for file_path in files {
         let abs_path = resolve_path(config_dir, file_path);
-        let mut reader = parse_fastx_file(&abs_path)
-            .context(format!("Failed to open file {} for bucket '{}'",
-                           abs_path.display(), bucket_name))?;
+        let mut reader = parse_fastx_file(&abs_path).context(format!(
+            "Failed to open file {} for bucket '{}'",
+            abs_path.display(),
+            bucket_name
+        ))?;
 
-        let filename = file_path.canonicalize()
+        let filename = file_path
+            .canonicalize()
             .unwrap_or_else(|_| file_path.to_path_buf())
             .to_string_lossy()
             .to_string();
 
         while let Some(record) = reader.next() {
-            let rec = record.context(format!("Invalid record in file {} (bucket '{}')",
-                                            abs_path.display(), bucket_name))?;
+            let rec = record.context(format!(
+                "Invalid record in file {} (bucket '{}')",
+                abs_path.display(),
+                bucket_name
+            ))?;
             let seq_name = String::from_utf8_lossy(rec.id()).to_string();
             let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, seq_name);
             idx.add_record(1, &source_label, &rec.seq(), &mut ws);
@@ -1713,7 +2083,11 @@ fn build_single_bucket(
 
     idx.finalize_bucket(1);
     let minimizer_count = idx.buckets.get(&1).map(|v| v.len()).unwrap_or(0);
-    log::info!("Completed bucket '{}': {} minimizers", bucket_name, minimizer_count);
+    log::info!(
+        "Completed bucket '{}': {} minimizers",
+        bucket_name,
+        minimizer_count
+    );
 
     let minimizers = idx.buckets.remove(&1).unwrap_or_default();
     let sources = idx.bucket_sources.remove(&1).unwrap_or_default();
@@ -1730,7 +2104,8 @@ fn build_index_from_config(
 
     // 1. Parse and validate config
     let cfg = parse_config(config_path)?;
-    let config_dir = config_path.parent()
+    let config_dir = config_path
+        .parent()
         .ok_or_else(|| anyhow!("Invalid config path"))?;
 
     log::info!("Validating file paths...");
@@ -1760,7 +2135,12 @@ fn build_index_from_config(
 
     for name in &bucket_names {
         let file_count = cfg.buckets[name].files.len();
-        log::info!("  - {}: {} file{}", name, file_count, if file_count == 1 { "" } else { "s" });
+        log::info!(
+            "  - {}: {} file{}",
+            name,
+            file_count,
+            if file_count == 1 { "" } else { "s" }
+        );
     }
 
     // 3. Build and save index - use batched approach for sharded, parallel for non-sharded
@@ -1768,8 +2148,11 @@ fn build_index_from_config(
         // BATCHED PARALLEL: Process buckets in batches to bound memory usage.
         // Memory bound: O(batch_size × avg_bucket + max_shard_size) instead of O(total_index)
         let batch_size = rayon::current_num_threads();
-        log::info!("Building {} buckets in batches of {} (memory-efficient mode)...",
-                   bucket_names.len(), batch_size);
+        log::info!(
+            "Building {} buckets in batches of {} (memory-efficient mode)...",
+            bucket_names.len(),
+            batch_size
+        );
 
         let mut builder = ShardedMainIndexBuilder::new(
             cfg.index.k,
@@ -1782,7 +2165,8 @@ fn build_index_from_config(
         let mut bucket_id = 1u32;
         for chunk in bucket_names.chunks(batch_size) {
             // Build this batch in parallel (parallel FASTA reading preserved)
-            let batch_results: Vec<_> = chunk.par_iter()
+            let batch_results: Vec<_> = chunk
+                .par_iter()
                 .map(|bucket_name| {
                     build_single_bucket(
                         bucket_name,
@@ -1797,17 +2181,15 @@ fn build_index_from_config(
 
             // Feed to builder (auto-flushes shards as they fill)
             for (name, minimizers, sources) in batch_results {
-                builder.add_bucket(
-                    bucket_id,
-                    &sanitize_bucket_name(&name),
-                    sources,
-                    minimizers,
-                )?;
+                builder.add_bucket(bucket_id, &sanitize_bucket_name(&name), sources, minimizers)?;
                 bucket_id += 1;
             }
             // batch_results dropped here, memory freed before next batch
 
-            log::info!("Completed batch, {} buckets processed so far", bucket_id - 1);
+            log::info!(
+                "Completed batch, {} buckets processed so far",
+                bucket_id - 1
+            );
         }
 
         let manifest = builder.finish()?;
@@ -1828,8 +2210,12 @@ fn build_index_from_config(
             let num_shards = manifest.shards.len();
 
             for (idx, shard_info) in manifest.shards.iter().enumerate() {
-                let shard_path = MainIndexManifest::shard_path(&cfg.index.output, shard_info.shard_id);
-                log::info!("Processing main shard {} for inversion...", shard_info.shard_id);
+                let shard_path =
+                    MainIndexManifest::shard_path(&cfg.index.output, shard_info.shard_id);
+                log::info!(
+                    "Processing main shard {} for inversion...",
+                    shard_info.shard_id
+                );
 
                 // Build inverted index from shard
                 let inverted = {
@@ -1837,8 +2223,11 @@ fn build_index_from_config(
                     InvertedIndex::build_from_shard(&main_shard)
                 };
 
-                log::info!("  Built inverted: {} unique minimizers, {} bucket entries",
-                    inverted.num_minimizers(), inverted.num_bucket_entries());
+                log::info!(
+                    "  Built inverted: {} unique minimizers, {} bucket entries",
+                    inverted.num_minimizers(),
+                    inverted.num_bucket_entries()
+                );
 
                 // Save as inverted shard with same ID
                 let inv_shard_path = ShardManifest::shard_path(&inverted_path, shard_info.shard_id);
@@ -1871,17 +2260,25 @@ fn build_index_from_config(
             let manifest_path = ShardManifest::manifest_path(&inverted_path);
             inv_manifest.save(&manifest_path)?;
 
-            log::info!("Created {} inverted shards (1:1 correspondence):", inv_manifest.shards.len());
+            log::info!(
+                "Created {} inverted shards (1:1 correspondence):",
+                inv_manifest.shards.len()
+            );
             for shard in &inv_manifest.shards {
-                log::info!("  Shard {}: {} unique minimizers, {} bucket entries",
-                    shard.shard_id, shard.num_minimizers, shard.num_bucket_ids);
+                log::info!(
+                    "  Shard {}: {} unique minimizers, {} bucket entries",
+                    shard.shard_id,
+                    shard.num_minimizers,
+                    shard.num_bucket_ids
+                );
             }
         }
     } else {
         // NON-SHARDED: Build all buckets in parallel (memory not constrained)
         log::info!("Building {} buckets in parallel...", bucket_names.len());
 
-        let bucket_results: Vec<_> = bucket_names.par_iter()
+        let bucket_results: Vec<_> = bucket_names
+            .par_iter()
             .map(|bucket_name| {
                 build_single_bucket(
                     bucket_name,
@@ -1898,9 +2295,13 @@ fn build_index_from_config(
 
         // Merge all bucket data into final index
         let mut final_index = Index::new(cfg.index.k, cfg.index.window, cfg.index.salt)?;
-        for (bucket_id, (bucket_name, minimizers, sources)) in bucket_results.into_iter().enumerate() {
+        for (bucket_id, (bucket_name, minimizers, sources)) in
+            bucket_results.into_iter().enumerate()
+        {
             let new_id = (bucket_id + 1) as u32;
-            final_index.bucket_names.insert(new_id, sanitize_bucket_name(&bucket_name));
+            final_index
+                .bucket_names
+                .insert(new_id, sanitize_bucket_name(&bucket_name));
             final_index.buckets.insert(new_id, minimizers);
             final_index.bucket_sources.insert(new_id, sources);
         }
@@ -1919,8 +2320,11 @@ fn build_index_from_config(
             let inverted_path = cfg.index.output.with_extension("ryxdi");
             log::info!("Building inverted index...");
             let inverted = InvertedIndex::build_from_index(&final_index);
-            log::info!("Inverted index built: {} unique minimizers, {} bucket entries",
-                inverted.num_minimizers(), inverted.num_bucket_entries());
+            log::info!(
+                "Inverted index built: {} unique minimizers, {} bucket entries",
+                inverted.num_minimizers(),
+                inverted.num_bucket_entries()
+            );
 
             // Save as single shard (shard_id = 0)
             let shard_path = ShardManifest::shard_path(&inverted_path, 0);
@@ -1939,7 +2343,9 @@ fn build_index_from_config(
                 salt: final_index.salt,
                 bucket_names: final_index.bucket_names.clone(),
                 bucket_sources: final_index.bucket_sources.clone(),
-                bucket_minimizer_counts: final_index.buckets.iter()
+                bucket_minimizer_counts: final_index
+                    .buckets
+                    .iter()
                     .map(|(&id, mins)| (id, mins.len()))
                     .collect(),
             };
@@ -1958,8 +2364,11 @@ fn build_index_from_config(
             inv_manifest.save(&manifest_path)?;
 
             log::info!("Created 1 inverted shard:");
-            log::info!("  Shard 0: {} unique minimizers, {} bucket entries",
-                inv_manifest.shards[0].num_minimizers, inv_manifest.shards[0].num_bucket_ids);
+            log::info!(
+                "  Shard 0: {} unique minimizers, {} bucket entries",
+                inv_manifest.shards[0].num_minimizers,
+                inv_manifest.shards[0].num_bucket_ids
+            );
         }
     }
 
@@ -1978,23 +2387,24 @@ struct FileAssignment {
     file_path: PathBuf,
     bucket_id: u32,
     bucket_name: String,
-    mode: &'static str,  // "new_bucket", "existing_bucket", "matched", "created"
+    mode: &'static str, // "new_bucket", "existing_bucket", "matched", "created"
     score: Option<f64>,
 }
 
 /// Data extracted from a single file in one pass
 struct FileData {
     path: PathBuf,
-    minimizers: Vec<u64>,  // sorted, deduplicated
-    sources: Vec<String>,  // source labels for each sequence
+    minimizers: Vec<u64>, // sorted, deduplicated
+    sources: Vec<String>, // source labels for each sequence
 }
 
 /// Extract minimizers and source labels from a file in a single pass
 fn extract_file_data(path: &Path, k: usize, w: usize, salt: u64) -> Result<FileData> {
-    let mut reader = parse_fastx_file(path)
-        .context(format!("Failed to open file {}", path.display()))?;
+    let mut reader =
+        parse_fastx_file(path).context(format!("Failed to open file {}", path.display()))?;
 
-    let filename = path.canonicalize()
+    let filename = path
+        .canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .into_owned();
@@ -2054,7 +2464,8 @@ fn find_bucket_by_name(bucket_names: &HashMap<u32, String>, name: &str) -> Resul
     let available: Vec<_> = bucket_names.values().collect();
     Err(anyhow!(
         "Bucket '{}' not found. Available buckets: {:?}",
-        name, available
+        name,
+        available
     ))
 }
 
@@ -2066,11 +2477,15 @@ struct IndexParams {
 }
 
 fn bucket_add_from_config(config_path: &Path) -> Result<()> {
-    log::info!("Adding files to index from config: {}", config_path.display());
+    log::info!(
+        "Adding files to index from config: {}",
+        config_path.display()
+    );
 
     // 1. Parse and validate config
     let cfg = parse_bucket_add_config(config_path)?;
-    let config_dir = config_path.parent()
+    let config_dir = config_path
+        .parent()
         .ok_or_else(|| anyhow!("Invalid config path"))?;
 
     log::info!("Validating file paths...");
@@ -2095,16 +2510,25 @@ fn bucket_add_single(
 ) -> Result<()> {
     let mut index = Index::load(index_path)?;
     let mut assignments: Vec<FileAssignment> = Vec::new();
-    let params = IndexParams { k: index.k, w: index.w, salt: index.salt };
+    let params = IndexParams {
+        k: index.k,
+        w: index.w,
+        salt: index.salt,
+    };
 
-    log::info!("Loaded index: k={}, w={}, {} buckets, {} total minimizers",
-        index.k, index.w, index.buckets.len(),
-        index.buckets.values().map(|v| v.len()).sum::<usize>());
+    log::info!(
+        "Loaded index: k={}, w={}, {} buckets, {} total minimizers",
+        index.k,
+        index.w,
+        index.buckets.len(),
+        index.buckets.values().map(|v| v.len()).sum::<usize>()
+    );
 
     match &cfg.assignment {
         AssignmentSettings::NewBucket { bucket_name } => {
             let new_id = index.next_id()?;
-            let name = bucket_name.clone()
+            let name = bucket_name
+                .clone()
                 .or_else(|| cfg.files.bucket_name.clone())
                 .unwrap_or_else(|| make_bucket_name_from_files(&cfg.files.paths));
             let name = sanitize_bucket_name(&name);
@@ -2123,8 +2547,13 @@ fn bucket_add_single(
                 let sources = index.bucket_sources.entry(new_id).or_default();
                 sources.extend(data.sources);
 
-                log::info!("  {} -> bucket {} ('{}') [{} minimizers]",
-                    file_path.display(), new_id, name, data.minimizers.len());
+                log::info!(
+                    "  {} -> bucket {} ('{}') [{} minimizers]",
+                    file_path.display(),
+                    new_id,
+                    name,
+                    data.minimizers.len()
+                );
                 assignments.push(FileAssignment {
                     file_path: file_path.clone(),
                     bucket_id: new_id,
@@ -2139,7 +2568,11 @@ fn bucket_add_single(
 
         AssignmentSettings::ExistingBucket { bucket_name } => {
             let bucket_id = find_bucket_by_name(&index.bucket_names, bucket_name)?;
-            log::info!("Adding to existing bucket {} ('{}')", bucket_id, bucket_name);
+            log::info!(
+                "Adding to existing bucket {} ('{}')",
+                bucket_id,
+                bucket_name
+            );
 
             for file_path in &cfg.files.paths {
                 let abs_path = resolve_path(config_dir, file_path);
@@ -2150,8 +2583,13 @@ fn bucket_add_single(
                 let sources = index.bucket_sources.entry(bucket_id).or_default();
                 sources.extend(data.sources);
 
-                log::info!("  {} -> bucket {} ('{}') [{} minimizers]",
-                    file_path.display(), bucket_id, bucket_name, data.minimizers.len());
+                log::info!(
+                    "  {} -> bucket {} ('{}') [{} minimizers]",
+                    file_path.display(),
+                    bucket_id,
+                    bucket_name,
+                    data.minimizers.len()
+                );
                 assignments.push(FileAssignment {
                     file_path: file_path.clone(),
                     bucket_id,
@@ -2164,8 +2602,19 @@ fn bucket_add_single(
             index.finalize_bucket(bucket_id);
         }
 
-        AssignmentSettings::BestBin { threshold, fallback } => {
-            best_bin_assign(&mut index, cfg, config_dir, params, *threshold, *fallback, &mut assignments)?;
+        AssignmentSettings::BestBin {
+            threshold,
+            fallback,
+        } => {
+            best_bin_assign(
+                &mut index,
+                cfg,
+                config_dir,
+                params,
+                *threshold,
+                *fallback,
+                &mut assignments,
+            )?;
         }
     }
 
@@ -2187,11 +2636,15 @@ fn best_bin_assign(
     fallback: BestBinFallback,
     assignments: &mut Vec<FileAssignment>,
 ) -> Result<()> {
-    log::info!("Best-bin mode: threshold={}, fallback={:?}", threshold, fallback);
+    log::info!(
+        "Best-bin mode: threshold={}, fallback={:?}",
+        threshold,
+        fallback
+    );
 
     // Track assignments by category
-    let mut matched: Vec<(FileData, u32, f64)> = Vec::new();  // file, bucket_id, score
-    let mut to_create: HashMap<String, Vec<FileData>> = HashMap::new();  // stem -> files
+    let mut matched: Vec<(FileData, u32, f64)> = Vec::new(); // file, bucket_id, score
+    let mut to_create: HashMap<String, Vec<FileData>> = HashMap::new(); // stem -> files
     let mut skipped_count = 0;
 
     // 1. Extract all file data and find best bucket for each
@@ -2218,20 +2671,45 @@ fn best_bin_assign(
 
         // Log and decide
         if let Some((id, score)) = best {
-            let name = index.bucket_names.get(&id).map(|s| s.as_str()).unwrap_or("unknown");
-            log::info!("{}: best match is bucket {} ('{}') with score {:.4}",
-                file_path.display(), id, name, score);
+            let name = index
+                .bucket_names
+                .get(&id)
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            log::info!(
+                "{}: best match is bucket {} ('{}') with score {:.4}",
+                file_path.display(),
+                id,
+                name,
+                score
+            );
 
             if score >= threshold {
                 matched.push((data, id, score));
             } else {
-                handle_below_threshold(file_path, &data, score, threshold, fallback,
-                    &mut to_create, &mut skipped_count)?;
+                handle_below_threshold(
+                    file_path,
+                    &data,
+                    score,
+                    threshold,
+                    fallback,
+                    &mut to_create,
+                    &mut skipped_count,
+                )?;
             }
         } else {
             // No existing buckets
-            log::info!("{}: no existing buckets to match against", file_path.display());
-            handle_no_buckets(file_path, data, fallback, &mut to_create, &mut skipped_count)?;
+            log::info!(
+                "{}: no existing buckets to match against",
+                file_path.display()
+            );
+            handle_no_buckets(
+                file_path,
+                data,
+                fallback,
+                &mut to_create,
+                &mut skipped_count,
+            )?;
         }
     }
 
@@ -2242,7 +2720,11 @@ fn best_bin_assign(
         let sources = index.bucket_sources.entry(bucket_id).or_default();
         sources.extend(data.sources);
 
-        let name = index.bucket_names.get(&bucket_id).cloned().unwrap_or_default();
+        let name = index
+            .bucket_names
+            .get(&bucket_id)
+            .cloned()
+            .unwrap_or_default();
         assignments.push(FileAssignment {
             file_path: data.path,
             bucket_id,
@@ -2257,7 +2739,12 @@ fn best_bin_assign(
         let new_id = index.next_id()?;
         let bucket_name = sanitize_bucket_name(&stem);
         index.bucket_names.insert(new_id, bucket_name.clone());
-        log::info!("Creating new bucket {} ('{}') for {} file(s)", new_id, bucket_name, files.len());
+        log::info!(
+            "Creating new bucket {} ('{}') for {} file(s)",
+            new_id,
+            bucket_name,
+            files.len()
+        );
 
         for data in files {
             let bucket = index.buckets.entry(new_id).or_default();
@@ -2278,7 +2765,8 @@ fn best_bin_assign(
     }
 
     // 4. Finalize modified existing buckets
-    let modified: HashSet<u32> = assignments.iter()
+    let modified: HashSet<u32> = assignments
+        .iter()
         .filter(|a| a.mode == "matched")
         .map(|a| a.bucket_id)
         .collect();
@@ -2312,18 +2800,28 @@ fn handle_below_threshold(
                 minimizers: data.minimizers.clone(),
                 sources: data.sources.clone(),
             });
-            log::info!("{}: will create new bucket (best score {:.4} < threshold {})",
-                file_path.display(), score, threshold);
+            log::info!(
+                "{}: will create new bucket (best score {:.4} < threshold {})",
+                file_path.display(),
+                score,
+                threshold
+            );
         }
         BestBinFallback::Skip => {
-            log::info!("{}: skipped (best score {:.4} < threshold {})",
-                file_path.display(), score, threshold);
+            log::info!(
+                "{}: skipped (best score {:.4} < threshold {})",
+                file_path.display(),
+                score,
+                threshold
+            );
             *skipped_count += 1;
         }
         BestBinFallback::Error => {
             return Err(anyhow!(
                 "{}: No bucket meets threshold {} (best: {:.4})",
-                file_path.display(), threshold, score
+                file_path.display(),
+                threshold,
+                score
             ));
         }
     }
@@ -2342,7 +2840,10 @@ fn handle_no_buckets(
         BestBinFallback::CreateNew => {
             let stem = get_file_stem(file_path);
             to_create.entry(stem).or_default().push(data);
-            log::info!("{}: will create new bucket (no existing buckets)", file_path.display());
+            log::info!(
+                "{}: will create new bucket (no existing buckets)",
+                file_path.display()
+            );
         }
         BestBinFallback::Skip => {
             // FIXED: Skip means skip, not create
@@ -2381,15 +2882,19 @@ fn bucket_add_sharded(
         salt: sharded.salt(),
     };
 
-    log::info!("Loaded sharded index: k={}, w={}, {} shards, {} buckets",
-        params.k, params.w,
+    log::info!(
+        "Loaded sharded index: k={}, w={}, {} shards, {} buckets",
+        params.k,
+        params.w,
         sharded.manifest().shards.len(),
-        sharded.manifest().bucket_names.len());
+        sharded.manifest().bucket_names.len()
+    );
 
     match &cfg.assignment {
         AssignmentSettings::NewBucket { bucket_name } => {
             let new_id = sharded.next_id()?;
-            let name = bucket_name.clone()
+            let name = bucket_name
+                .clone()
                 .or_else(|| cfg.files.bucket_name.clone())
                 .unwrap_or_else(|| make_bucket_name_from_files(&cfg.files.paths));
             let name = sanitize_bucket_name(&name);
@@ -2403,8 +2908,13 @@ fn bucket_add_sharded(
                 let abs_path = resolve_path(config_dir, file_path);
                 let data = extract_file_data(&abs_path, params.k, params.w, params.salt)?;
 
-                log::info!("  {} -> bucket {} ('{}') [{} minimizers]",
-                    file_path.display(), new_id, name, data.minimizers.len());
+                log::info!(
+                    "  {} -> bucket {} ('{}') [{} minimizers]",
+                    file_path.display(),
+                    new_id,
+                    name,
+                    data.minimizers.len()
+                );
 
                 all_mins.extend(data.minimizers);
                 all_sources.extend(data.sources);
@@ -2427,7 +2937,11 @@ fn bucket_add_sharded(
 
         AssignmentSettings::ExistingBucket { bucket_name } => {
             let bucket_id = find_bucket_by_name(&sharded.manifest().bucket_names, bucket_name)?;
-            log::info!("Adding to existing bucket {} ('{}')", bucket_id, bucket_name);
+            log::info!(
+                "Adding to existing bucket {} ('{}')",
+                bucket_id,
+                bucket_name
+            );
 
             let mut all_mins = Vec::new();
             let mut all_sources = Vec::new();
@@ -2436,8 +2950,13 @@ fn bucket_add_sharded(
                 let abs_path = resolve_path(config_dir, file_path);
                 let data = extract_file_data(&abs_path, params.k, params.w, params.salt)?;
 
-                log::info!("  {} -> bucket {} ('{}') [{} minimizers]",
-                    file_path.display(), bucket_id, bucket_name, data.minimizers.len());
+                log::info!(
+                    "  {} -> bucket {} ('{}') [{} minimizers]",
+                    file_path.display(),
+                    bucket_id,
+                    bucket_name,
+                    data.minimizers.len()
+                );
 
                 all_mins.extend(data.minimizers);
                 all_sources.extend(data.sources);
@@ -2456,8 +2975,19 @@ fn bucket_add_sharded(
             sharded.update_bucket(bucket_id, all_sources, all_mins)?;
         }
 
-        AssignmentSettings::BestBin { threshold, fallback } => {
-            best_bin_assign_sharded(&mut sharded, cfg, config_dir, params, *threshold, *fallback, &mut assignments)?;
+        AssignmentSettings::BestBin {
+            threshold,
+            fallback,
+        } => {
+            best_bin_assign_sharded(
+                &mut sharded,
+                cfg,
+                config_dir,
+                params,
+                *threshold,
+                *fallback,
+                &mut assignments,
+            )?;
         }
     }
 
@@ -2475,7 +3005,11 @@ fn best_bin_assign_sharded(
     fallback: BestBinFallback,
     assignments: &mut Vec<FileAssignment>,
 ) -> Result<()> {
-    log::info!("Best-bin mode (sharded): threshold={}, fallback={:?}", threshold, fallback);
+    log::info!(
+        "Best-bin mode (sharded): threshold={}, fallback={:?}",
+        threshold,
+        fallback
+    );
 
     // 1. Extract all file data upfront (single pass per file)
     let mut file_data: Vec<FileData> = Vec::new();
@@ -2489,11 +3023,11 @@ fn best_bin_assign_sharded(
     let mut file_best: Vec<Option<(u32, f64)>> = vec![None; file_data.len()];
 
     // 3. Stream through shards one at a time (memory efficient)
-    let shard_infos: Vec<_> = sharded.manifest().shards.iter().cloned().collect();
+    let shard_infos: Vec<_> = sharded.manifest().shards.to_vec();
     log::info!("Scanning {} shards for best matches...", shard_infos.len());
 
     for shard_info in &shard_infos {
-        let shard_path = MainIndexManifest::shard_path(&sharded.base_path(), shard_info.shard_id);
+        let shard_path = MainIndexManifest::shard_path(sharded.base_path(), shard_info.shard_id);
         let shard = MainIndexShard::load(&shard_path)?;
 
         // Check each file against buckets in this shard
@@ -2515,8 +3049,8 @@ fn best_bin_assign_sharded(
     }
 
     // 4. Make assignment decisions
-    let mut matched: Vec<(usize, u32, f64)> = Vec::new();  // file_idx, bucket_id, score
-    let mut to_create: HashMap<String, Vec<usize>> = HashMap::new();  // stem -> file indices
+    let mut matched: Vec<(usize, u32, f64)> = Vec::new(); // file_idx, bucket_id, score
+    let mut to_create: HashMap<String, Vec<usize>> = HashMap::new(); // stem -> file indices
     let mut skipped_count = 0;
 
     for (idx, data) in file_data.iter().enumerate() {
@@ -2527,11 +3061,19 @@ fn best_bin_assign_sharded(
         }
 
         if let Some((bucket_id, score)) = file_best[idx] {
-            let name = sharded.manifest().bucket_names.get(&bucket_id)
+            let name = sharded
+                .manifest()
+                .bucket_names
+                .get(&bucket_id)
                 .map(|s| s.as_str())
                 .unwrap_or("unknown");
-            log::info!("{}: best match is bucket {} ('{}') with score {:.4}",
-                data.path.display(), bucket_id, name, score);
+            log::info!(
+                "{}: best match is bucket {} ('{}') with score {:.4}",
+                data.path.display(),
+                bucket_id,
+                name,
+                score
+            );
 
             if score >= threshold {
                 matched.push((idx, bucket_id, score));
@@ -2540,29 +3082,45 @@ fn best_bin_assign_sharded(
                     BestBinFallback::CreateNew => {
                         let stem = get_file_stem(&data.path);
                         to_create.entry(stem).or_default().push(idx);
-                        log::info!("{}: will create new bucket (score {:.4} < threshold {})",
-                            data.path.display(), score, threshold);
+                        log::info!(
+                            "{}: will create new bucket (score {:.4} < threshold {})",
+                            data.path.display(),
+                            score,
+                            threshold
+                        );
                     }
                     BestBinFallback::Skip => {
-                        log::info!("{}: skipped (score {:.4} < threshold {})",
-                            data.path.display(), score, threshold);
+                        log::info!(
+                            "{}: skipped (score {:.4} < threshold {})",
+                            data.path.display(),
+                            score,
+                            threshold
+                        );
                         skipped_count += 1;
                     }
                     BestBinFallback::Error => {
                         return Err(anyhow!(
                             "{}: No bucket meets threshold {} (best: {:.4})",
-                            data.path.display(), threshold, score
+                            data.path.display(),
+                            threshold,
+                            score
                         ));
                     }
                 }
             }
         } else {
-            log::info!("{}: no existing buckets to match against", data.path.display());
+            log::info!(
+                "{}: no existing buckets to match against",
+                data.path.display()
+            );
             match fallback {
                 BestBinFallback::CreateNew => {
                     let stem = get_file_stem(&data.path);
                     to_create.entry(stem).or_default().push(idx);
-                    log::info!("{}: will create new bucket (no existing buckets)", data.path.display());
+                    log::info!(
+                        "{}: will create new bucket (no existing buckets)",
+                        data.path.display()
+                    );
                 }
                 BestBinFallback::Skip => {
                     log::info!("{}: skipped (no existing buckets)", data.path.display());
@@ -2585,8 +3143,18 @@ fn best_bin_assign_sharded(
     }
 
     for (bucket_id, files) in by_bucket {
-        let bucket_name = sharded.manifest().bucket_names.get(&bucket_id).cloned().unwrap_or_default();
-        log::info!("Updating bucket {} ('{}') with {} file(s)", bucket_id, bucket_name, files.len());
+        let bucket_name = sharded
+            .manifest()
+            .bucket_names
+            .get(&bucket_id)
+            .cloned()
+            .unwrap_or_default();
+        log::info!(
+            "Updating bucket {} ('{}') with {} file(s)",
+            bucket_id,
+            bucket_name,
+            files.len()
+        );
 
         let mut all_mins = Vec::new();
         let mut all_sources = Vec::new();
@@ -2615,7 +3183,12 @@ fn best_bin_assign_sharded(
     for (stem, indices) in to_create {
         let new_id = sharded.next_id()?;
         let bucket_name = sanitize_bucket_name(&stem);
-        log::info!("Creating new bucket {} ('{}') for {} file(s)", new_id, bucket_name, indices.len());
+        log::info!(
+            "Creating new bucket {} ('{}') for {} file(s)",
+            new_id,
+            bucket_name,
+            indices.len()
+        );
 
         let mut all_mins = Vec::new();
         let mut all_sources = Vec::new();
@@ -2657,7 +3230,8 @@ fn make_bucket_name_from_files(paths: &[PathBuf]) -> String {
     if paths.is_empty() {
         return UNNAMED_BUCKET.to_string();
     }
-    paths[0].file_stem()
+    paths[0]
+        .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(UNNAMED_BUCKET)
         .to_string()
@@ -2676,7 +3250,10 @@ fn print_assignment_summary(assignments: &[FileAssignment]) {
     // Group by bucket
     let mut by_bucket: HashMap<u32, Vec<&FileAssignment>> = HashMap::new();
     for assignment in assignments {
-        by_bucket.entry(assignment.bucket_id).or_default().push(assignment);
+        by_bucket
+            .entry(assignment.bucket_id)
+            .or_default()
+            .push(assignment);
     }
 
     let mut bucket_ids: Vec<_> = by_bucket.keys().copied().collect();
@@ -2685,17 +3262,28 @@ fn print_assignment_summary(assignments: &[FileAssignment]) {
     for bucket_id in bucket_ids {
         let files = &by_bucket[&bucket_id];
         let first = files[0];
-        println!("\nBucket {} ('{}') [{}]:", bucket_id, first.bucket_name, first.mode);
+        println!(
+            "\nBucket {} ('{}') [{}]:",
+            bucket_id, first.bucket_name, first.mode
+        );
         for assignment in files {
             if let Some(score) = assignment.score {
-                println!("  - {} (score: {:.4})", assignment.file_path.display(), score);
+                println!(
+                    "  - {} (score: {:.4})",
+                    assignment.file_path.display(),
+                    score
+                );
             } else {
                 println!("  - {}", assignment.file_path.display());
             }
         }
     }
 
-    println!("\n{} files assigned to {} bucket(s)", assignments.len(), by_bucket.len());
+    println!(
+        "\n{} files assigned to {} bucket(s)",
+        assignments.len(),
+        by_bucket.len()
+    );
 }
 
 // --- INSPECT COMMAND HELPERS ---
@@ -2720,15 +3308,17 @@ fn extract_kmer_string(seq: &[u8], pos: usize, k: usize, strand: Strand) -> Stri
 
     match strand {
         Strand::Forward => String::from_utf8_lossy(kmer_bytes).to_string(),
-        Strand::ReverseComplement => {
-            kmer_bytes.iter().rev().map(|&b| match b {
+        Strand::ReverseComplement => kmer_bytes
+            .iter()
+            .rev()
+            .map(|&b| match b {
                 b'A' | b'a' => 'T',
                 b'T' | b't' => 'A',
                 b'G' | b'g' => 'C',
                 b'C' | b'c' => 'G',
                 other => other as char,
-            }).collect()
-        }
+            })
+            .collect(),
     }
 }
 
@@ -2741,7 +3331,9 @@ fn build_reference_minimizer_map(
     let mut ws = MinimizerWorkspace::new();
 
     // Get source info for this bucket (format: "filepath::seqname")
-    let sources = index.bucket_sources.get(&bucket_id)
+    let sources = index
+        .bucket_sources
+        .get(&bucket_id)
         .ok_or_else(|| anyhow!("Bucket {} has no sources", bucket_id))?;
 
     // Group sources by file path
@@ -2815,13 +3407,18 @@ fn inspect_matches(
     // 1. Load the index
     log::info!("Loading index from {:?}", index_path);
     let index = Index::load(index_path)?;
-    log::info!("Index loaded: {} buckets, K={}, W={}", index.buckets.len(), index.k, index.w);
+    log::info!(
+        "Index loaded: {} buckets, K={}, W={}",
+        index.buckets.len(),
+        index.k,
+        index.w
+    );
 
     // 2. Load sequence IDs to inspect
     log::info!("Loading sequence IDs from {:?}", ids_file);
     let target_ids: HashSet<String> = std::io::BufReader::new(File::open(ids_file)?)
         .lines()
-        .filter_map(|l| l.ok())
+        .map_while(Result::ok)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
@@ -2835,13 +3432,22 @@ fn inspect_matches(
     }
 
     // 4. Build reference minimizer maps for each bucket
-    log::info!("Building reference minimizer maps for {} buckets...", bucket_filter.len());
+    log::info!(
+        "Building reference minimizer maps for {} buckets...",
+        bucket_filter.len()
+    );
     let mut ref_maps: HashMap<u32, HashMap<u64, Vec<ReferenceMatch>>> = HashMap::new();
     for &bucket_id in bucket_filter {
-        let bucket_name = index.bucket_names.get(&bucket_id)
+        let bucket_name = index
+            .bucket_names
+            .get(&bucket_id)
             .map(|s| s.as_str())
             .unwrap_or("unknown");
-        log::info!("  Scanning references for bucket {} ({})...", bucket_id, bucket_name);
+        log::info!(
+            "  Scanning references for bucket {} ({})...",
+            bucket_id,
+            bucket_name
+        );
         ref_maps.insert(bucket_id, build_reference_minimizer_map(&index, bucket_id)?);
     }
     log::info!("Reference maps built.");
@@ -2874,10 +3480,13 @@ fn inspect_matches(
             for &bucket_id in bucket_filter {
                 if let Some(bucket) = index.buckets.get(&bucket_id) {
                     if bucket.binary_search(&m.hash).is_ok() {
-                        let name = index.bucket_names.get(&bucket_id)
+                        let name = index
+                            .bucket_names
+                            .get(&bucket_id)
                             .map(|s| s.as_str())
                             .unwrap_or("unknown");
-                        let ref_matches = ref_maps.get(&bucket_id)
+                        let ref_matches = ref_maps
+                            .get(&bucket_id)
                             .and_then(|map| map.get(&m.hash))
                             .map(|v| v.as_slice())
                             .unwrap_or(&[]);
@@ -2894,10 +3503,16 @@ fn inspect_matches(
                 }
 
                 let query_kmer = extract_kmer_string(&seq, m.position, index.k, m.strand);
-                let strand_char = if m.strand == Strand::Forward { '+' } else { '-' };
+                let strand_char = if m.strand == Strand::Forward {
+                    '+'
+                } else {
+                    '-'
+                };
 
-                println!("  position: {}  strand: {}  kmer: {}  minimizer: 0x{:016X}",
-                    m.position, strand_char, query_kmer, m.hash);
+                println!(
+                    "  position: {}  strand: {}  kmer: {}  minimizer: 0x{:016X}",
+                    m.position, strand_char, query_kmer, m.hash
+                );
 
                 for (bucket_id, bucket_name, ref_matches) in bucket_matches {
                     println!("    bucket: {} (id={})", bucket_name, bucket_id);
@@ -2908,9 +3523,11 @@ fn inspect_matches(
                     }
 
                     // Group reference matches by file path, then by seq_id
-                    let mut by_file: HashMap<&str, HashMap<&str, Vec<&ReferenceMatch>>> = HashMap::new();
+                    let mut by_file: HashMap<&str, HashMap<&str, Vec<&ReferenceMatch>>> =
+                        HashMap::new();
                     for rm in ref_matches {
-                        by_file.entry(&rm.file_path)
+                        by_file
+                            .entry(&rm.file_path)
                             .or_default()
                             .entry(&rm.seq_id)
                             .or_default()
@@ -2928,9 +3545,15 @@ fn inspect_matches(
                         for seq_id in seq_ids {
                             println!("        ref: {}", seq_id);
                             for rm in &seqs[seq_id] {
-                                let ref_strand = if rm.strand == Strand::Forward { '+' } else { '-' };
-                                println!("          pos: {}  strand: {}  kmer: {}",
-                                    rm.position, ref_strand, rm.kmer);
+                                let ref_strand = if rm.strand == Strand::Forward {
+                                    '+'
+                                } else {
+                                    '-'
+                                };
+                                println!(
+                                    "          pos: {}  strand: {}  kmer: {}",
+                                    rm.position, ref_strand, rm.kmer
+                                );
                             }
                         }
                     }
@@ -2939,8 +3562,10 @@ fn inspect_matches(
         }
     }
 
-    log::info!("Inspection complete: {} queries processed, {} had matches",
-        queries_processed, queries_with_matches);
+    log::info!(
+        "Inspection complete: {} queries processed, {} had matches",
+        queries_processed,
+        queries_with_matches
+    );
     Ok(())
 }
-

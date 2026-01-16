@@ -15,21 +15,31 @@ fn test_config_based_index_building() -> Result<()> {
     // Write simple test sequences
     let mut file1 = File::create(&ref1_path)?;
     writeln!(file1, ">seq1")?;
-    writeln!(file1, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")?;
+    writeln!(
+        file1,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    )?;
 
     let mut file2 = File::create(&ref2_path)?;
     writeln!(file2, ">seq2")?;
-    writeln!(file2, "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT")?;
+    writeln!(
+        file2,
+        "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+    )?;
 
     let mut file3 = File::create(&ref3_path)?;
     writeln!(file3, ">seq3")?;
-    writeln!(file3, "GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG")?;
+    writeln!(
+        file3,
+        "GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG"
+    )?;
 
     // Create TOML config file
     let config_path = dir.path().join("test_config.toml");
     let output_path = dir.path().join("test_output.ryidx");
 
-    let config_content = format!(r#"
+    let config_content = format!(
+        r#"
 [index]
 window = 50
 salt = 0x5555555555555555
@@ -40,7 +50,9 @@ files = ["ref1.fa", "ref2.fa"]
 
 [buckets.BucketB]
 files = ["ref3.fa"]
-"#, output_path.display());
+"#,
+        output_path.display()
+    );
 
     let mut config_file = File::create(&config_path)?;
     config_file.write_all(config_content.as_bytes())?;
@@ -118,7 +130,10 @@ output = "test.ryidx"
     let result = rype::config::parse_config(&config_path);
     assert!(result.is_err());
     // The error will be about parsing TOML (missing field)
-    assert!(result.unwrap_err().to_string().contains("Failed to parse TOML"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Failed to parse TOML"));
 
     Ok(())
 }
@@ -136,11 +151,15 @@ fn test_bucket_add_config_parse_new_bucket() -> Result<()> {
     // Create a test FASTA file
     let ref_path = dir.path().join("ref.fa");
     let mut file = File::create(&ref_path)?;
-    writeln!(file, ">seq1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")?;
+    writeln!(
+        file,
+        ">seq1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    )?;
 
     // Create bucket-add config
     let config_path = dir.path().join("add_config.toml");
-    let config_content = format!(r#"
+    let config_content = format!(
+        r#"
 [target]
 index = "{}"
 
@@ -150,7 +169,9 @@ bucket_name = "NewBucket"
 
 [files]
 paths = ["ref.fa"]
-"#, index_path.display());
+"#,
+        index_path.display()
+    );
 
     let mut config_file = File::create(&config_path)?;
     config_file.write_all(config_content.as_bytes())?;
@@ -182,11 +203,15 @@ fn test_bucket_add_config_parse_existing_bucket() -> Result<()> {
     // Create a test FASTA file
     let ref_path = dir.path().join("ref.fa");
     let mut file = File::create(&ref_path)?;
-    writeln!(file, ">seq1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")?;
+    writeln!(
+        file,
+        ">seq1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    )?;
 
     // Create bucket-add config
     let config_path = dir.path().join("add_config.toml");
-    let config_content = format!(r#"
+    let config_content = format!(
+        r#"
 [target]
 index = "{}"
 
@@ -196,7 +221,9 @@ bucket_name = "ExistingBucket"
 
 [files]
 paths = ["ref.fa"]
-"#, index_path.display());
+"#,
+        index_path.display()
+    );
 
     let mut config_file = File::create(&config_path)?;
     config_file.write_all(config_content.as_bytes())?;
@@ -225,11 +252,15 @@ fn test_bucket_add_config_parse_best_bin() -> Result<()> {
     // Create a test FASTA file
     let ref_path = dir.path().join("ref.fa");
     let mut file = File::create(&ref_path)?;
-    writeln!(file, ">seq1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")?;
+    writeln!(
+        file,
+        ">seq1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    )?;
 
     // Create bucket-add config with best_bin mode
     let config_path = dir.path().join("add_config.toml");
-    let config_content = format!(r#"
+    let config_content = format!(
+        r#"
 [target]
 index = "{}"
 
@@ -240,7 +271,9 @@ fallback = "create_new"
 
 [files]
 paths = ["ref.fa"]
-"#, index_path.display());
+"#,
+        index_path.display()
+    );
 
     let mut config_file = File::create(&config_path)?;
     config_file.write_all(config_content.as_bytes())?;
@@ -249,7 +282,10 @@ paths = ["ref.fa"]
     let cfg = rype::config::parse_bucket_add_config(&config_path)?;
 
     match &cfg.assignment {
-        rype::config::AssignmentSettings::BestBin { threshold, fallback } => {
+        rype::config::AssignmentSettings::BestBin {
+            threshold,
+            fallback,
+        } => {
             assert!((threshold - 0.25).abs() < 0.001);
             assert_eq!(*fallback, rype::config::BestBinFallback::CreateNew);
         }
@@ -270,11 +306,15 @@ fn test_bucket_add_config_parse_best_bin_skip() -> Result<()> {
     // Create a test FASTA file
     let ref_path = dir.path().join("ref.fa");
     let mut file = File::create(&ref_path)?;
-    writeln!(file, ">seq1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")?;
+    writeln!(
+        file,
+        ">seq1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    )?;
 
     // Create bucket-add config with skip fallback
     let config_path = dir.path().join("add_config.toml");
-    let config_content = format!(r#"
+    let config_content = format!(
+        r#"
 [target]
 index = "{}"
 
@@ -285,7 +325,9 @@ fallback = "skip"
 
 [files]
 paths = ["ref.fa"]
-"#, index_path.display());
+"#,
+        index_path.display()
+    );
 
     let mut config_file = File::create(&config_path)?;
     config_file.write_all(config_content.as_bytes())?;
@@ -294,7 +336,10 @@ paths = ["ref.fa"]
     let cfg = rype::config::parse_bucket_add_config(&config_path)?;
 
     match &cfg.assignment {
-        rype::config::AssignmentSettings::BestBin { threshold, fallback } => {
+        rype::config::AssignmentSettings::BestBin {
+            threshold,
+            fallback,
+        } => {
             assert!((threshold - 0.5).abs() < 0.001);
             assert_eq!(*fallback, rype::config::BestBinFallback::Skip);
         }
@@ -314,7 +359,8 @@ fn test_bucket_add_config_invalid_threshold() -> Result<()> {
 
     // Create config with invalid threshold
     let config_path = dir.path().join("add_config.toml");
-    let config_content = format!(r#"
+    let config_content = format!(
+        r#"
 [target]
 index = "{}"
 
@@ -324,7 +370,9 @@ threshold = 1.5
 
 [files]
 paths = ["nonexistent.fa"]
-"#, index_path.display());
+"#,
+        index_path.display()
+    );
 
     let mut config_file = File::create(&config_path)?;
     config_file.write_all(config_content.as_bytes())?;
@@ -332,7 +380,10 @@ paths = ["nonexistent.fa"]
 
     let result = rype::config::parse_bucket_add_config(&config_path);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("threshold must be between 0.0 and 1.0"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("threshold must be between 0.0 and 1.0"));
 
     Ok(())
 }
@@ -344,7 +395,10 @@ fn test_bucket_add_config_validation_missing_index() -> Result<()> {
     // Create a test FASTA file
     let ref_path = dir.path().join("ref.fa");
     let mut file = File::create(&ref_path)?;
-    writeln!(file, ">seq1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")?;
+    writeln!(
+        file,
+        ">seq1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    )?;
 
     // Create config pointing to non-existent index
     let config_path = dir.path().join("add_config.toml");
@@ -366,7 +420,10 @@ paths = ["ref.fa"]
     let cfg = rype::config::parse_bucket_add_config(&config_path)?;
     let result = rype::config::validate_bucket_add_config(&cfg, dir.path());
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Target index not found"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Target index not found"));
 
     Ok(())
 }
@@ -381,7 +438,8 @@ fn test_bucket_add_config_validation_missing_file() -> Result<()> {
 
     // Create config pointing to non-existent file
     let config_path = dir.path().join("add_config.toml");
-    let config_content = format!(r#"
+    let config_content = format!(
+        r#"
 [target]
 index = "{}"
 
@@ -390,7 +448,9 @@ mode = "new_bucket"
 
 [files]
 paths = ["nonexistent.fa"]
-"#, index_path.display());
+"#,
+        index_path.display()
+    );
 
     let mut config_file = File::create(&config_path)?;
     config_file.write_all(config_content.as_bytes())?;
@@ -427,7 +487,10 @@ paths = []
 
     let result = rype::config::parse_bucket_add_config(&config_path);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("at least one file"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("at least one file"));
 
     Ok(())
 }

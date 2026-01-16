@@ -22,9 +22,7 @@ use rype::{classify_batch, Index, InvertedIndex, MinimizerWorkspace};
 /// Generate a DNA sequence of given length with a deterministic pattern.
 fn generate_sequence(len: usize, seed: u8) -> Vec<u8> {
     let bases = [b'A', b'C', b'G', b'T'];
-    (0..len)
-        .map(|i| bases[(i + seed as usize) % 4])
-        .collect()
+    (0..len).map(|i| bases[(i + seed as usize) % 4]).collect()
 }
 
 /// Create a test batch with the expected schema.
@@ -41,11 +39,7 @@ fn make_test_batch(ids: &[i64], seqs: &[&[u8]]) -> RecordBatch {
 }
 
 /// Create a test batch with paired-end sequences.
-fn make_test_batch_paired(
-    ids: &[i64],
-    seqs: &[&[u8]],
-    pairs: &[Option<&[u8]>],
-) -> RecordBatch {
+fn make_test_batch_paired(ids: &[i64], seqs: &[&[u8]], pairs: &[Option<&[u8]>]) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new(COL_ID, DataType::Int64, false),
         Field::new(COL_SEQUENCE, DataType::Binary, false),
@@ -183,11 +177,7 @@ fn test_arrow_with_paired_end() -> Result<()> {
     let pair1 = generate_sequence(80, 0);
     let seq2 = generate_sequence(80, 2);
 
-    let batch = make_test_batch_paired(
-        &[1, 2],
-        &[&seq1, &seq2],
-        &[Some(pair1.as_slice()), None],
-    );
+    let batch = make_test_batch_paired(&[1, 2], &[&seq1, &seq2], &[Some(pair1.as_slice()), None]);
 
     let result = classify_arrow_batch(&index, None, &batch, 0.0)?;
 
@@ -225,14 +215,22 @@ fn test_arrow_streaming_multiple_batches() -> Result<()> {
     let classifier = IndexStreamClassifier::new(&index, None, 0.0);
 
     // Create multiple batches
-    let batch1 = make_test_batch(&[1, 2], &[&generate_sequence(100, 0), &generate_sequence(100, 1)]);
-    let batch2 = make_test_batch(&[3, 4], &[&generate_sequence(100, 2), &generate_sequence(100, 3)]);
+    let batch1 = make_test_batch(
+        &[1, 2],
+        &[&generate_sequence(100, 0), &generate_sequence(100, 1)],
+    );
+    let batch2 = make_test_batch(
+        &[3, 4],
+        &[&generate_sequence(100, 2), &generate_sequence(100, 3)],
+    );
     let batch3 = make_test_batch(&[5], &[&generate_sequence(100, 0)]);
 
     let input_batches: Vec<Result<RecordBatch, arrow::error::ArrowError>> =
         vec![Ok(batch1), Ok(batch2), Ok(batch3)];
 
-    let results: Vec<_> = classifier.classify_iter(input_batches.into_iter()).collect();
+    let results: Vec<_> = classifier
+        .classify_iter(input_batches.into_iter())
+        .collect();
 
     assert_eq!(results.len(), 3, "Should have one result per input batch");
     for result in results {
