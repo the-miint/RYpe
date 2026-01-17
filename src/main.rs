@@ -20,7 +20,7 @@ use rype::{
     classify_batch_sharded_merge_join, classify_batch_sharded_sequential, extract_into,
     extract_with_positions, Index, IndexMetadata, InvertedIndex, MainIndexManifest, MainIndexShard,
     MinimizerWorkspace, QueryRecord, ShardManifest, ShardedInvertedIndex, ShardedMainIndex,
-    ShardedMainIndexBuilder, Strand,
+    ShardedMainIndexBuilder, Strand, ENABLE_TIMING,
 };
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -43,6 +43,27 @@ fn parse_shard_size_arg(s: &str) -> Result<usize, String> {
         Ok(Some(bytes)) => Ok(bytes),
         Ok(None) => Err("'auto' not supported for shard size".to_string()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Parse shard format argument ("legacy" or "parquet")
+fn parse_shard_format(s: &str) -> Result<String, String> {
+    match s.to_lowercase().as_str() {
+        "legacy" | "ryxs" => Ok("legacy".to_string()),
+        "parquet" | "pq" => {
+            #[cfg(feature = "parquet")]
+            {
+                Ok("parquet".to_string())
+            }
+            #[cfg(not(feature = "parquet"))]
+            {
+                Err("Parquet format requires --features parquet".to_string())
+            }
+        }
+        _ => Err(format!(
+            "Unknown format '{}'. Valid options: legacy, parquet",
+            s
+        )),
     }
 }
 
@@ -325,14 +346,23 @@ Creates bucket-partitioned shards:
 - Sharded main index: creates 1:1 inverted shard correspondence
 - Single-file main index: creates a 1-shard inverted index
 
+FORMATS:
+  legacy   - Custom RYXS binary format (default, smaller files)
+  parquet  - Apache Parquet format (faster parallel I/O, requires --features parquet)
+
 USAGE:
-  rype index invert -i index.ryidx      # Creates index.ryxdi.manifest + .shard.0
-  rype classify run -i index.ryidx -I   # Use inverted index automatically"
+  rype index invert -i index.ryidx                    # Legacy format
+  rype index invert -i index.ryidx --format parquet   # Parquet format
+  rype classify run -i index.ryidx -I                 # Auto-detects format"
     )]
     Invert {
         /// Path to primary index file (.ryidx)
         #[arg(short, long)]
         index: PathBuf,
+
+        /// Output format for inverted index shards
+        #[arg(long, default_value = "legacy", value_parser = parse_shard_format)]
+        format: String,
     },
 
     /// Show detailed minimizer statistics for compression analysis
@@ -456,6 +486,10 @@ WHEN TO USE 'run' vs 'aggregate':
         /// May be slower for queries with many unique minimizers.
         #[arg(short = 'M', long)]
         merge_join: bool,
+
+        /// Print timing diagnostics to stderr for performance analysis.
+        #[arg(long)]
+        timing: bool,
     },
 
     /// Batch classify reads (identical to 'run', kept for backwards compatibility)
@@ -481,6 +515,8 @@ WHEN TO USE 'run' vs 'aggregate':
         use_inverted: bool,
         #[arg(short = 'M', long)]
         merge_join: bool,
+        #[arg(long)]
+        timing: bool,
     },
 
     /// Pool all reads for sample-level classification (higher sensitivity)
@@ -1082,8 +1118,22 @@ fn main() -> Result<()> {
                 bucket_add_from_config(&config)?;
             }
 
-            IndexCommands::Invert { index } => {
+            IndexCommands::Invert { index, format } => {
                 let output_path = index.with_extension("ryxdi");
+                let use_parquet = format == "parquet";
+
+                // For Parquet format, create the inverted directory
+                #[cfg(feature = "parquet")]
+                if use_parquet {
+                    let inverted_dir = output_path.join("inverted");
+                    std::fs::create_dir_all(&inverted_dir).with_context(|| {
+                        format!(
+                            "Failed to create inverted directory: {}",
+                            inverted_dir.display()
+                        )
+                    })?;
+                    log::info!("Using Parquet format, output to {:?}", output_path);
+                }
 
                 // Track files we create for cleanup on error
                 let mut created_files: Vec<PathBuf> = Vec::new();
@@ -1128,17 +1178,36 @@ fn main() -> Result<()> {
                             );
 
                             // Save as inverted shard with same ID
-                            let inv_shard_path =
-                                ShardManifest::shard_path(&output_path, shard_info.shard_id);
                             let is_last = idx == num_shards - 1;
-                            let inv_shard_info = inverted.save_shard(
-                                &inv_shard_path,
-                                shard_info.shard_id,
-                                0,
-                                inverted.num_minimizers(),
-                                is_last,
-                            )?;
-                            created_files.push(inv_shard_path);
+                            let inv_shard_info = if use_parquet {
+                                #[cfg(feature = "parquet")]
+                                {
+                                    let inv_shard_path = ShardManifest::shard_path_parquet(
+                                        &output_path,
+                                        shard_info.shard_id,
+                                    );
+                                    let info = inverted
+                                        .save_shard_parquet(&inv_shard_path, shard_info.shard_id)?;
+                                    created_files.push(inv_shard_path);
+                                    info
+                                }
+                                #[cfg(not(feature = "parquet"))]
+                                {
+                                    anyhow::bail!("Parquet format requires --features parquet");
+                                }
+                            } else {
+                                let inv_shard_path =
+                                    ShardManifest::shard_path(&output_path, shard_info.shard_id);
+                                let info = inverted.save_shard(
+                                    &inv_shard_path,
+                                    shard_info.shard_id,
+                                    0,
+                                    inverted.num_minimizers(),
+                                    is_last,
+                                )?;
+                                created_files.push(inv_shard_path);
+                                info
+                            };
 
                             total_minimizers += inv_shard_info.num_minimizers;
                             total_bucket_ids += inv_shard_info.num_bucket_ids;
@@ -1181,15 +1250,30 @@ fn main() -> Result<()> {
 
                     (|| -> Result<ShardManifest> {
                         // Save as single shard (shard_id = 0)
-                        let shard_path = ShardManifest::shard_path(&output_path, 0);
-                        let inv_shard_info = inverted.save_shard(
-                            &shard_path,
-                            0, // shard_id
-                            0, // min_start
-                            inverted.num_minimizers(),
-                            true, // is_last (and only) shard
-                        )?;
-                        created_files.push(shard_path);
+                        let inv_shard_info = if use_parquet {
+                            #[cfg(feature = "parquet")]
+                            {
+                                let shard_path = ShardManifest::shard_path_parquet(&output_path, 0);
+                                let info = inverted.save_shard_parquet(&shard_path, 0)?;
+                                created_files.push(shard_path);
+                                info
+                            }
+                            #[cfg(not(feature = "parquet"))]
+                            {
+                                anyhow::bail!("Parquet format requires --features parquet");
+                            }
+                        } else {
+                            let shard_path = ShardManifest::shard_path(&output_path, 0);
+                            let info = inverted.save_shard(
+                                &shard_path,
+                                0, // shard_id
+                                0, // min_start
+                                inverted.num_minimizers(),
+                                true, // is_last (and only) shard
+                            )?;
+                            created_files.push(shard_path);
+                            info
+                        };
 
                         // Create manifest with single shard
                         let metadata = IndexMetadata {
@@ -1495,6 +1579,7 @@ fn main() -> Result<()> {
                 output,
                 use_inverted,
                 merge_join,
+                timing,
             }
             | ClassifyCommands::Batch {
                 index,
@@ -1507,9 +1592,15 @@ fn main() -> Result<()> {
                 output,
                 use_inverted,
                 merge_join,
+                timing,
             } => {
                 if merge_join && !use_inverted {
                     return Err(anyhow!("--merge-join requires --use-inverted"));
+                }
+
+                // Enable timing diagnostics if requested
+                if timing {
+                    ENABLE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 // Determine effective batch size: user override or adaptive

@@ -17,6 +17,16 @@ use crate::constants::{MAX_INVERTED_BUCKET_IDS, MAX_INVERTED_MINIMIZERS};
 use crate::inverted::InvertedIndex;
 use crate::types::IndexMetadata;
 
+/// Format for inverted index shard files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShardFormat {
+    /// Legacy RYXS format (custom binary with zstd compression)
+    #[default]
+    Legacy,
+    /// Parquet format (requires parquet feature)
+    Parquet,
+}
+
 /// Information about a single shard in a sharded inverted index.
 #[derive(Debug, Clone)]
 pub struct ShardInfo {
@@ -278,6 +288,23 @@ impl ShardManifest {
         path.set_file_name(format!("{}.shard.{}", name, shard_id));
         path
     }
+
+    /// Get the path for a Parquet shard file given a base path and shard ID.
+    ///
+    /// For Parquet-based indices, shards are stored in an `inverted/` subdirectory
+    /// with `.parquet` extension.
+    pub fn shard_path_parquet(base: &Path, shard_id: u32) -> PathBuf {
+        base.join("inverted")
+            .join(format!("shard.{}.parquet", shard_id))
+    }
+
+    /// Get the shard path for a specific format.
+    pub fn shard_path_for_format(base: &Path, shard_id: u32, format: ShardFormat) -> PathBuf {
+        match format {
+            ShardFormat::Legacy => Self::shard_path(base, shard_id),
+            ShardFormat::Parquet => Self::shard_path_parquet(base, shard_id),
+        }
+    }
 }
 
 /// Handle for a sharded inverted index.
@@ -288,17 +315,54 @@ impl ShardManifest {
 pub struct ShardedInvertedIndex {
     manifest: ShardManifest,
     base_path: PathBuf,
+    shard_format: ShardFormat,
 }
 
 impl ShardedInvertedIndex {
     /// Open a sharded inverted index by loading just the manifest.
+    ///
+    /// Auto-detects whether shards are in legacy RYXS or Parquet format
+    /// by checking for the presence of shard files.
     pub fn open(base_path: &Path) -> Result<Self> {
+        let manifest_path = ShardManifest::manifest_path(base_path);
+        let manifest = ShardManifest::load(&manifest_path)?;
+
+        // Detect shard format by checking which file exists for shard 0
+        let shard_format = if !manifest.shards.is_empty() {
+            let parquet_path = ShardManifest::shard_path_parquet(base_path, 0);
+            let legacy_path = ShardManifest::shard_path(base_path, 0);
+
+            if parquet_path.exists() {
+                ShardFormat::Parquet
+            } else if legacy_path.exists() {
+                ShardFormat::Legacy
+            } else {
+                return Err(anyhow!(
+                    "No shard file found at {} or {}",
+                    parquet_path.display(),
+                    legacy_path.display()
+                ));
+            }
+        } else {
+            ShardFormat::Legacy // Default for empty manifests
+        };
+
+        Ok(ShardedInvertedIndex {
+            manifest,
+            base_path: base_path.to_path_buf(),
+            shard_format,
+        })
+    }
+
+    /// Open with explicit format (useful for testing or when format is known).
+    pub fn open_with_format(base_path: &Path, format: ShardFormat) -> Result<Self> {
         let manifest_path = ShardManifest::manifest_path(base_path);
         let manifest = ShardManifest::load(&manifest_path)?;
 
         Ok(ShardedInvertedIndex {
             manifest,
             base_path: base_path.to_path_buf(),
+            shard_format: format,
         })
     }
 
@@ -345,6 +409,99 @@ impl ShardedInvertedIndex {
     /// Returns a reference to the base path.
     pub fn base_path(&self) -> &Path {
         &self.base_path
+    }
+
+    /// Returns the shard format (Legacy or Parquet).
+    pub fn shard_format(&self) -> ShardFormat {
+        self.shard_format
+    }
+
+    /// Get the path for a specific shard, using the detected format.
+    pub fn shard_path(&self, shard_id: u32) -> PathBuf {
+        ShardManifest::shard_path_for_format(&self.base_path, shard_id, self.shard_format)
+    }
+
+    /// Load a specific shard by ID.
+    ///
+    /// Uses the detected format to load either legacy RYXS or Parquet shards.
+    pub fn load_shard(&self, shard_id: u32) -> Result<InvertedIndex> {
+        let path = self.shard_path(shard_id);
+        match self.shard_format {
+            ShardFormat::Legacy => InvertedIndex::load_shard(&path),
+            ShardFormat::Parquet => {
+                #[cfg(feature = "parquet")]
+                {
+                    InvertedIndex::load_shard_parquet_with_params(
+                        &path,
+                        self.manifest.k,
+                        self.manifest.w,
+                        self.manifest.salt,
+                        self.manifest.source_hash,
+                    )
+                }
+                #[cfg(not(feature = "parquet"))]
+                {
+                    Err(anyhow!(
+                        "Parquet shard format requires --features parquet: {}",
+                        path.display()
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Load a shard, filtering to only include data relevant to query minimizers.
+    ///
+    /// For Parquet shards, this uses merge-scan to identify which row groups contain
+    /// query minimizers, then loads only those row groups and filters rows. This can
+    /// skip 90%+ of data for sparse queries.
+    ///
+    /// For legacy shards, falls back to full loading (no row group filtering available).
+    ///
+    /// # Arguments
+    /// * `shard_id` - The shard to load
+    /// * `query_minimizers` - Sorted slice of query minimizers to match against
+    ///
+    /// # Returns
+    /// An InvertedIndex containing only minimizers present in the query set.
+    pub fn load_shard_for_query(
+        &self,
+        shard_id: u32,
+        query_minimizers: &[u64],
+    ) -> Result<InvertedIndex> {
+        let path = self.shard_path(shard_id);
+        match self.shard_format {
+            ShardFormat::Legacy => {
+                // Legacy format doesn't support row group filtering
+                // Load full shard (caller will filter during merge-join)
+                InvertedIndex::load_shard(&path)
+            }
+            ShardFormat::Parquet => {
+                #[cfg(feature = "parquet")]
+                {
+                    InvertedIndex::load_shard_parquet_for_query(
+                        &path,
+                        self.manifest.k,
+                        self.manifest.w,
+                        self.manifest.salt,
+                        self.manifest.source_hash,
+                        query_minimizers,
+                    )
+                }
+                #[cfg(not(feature = "parquet"))]
+                {
+                    Err(anyhow!(
+                        "Parquet shard format requires --features parquet: {}",
+                        path.display()
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Check if this index uses Parquet format (supports filtered loading).
+    pub fn is_parquet(&self) -> bool {
+        matches!(self.shard_format, ShardFormat::Parquet)
     }
 
     /// Validate against Index metadata.

@@ -309,6 +309,16 @@ impl InvertedIndex {
         &self.minimizers
     }
 
+    /// Get the CSR offsets array (for debugging/inspection).
+    pub fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+
+    /// Get the bucket IDs array (for debugging/inspection).
+    pub fn bucket_ids(&self) -> &[u32] {
+        &self.bucket_ids
+    }
+
     /// Save a subset of this inverted index as a shard file (RYXS format v1).
     pub fn save_shard(
         &self,
@@ -444,7 +454,39 @@ impl InvertedIndex {
     }
 
     /// Load a shard file into an InvertedIndex.
+    ///
+    /// Supports both legacy RYXS format and Parquet format (auto-detected by extension).
+    ///
+    /// # Parquet Shards
+    /// Parquet shards should be loaded via `ShardedInvertedIndex::load_shard()` which
+    /// provides the required parameters (k, w, salt, source_hash) from the manifest.
+    /// Loading a Parquet shard directly requires these parameters and will fail.
     pub fn load_shard(path: &Path) -> Result<Self> {
+        // Detect format based on extension
+        if path.extension().map(|e| e == "parquet").unwrap_or(false) {
+            #[cfg(feature = "parquet")]
+            {
+                return Err(anyhow!(
+                    "Parquet shards must be loaded via ShardedInvertedIndex::load_shard() \
+                     which provides parameters from the manifest. \
+                     Use load_shard_parquet_with_params() directly if you have the parameters. \
+                     Path: {}",
+                    path.display()
+                ));
+            }
+            #[cfg(not(feature = "parquet"))]
+            {
+                return Err(anyhow!(
+                    "Parquet shard format requires --features parquet: {}",
+                    path.display()
+                ));
+            }
+        }
+        Self::load_shard_legacy(path)
+    }
+
+    /// Load a legacy RYXS format shard file.
+    fn load_shard_legacy(path: &Path) -> Result<Self> {
         let mut reader = BufReader::new(File::open(path)?);
         let mut buf4 = [0u8; 4];
         let mut buf8 = [0u8; 8];
@@ -652,6 +694,859 @@ impl InvertedIndex {
             minimizers,
             offsets,
             bucket_ids,
+        })
+    }
+
+    /// Save this inverted index as a Parquet shard file.
+    ///
+    /// The Parquet schema is flattened: (minimizer: u64, bucket_id: u32)
+    /// with one row per (minimizer, bucket_id) pair, sorted by minimizer then bucket_id.
+    /// This enables row group filtering based on minimizer range statistics.
+    ///
+    /// # Memory Efficiency
+    /// Streams directly from CSR format without materializing the full flattened
+    /// dataset. Memory usage is O(BATCH_SIZE) instead of O(total_pairs).
+    ///
+    /// # Arguments
+    /// * `path` - Output path (should end in .parquet)
+    /// * `shard_id` - Shard identifier for manifest
+    ///
+    /// # Returns
+    /// ShardInfo describing the written shard.
+    #[cfg(feature = "parquet")]
+    pub fn save_shard_parquet(&self, path: &Path, shard_id: u32) -> Result<ShardInfo> {
+        use anyhow::Context;
+        use arrow::array::{ArrayRef, UInt32Builder, UInt64Builder};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::basic::{Compression, Encoding};
+        use parquet::file::properties::{WriterProperties, WriterVersion};
+        use std::sync::Arc;
+
+        if self.minimizers.is_empty() {
+            // Empty shard - don't create file
+            return Ok(ShardInfo {
+                shard_id,
+                min_start: 0,
+                min_end: 0,
+                is_last_shard: true,
+                num_minimizers: 0,
+                num_bucket_ids: 0,
+            });
+        }
+
+        // Schema: (minimizer: u64, bucket_id: u32)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("minimizer", DataType::UInt64, false),
+            Field::new("bucket_id", DataType::UInt32, false),
+        ]));
+
+        // Writer properties: Snappy (fast), DELTA_BINARY_PACKED for both columns.
+        // DELTA_BINARY_PACKED works well for bucket_ids because they cluster within
+        // row groups (same minimizer range → similar bucket distribution).
+        let props = WriterProperties::builder()
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_compression(Compression::SNAPPY)
+            .set_column_encoding(
+                parquet::schema::types::ColumnPath::new(vec!["minimizer".to_string()]),
+                Encoding::DELTA_BINARY_PACKED,
+            )
+            .set_column_dictionary_enabled(
+                parquet::schema::types::ColumnPath::new(vec!["minimizer".to_string()]),
+                false,
+            )
+            .set_column_encoding(
+                parquet::schema::types::ColumnPath::new(vec!["bucket_id".to_string()]),
+                Encoding::DELTA_BINARY_PACKED,
+            )
+            .set_column_dictionary_enabled(
+                parquet::schema::types::ColumnPath::new(vec!["bucket_id".to_string()]),
+                false,
+            )
+            .set_max_row_group_size(100_000)
+            .build();
+
+        let file = std::fs::File::create(path)
+            .with_context(|| format!("Failed to create Parquet shard: {}", path.display()))?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+
+        // Stream from CSR format in batches without materializing all pairs
+        const BATCH_SIZE: usize = 100_000;
+        let mut minimizer_builder = UInt64Builder::with_capacity(BATCH_SIZE);
+        let mut bucket_id_builder = UInt32Builder::with_capacity(BATCH_SIZE);
+        let mut pairs_in_batch = 0;
+
+        for (i, &minimizer) in self.minimizers.iter().enumerate() {
+            let start = self.offsets[i] as usize;
+            let end = self.offsets[i + 1] as usize;
+
+            for &bucket_id in &self.bucket_ids[start..end] {
+                minimizer_builder.append_value(minimizer);
+                bucket_id_builder.append_value(bucket_id);
+                pairs_in_batch += 1;
+
+                if pairs_in_batch >= BATCH_SIZE {
+                    // Flush batch
+                    let minimizer_array: ArrayRef = Arc::new(minimizer_builder.finish());
+                    let bucket_id_array: ArrayRef = Arc::new(bucket_id_builder.finish());
+
+                    let batch = RecordBatch::try_new(
+                        schema.clone(),
+                        vec![minimizer_array, bucket_id_array],
+                    )?;
+                    writer.write(&batch)?;
+
+                    // Reset builders for next batch
+                    minimizer_builder = UInt64Builder::with_capacity(BATCH_SIZE);
+                    bucket_id_builder = UInt32Builder::with_capacity(BATCH_SIZE);
+                    pairs_in_batch = 0;
+                }
+            }
+        }
+
+        // Flush remaining pairs
+        if pairs_in_batch > 0 {
+            let minimizer_array: ArrayRef = Arc::new(minimizer_builder.finish());
+            let bucket_id_array: ArrayRef = Arc::new(bucket_id_builder.finish());
+
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![minimizer_array, bucket_id_array])?;
+            writer.write(&batch)?;
+        }
+
+        writer.close()?;
+
+        let min_start = self.minimizers[0];
+        let min_end = 0; // Last shard marker
+
+        Ok(ShardInfo {
+            shard_id,
+            min_start,
+            min_end,
+            is_last_shard: true,
+            num_minimizers: self.minimizers.len(),
+            num_bucket_ids: self.bucket_ids.len(),
+        })
+    }
+
+    /// Load a Parquet shard with explicit parameters.
+    ///
+    /// This is the main entry point for loading Parquet shards. Parameters are
+    /// provided by the manifest file that accompanies Parquet shards.
+    ///
+    /// # Performance
+    /// Row groups are read in parallel using rayon, then concatenated and
+    /// validated in a single pass to build the CSR structure.
+    ///
+    /// # Memory
+    /// Uses a shared Bytes buffer to avoid opening N file descriptors.
+    /// Peak memory usage is 2x the Parquet file size (buffer + decoded pairs).
+    #[cfg(feature = "parquet")]
+    pub fn load_shard_parquet_with_params(
+        path: &Path,
+        k: usize,
+        w: usize,
+        salt: u64,
+        source_hash: u64,
+    ) -> Result<Self> {
+        use anyhow::Context;
+        use arrow::array::{Array, UInt32Array, UInt64Array};
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use rayon::prelude::*;
+        use std::fs::File;
+        use std::io::Read;
+
+        // Validate k value (same as legacy format)
+        if !matches!(k, 16 | 32 | 64) {
+            return Err(anyhow!(
+                "Invalid K value for Parquet shard: {} (must be 16, 32, or 64)",
+                k
+            ));
+        }
+
+        // Read entire file into memory once (avoids N file opens)
+        let mut file = File::open(path)
+            .with_context(|| format!("Failed to open Parquet shard: {}", path.display()))?;
+        let file_size = file.metadata()?.len() as usize;
+        let mut buffer = Vec::with_capacity(file_size);
+        file.read_to_end(&mut buffer)?;
+        let bytes = Bytes::from(buffer);
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?;
+        let metadata = builder.metadata().clone();
+        let num_row_groups = metadata.num_row_groups();
+
+        if num_row_groups == 0 {
+            return Ok(InvertedIndex {
+                k,
+                w,
+                salt,
+                source_hash,
+                minimizers: Vec::new(),
+                offsets: vec![0],
+                bucket_ids: Vec::new(),
+            });
+        }
+
+        // Parallel read of row groups using shared bytes
+        let row_group_results: Vec<Result<Vec<(u64, u32)>>> = (0..num_row_groups)
+            .into_par_iter()
+            .map(|rg_idx| {
+                let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?;
+                let reader = builder.with_row_groups(vec![rg_idx]).build()?;
+
+                let mut pairs = Vec::new();
+
+                for batch in reader {
+                    let batch = batch?;
+
+                    let min_col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .context("Expected UInt64Array for minimizer column")?;
+
+                    let bid_col = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<UInt32Array>()
+                        .context("Expected UInt32Array for bucket_id column")?;
+
+                    for i in 0..batch.num_rows() {
+                        pairs.push((min_col.value(i), bid_col.value(i)));
+                    }
+                }
+
+                Ok(pairs)
+            })
+            .collect();
+
+        // Concatenate row groups in order (they're already sorted globally since we write them that way)
+        // This is O(n) vs O(n log k) for k-way merge, and avoids tuple overhead.
+        let mut all_minimizers: Vec<u64> = Vec::new();
+        let mut all_bucket_ids: Vec<u32> = Vec::new();
+
+        for result in row_group_results {
+            let pairs = result?;
+            for (m, b) in pairs {
+                all_minimizers.push(m);
+                all_bucket_ids.push(b);
+            }
+        }
+
+        if all_minimizers.is_empty() {
+            return Ok(InvertedIndex {
+                k,
+                w,
+                salt,
+                source_hash,
+                minimizers: Vec::new(),
+                offsets: vec![0],
+                bucket_ids: Vec::new(),
+            });
+        }
+
+        // Validate global ordering and build CSR structure in one pass
+        let mut minimizers: Vec<u64> = Vec::with_capacity(all_minimizers.len() / 2);
+        let mut offsets: Vec<u32> = Vec::with_capacity(all_minimizers.len() / 2 + 1);
+        let mut bucket_ids_out: Vec<u32> = Vec::with_capacity(all_bucket_ids.len());
+
+        offsets.push(0);
+        let mut current_min = all_minimizers[0];
+        let mut prev_min = all_minimizers[0];
+        minimizers.push(current_min);
+
+        for (i, (&m, &b)) in all_minimizers.iter().zip(all_bucket_ids.iter()).enumerate() {
+            // Validation: minimizers must be non-decreasing
+            if m < prev_min {
+                return Err(anyhow!(
+                    "Parquet shard has unsorted minimizers at row {}: {} < {} (corrupt file?)",
+                    i,
+                    m,
+                    prev_min
+                ));
+            }
+            prev_min = m;
+
+            if m != current_min {
+                // New minimizer - finalize previous
+                offsets.push(bucket_ids_out.len() as u32);
+                minimizers.push(m);
+                current_min = m;
+            }
+            bucket_ids_out.push(b);
+        }
+
+        // Finalize last minimizer
+        offsets.push(bucket_ids_out.len() as u32);
+
+        // Validation: offsets must be monotonically increasing
+        if offsets.windows(2).any(|w| w[0] > w[1]) {
+            return Err(anyhow!(
+                "Parquet shard produced invalid offsets (internal error)"
+            ));
+        }
+
+        // Validation: minimizers must be strictly increasing (after grouping)
+        if minimizers.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(anyhow!(
+                "Parquet shard has duplicate minimizers after merge (corrupt file?)"
+            ));
+        }
+
+        // Validation: size limits (same as legacy format)
+        if minimizers.len() > MAX_INVERTED_MINIMIZERS {
+            return Err(anyhow!(
+                "Parquet shard has too many minimizers: {} (limit: {})",
+                minimizers.len(),
+                MAX_INVERTED_MINIMIZERS
+            ));
+        }
+        if bucket_ids_out.len() > MAX_INVERTED_BUCKET_IDS {
+            return Err(anyhow!(
+                "Parquet shard has too many bucket IDs: {} (limit: {})",
+                bucket_ids_out.len(),
+                MAX_INVERTED_BUCKET_IDS
+            ));
+        }
+
+        minimizers.shrink_to_fit();
+        offsets.shrink_to_fit();
+        bucket_ids_out.shrink_to_fit();
+
+        Ok(InvertedIndex {
+            k,
+            w,
+            salt,
+            source_hash,
+            minimizers,
+            offsets,
+            bucket_ids: bucket_ids_out,
+        })
+    }
+
+    /// Load only the row groups that overlap with the given minimizer range.
+    ///
+    /// This enables efficient query processing when the query minimizers span
+    /// a small fraction of the total range. Row groups are filtered based on
+    /// their min/max statistics before loading.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the Parquet shard file
+    /// * `k`, `w`, `salt`, `source_hash` - Index parameters from manifest
+    /// * `query_min` - Minimum minimizer in the query set
+    /// * `query_max` - Maximum minimizer in the query set
+    ///
+    /// # Returns
+    /// A partial InvertedIndex containing only minimizers in the overlapping range.
+    #[cfg(feature = "parquet")]
+    pub fn load_shard_parquet_filtered(
+        path: &Path,
+        k: usize,
+        w: usize,
+        salt: u64,
+        source_hash: u64,
+        query_min: u64,
+        query_max: u64,
+    ) -> Result<Self> {
+        use anyhow::Context;
+        use arrow::array::{Array, UInt32Array, UInt64Array};
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::reader::FileReader;
+        use parquet::file::serialized_reader::SerializedFileReader;
+        use parquet::file::statistics::Statistics;
+        use rayon::prelude::*;
+        use std::fs::File;
+        use std::io::Read;
+
+        // Validate k value
+        if !matches!(k, 16 | 32 | 64) {
+            return Err(anyhow!(
+                "Invalid K value for Parquet shard: {} (must be 16, 32, or 64)",
+                k
+            ));
+        }
+
+        // Read entire file into memory
+        let mut file = File::open(path)
+            .with_context(|| format!("Failed to open Parquet shard: {}", path.display()))?;
+        let file_size = file.metadata()?.len() as usize;
+        let mut buffer = Vec::with_capacity(file_size);
+        file.read_to_end(&mut buffer)?;
+        let bytes = Bytes::from(buffer);
+
+        // Get metadata to filter row groups
+        let parquet_reader = SerializedFileReader::new(bytes.clone())?;
+        let metadata = parquet_reader.metadata();
+        let num_row_groups = metadata.num_row_groups();
+
+        if num_row_groups == 0 {
+            return Ok(InvertedIndex {
+                k,
+                w,
+                salt,
+                source_hash,
+                minimizers: Vec::new(),
+                offsets: vec![0],
+                bucket_ids: Vec::new(),
+            });
+        }
+
+        // Find row groups that overlap with query range
+        let mut matching_row_groups: Vec<usize> = Vec::new();
+
+        for rg_idx in 0..num_row_groups {
+            let rg_meta = metadata.row_group(rg_idx);
+            let col_meta = rg_meta.column(0); // minimizer column
+
+            if let Some(stats) = col_meta.statistics() {
+                match stats {
+                    Statistics::Int64(s) => {
+                        // Parquet stores u64 as i64, interpret correctly
+                        let rg_min = s.min_opt().map(|v| *v as u64).unwrap_or(0);
+                        let rg_max = s.max_opt().map(|v| *v as u64).unwrap_or(u64::MAX);
+
+                        // Check if row group overlaps with query range
+                        if rg_max >= query_min && rg_min <= query_max {
+                            matching_row_groups.push(rg_idx);
+                        }
+                    }
+                    _ => {
+                        // Unknown stats type, include to be safe
+                        matching_row_groups.push(rg_idx);
+                    }
+                }
+            } else {
+                // No stats, include to be safe
+                matching_row_groups.push(rg_idx);
+            }
+        }
+
+        if matching_row_groups.is_empty() {
+            return Ok(InvertedIndex {
+                k,
+                w,
+                salt,
+                source_hash,
+                minimizers: Vec::new(),
+                offsets: vec![0],
+                bucket_ids: Vec::new(),
+            });
+        }
+
+        // Parallel read of matching row groups only
+        let row_group_results: Vec<Result<Vec<(u64, u32)>>> = matching_row_groups
+            .par_iter()
+            .map(|&rg_idx| {
+                let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?;
+                let reader = builder.with_row_groups(vec![rg_idx]).build()?;
+
+                let mut pairs = Vec::new();
+
+                for batch in reader {
+                    let batch = batch?;
+
+                    let min_col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .context("Expected UInt64Array for minimizer column")?;
+
+                    let bid_col = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<UInt32Array>()
+                        .context("Expected UInt32Array for bucket_id column")?;
+
+                    for i in 0..batch.num_rows() {
+                        let m = min_col.value(i);
+                        // Only include pairs within the query range
+                        if m >= query_min && m <= query_max {
+                            pairs.push((m, bid_col.value(i)));
+                        }
+                    }
+                }
+
+                Ok(pairs)
+            })
+            .collect();
+
+        // Concatenate results (row groups are already sorted)
+        let mut all_minimizers: Vec<u64> = Vec::new();
+        let mut all_bucket_ids: Vec<u32> = Vec::new();
+
+        for result in row_group_results {
+            let pairs = result?;
+            for (m, b) in pairs {
+                all_minimizers.push(m);
+                all_bucket_ids.push(b);
+            }
+        }
+
+        if all_minimizers.is_empty() {
+            return Ok(InvertedIndex {
+                k,
+                w,
+                salt,
+                source_hash,
+                minimizers: Vec::new(),
+                offsets: vec![0],
+                bucket_ids: Vec::new(),
+            });
+        }
+
+        // Build CSR structure with validation
+        let mut minimizers: Vec<u64> = Vec::with_capacity(all_minimizers.len() / 2);
+        let mut offsets: Vec<u32> = Vec::with_capacity(all_minimizers.len() / 2 + 1);
+        let mut bucket_ids_out: Vec<u32> = Vec::with_capacity(all_bucket_ids.len());
+
+        offsets.push(0);
+        let mut current_min = all_minimizers[0];
+        let mut prev_min = all_minimizers[0];
+        minimizers.push(current_min);
+
+        for (i, (&m, &b)) in all_minimizers.iter().zip(all_bucket_ids.iter()).enumerate() {
+            if m < prev_min {
+                return Err(anyhow!(
+                    "Parquet shard has unsorted minimizers at row {}: {} < {}",
+                    i,
+                    m,
+                    prev_min
+                ));
+            }
+            prev_min = m;
+
+            if m != current_min {
+                offsets.push(bucket_ids_out.len() as u32);
+                minimizers.push(m);
+                current_min = m;
+            }
+            bucket_ids_out.push(b);
+        }
+
+        offsets.push(bucket_ids_out.len() as u32);
+
+        minimizers.shrink_to_fit();
+        offsets.shrink_to_fit();
+        bucket_ids_out.shrink_to_fit();
+
+        Ok(InvertedIndex {
+            k,
+            w,
+            salt,
+            source_hash,
+            minimizers,
+            offsets,
+            bucket_ids: bucket_ids_out,
+        })
+    }
+
+    /// Get row group statistics from a Parquet shard without loading data.
+    ///
+    /// Returns a list of (row_group_index, min_minimizer, max_minimizer) tuples.
+    /// This can be used to plan which row groups to load for a query.
+    #[cfg(feature = "parquet")]
+    pub fn get_parquet_row_group_stats(path: &Path) -> Result<Vec<(usize, u64, u64)>> {
+        use parquet::file::reader::FileReader;
+        use parquet::file::serialized_reader::SerializedFileReader;
+        use parquet::file::statistics::Statistics;
+        use std::fs::File;
+
+        let file = File::open(path)?;
+        let reader = SerializedFileReader::new(file)?;
+        let metadata = reader.metadata();
+        let num_row_groups = metadata.num_row_groups();
+
+        let mut stats = Vec::with_capacity(num_row_groups);
+
+        for rg_idx in 0..num_row_groups {
+            let rg_meta = metadata.row_group(rg_idx);
+            let col_meta = rg_meta.column(0); // minimizer column
+
+            let (rg_min, rg_max) = if let Some(Statistics::Int64(s)) = col_meta.statistics() {
+                let min = s.min_opt().map(|v| *v as u64).unwrap_or(0);
+                let max = s.max_opt().map(|v| *v as u64).unwrap_or(u64::MAX);
+                (min, max)
+            } else {
+                (0, u64::MAX) // No stats, assume full range
+            };
+
+            stats.push((rg_idx, rg_min, rg_max));
+        }
+
+        Ok(stats)
+    }
+
+    /// Find which row groups contain at least one query minimizer.
+    ///
+    /// Uses binary search per row group: O(R × log Q) where R = row groups, Q = query minimizers.
+    /// This is correct even if row groups overlap or are unsorted.
+    ///
+    /// # Arguments
+    /// * `query_minimizers` - Sorted slice of query minimizers (caller must ensure sorted)
+    /// * `row_group_stats` - List of (row_group_idx, min, max) tuples
+    ///
+    /// # Returns
+    /// Vector of row group indices that contain at least one query minimizer.
+    #[cfg(feature = "parquet")]
+    pub fn find_matching_row_groups(
+        query_minimizers: &[u64],
+        row_group_stats: &[(usize, u64, u64)],
+    ) -> Vec<usize> {
+        if query_minimizers.is_empty() || row_group_stats.is_empty() {
+            return Vec::new();
+        }
+
+        // For each row group, binary search to check if any query minimizer falls within its range
+        let mut matching = Vec::new();
+
+        for &(rg_id, rg_min, rg_max) in row_group_stats {
+            // Find first query minimizer >= rg_min
+            let start = query_minimizers.partition_point(|&m| m < rg_min);
+
+            // If that minimizer exists and is <= rg_max, this row group matches
+            if start < query_minimizers.len() && query_minimizers[start] <= rg_max {
+                matching.push(rg_id);
+            }
+        }
+
+        matching
+    }
+
+    /// Load a Parquet shard, reading only row groups that contain query minimizers.
+    ///
+    /// Uses binary search to determine which row groups to load, then filters rows
+    /// within those groups. This can skip 90%+ of data for sparse queries.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the Parquet shard file
+    /// * `k`, `w`, `salt`, `source_hash` - Index parameters from manifest
+    /// * `query_minimizers` - Sorted slice of query minimizers to match against
+    ///
+    /// # Panics (debug mode)
+    /// Panics if `query_minimizers` is not sorted.
+    ///
+    /// # Returns
+    /// A partial InvertedIndex containing only data from matching row groups.
+    #[cfg(feature = "parquet")]
+    pub fn load_shard_parquet_for_query(
+        path: &Path,
+        k: usize,
+        w: usize,
+        salt: u64,
+        source_hash: u64,
+        query_minimizers: &[u64],
+    ) -> Result<Self> {
+        use anyhow::Context;
+        use arrow::array::{Array, UInt32Array, UInt64Array};
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::reader::FileReader;
+        use parquet::file::serialized_reader::SerializedFileReader;
+        use parquet::file::statistics::Statistics;
+        use rayon::prelude::*;
+        use std::fs::File;
+        use std::io::Read;
+
+        // Fix #5: Validate query_minimizers is sorted
+        debug_assert!(
+            query_minimizers.windows(2).all(|w| w[0] <= w[1]),
+            "query_minimizers must be sorted"
+        );
+
+        // Validate k value
+        if !matches!(k, 16 | 32 | 64) {
+            return Err(anyhow!(
+                "Invalid K value for Parquet shard: {} (must be 16, 32, or 64)",
+                k
+            ));
+        }
+
+        if query_minimizers.is_empty() {
+            return Ok(InvertedIndex {
+                k,
+                w,
+                salt,
+                source_hash,
+                minimizers: Vec::new(),
+                offsets: vec![0],
+                bucket_ids: Vec::new(),
+            });
+        }
+
+        // Fix #2: Read file into memory for parallel access
+        // Note: We still need Bytes for parallel row group reading with ParquetRecordBatchReaderBuilder.
+        // The Parquet library's SerializedFileReader doesn't support concurrent access from multiple threads.
+        // TODO: Consider memory-mapping for very large files.
+        let mut file = File::open(path)
+            .with_context(|| format!("Failed to open Parquet shard: {}", path.display()))?;
+        let file_size = file.metadata()?.len() as usize;
+        let mut buffer = Vec::with_capacity(file_size);
+        file.read_to_end(&mut buffer)?;
+        let bytes = Bytes::from(buffer);
+
+        // Get row group statistics
+        let parquet_reader = SerializedFileReader::new(bytes.clone())?;
+        let metadata = parquet_reader.metadata();
+        let num_row_groups = metadata.num_row_groups();
+
+        if num_row_groups == 0 {
+            return Ok(InvertedIndex {
+                k,
+                w,
+                salt,
+                source_hash,
+                minimizers: Vec::new(),
+                offsets: vec![0],
+                bucket_ids: Vec::new(),
+            });
+        }
+
+        // Build row group stats
+        let mut rg_stats: Vec<(usize, u64, u64)> = Vec::with_capacity(num_row_groups);
+        for rg_idx in 0..num_row_groups {
+            let rg_meta = metadata.row_group(rg_idx);
+            let col_meta = rg_meta.column(0); // minimizer column
+
+            let (rg_min, rg_max) = if let Some(Statistics::Int64(s)) = col_meta.statistics() {
+                let min = s.min_opt().map(|v| *v as u64).unwrap_or(0);
+                let max = s.max_opt().map(|v| *v as u64).unwrap_or(u64::MAX);
+                (min, max)
+            } else {
+                (0, u64::MAX) // No stats, assume full range
+            };
+
+            rg_stats.push((rg_idx, rg_min, rg_max));
+        }
+
+        // Find matching row groups using binary search
+        let matching_row_groups = Self::find_matching_row_groups(query_minimizers, &rg_stats);
+
+        if matching_row_groups.is_empty() {
+            return Ok(InvertedIndex {
+                k,
+                w,
+                salt,
+                source_hash,
+                minimizers: Vec::new(),
+                offsets: vec![0],
+                bucket_ids: Vec::new(),
+            });
+        }
+
+        // Fix #4: Removed arbitrary 50% fallback threshold.
+        // Filtered loading is always beneficial - even loading 90% of row groups
+        // still filters individual rows within those groups.
+
+        // Fix #7: For small query sets, use binary search instead of HashSet
+        let use_hashset = query_minimizers.len() > 1000;
+        let query_set: Option<std::collections::HashSet<u64>> = if use_hashset {
+            Some(query_minimizers.iter().copied().collect())
+        } else {
+            None
+        };
+
+        // Parallel read of matching row groups only
+        // Fix #6: Each row group is internally sorted by minimizer (enforced at write time).
+        // Results from different row groups may overlap, so we sort after concatenation.
+        let row_group_results: Vec<Result<Vec<(u64, u32)>>> = matching_row_groups
+            .par_iter()
+            .map(|&rg_idx| {
+                let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?;
+                let reader = builder.with_row_groups(vec![rg_idx]).build()?;
+
+                let mut pairs = Vec::new();
+
+                for batch in reader {
+                    let batch = batch?;
+
+                    let min_col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .context("Expected UInt64Array for minimizer column")?;
+
+                    let bid_col = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<UInt32Array>()
+                        .context("Expected UInt32Array for bucket_id column")?;
+
+                    for i in 0..batch.num_rows() {
+                        let m = min_col.value(i);
+                        // Filter: only include pairs where minimizer is in query set
+                        let matches = if let Some(ref hs) = query_set {
+                            hs.contains(&m)
+                        } else {
+                            // Binary search for small query sets
+                            query_minimizers.binary_search(&m).is_ok()
+                        };
+                        if matches {
+                            pairs.push((m, bid_col.value(i)));
+                        }
+                    }
+                }
+
+                Ok(pairs)
+            })
+            .collect();
+
+        // Concatenate results
+        let mut all_pairs: Vec<(u64, u32)> = Vec::new();
+
+        for result in row_group_results {
+            let pairs = result?;
+            all_pairs.extend(pairs);
+        }
+
+        if all_pairs.is_empty() {
+            return Ok(InvertedIndex {
+                k,
+                w,
+                salt,
+                source_hash,
+                minimizers: Vec::new(),
+                offsets: vec![0],
+                bucket_ids: Vec::new(),
+            });
+        }
+
+        // Fix #3: Sort concatenated results to handle overlapping row groups
+        all_pairs.sort_unstable_by_key(|&(m, _)| m);
+
+        // Build CSR structure
+        let mut minimizers: Vec<u64> = Vec::with_capacity(all_pairs.len() / 2);
+        let mut offsets: Vec<u32> = Vec::with_capacity(all_pairs.len() / 2 + 1);
+        let mut bucket_ids_out: Vec<u32> = Vec::with_capacity(all_pairs.len());
+
+        offsets.push(0);
+        let mut current_min = all_pairs[0].0;
+        minimizers.push(current_min);
+
+        for &(m, b) in &all_pairs {
+            if m != current_min {
+                offsets.push(bucket_ids_out.len() as u32);
+                minimizers.push(m);
+                current_min = m;
+            }
+            bucket_ids_out.push(b);
+        }
+
+        offsets.push(bucket_ids_out.len() as u32);
+
+        // Fix #8: Removed shrink_to_fit() calls - they cause unnecessary reallocation
+
+        Ok(InvertedIndex {
+            k,
+            w,
+            salt,
+            source_hash,
+            minimizers,
+            offsets,
+            bucket_ids: bucket_ids_out,
         })
     }
 }
@@ -1604,6 +2499,213 @@ mod tests {
         for &m in &sorted_mins {
             let found = loaded.minimizers().binary_search(&m).is_ok();
             assert!(found, "Minimizer {} lost after round-trip", m);
+        }
+
+        Ok(())
+    }
+
+    // ==================== Parquet I/O Tests ====================
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_inverted_parquet_roundtrip() -> Result<()> {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("shard.0.parquet");
+
+        // Create an inverted index
+        let mut index = Index::new(64, 50, 0xABCD).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.buckets.insert(2, vec![200, 300, 400]);
+        index.buckets.insert(3, vec![500, 600]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.bucket_names.insert(3, "C".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        let original_minimizers = inverted.minimizers().to_vec();
+        let original_bucket_ids = inverted.bucket_ids().to_vec();
+
+        // Save as Parquet
+        let shard_info = inverted.save_shard_parquet(&path, 0)?;
+
+        assert_eq!(shard_info.shard_id, 0);
+        assert_eq!(shard_info.num_minimizers, inverted.num_minimizers());
+        assert_eq!(shard_info.num_bucket_ids, inverted.num_bucket_entries());
+
+        // Load back
+        let loaded = InvertedIndex::load_shard_parquet_with_params(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+        )?;
+
+        // Verify structure
+        assert_eq!(loaded.k, 64);
+        assert_eq!(loaded.w, 50);
+        assert_eq!(loaded.salt, 0xABCD);
+        assert_eq!(loaded.num_minimizers(), inverted.num_minimizers());
+        assert_eq!(loaded.num_bucket_entries(), inverted.num_bucket_entries());
+
+        // Verify minimizers match
+        assert_eq!(loaded.minimizers(), original_minimizers.as_slice());
+
+        // Verify bucket_ids match
+        assert_eq!(loaded.bucket_ids(), original_bucket_ids.as_slice());
+
+        // Verify queries work
+        let hits = loaded.get_bucket_hits(&[200, 300, 500]);
+        assert_eq!(hits.get(&1), Some(&2)); // 200, 300
+        assert_eq!(hits.get(&2), Some(&2)); // 200, 300
+        assert_eq!(hits.get(&3), Some(&1)); // 500
+
+        Ok(())
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_inverted_parquet_empty() -> Result<()> {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("empty.parquet");
+
+        // Create an empty inverted index
+        let index = Index::new(64, 50, 0).unwrap();
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Save as Parquet
+        let shard_info = inverted.save_shard_parquet(&path, 0)?;
+        assert_eq!(shard_info.num_minimizers, 0);
+        assert_eq!(shard_info.num_bucket_ids, 0);
+
+        // Empty shard doesn't create file, so load should handle this
+        // For now, just verify the shard_info is correct
+        Ok(())
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_inverted_parquet_large_values() -> Result<()> {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("large.parquet");
+
+        // Create minimizers with large values
+        let minimizers: Vec<u64> = vec![
+            1,
+            1000,
+            1_000_000,
+            1_000_000_000,
+            1_000_000_000_000,
+            u64::MAX / 2,
+            u64::MAX - 100,
+            u64::MAX - 1,
+        ];
+
+        let mut index = Index::new(64, 50, 0x12345678).unwrap();
+        index.buckets.insert(1, minimizers.clone());
+        index.bucket_names.insert(1, "test".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Save and load
+        inverted.save_shard_parquet(&path, 0)?;
+        let loaded = InvertedIndex::load_shard_parquet_with_params(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+        )?;
+
+        // Verify all large values survived
+        for &m in &minimizers {
+            let found = loaded.minimizers().binary_search(&m).is_ok();
+            assert!(found, "Large minimizer {} lost", m);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_inverted_parquet_load_shard_requires_params() -> Result<()> {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let parquet_path = tmp.path().join("shard.parquet");
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Save as Parquet
+        inverted.save_shard_parquet(&parquet_path, 0)?;
+
+        // load_shard should error for Parquet files (they need manifest parameters)
+        let result = InvertedIndex::load_shard(&parquet_path);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Parquet shards must be loaded via ShardedInvertedIndex"));
+
+        // Direct loading with params should work
+        let loaded = InvertedIndex::load_shard_parquet_with_params(
+            &parquet_path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+        )?;
+        assert_eq!(loaded.num_minimizers(), inverted.num_minimizers());
+
+        Ok(())
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_inverted_parquet_many_buckets() -> Result<()> {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("many_buckets.parquet");
+
+        // Create index with many buckets sharing some minimizers
+        let mut index = Index::new(64, 50, 0xBEEF).unwrap();
+        let shared = vec![100, 200, 300, 400, 500];
+        for i in 0..50 {
+            let mut mins = shared.clone();
+            mins.push(1000 + i as u64); // Each bucket has one unique minimizer
+            mins.sort();
+            index.buckets.insert(i, mins);
+            index.bucket_names.insert(i, format!("bucket_{}", i));
+        }
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Save and load
+        inverted.save_shard_parquet(&path, 0)?;
+        let loaded = InvertedIndex::load_shard_parquet_with_params(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+        )?;
+
+        // Shared minimizer 200 should map to all 50 buckets
+        let hits = loaded.get_bucket_hits(&[200]);
+        assert_eq!(hits.len(), 50);
+        for i in 0..50 {
+            assert_eq!(hits.get(&i), Some(&1));
         }
 
         Ok(())

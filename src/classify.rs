@@ -10,14 +10,26 @@ use anyhow::Result;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use crate::extraction::{count_hits, get_paired_minimizers_into};
 use crate::index::Index;
 use crate::inverted::{InvertedIndex, QueryInvertedIndex};
-use crate::sharded::{ShardManifest, ShardedInvertedIndex};
+use crate::sharded::ShardedInvertedIndex;
 use crate::sharded_main::ShardedMainIndex;
 use crate::types::{HitResult, QueryRecord};
 use crate::workspace::MinimizerWorkspace;
+
+/// Controls whether timing diagnostics are printed to stderr
+pub static ENABLE_TIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Print timing info if enabled
+#[inline]
+fn log_timing(phase: &str, elapsed_ms: u128) {
+    if ENABLE_TIMING.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[TIMING] {}: {}ms", phase, elapsed_ms);
+    }
+}
 
 /// Filter out negative minimizers from forward and reverse-complement minimizer vectors.
 ///
@@ -157,9 +169,10 @@ pub fn classify_batch_sharded_sequential(
     records: &[QueryRecord],
     threshold: f64,
 ) -> Result<Vec<HitResult>> {
+    let t_start = Instant::now();
     let manifest = sharded.manifest();
-    let base_path = sharded.base_path();
 
+    let t_extract = Instant::now();
     let processed: Vec<_> = records
         .par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
@@ -169,15 +182,30 @@ pub fn classify_batch_sharded_sequential(
             (*id, fa, fb)
         })
         .collect();
+    log_timing("sequential: extraction", t_extract.elapsed().as_millis());
 
     let all_hits: Vec<Mutex<HashMap<u32, (usize, usize)>>> = (0..processed.len())
         .map(|_| Mutex::new(HashMap::new()))
         .collect();
 
-    for shard_info in &manifest.shards {
-        let shard_path = ShardManifest::shard_path(base_path, shard_info.shard_id);
-        let shard = InvertedIndex::load_shard(&shard_path)?;
+    // Build sorted unique minimizers for filtered loading (Parquet only)
+    let mut all_minimizers: Vec<u64> = processed
+        .iter()
+        .flat_map(|(_, fwd, rc)| fwd.iter().chain(rc.iter()).copied())
+        .collect();
+    all_minimizers.sort_unstable();
+    all_minimizers.dedup();
 
+    let mut total_shard_load_ms = 0u128;
+    let mut total_shard_query_ms = 0u128;
+
+    for shard_info in &manifest.shards {
+        let t_load = Instant::now();
+        // Use filtered loading for Parquet shards
+        let shard = sharded.load_shard_for_query(shard_info.shard_id, &all_minimizers)?;
+        total_shard_load_ms += t_load.elapsed().as_millis();
+
+        let t_query = Instant::now();
         processed
             .par_iter()
             .enumerate()
@@ -193,9 +221,13 @@ pub fn classify_batch_sharded_sequential(
                     hits.entry(bucket_id).or_insert((0, 0)).1 += count;
                 }
             });
+        total_shard_query_ms += t_query.elapsed().as_millis();
         // shard dropped here, freeing memory before loading next
     }
+    log_timing("sequential: shard_load_total", total_shard_load_ms);
+    log_timing("sequential: shard_query_total", total_shard_query_ms);
 
+    let t_score = Instant::now();
     let results: Vec<HitResult> = processed
         .iter()
         .enumerate()
@@ -220,6 +252,8 @@ pub fn classify_batch_sharded_sequential(
                 .collect::<Vec<_>>()
         })
         .collect();
+    log_timing("sequential: scoring", t_score.elapsed().as_millis());
+    log_timing("sequential: total", t_start.elapsed().as_millis());
 
     Ok(results)
 }
@@ -246,14 +280,16 @@ pub fn classify_batch_sharded_merge_join(
     records: &[QueryRecord],
     threshold: f64,
 ) -> Result<Vec<HitResult>> {
+    let t_start = Instant::now();
+
     if records.is_empty() {
         return Ok(Vec::new());
     }
 
     let manifest = sharded.manifest();
-    let base_path = sharded.base_path();
 
     // Extract minimizers in parallel, filtering negatives if provided
+    let t_extract = Instant::now();
     let extracted: Vec<_> = records
         .par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (_, s1, s2)| {
@@ -262,12 +298,18 @@ pub fn classify_batch_sharded_merge_join(
             filter_negative_mins(ha, hb, negative_mins)
         })
         .collect();
+    log_timing("merge_join: extraction", t_extract.elapsed().as_millis());
 
     // Collect query IDs
     let query_ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
 
     // Build query inverted index
+    let t_build_idx = Instant::now();
     let query_idx = QueryInvertedIndex::build(&extracted);
+    log_timing(
+        "merge_join: build_query_index",
+        t_build_idx.elapsed().as_millis(),
+    );
 
     let num_reads = query_idx.num_reads();
     if num_reads == 0 {
@@ -279,17 +321,31 @@ pub fn classify_batch_sharded_merge_join(
         .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
         .collect();
 
+    let mut total_shard_load_ms = 0u128;
+    let mut total_merge_join_ms = 0u128;
+
+    // Get query minimizers for filtered loading (Parquet only)
+    let query_minimizers = query_idx.minimizers();
+
     // Process each shard sequentially
     for shard_info in &manifest.shards {
-        let shard_path = ShardManifest::shard_path(base_path, shard_info.shard_id);
-        let shard = InvertedIndex::load_shard(&shard_path)?;
+        let t_load = Instant::now();
+        // Use filtered loading for Parquet shards - only loads row groups
+        // that contain query minimizers, potentially skipping 90%+ of data
+        let shard = sharded.load_shard_for_query(shard_info.shard_id, query_minimizers)?;
+        total_shard_load_ms += t_load.elapsed().as_millis();
 
+        let t_merge = Instant::now();
         // Accumulate hits from this shard
         accumulate_merge_join(&query_idx, &shard, &mut accumulators);
+        total_merge_join_ms += t_merge.elapsed().as_millis();
         // shard dropped here, freeing memory before loading next
     }
+    log_timing("merge_join: shard_load_total", total_shard_load_ms);
+    log_timing("merge_join: merge_join_total", total_merge_join_ms);
 
     // Score and filter
+    let t_score = Instant::now();
     let mut results = Vec::new();
     for (read_idx, buckets) in accumulators.into_iter().enumerate() {
         let fwd_total = query_idx.fwd_counts[read_idx] as usize;
@@ -307,6 +363,9 @@ pub fn classify_batch_sharded_merge_join(
             }
         }
     }
+    log_timing("merge_join: scoring", t_score.elapsed().as_millis());
+    log_timing("merge_join: total", t_start.elapsed().as_millis());
+
     Ok(results)
 }
 
@@ -1501,5 +1560,263 @@ mod tests {
             assert_eq!(results_none[0].bucket_id, results_no_overlap[0].bucket_id);
             assert!((results_none[0].score - results_no_overlap[0].score).abs() < 0.001);
         }
+    }
+
+    // ==================== Parquet Shard Classification Tests ====================
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_classify_batch_sharded_sequential_parquet() -> anyhow::Result<()> {
+        use crate::sharded::{ShardFormat, ShardManifest};
+        use std::fs;
+
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        // Create inverted directory for Parquet shards
+        let inverted_dir = base_path.join("inverted");
+        fs::create_dir_all(&inverted_dir)?;
+
+        let mut index = Index::new(32, 10, 0x1234).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq2 = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+
+        index.add_record(1, "ref1", seq1, &mut ws);
+        index.add_record(2, "ref2", seq2, &mut ws);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.finalize_bucket(1);
+        index.finalize_bucket(2);
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Save as Parquet shard
+        let shard_path = ShardManifest::shard_path_parquet(&base_path, 0);
+        let shard_info = inverted.save_shard_parquet(&shard_path, 0)?;
+
+        let manifest = ShardManifest {
+            k: inverted.k,
+            w: inverted.w,
+            salt: inverted.salt,
+            source_hash: 0,
+            total_minimizers: inverted.num_minimizers(),
+            total_bucket_ids: inverted.num_bucket_entries(),
+            has_overlapping_shards: true,
+            shards: vec![shard_info],
+        };
+        let manifest_path = ShardManifest::manifest_path(&base_path);
+        manifest.save(&manifest_path)?;
+
+        // Open with auto-detection (should detect Parquet)
+        let sharded = ShardedInvertedIndex::open(&base_path)?;
+        assert_eq!(sharded.shard_format(), ShardFormat::Parquet);
+
+        let query1: &[u8] = seq1;
+        let query2: &[u8] = seq2;
+        let records: Vec<QueryRecord> = vec![(0, query1, None), (1, query2, None)];
+
+        let threshold = 0.1;
+
+        // Classify using Parquet shards
+        let results_parquet =
+            classify_batch_sharded_sequential(&sharded, None, &records, threshold)?;
+
+        // Should have results matching both sequences
+        assert!(!results_parquet.is_empty());
+
+        // Verify we get hits for both queries
+        let query0_hits: Vec<_> = results_parquet.iter().filter(|r| r.query_id == 0).collect();
+        let query1_hits: Vec<_> = results_parquet.iter().filter(|r| r.query_id == 1).collect();
+
+        assert!(!query0_hits.is_empty(), "Query 0 should have hits");
+        assert!(!query1_hits.is_empty(), "Query 1 should have hits");
+
+        // Query 0 should match bucket 1 with high score
+        let q0_b1 = query0_hits.iter().find(|r| r.bucket_id == 1);
+        assert!(q0_b1.is_some(), "Query 0 should match bucket 1");
+        assert!(
+            q0_b1.unwrap().score > 0.9,
+            "Query 0 should have high score for bucket 1"
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_classify_batch_sharded_merge_join_parquet() -> anyhow::Result<()> {
+        use crate::sharded::{ShardFormat, ShardManifest};
+        use std::fs;
+
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        // Create inverted directory for Parquet shards
+        let inverted_dir = base_path.join("inverted");
+        fs::create_dir_all(&inverted_dir)?;
+
+        let mut index = Index::new(32, 10, 0x1234).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq2 = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+
+        index.add_record(1, "ref1", seq1, &mut ws);
+        index.add_record(2, "ref2", seq2, &mut ws);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.finalize_bucket(1);
+        index.finalize_bucket(2);
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Save as Parquet shard
+        let shard_path = ShardManifest::shard_path_parquet(&base_path, 0);
+        let shard_info = inverted.save_shard_parquet(&shard_path, 0)?;
+
+        let manifest = ShardManifest {
+            k: inverted.k,
+            w: inverted.w,
+            salt: inverted.salt,
+            source_hash: 0,
+            total_minimizers: inverted.num_minimizers(),
+            total_bucket_ids: inverted.num_bucket_entries(),
+            has_overlapping_shards: true,
+            shards: vec![shard_info],
+        };
+        let manifest_path = ShardManifest::manifest_path(&base_path);
+        manifest.save(&manifest_path)?;
+
+        let sharded = ShardedInvertedIndex::open(&base_path)?;
+        assert_eq!(sharded.shard_format(), ShardFormat::Parquet);
+
+        let query1: &[u8] = seq1;
+        let query2: &[u8] = seq2;
+        let records: Vec<QueryRecord> = vec![(0, query1, None), (1, query2, None)];
+
+        let threshold = 0.1;
+
+        // Classify using merge-join with Parquet shards
+        let results_parquet =
+            classify_batch_sharded_merge_join(&sharded, None, &records, threshold)?;
+
+        assert!(!results_parquet.is_empty());
+
+        // Verify we get hits for both queries
+        let query0_hits: Vec<_> = results_parquet.iter().filter(|r| r.query_id == 0).collect();
+        let query1_hits: Vec<_> = results_parquet.iter().filter(|r| r.query_id == 1).collect();
+
+        assert!(!query0_hits.is_empty(), "Query 0 should have hits");
+        assert!(!query1_hits.is_empty(), "Query 1 should have hits");
+
+        Ok(())
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_classify_parquet_matches_legacy() -> anyhow::Result<()> {
+        use crate::sharded::ShardManifest;
+        use std::fs;
+
+        let dir = tempfile::tempdir()?;
+        let legacy_base = dir.path().join("legacy.ryxdi");
+        let parquet_base = dir.path().join("parquet.ryxdi");
+
+        // Create inverted directory for Parquet shards
+        let inverted_dir = parquet_base.join("inverted");
+        fs::create_dir_all(&inverted_dir)?;
+
+        let mut index = Index::new(32, 10, 0x1234).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq2 = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+
+        index.add_record(1, "ref1", seq1, &mut ws);
+        index.add_record(2, "ref2", seq2, &mut ws);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.finalize_bucket(1);
+        index.finalize_bucket(2);
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Save as legacy shard
+        let legacy_shard_path = ShardManifest::shard_path(&legacy_base, 0);
+        let legacy_shard_info =
+            inverted.save_shard(&legacy_shard_path, 0, 0, inverted.num_minimizers(), true)?;
+
+        let legacy_manifest = ShardManifest {
+            k: inverted.k,
+            w: inverted.w,
+            salt: inverted.salt,
+            source_hash: 0,
+            total_minimizers: inverted.num_minimizers(),
+            total_bucket_ids: inverted.num_bucket_entries(),
+            has_overlapping_shards: true,
+            shards: vec![legacy_shard_info],
+        };
+        legacy_manifest.save(&ShardManifest::manifest_path(&legacy_base))?;
+
+        // Save as Parquet shard
+        let parquet_shard_path = ShardManifest::shard_path_parquet(&parquet_base, 0);
+        let parquet_shard_info = inverted.save_shard_parquet(&parquet_shard_path, 0)?;
+
+        let parquet_manifest = ShardManifest {
+            k: inverted.k,
+            w: inverted.w,
+            salt: inverted.salt,
+            source_hash: 0,
+            total_minimizers: inverted.num_minimizers(),
+            total_bucket_ids: inverted.num_bucket_entries(),
+            has_overlapping_shards: true,
+            shards: vec![parquet_shard_info],
+        };
+        parquet_manifest.save(&ShardManifest::manifest_path(&parquet_base))?;
+
+        let legacy_sharded = ShardedInvertedIndex::open(&legacy_base)?;
+        let parquet_sharded = ShardedInvertedIndex::open(&parquet_base)?;
+
+        let query1: &[u8] = seq1;
+        let query2: &[u8] = seq2;
+        let records: Vec<QueryRecord> = vec![(0, query1, None), (1, query2, None)];
+
+        let threshold = 0.1;
+
+        // Classify with both formats
+        let results_legacy =
+            classify_batch_sharded_sequential(&legacy_sharded, None, &records, threshold)?;
+        let results_parquet =
+            classify_batch_sharded_sequential(&parquet_sharded, None, &records, threshold)?;
+
+        // Results should match
+        assert_eq!(
+            results_legacy.len(),
+            results_parquet.len(),
+            "Result counts should match: legacy={}, parquet={}",
+            results_legacy.len(),
+            results_parquet.len()
+        );
+
+        let mut sorted_legacy = results_legacy.clone();
+        sorted_legacy.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
+
+        let mut sorted_parquet = results_parquet.clone();
+        sorted_parquet.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
+
+        for (leg, pq) in sorted_legacy.iter().zip(sorted_parquet.iter()) {
+            assert_eq!(leg.query_id, pq.query_id, "Query IDs should match");
+            assert_eq!(leg.bucket_id, pq.bucket_id, "Bucket IDs should match");
+            assert!(
+                (leg.score - pq.score).abs() < 0.001,
+                "Scores should match: {} vs {}",
+                leg.score,
+                pq.score
+            );
+        }
+
+        Ok(())
     }
 }

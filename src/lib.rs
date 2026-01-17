@@ -44,6 +44,10 @@ pub mod memory;
 #[cfg(feature = "arrow")]
 pub mod arrow;
 
+// Parquet-based index format (optional feature)
+#[cfg(feature = "parquet")]
+pub mod parquet_index;
+
 // Re-export types
 pub use types::{HitResult, IndexMetadata, QueryRecord};
 
@@ -60,13 +64,13 @@ pub use extraction::{
 };
 
 // Re-export index
-pub use index::Index;
+pub use index::{Index, IndexFormat};
 
 // Re-export inverted index
 pub use inverted::{InvertedIndex, QueryInvertedIndex};
 
 // Re-export sharded index types
-pub use sharded::{ShardInfo, ShardManifest, ShardedInvertedIndex};
+pub use sharded::{ShardFormat, ShardInfo, ShardManifest, ShardedInvertedIndex};
 
 // Re-export sharded main index types
 pub use sharded_main::{
@@ -77,5 +81,5 @@ pub use sharded_main::{
 // Re-export classification functions
 pub use classify::{
     aggregate_batch, classify_batch, classify_batch_merge_join, classify_batch_sharded_main,
-    classify_batch_sharded_merge_join, classify_batch_sharded_sequential,
+    classify_batch_sharded_merge_join, classify_batch_sharded_sequential, ENABLE_TIMING,
 };

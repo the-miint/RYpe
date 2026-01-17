@@ -28,6 +28,8 @@ log = "0.4"
 env_logger = "0.11"
 zstd = "0.13"  # Compression for inverted index
 arrow = { version = "57", default-features = false, features = ["ffi"], optional = true }
+parquet = { version = "57", default-features = false, features = ["zstd", "snap", "arrow"], optional = true }
+bytes = { version = "1.5", optional = true }
 
 [dev-dependencies]
 tempfile = "3.24.0"
@@ -36,7 +38,32 @@ tempfile = "3.24.0"
 name = "debug_inverted"
 path = "src/bin/debug_inverted.rs"
 
+[[example]]
+name = "parquet_poc"
+required-features = ["parquet"]
+
+[[example]]
+name = "parquet_main_poc"
+required-features = ["parquet"]
+
+[[example]]
+name = "bench_fixed_impl"
+required-features = ["parquet"]
+
+[[example]]
+name = "explore_row_group_stats"
+required-features = ["parquet"]
+
+[[example]]
+name = "bench_filtered_load"
+required-features = ["parquet"]
+
+[[example]]
+name = "bench_e2e_classification"
+required-features = ["parquet"]
+
 [features]
 default = []
 arrow = ["dep:arrow"]
+parquet = ["dep:parquet", "dep:arrow", "dep:bytes"]
 
