@@ -1342,20 +1342,25 @@ impl InvertedIndex {
     ) -> Result<Self> {
         use anyhow::Context;
         use arrow::array::{Array, UInt32Array, UInt64Array};
-        use bytes::Bytes;
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use parquet::file::reader::FileReader;
         use parquet::file::serialized_reader::SerializedFileReader;
         use parquet::file::statistics::Statistics;
         use rayon::prelude::*;
         use std::fs::File;
-        use std::io::Read;
 
-        // Fix #5: Validate query_minimizers is sorted
-        debug_assert!(
-            query_minimizers.windows(2).all(|w| w[0] <= w[1]),
-            "query_minimizers must be sorted"
-        );
+        // For small query sets, binary search on sorted array is O(log n) and faster than
+        // HashSet lookup which is O(1) but has higher constant factors (hashing + probe).
+        // Empirically, break-even point is ~1000 elements on modern CPUs.
+        const QUERY_HASHSET_THRESHOLD: usize = 1000;
+
+        // Validate query_minimizers is sorted - required for binary search correctness
+        // in find_matching_row_groups() and row-level filtering.
+        if !query_minimizers.is_empty() && !query_minimizers.windows(2).all(|w| w[0] <= w[1]) {
+            return Err(anyhow!(
+                "query_minimizers must be sorted (precondition violation)"
+            ));
+        }
 
         // Validate k value
         if !matches!(k, 16 | 32 | 64) {
@@ -1377,52 +1382,71 @@ impl InvertedIndex {
             });
         }
 
-        // Fix #2: Read file into memory for parallel access
-        // Note: We still need Bytes for parallel row group reading with ParquetRecordBatchReaderBuilder.
-        // The Parquet library's SerializedFileReader doesn't support concurrent access from multiple threads.
-        // TODO: Consider memory-mapping for very large files.
-        let mut file = File::open(path)
-            .with_context(|| format!("Failed to open Parquet shard: {}", path.display()))?;
-        let file_size = file.metadata()?.len() as usize;
-        let mut buffer = Vec::with_capacity(file_size);
-        file.read_to_end(&mut buffer)?;
-        let bytes = Bytes::from(buffer);
+        // Read Parquet footer (metadata) only - not the full file data.
+        // SerializedFileReader::new(File) reads just the footer (~few KB) to get metadata.
+        // The file handle is explicitly scoped so it's closed before parallel reads begin.
+        let (_num_row_groups, rg_stats) = {
+            let file = File::open(path)
+                .with_context(|| format!("Failed to open Parquet shard: {}", path.display()))?;
+            let parquet_reader = SerializedFileReader::new(file)?;
+            let metadata = parquet_reader.metadata();
+            let num_row_groups = metadata.num_row_groups();
 
-        // Get row group statistics
-        let parquet_reader = SerializedFileReader::new(bytes.clone())?;
-        let metadata = parquet_reader.metadata();
-        let num_row_groups = metadata.num_row_groups();
+            if num_row_groups == 0 {
+                return Ok(InvertedIndex {
+                    k,
+                    w,
+                    salt,
+                    source_hash,
+                    minimizers: Vec::new(),
+                    offsets: vec![0],
+                    bucket_ids: Vec::new(),
+                });
+            }
 
-        if num_row_groups == 0 {
-            return Ok(InvertedIndex {
-                k,
-                w,
-                salt,
-                source_hash,
-                minimizers: Vec::new(),
-                offsets: vec![0],
-                bucket_ids: Vec::new(),
-            });
-        }
+            // Build row group stats from Parquet metadata.
+            // Statistics (min/max) enable filtering row groups before reading data.
+            let mut rg_stats: Vec<(usize, u64, u64)> = Vec::with_capacity(num_row_groups);
+            let mut stats_missing_count = 0;
 
-        // Build row group stats
-        let mut rg_stats: Vec<(usize, u64, u64)> = Vec::with_capacity(num_row_groups);
-        for rg_idx in 0..num_row_groups {
-            let rg_meta = metadata.row_group(rg_idx);
-            let col_meta = rg_meta.column(0); // minimizer column
+            for rg_idx in 0..num_row_groups {
+                let rg_meta = metadata.row_group(rg_idx);
+                let col_meta = rg_meta.column(0); // minimizer column
 
-            let (rg_min, rg_max) = if let Some(Statistics::Int64(s)) = col_meta.statistics() {
-                let min = s.min_opt().map(|v| *v as u64).unwrap_or(0);
-                let max = s.max_opt().map(|v| *v as u64).unwrap_or(u64::MAX);
-                (min, max)
-            } else {
-                (0, u64::MAX) // No stats, assume full range
-            };
+                let (rg_min, rg_max) = if let Some(Statistics::Int64(s)) = col_meta.statistics() {
+                    let min = s.min_opt().map(|v| *v as u64).unwrap_or(0);
+                    let max = s.max_opt().map(|v| *v as u64).unwrap_or(u64::MAX);
+                    (min, max)
+                } else {
+                    // No stats available - assume full range (disables filtering for this row group)
+                    stats_missing_count += 1;
+                    (0, u64::MAX)
+                };
 
-            rg_stats.push((rg_idx, rg_min, rg_max));
-        }
+                rg_stats.push((rg_idx, rg_min, rg_max));
+            }
 
-        // Find matching row groups using binary search
+            // Warn if statistics are missing - this disables the row group filtering optimization
+            if stats_missing_count == num_row_groups {
+                eprintln!(
+                    "Warning: Parquet file {} has no row group statistics; \
+                     row group filtering disabled (all {} row groups will be read)",
+                    path.display(),
+                    num_row_groups
+                );
+            } else if stats_missing_count > 0 {
+                eprintln!(
+                    "Warning: Parquet file {} has {} of {} row groups without statistics",
+                    path.display(),
+                    stats_missing_count,
+                    num_row_groups
+                );
+            }
+
+            (num_row_groups, rg_stats)
+        }; // parquet_reader and file handle dropped here
+
+        // Find matching row groups using binary search on statistics
         let matching_row_groups = Self::find_matching_row_groups(query_minimizers, &rg_stats);
 
         if matching_row_groups.is_empty() {
@@ -1437,28 +1461,35 @@ impl InvertedIndex {
             });
         }
 
-        // Fix #4: Removed arbitrary 50% fallback threshold.
         // Filtered loading is always beneficial - even loading 90% of row groups
-        // still filters individual rows within those groups.
-
-        // Fix #7: For small query sets, use binary search instead of HashSet
-        let use_hashset = query_minimizers.len() > 1000;
+        // still filters individual rows within those groups, reducing memory usage.
+        let use_hashset = query_minimizers.len() > QUERY_HASHSET_THRESHOLD;
         let query_set: Option<std::collections::HashSet<u64>> = if use_hashset {
             Some(query_minimizers.iter().copied().collect())
         } else {
             None
         };
 
-        // Parallel read of matching row groups only
-        // Fix #6: Each row group is internally sorted by minimizer (enforced at write time).
+        // Parallel read of matching row groups only.
+        // Each row group is internally sorted by minimizer (enforced at write time).
         // Results from different row groups may overlap, so we sort after concatenation.
+        // Each thread opens its own file handle; OS page cache handles deduplication.
+        let path = path.to_path_buf(); // Clone path for parallel closure
+
+        // Estimate pairs per row group for pre-allocation. Row groups are ~100k rows,
+        // and we expect query selectivity to filter most rows. Conservative estimate: 10%.
+        const ROW_GROUP_SIZE: usize = 100_000;
+        const EXPECTED_SELECTIVITY: f64 = 0.10;
+        let estimated_pairs_per_rg = (ROW_GROUP_SIZE as f64 * EXPECTED_SELECTIVITY) as usize;
+
         let row_group_results: Vec<Result<Vec<(u64, u32)>>> = matching_row_groups
             .par_iter()
             .map(|&rg_idx| {
-                let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?;
+                let file = File::open(&path)?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
                 let reader = builder.with_row_groups(vec![rg_idx]).build()?;
 
-                let mut pairs = Vec::new();
+                let mut pairs = Vec::with_capacity(estimated_pairs_per_rg);
 
                 for batch in reader {
                     let batch = batch?;
@@ -1494,11 +1525,13 @@ impl InvertedIndex {
             })
             .collect();
 
-        // Concatenate results
+        // Concatenate results from all row groups, adding context for failures
         let mut all_pairs: Vec<(u64, u32)> = Vec::new();
 
-        for result in row_group_results {
-            let pairs = result?;
+        for (idx, result) in matching_row_groups.iter().zip(row_group_results) {
+            let pairs = result.with_context(|| {
+                format!("Failed to read row group {} from {}", idx, path.display())
+            })?;
             all_pairs.extend(pairs);
         }
 
@@ -1514,7 +1547,9 @@ impl InvertedIndex {
             });
         }
 
-        // Fix #3: Sort concatenated results to handle overlapping row groups
+        // Sort concatenated results to handle overlapping row groups.
+        // Multiple row groups may contain the same minimizer if a bucket list spans
+        // the row group size boundary during write.
         all_pairs.sort_unstable_by_key(|&(m, _)| m);
 
         // Build CSR structure
@@ -1537,7 +1572,8 @@ impl InvertedIndex {
 
         offsets.push(bucket_ids_out.len() as u32);
 
-        // Fix #8: Removed shrink_to_fit() calls - they cause unnecessary reallocation
+        // Note: We intentionally don't call shrink_to_fit() here.
+        // The slight memory overhead is preferable to the reallocation cost.
 
         Ok(InvertedIndex {
             k,
@@ -2707,6 +2743,297 @@ mod tests {
         for i in 0..50 {
             assert_eq!(hits.get(&i), Some(&1));
         }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_load_parquet_for_query_basic() -> Result<()> {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("shard.parquet");
+
+        // Create an inverted index with multiple minimizers across buckets
+        let mut index = Index::new(64, 50, 0xABCD).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300, 400, 500]);
+        index.buckets.insert(2, vec![200, 300, 600, 700]);
+        index.buckets.insert(3, vec![500, 800, 900]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.bucket_names.insert(3, "C".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Save as Parquet
+        inverted.save_shard_parquet(&path, 0)?;
+
+        // Query for specific minimizers - should only return matching entries
+        let query_minimizers = vec![200, 300, 500]; // sorted
+        let loaded = InvertedIndex::load_shard_parquet_for_query(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+            &query_minimizers,
+        )?;
+
+        // Verify we only got the queried minimizers
+        assert_eq!(loaded.minimizers().len(), 3);
+        assert!(loaded.minimizers().contains(&200));
+        assert!(loaded.minimizers().contains(&300));
+        assert!(loaded.minimizers().contains(&500));
+
+        // Verify bucket hits are correct
+        let hits = loaded.get_bucket_hits(&[200, 300, 500]);
+        assert_eq!(hits.get(&1), Some(&3)); // 200, 300, 500
+        assert_eq!(hits.get(&2), Some(&2)); // 200, 300
+        assert_eq!(hits.get(&3), Some(&1)); // 500
+
+        Ok(())
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_load_parquet_for_query_empty_query() -> Result<()> {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("shard.parquet");
+
+        // Create an inverted index
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_shard_parquet(&path, 0)?;
+
+        // Empty query should return empty result without reading row groups
+        let loaded = InvertedIndex::load_shard_parquet_for_query(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+            &[], // empty query
+        )?;
+
+        assert_eq!(loaded.minimizers().len(), 0);
+        assert_eq!(loaded.bucket_ids().len(), 0);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_load_parquet_for_query_no_matches() -> Result<()> {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("shard.parquet");
+
+        // Create an inverted index with minimizers in a specific range
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_shard_parquet(&path, 0)?;
+
+        // Query for minimizers not in the file - should return empty
+        let query_minimizers = vec![1000, 2000, 3000]; // sorted, but not in file
+        let loaded = InvertedIndex::load_shard_parquet_for_query(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+            &query_minimizers,
+        )?;
+
+        assert_eq!(loaded.minimizers().len(), 0);
+        assert_eq!(loaded.bucket_ids().len(), 0);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_load_parquet_for_query_multiple_row_groups() -> Result<()> {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("large.parquet");
+
+        // Create a large inverted index that will span multiple row groups (>100k pairs)
+        // Each bucket has many minimizers to create enough pairs
+        let mut index = Index::new(64, 50, 0x1234).unwrap();
+
+        // Create 10 buckets, each with 15000 minimizers (150k pairs total = 2+ row groups)
+        for bucket_id in 0..10u32 {
+            let base = bucket_id as u64 * 100_000;
+            let minimizers: Vec<u64> = (0..15000).map(|i| base + i as u64).collect();
+            index.buckets.insert(bucket_id, minimizers);
+            index
+                .bucket_names
+                .insert(bucket_id, format!("bucket_{}", bucket_id));
+        }
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_shard_parquet(&path, 0)?;
+
+        // Query for minimizers from different row groups
+        // First row group: bucket 0 minimizers (0-99999)
+        // Later row groups: bucket 5 minimizers (500000-514999)
+        let query_minimizers = vec![100, 200, 500_100, 500_200]; // sorted
+        let loaded = InvertedIndex::load_shard_parquet_for_query(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+            &query_minimizers,
+        )?;
+
+        // Should find all queried minimizers
+        assert!(loaded.minimizers().contains(&100));
+        assert!(loaded.minimizers().contains(&200));
+        assert!(loaded.minimizers().contains(&500_100));
+        assert!(loaded.minimizers().contains(&500_200));
+
+        // Bucket 0 should have hits for 100, 200
+        // Bucket 5 should have hits for 500100, 500200
+        let hits = loaded.get_bucket_hits(&query_minimizers);
+        assert_eq!(hits.get(&0), Some(&2));
+        assert_eq!(hits.get(&5), Some(&2));
+
+        Ok(())
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_load_parquet_for_query_unsorted_input() -> Result<()> {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("shard.parquet");
+
+        // Create a simple Parquet file
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_shard_parquet(&path, 0)?;
+
+        // Unsorted query should fail with clear error
+        let unsorted_query = vec![300, 100, 200]; // NOT sorted
+        let result = InvertedIndex::load_shard_parquet_for_query(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+            &unsorted_query,
+        );
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("sorted"),
+            "Error message should mention sorting: {}",
+            err_msg
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_load_parquet_for_query_large_query_set() -> Result<()> {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("shard.parquet");
+
+        // Create Parquet file with many minimizers
+        let mut index = Index::new(64, 50, 0xBEEF).unwrap();
+        let minimizers: Vec<u64> = (0..5000).map(|i| i as u64 * 10).collect();
+        index.buckets.insert(1, minimizers);
+        index.bucket_names.insert(1, "big".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_shard_parquet(&path, 0)?;
+
+        // Query with >1000 minimizers to exercise HashSet code path
+        let query_minimizers: Vec<u64> = (0..2000).map(|i| i as u64 * 10).collect();
+        let loaded = InvertedIndex::load_shard_parquet_for_query(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+            &query_minimizers,
+        )?;
+
+        // Should find all 2000 queried minimizers
+        assert_eq!(loaded.minimizers().len(), 2000);
+
+        // Verify bucket hits
+        let hits = loaded.get_bucket_hits(&query_minimizers);
+        assert_eq!(hits.get(&1), Some(&2000));
+
+        Ok(())
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_load_parquet_for_query_boundary_conditions() -> Result<()> {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("shard.parquet");
+
+        // Create Parquet file with specific minimizers
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 500, 1000]); // min=100, max=1000
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_shard_parquet(&path, 0)?;
+
+        // Test query at exact boundaries
+        let query_minimizers = vec![100, 1000]; // exactly min and max
+        let loaded = InvertedIndex::load_shard_parquet_for_query(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+            &query_minimizers,
+        )?;
+
+        // Should find both boundary minimizers
+        assert_eq!(loaded.minimizers().len(), 2);
+        assert!(loaded.minimizers().contains(&100));
+        assert!(loaded.minimizers().contains(&1000));
+
+        // Test query just outside boundaries
+        let query_outside = vec![99, 1001]; // just outside min and max
+        let loaded_outside = InvertedIndex::load_shard_parquet_for_query(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+            &query_outside,
+        )?;
+
+        // Should find nothing (99 < min, 1001 > max)
+        assert_eq!(loaded_outside.minimizers().len(), 0);
 
         Ok(())
     }
