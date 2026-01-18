@@ -180,57 +180,6 @@ fn test_bucket_naming_consistency() -> Result<()> {
     Ok(())
 }
 
-/// Test that merge_buckets correctly updates minimizer count (Issue #3)
-#[test]
-fn test_merge_buckets_minimizer_count() -> Result<()> {
-    let dir = tempdir()?;
-    let index_file = dir.path().join("test.ryidx");
-
-    // Create index with two buckets
-    let mut index = Index::new(64, 50, 0).unwrap();
-    let mut ws = rype::MinimizerWorkspace::new();
-
-    // Bucket 1: Poly-A sequence
-    let seq1 = vec![b'A'; 80];
-    index.bucket_names.insert(1, "bucket1".to_string());
-    index.add_record(1, "source1", &seq1, &mut ws);
-    index.finalize_bucket(1);
-
-    // Bucket 2: Poly-T sequence
-    let seq2 = vec![b'T'; 80];
-    index.bucket_names.insert(2, "bucket2".to_string());
-    index.add_record(2, "source2", &seq2, &mut ws);
-    index.finalize_bucket(2);
-
-    let count_before = index.buckets[&2].len();
-    index.save(&index_file)?;
-
-    // Simulate: cargo run -- index-bucket-merge -i test.ryidx --src 1 --dest 2
-    let mut idx = Index::load(&index_file)?;
-    idx.merge_buckets(1, 2)?;
-    idx.save(&index_file)?;
-
-    // Verify: Minimizer count should be updated
-    let loaded = Index::load(&index_file)?;
-    assert_eq!(loaded.buckets.len(), 1, "Should have 1 bucket after merge");
-    assert!(
-        !loaded.buckets.contains_key(&1),
-        "Source bucket should be removed"
-    );
-    assert!(loaded.buckets.contains_key(&2), "Dest bucket should exist");
-
-    let count_after = loaded.buckets[&2].len();
-    assert!(
-        count_after >= count_before,
-        "Minimizer count should be >= original count after merge"
-    );
-
-    // Verify sources were merged
-    assert_eq!(loaded.bucket_sources[&2].len(), 2, "Should have 2 sources");
-
-    Ok(())
-}
-
 /// Test extract_with_positions returns correct positions and strands
 #[test]
 fn test_extract_with_positions_correctness() -> Result<()> {

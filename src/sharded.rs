@@ -9,6 +9,7 @@
 //! one shard at a time.
 
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -46,14 +47,16 @@ pub struct ShardInfo {
 
 /// Manifest describing a sharded inverted index.
 ///
-/// Format v3:
+/// Format v5:
 /// - Magic: "RYXM" (4 bytes)
-/// - Version: 3 (u32)
+/// - Version: 5 (u32)
 /// - k (u64), w (u64), salt (u64), source_hash (u64)
 /// - total_minimizers (u64), total_bucket_ids (u64)
 /// - has_overlapping_shards (u8): 1 if shards have overlapping minimizer ranges, 0 otherwise
+/// - shard_format (u8): 0 = Legacy, 1 = Parquet (FIX #4: explicit format storage)
 /// - num_shards (u32)
 /// - For each shard: shard_id (u32), min_start (u64), min_end (u64), is_last_shard (u8), num_minimizers (u64), num_bucket_ids (u64)
+/// - Bucket metadata (same as v4)
 ///
 /// # Shard Partitioning
 ///
@@ -82,19 +85,27 @@ pub struct ShardManifest {
     /// Always `true` for bucket-partitioned shards (the only type currently supported).
     /// When true, shards have overlapping minimizer ranges and classification must check all shards.
     pub has_overlapping_shards: bool,
+    /// FIX #4: Explicit shard format stored in manifest (no file-existence guessing).
+    pub shard_format: ShardFormat,
     pub shards: Vec<ShardInfo>,
+    /// Bucket names (v4+). Maps bucket_id to human-readable name.
+    pub bucket_names: HashMap<u32, String>,
+    /// Bucket sources (v4+). Maps bucket_id to list of source sequence names.
+    pub bucket_sources: HashMap<u32, Vec<String>>,
+    /// Bucket minimizer counts (v4+). Maps bucket_id to number of minimizers.
+    pub bucket_minimizer_counts: HashMap<u32, usize>,
 }
 
 impl ShardManifest {
     /// Maximum allowed shards in a manifest (prevents DoS via huge allocations)
     const MAX_SHARDS: u32 = 10_000;
 
-    /// Save the manifest to a file.
+    /// Save the manifest to a file (v5 format with shard_format and bucket metadata).
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
 
         writer.write_all(b"RYXM")?;
-        writer.write_all(&3u32.to_le_bytes())?;
+        writer.write_all(&5u32.to_le_bytes())?; // Version 5 with shard_format
 
         writer.write_all(&(self.k as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
@@ -109,6 +120,13 @@ impl ShardManifest {
         } else {
             0u8
         }])?;
+
+        // FIX #4: Write shard format explicitly
+        writer.write_all(&[match self.shard_format {
+            ShardFormat::Legacy => 0u8,
+            ShardFormat::Parquet => 1u8,
+        }])?;
+
         writer.write_all(&(self.shards.len() as u32).to_le_bytes())?;
 
         for shard in &self.shards {
@@ -120,12 +138,56 @@ impl ShardManifest {
             writer.write_all(&(shard.num_bucket_ids as u64).to_le_bytes())?;
         }
 
+        // V4: Write bucket metadata
+        let num_buckets = self.bucket_names.len() as u32;
+        writer.write_all(&num_buckets.to_le_bytes())?;
+
+        // Sort bucket IDs for deterministic output
+        let mut sorted_bucket_ids: Vec<_> = self.bucket_names.keys().copied().collect();
+        sorted_bucket_ids.sort_unstable();
+
+        for bucket_id in &sorted_bucket_ids {
+            writer.write_all(&bucket_id.to_le_bytes())?;
+
+            // Write name
+            let name = self
+                .bucket_names
+                .get(bucket_id)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let name_bytes = name.as_bytes();
+            writer.write_all(&(name_bytes.len() as u64).to_le_bytes())?;
+            writer.write_all(name_bytes)?;
+
+            // Write minimizer count
+            let minimizer_count = self
+                .bucket_minimizer_counts
+                .get(bucket_id)
+                .copied()
+                .unwrap_or(0);
+            writer.write_all(&(minimizer_count as u64).to_le_bytes())?;
+
+            // Write sources
+            let empty_sources: Vec<String> = Vec::new();
+            let sources = self.bucket_sources.get(bucket_id).unwrap_or(&empty_sources);
+            writer.write_all(&(sources.len() as u64).to_le_bytes())?;
+            for src in sources {
+                let s_bytes = src.as_bytes();
+                writer.write_all(&(s_bytes.len() as u64).to_le_bytes())?;
+                writer.write_all(s_bytes)?;
+            }
+        }
+
         writer.flush()?;
         Ok(())
     }
 
     /// Load a manifest from a file.
+    ///
+    /// Supports v3 (backward compat), v4 (bucket metadata), and v5 (shard_format field).
     pub fn load(path: &Path) -> Result<Self> {
+        use crate::constants::{MAX_NUM_BUCKETS, MAX_STRING_LENGTH};
+
         let mut reader = BufReader::new(File::open(path)?);
         let mut buf1 = [0u8; 1];
         let mut buf4 = [0u8; 4];
@@ -138,10 +200,10 @@ impl ShardManifest {
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != 3 {
+        if !matches!(version, 3..=5) {
             return Err(anyhow!(
-                "Unsupported inverted index manifest version: {} (expected 3).\n\
-                 This inverted index was created with an older version. Regenerate it:\n  \
+                "Unsupported inverted index manifest version: {} (expected 3, 4, or 5).\n\
+                 This inverted index was created with an incompatible version. Regenerate it:\n  \
                  rype index invert -i <main-index.ryidx>",
                 version
             ));
@@ -187,6 +249,23 @@ impl ShardManifest {
 
         reader.read_exact(&mut buf1)?;
         let has_overlapping_shards = buf1[0] != 0;
+
+        // FIX #4: Read shard_format for v5+, default to Legacy for older versions
+        let shard_format = if version >= 5 {
+            reader.read_exact(&mut buf1)?;
+            match buf1[0] {
+                0 => ShardFormat::Legacy,
+                1 => ShardFormat::Parquet,
+                other => {
+                    return Err(anyhow!(
+                        "Invalid shard_format value in manifest: {} (expected 0 or 1)",
+                        other
+                    ));
+                }
+            }
+        } else {
+            ShardFormat::Legacy // Default for v3/v4
+        };
 
         reader.read_exact(&mut buf4)?;
         let num_shards = u32::from_le_bytes(buf4);
@@ -261,6 +340,73 @@ impl ShardManifest {
             }
         }
 
+        // V4: Read bucket metadata, V3: use empty maps
+        let (bucket_names, bucket_sources, bucket_minimizer_counts) = if version >= 4 {
+            reader.read_exact(&mut buf4)?;
+            let num_buckets = u32::from_le_bytes(buf4);
+            if num_buckets > MAX_NUM_BUCKETS {
+                return Err(anyhow!(
+                    "Number of buckets {} exceeds maximum {}",
+                    num_buckets,
+                    MAX_NUM_BUCKETS
+                ));
+            }
+
+            let mut bucket_names = HashMap::new();
+            let mut bucket_sources = HashMap::new();
+            let mut bucket_minimizer_counts = HashMap::new();
+
+            for _ in 0..num_buckets {
+                reader.read_exact(&mut buf4)?;
+                let bucket_id = u32::from_le_bytes(buf4);
+
+                // Read name
+                reader.read_exact(&mut buf8)?;
+                let name_len = u64::from_le_bytes(buf8) as usize;
+                if name_len > MAX_STRING_LENGTH {
+                    return Err(anyhow!(
+                        "Bucket name length {} exceeds maximum {}",
+                        name_len,
+                        MAX_STRING_LENGTH
+                    ));
+                }
+                let mut name_buf = vec![0u8; name_len];
+                reader.read_exact(&mut name_buf)?;
+                let name = String::from_utf8(name_buf)?;
+                bucket_names.insert(bucket_id, name);
+
+                // Read minimizer count
+                reader.read_exact(&mut buf8)?;
+                let minimizer_count = u64::from_le_bytes(buf8) as usize;
+                bucket_minimizer_counts.insert(bucket_id, minimizer_count);
+
+                // Read sources
+                reader.read_exact(&mut buf8)?;
+                let src_count = u64::from_le_bytes(buf8) as usize;
+                let mut sources = Vec::with_capacity(src_count);
+                for _ in 0..src_count {
+                    reader.read_exact(&mut buf8)?;
+                    let src_len = u64::from_le_bytes(buf8) as usize;
+                    if src_len > MAX_STRING_LENGTH {
+                        return Err(anyhow!(
+                            "Source string length {} exceeds maximum {}",
+                            src_len,
+                            MAX_STRING_LENGTH
+                        ));
+                    }
+                    let mut src_buf = vec![0u8; src_len];
+                    reader.read_exact(&mut src_buf)?;
+                    sources.push(String::from_utf8(src_buf)?);
+                }
+                bucket_sources.insert(bucket_id, sources);
+            }
+
+            (bucket_names, bucket_sources, bucket_minimizer_counts)
+        } else {
+            // V3 backward compat: empty metadata maps
+            (HashMap::new(), HashMap::new(), HashMap::new())
+        };
+
         Ok(ShardManifest {
             k,
             w,
@@ -269,7 +415,11 @@ impl ShardManifest {
             total_minimizers,
             total_bucket_ids,
             has_overlapping_shards,
+            shard_format, // FIX #4: Explicit format from manifest
             shards,
+            bucket_names,
+            bucket_sources,
+            bucket_minimizer_counts,
         })
     }
 
@@ -305,6 +455,30 @@ impl ShardManifest {
             ShardFormat::Parquet => Self::shard_path_parquet(base, shard_id),
         }
     }
+
+    /// Convert to IndexMetadata for compatibility with existing code.
+    ///
+    /// Returns None if the manifest was loaded from v3 format (no bucket metadata).
+    pub fn to_metadata(&self) -> Option<IndexMetadata> {
+        if self.bucket_names.is_empty() {
+            // V3 manifest - no metadata available
+            None
+        } else {
+            Some(IndexMetadata {
+                k: self.k,
+                w: self.w,
+                salt: self.salt,
+                bucket_names: self.bucket_names.clone(),
+                bucket_sources: self.bucket_sources.clone(),
+                bucket_minimizer_counts: self.bucket_minimizer_counts.clone(),
+            })
+        }
+    }
+
+    /// Check if this manifest has bucket metadata (v4+).
+    pub fn has_bucket_metadata(&self) -> bool {
+        !self.bucket_names.is_empty()
+    }
 }
 
 /// Handle for a sharded inverted index.
@@ -321,14 +495,19 @@ pub struct ShardedInvertedIndex {
 impl ShardedInvertedIndex {
     /// Open a sharded inverted index by loading just the manifest.
     ///
-    /// Auto-detects whether shards are in legacy RYXS or Parquet format
-    /// by checking for the presence of shard files.
+    /// FIX #4: Uses the shard_format stored in the manifest instead of
+    /// file-existence guessing. Falls back to file checking for v3/v4
+    /// manifests that don't have explicit format.
     pub fn open(base_path: &Path) -> Result<Self> {
         let manifest_path = ShardManifest::manifest_path(base_path);
         let manifest = ShardManifest::load(&manifest_path)?;
 
-        // Detect shard format by checking which file exists for shard 0
-        let shard_format = if !manifest.shards.is_empty() {
+        // FIX #4: Use format from manifest (v5+), fall back to file checking for v3/v4
+        let shard_format = if manifest.shard_format != ShardFormat::Legacy {
+            // v5+ manifest has explicit format
+            manifest.shard_format
+        } else if !manifest.shards.is_empty() {
+            // v3/v4 manifest - fall back to file-existence checking
             let parquet_path = ShardManifest::shard_path_parquet(base_path, 0);
             let legacy_path = ShardManifest::shard_path(base_path, 0);
 
@@ -363,6 +542,61 @@ impl ShardedInvertedIndex {
             manifest,
             base_path: base_path.to_path_buf(),
             shard_format: format,
+        })
+    }
+
+    /// Open a Parquet-format inverted index directory.
+    ///
+    /// This is for indices created with `--parquet` flag where the directory
+    /// contains manifest.toml instead of .manifest binary file.
+    #[cfg(feature = "parquet")]
+    pub fn open_parquet(base_path: &Path) -> Result<Self> {
+        use crate::parquet_index::{self, ParquetManifest};
+
+        // Load Parquet manifest
+        let parquet_manifest = ParquetManifest::load(base_path)?;
+
+        // Load bucket metadata from buckets.parquet
+        let (bucket_names, bucket_sources) = parquet_index::read_buckets_parquet(base_path)?;
+
+        // Convert to ShardManifest format
+        let inverted = parquet_manifest
+            .inverted
+            .as_ref()
+            .ok_or_else(|| anyhow!("Parquet index missing inverted section in manifest"))?;
+
+        let shards: Vec<ShardInfo> = inverted
+            .shards
+            .iter()
+            .map(|s| ShardInfo {
+                shard_id: s.shard_id,
+                min_start: s.min_minimizer,
+                min_end: s.max_minimizer,
+                is_last_shard: s.shard_id == inverted.num_shards.saturating_sub(1),
+                num_minimizers: s.num_entries as usize,
+                num_bucket_ids: s.num_entries as usize, // In Parquet, each entry is a (minimizer, bucket_id) pair
+            })
+            .collect();
+
+        let manifest = ShardManifest {
+            k: parquet_manifest.k,
+            w: parquet_manifest.w,
+            salt: parquet_manifest.salt,
+            source_hash: parquet_manifest.source_hash,
+            total_minimizers: inverted.total_entries as usize,
+            total_bucket_ids: inverted.total_entries as usize,
+            has_overlapping_shards: inverted.has_overlapping_shards,
+            shard_format: ShardFormat::Parquet, // FIX #4: Explicit format
+            shards,
+            bucket_names,
+            bucket_sources,
+            bucket_minimizer_counts: HashMap::new(), // Not stored in Parquet format
+        };
+
+        Ok(ShardedInvertedIndex {
+            manifest,
+            base_path: base_path.to_path_buf(),
+            shard_format: ShardFormat::Parquet,
         })
     }
 
@@ -558,6 +792,7 @@ mod tests {
             total_minimizers: 1000,
             total_bucket_ids: 5000,
             has_overlapping_shards: false,
+            shard_format: ShardFormat::Legacy,
             shards: vec![
                 ShardInfo {
                     shard_id: 0,
@@ -576,6 +811,9 @@ mod tests {
                     num_bucket_ids: 3000,
                 },
             ],
+            bucket_names: HashMap::new(),
+            bucket_sources: HashMap::new(),
+            bucket_minimizer_counts: HashMap::new(),
         };
 
         manifest.save(&path)?;
@@ -587,6 +825,7 @@ mod tests {
         assert_eq!(loaded.source_hash, 0x12345678);
         assert_eq!(loaded.total_minimizers, 1000);
         assert_eq!(loaded.total_bucket_ids, 5000);
+        assert_eq!(loaded.shard_format, ShardFormat::Legacy);
         assert!(!loaded.has_overlapping_shards);
         assert_eq!(loaded.shards.len(), 2);
 
@@ -604,7 +843,119 @@ mod tests {
         assert_eq!(loaded.shards[1].num_minimizers, 600);
         assert_eq!(loaded.shards[1].num_bucket_ids, 3000);
 
+        // Empty metadata maps should round-trip
+        assert!(loaded.bucket_names.is_empty());
+        assert!(loaded.bucket_sources.is_empty());
+        assert!(loaded.bucket_minimizer_counts.is_empty());
+
         Ok(())
+    }
+
+    #[test]
+    fn test_shard_manifest_v4_roundtrip_with_metadata() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        let mut bucket_names = HashMap::new();
+        bucket_names.insert(1, "BucketA".to_string());
+        bucket_names.insert(2, "BucketB".to_string());
+
+        let mut bucket_sources = HashMap::new();
+        bucket_sources.insert(
+            1,
+            vec!["file1.fa||seq1".to_string(), "file1.fa||seq2".to_string()],
+        );
+        bucket_sources.insert(2, vec!["file2.fa||seqX".to_string()]);
+
+        let mut bucket_minimizer_counts = HashMap::new();
+        bucket_minimizer_counts.insert(1, 1000);
+        bucket_minimizer_counts.insert(2, 2000);
+
+        let manifest = ShardManifest {
+            k: 64,
+            w: 50,
+            salt: 0xDEADBEEF,
+            source_hash: 0x12345678,
+            total_minimizers: 3000,
+            total_bucket_ids: 3000,
+            has_overlapping_shards: true,
+            shard_format: ShardFormat::Parquet, // Test Parquet format
+            shards: vec![ShardInfo {
+                shard_id: 0,
+                min_start: 0,
+                min_end: 0,
+                is_last_shard: true,
+                num_minimizers: 3000,
+                num_bucket_ids: 3000,
+            }],
+            bucket_names: bucket_names.clone(),
+            bucket_sources: bucket_sources.clone(),
+            bucket_minimizer_counts: bucket_minimizer_counts.clone(),
+        };
+
+        manifest.save(&path)?;
+        let loaded = ShardManifest::load(&path)?;
+
+        assert_eq!(loaded.bucket_names, bucket_names);
+        assert_eq!(loaded.bucket_sources, bucket_sources);
+        assert_eq!(loaded.bucket_minimizer_counts, bucket_minimizer_counts);
+        assert_eq!(loaded.shard_format, ShardFormat::Parquet);
+
+        // Verify to_metadata works
+        let metadata = loaded.to_metadata().expect("should have metadata");
+        assert_eq!(metadata.k, 64);
+        assert_eq!(metadata.w, 50);
+        assert_eq!(metadata.salt, 0xDEADBEEF);
+        assert_eq!(metadata.bucket_names, bucket_names);
+        assert_eq!(metadata.bucket_sources, bucket_sources);
+        assert_eq!(metadata.bucket_minimizer_counts, bucket_minimizer_counts);
+
+        assert!(loaded.has_bucket_metadata());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_shard_manifest_v3_backward_compat() {
+        // Manually construct a v3 manifest file (without bucket metadata)
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+
+        // Write v3 format data
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RYXM"); // Magic
+        data.extend_from_slice(&3u32.to_le_bytes()); // Version 3
+        data.extend_from_slice(&64u64.to_le_bytes()); // k
+        data.extend_from_slice(&50u64.to_le_bytes()); // w
+        data.extend_from_slice(&0xDEADBEEFu64.to_le_bytes()); // salt
+        data.extend_from_slice(&0x12345678u64.to_le_bytes()); // source_hash
+        data.extend_from_slice(&100u64.to_le_bytes()); // total_minimizers
+        data.extend_from_slice(&100u64.to_le_bytes()); // total_bucket_ids
+        data.push(1u8); // has_overlapping_shards = true
+        data.extend_from_slice(&1u32.to_le_bytes()); // num_shards = 1
+
+        // One shard
+        data.extend_from_slice(&0u32.to_le_bytes()); // shard_id
+        data.extend_from_slice(&0u64.to_le_bytes()); // min_start
+        data.extend_from_slice(&0u64.to_le_bytes()); // min_end
+        data.push(1u8); // is_last_shard = true
+        data.extend_from_slice(&100u64.to_le_bytes()); // num_minimizers
+        data.extend_from_slice(&100u64.to_le_bytes()); // num_bucket_ids
+
+        std::fs::write(path, data).unwrap();
+
+        // Load and verify backward compat
+        let loaded = ShardManifest::load(path).unwrap();
+        assert_eq!(loaded.k, 64);
+        assert_eq!(loaded.w, 50);
+        assert_eq!(loaded.shards.len(), 1);
+
+        // V3 manifests have empty metadata maps
+        assert!(loaded.bucket_names.is_empty());
+        assert!(loaded.bucket_sources.is_empty());
+        assert!(loaded.bucket_minimizer_counts.is_empty());
+        assert!(!loaded.has_bucket_metadata());
+        assert!(loaded.to_metadata().is_none());
     }
 
     #[test]
@@ -623,6 +974,7 @@ mod tests {
             total_minimizers: 150, // Sum with duplicates, not unique count
             total_bucket_ids: 150,
             has_overlapping_shards: true,
+            shard_format: ShardFormat::Legacy,
             shards: vec![
                 ShardInfo {
                     shard_id: 0,
@@ -649,6 +1001,9 @@ mod tests {
                     num_bucket_ids: 50,
                 },
             ],
+            bucket_names: HashMap::new(),
+            bucket_sources: HashMap::new(),
+            bucket_minimizer_counts: HashMap::new(),
         };
 
         manifest.save(&path)?;
@@ -763,7 +1118,11 @@ mod tests {
             total_minimizers: inverted.num_minimizers(),
             total_bucket_ids: inverted.num_bucket_entries(),
             has_overlapping_shards: true,
+            shard_format: ShardFormat::Legacy,
             shards: vec![shard_info],
+            bucket_names: HashMap::new(),
+            bucket_sources: HashMap::new(),
+            bucket_minimizer_counts: HashMap::new(),
         };
         let manifest_path = ShardManifest::manifest_path(&base_path);
         manifest.save(&manifest_path)?;
@@ -774,6 +1133,7 @@ mod tests {
         assert_eq!(sharded.w(), 50);
         assert_eq!(sharded.salt(), 0x1234);
         assert_eq!(sharded.num_shards(), 1);
+        assert_eq!(sharded.shard_format(), ShardFormat::Legacy);
 
         Ok(())
     }

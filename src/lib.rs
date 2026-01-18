@@ -48,6 +48,13 @@ pub mod arrow;
 #[cfg(feature = "parquet")]
 pub mod parquet_index;
 
+// Re-export Parquet types when feature is enabled
+#[cfg(feature = "parquet")]
+pub use parquet_index::{
+    compute_source_hash, create_parquet_inverted_index, is_parquet_index, BucketData,
+    BucketMetadata, InvertedManifest, InvertedShardInfo, ParquetManifest,
+};
+
 // Re-export types
 pub use types::{HitResult, IndexMetadata, QueryRecord};
 
@@ -64,7 +71,7 @@ pub use extraction::{
 };
 
 // Re-export index
-pub use index::{Index, IndexFormat};
+pub use index::Index;
 
 // Re-export inverted index
 pub use inverted::{InvertedIndex, QueryInvertedIndex};

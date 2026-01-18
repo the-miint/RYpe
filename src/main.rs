@@ -19,8 +19,8 @@ use rype::{
     aggregate_batch, classify_batch, classify_batch_sharded_main,
     classify_batch_sharded_merge_join, classify_batch_sharded_sequential, extract_into,
     extract_with_positions, Index, IndexMetadata, InvertedIndex, MainIndexManifest, MainIndexShard,
-    MinimizerWorkspace, QueryRecord, ShardManifest, ShardedInvertedIndex, ShardedMainIndex,
-    ShardedMainIndexBuilder, Strand, ENABLE_TIMING,
+    MinimizerWorkspace, QueryRecord, ShardFormat, ShardManifest, ShardedInvertedIndex,
+    ShardedMainIndex, ShardedMainIndexBuilder, Strand, ENABLE_TIMING,
 };
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -80,15 +80,34 @@ fn sanitize_bucket_name(name: &str) -> String {
         .collect()
 }
 
-/// Load metadata from either a sharded or non-sharded main index.
+/// Load metadata from Parquet, sharded, or single-file indices.
 ///
-/// This helper handles the case where the main index might be sharded (with .manifest
-/// and .shard.* files) or a single-file index.
+/// This helper handles:
+/// - Parquet inverted index directories (with manifest.toml)
+/// - Sharded main indices (with .manifest and .shard.* files)
+/// - Single-file indices (.ryidx)
 fn load_index_metadata(path: &Path) -> Result<IndexMetadata> {
+    // Check for Parquet format first (directory with manifest.toml)
+    #[cfg(feature = "parquet")]
+    if rype::is_parquet_index(path) {
+        let manifest = rype::ParquetManifest::load(path)?;
+        let (bucket_names, bucket_sources) = rype::parquet_index::read_buckets_parquet(path)?;
+        return Ok(IndexMetadata {
+            k: manifest.k,
+            w: manifest.w,
+            salt: manifest.salt,
+            bucket_names,
+            bucket_sources,
+            bucket_minimizer_counts: HashMap::new(),
+        });
+    }
+
+    // Check for sharded main index
     if MainIndexManifest::is_sharded(path) {
         let manifest = MainIndexManifest::load(&MainIndexManifest::manifest_path(path))?;
         Ok(manifest.to_metadata())
     } else {
+        // Single-file index
         Index::load_metadata(path)
     }
 }
@@ -210,6 +229,12 @@ enum IndexCommands {
         /// Creates multiple shard files loaded on-demand during classification.
         #[arg(long, value_parser = parse_shard_size_arg)]
         max_shard_size: Option<usize>,
+
+        /// Create Parquet inverted index directly (bypasses main index).
+        /// Output will be a directory (e.g., index.ryxdi/) containing Parquet files.
+        /// This is the recommended format for large indices.
+        #[arg(long)]
+        parquet: bool,
     },
 
     /// Show index statistics and bucket information
@@ -251,21 +276,6 @@ enum IndexCommands {
         /// Reference file to add (creates a new bucket)
         #[arg(short, long)]
         reference: PathBuf,
-    },
-
-    /// Merge two buckets within an index (source absorbed into destination)
-    BucketMerge {
-        /// Path to index file (modified in place)
-        #[arg(short, long)]
-        index: PathBuf,
-
-        /// Source bucket ID (will be removed after merge)
-        #[arg(long)]
-        src: u32,
-
-        /// Destination bucket ID (receives source's minimizers)
-        #[arg(long)]
-        dest: u32,
     },
 
     /// Merge multiple indices into one (buckets renumbered to avoid conflicts)
@@ -659,6 +669,121 @@ fn add_reference_file_to_index(
     Ok(())
 }
 
+/// Create Parquet inverted index directly from reference files.
+///
+/// This bypasses the main index entirely and streams (minimizer, bucket_id)
+/// pairs directly to Parquet format.
+#[cfg(feature = "parquet")]
+fn create_parquet_index_from_refs(
+    output: &Path,
+    references: &[PathBuf],
+    k: usize,
+    w: usize,
+    salt: u64,
+    separate_buckets: bool,
+    max_shard_bytes: Option<usize>,
+) -> Result<()> {
+    use rype::{create_parquet_inverted_index, extract_into, BucketData};
+
+    log::info!(
+        "Creating Parquet inverted index at {:?} (K={}, W={}, salt={:#x})",
+        output,
+        k,
+        w,
+        salt
+    );
+
+    let mut buckets: Vec<BucketData> = Vec::new();
+    let mut next_id: u32 = 1;
+    let mut ws = MinimizerWorkspace::new();
+
+    for ref_path in references {
+        log::info!("Processing reference: {}", ref_path.display());
+        let mut reader = parse_fastx_file(ref_path).context("Failed to open reference file")?;
+        let filename = ref_path
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        if separate_buckets {
+            // One bucket per sequence
+            while let Some(record) = reader.next() {
+                let rec = record.context("Invalid record")?;
+                let seq = rec.seq();
+                let name = String::from_utf8_lossy(rec.id()).to_string();
+                let bucket_id = next_id;
+                next_id += 1;
+
+                // Extract minimizers
+                extract_into(&seq, k, w, salt, &mut ws);
+                let mut minimizers = std::mem::take(&mut ws.buffer);
+                minimizers.sort_unstable();
+                minimizers.dedup();
+
+                let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
+                buckets.push(BucketData {
+                    bucket_id,
+                    bucket_name: sanitize_bucket_name(&name),
+                    sources: vec![source_label],
+                    minimizers,
+                });
+            }
+        } else {
+            // All sequences from file go into one bucket
+            let bucket_id = next_id;
+            next_id += 1;
+
+            let mut all_minimizers: Vec<u64> = Vec::new();
+            let mut sources: Vec<String> = Vec::new();
+
+            while let Some(record) = reader.next() {
+                let rec = record.context("Invalid record")?;
+                let seq = rec.seq();
+                let name = String::from_utf8_lossy(rec.id()).to_string();
+
+                // Extract minimizers
+                extract_into(&seq, k, w, salt, &mut ws);
+                all_minimizers.extend_from_slice(&ws.buffer);
+
+                let source_label = format!("{}{}{}", filename, Index::BUCKET_SOURCE_DELIM, name);
+                sources.push(source_label);
+            }
+
+            // Sort and deduplicate
+            all_minimizers.sort_unstable();
+            all_minimizers.dedup();
+
+            buckets.push(BucketData {
+                bucket_id,
+                bucket_name: sanitize_bucket_name(&filename),
+                sources,
+                minimizers: all_minimizers,
+            });
+        }
+    }
+
+    let total_minimizers: usize = buckets.iter().map(|b| b.minimizers.len()).sum();
+    log::info!(
+        "Extracted minimizers from {} buckets ({} total)",
+        buckets.len(),
+        total_minimizers
+    );
+
+    // Create the Parquet index
+    let manifest = create_parquet_inverted_index(output, buckets, k, w, salt, max_shard_bytes)?;
+
+    log::info!("Created Parquet inverted index:");
+    log::info!("  Buckets: {}", manifest.num_buckets);
+    if let Some(ref inv) = manifest.inverted {
+        log::info!("  Shards: {}", inv.num_shards);
+        log::info!("  Total entries: {}", inv.total_entries);
+    }
+    log::info!("Done.");
+
+    Ok(())
+}
+
 // --- IO HANDLER ---
 
 type OwnedRecord = (i64, Vec<u8>, Option<Vec<u8>>);
@@ -757,39 +882,64 @@ fn main() -> Result<()> {
                 salt,
                 separate_buckets,
                 max_shard_size,
+                parquet,
             } => {
                 if !matches!(kmer_size, 16 | 32 | 64) {
                     return Err(anyhow!("K must be 16, 32, or 64 (got {})", kmer_size));
                 }
-                let mut index = Index::new(kmer_size, window, salt)?;
-                let mut next_id = 1;
 
-                for ref_file in reference {
-                    add_reference_file_to_index(
-                        &mut index,
-                        &ref_file,
-                        separate_buckets,
-                        &mut next_id,
-                    )?;
-                }
-
-                if let Some(max_bytes) = max_shard_size {
-                    log::info!(
-                        "Saving sharded index to {:?} (max {} bytes/shard)...",
-                        output,
-                        max_bytes
-                    );
-                    let manifest = index.save_sharded(&output, max_bytes)?;
-                    log::info!(
-                        "Created {} shards with {} total minimizers.",
-                        manifest.shards.len(),
-                        manifest.total_minimizers
-                    );
+                if parquet {
+                    // Create Parquet inverted index directly
+                    #[cfg(feature = "parquet")]
+                    {
+                        create_parquet_index_from_refs(
+                            &output,
+                            &reference,
+                            kmer_size,
+                            window,
+                            salt,
+                            separate_buckets,
+                            max_shard_size,
+                        )?;
+                    }
+                    #[cfg(not(feature = "parquet"))]
+                    {
+                        return Err(anyhow!(
+                            "--parquet requires building with --features parquet"
+                        ));
+                    }
                 } else {
-                    log::info!("Saving index to {:?}...", output);
-                    index.save(&output)?;
+                    // Legacy: create main index
+                    let mut index = Index::new(kmer_size, window, salt)?;
+                    let mut next_id = 1;
+
+                    for ref_file in reference {
+                        add_reference_file_to_index(
+                            &mut index,
+                            &ref_file,
+                            separate_buckets,
+                            &mut next_id,
+                        )?;
+                    }
+
+                    if let Some(max_bytes) = max_shard_size {
+                        log::info!(
+                            "Saving sharded index to {:?} (max {} bytes/shard)...",
+                            output,
+                            max_bytes
+                        );
+                        let manifest = index.save_sharded(&output, max_bytes)?;
+                        log::info!(
+                            "Created {} shards with {} total minimizers.",
+                            manifest.shards.len(),
+                            manifest.total_minimizers
+                        );
+                    } else {
+                        log::info!("Saving index to {:?}...", output);
+                        index.save(&output)?;
+                    }
+                    log::info!("Done.");
                 }
-                log::info!("Done.");
             }
 
             IndexCommands::Stats { index, inverted } => {
@@ -1042,25 +1192,6 @@ fn main() -> Result<()> {
                 }
             }
 
-            IndexCommands::BucketMerge { index, src, dest } => {
-                let main_manifest_path = MainIndexManifest::manifest_path(&index);
-
-                if main_manifest_path.exists() {
-                    // Sharded main index
-                    let mut sharded = ShardedMainIndex::open(&index)?;
-                    log::info!("Merging Bucket {} -> Bucket {} (sharded)...", src, dest);
-                    sharded.merge_buckets(src, dest)?;
-                    log::info!("Done.");
-                } else {
-                    // Single-file main index
-                    let mut idx = Index::load(&index)?;
-                    log::info!("Merging Bucket {} -> Bucket {}...", src, dest);
-                    idx.merge_buckets(src, dest)?;
-                    idx.save(&index)?;
-                    log::info!("Done.");
-                }
-            }
-
             IndexCommands::Merge { output, inputs } => {
                 // Logic: Load first index, then merge others into it.
                 // Warning: Salt/W must match.
@@ -1214,18 +1345,25 @@ fn main() -> Result<()> {
                             inv_shards.push(inv_shard_info);
                         }
 
-                        // Create inverted manifest
+                        // Create inverted manifest with bucket metadata from main index
+                        let main_metadata = main_manifest.to_metadata();
                         let inv_manifest = ShardManifest {
                             k: main_manifest.k,
                             w: main_manifest.w,
                             salt: main_manifest.salt,
-                            source_hash: InvertedIndex::compute_metadata_hash(
-                                &main_manifest.to_metadata(),
-                            ),
+                            source_hash: InvertedIndex::compute_metadata_hash(&main_metadata),
                             total_minimizers,
                             total_bucket_ids,
                             has_overlapping_shards: true,
+                            shard_format: if use_parquet {
+                                ShardFormat::Parquet
+                            } else {
+                                ShardFormat::Legacy
+                            },
                             shards: inv_shards,
+                            bucket_names: main_metadata.bucket_names,
+                            bucket_sources: main_metadata.bucket_sources,
+                            bucket_minimizer_counts: main_metadata.bucket_minimizer_counts,
                         };
 
                         let manifest_path = ShardManifest::manifest_path(&output_path);
@@ -1275,18 +1413,19 @@ fn main() -> Result<()> {
                             info
                         };
 
-                        // Create manifest with single shard
+                        // Create manifest with single shard and bucket metadata
+                        let bucket_minimizer_counts: std::collections::HashMap<u32, usize> = idx
+                            .buckets
+                            .iter()
+                            .map(|(&id, mins)| (id, mins.len()))
+                            .collect();
                         let metadata = IndexMetadata {
                             k: idx.k,
                             w: idx.w,
                             salt: idx.salt,
                             bucket_names: idx.bucket_names.clone(),
                             bucket_sources: idx.bucket_sources.clone(),
-                            bucket_minimizer_counts: idx
-                                .buckets
-                                .iter()
-                                .map(|(&id, mins)| (id, mins.len()))
-                                .collect(),
+                            bucket_minimizer_counts: bucket_minimizer_counts.clone(),
                         };
                         let inv_manifest = ShardManifest {
                             k: idx.k,
@@ -1296,7 +1435,15 @@ fn main() -> Result<()> {
                             total_minimizers: inv_shard_info.num_minimizers,
                             total_bucket_ids: inv_shard_info.num_bucket_ids,
                             has_overlapping_shards: true,
+                            shard_format: if use_parquet {
+                                ShardFormat::Parquet
+                            } else {
+                                ShardFormat::Legacy
+                            },
                             shards: vec![inv_shard_info],
+                            bucket_names: idx.bucket_names.clone(),
+                            bucket_sources: idx.bucket_sources.clone(),
+                            bucket_minimizer_counts,
                         };
 
                         let manifest_path = ShardManifest::manifest_path(&output_path);
@@ -1719,13 +1866,44 @@ fn main() -> Result<()> {
                 };
 
                 if use_inverted {
-                    // Use inverted index path - detect sharded vs single-file format
-                    let inverted_path = index.with_extension("ryxdi");
-                    let manifest_path = ShardManifest::manifest_path(&inverted_path);
+                    // Use inverted index path - detect format:
+                    // 1. Parquet format: directory with manifest.toml
+                    // 2. Legacy RYXS: .ryxdi.manifest file
+                    #[cfg(feature = "parquet")]
+                    let is_parquet = rype::is_parquet_index(&index);
+                    #[cfg(not(feature = "parquet"))]
+                    let is_parquet = false;
 
-                    // Load index metadata first (needed for both paths)
-                    log::info!("Loading index metadata from {:?}", index);
-                    let metadata = load_index_metadata(&index)?;
+                    let (inverted_path, metadata) = if is_parquet {
+                        // Parquet index passed directly - load metadata from it
+                        #[cfg(feature = "parquet")]
+                        {
+                            log::info!("Detected Parquet index at {:?}", index);
+                            let manifest = rype::ParquetManifest::load(&index)?;
+                            let (bucket_names, bucket_sources) =
+                                rype::parquet_index::read_buckets_parquet(&index)?;
+                            let metadata = IndexMetadata {
+                                k: manifest.k,
+                                w: manifest.w,
+                                salt: manifest.salt,
+                                bucket_names,
+                                bucket_sources,
+                                bucket_minimizer_counts: HashMap::new(), // Not stored in Parquet manifest
+                            };
+                            (index.clone(), metadata)
+                        }
+                        #[cfg(not(feature = "parquet"))]
+                        {
+                            unreachable!()
+                        }
+                    } else {
+                        // Legacy: derive inverted path from main index
+                        let inverted_path = index.with_extension("ryxdi");
+                        log::info!("Loading index metadata from {:?}", index);
+                        let metadata = load_index_metadata(&index)?;
+                        (inverted_path, metadata)
+                    };
+
                     log::info!("Metadata loaded: {} buckets", metadata.bucket_names.len());
 
                     let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
@@ -1734,93 +1912,100 @@ fn main() -> Result<()> {
                     let mut total_reads = 0;
                     let mut batch_num = 0;
 
-                    if manifest_path.exists() {
-                        // Sharded inverted index - use sequential loading to minimize memory
+                    // Load sharded inverted index - use format-appropriate loader
+                    let sharded = if is_parquet {
+                        #[cfg(feature = "parquet")]
+                        {
+                            log::info!("Loading Parquet inverted index from {:?}", inverted_path);
+                            ShardedInvertedIndex::open_parquet(&inverted_path)?
+                        }
+                        #[cfg(not(feature = "parquet"))]
+                        {
+                            return Err(anyhow!("Parquet index requires --features parquet"));
+                        }
+                    } else {
+                        let manifest_path = ShardManifest::manifest_path(&inverted_path);
+                        if !manifest_path.exists() {
+                            return Err(anyhow!(
+                                "Inverted index not found: {:?}. Create it with 'rype index invert -i {:?}' or use --parquet for direct creation.",
+                                inverted_path, index
+                            ));
+                        }
                         log::info!(
                             "Loading sharded inverted index manifest from {:?}",
                             inverted_path
                         );
-                        let sharded = ShardedInvertedIndex::open(&inverted_path)?;
-                        log::info!(
-                            "Sharded index: {} shards, {} total minimizers",
-                            sharded.num_shards(),
-                            sharded.total_minimizers()
-                        );
+                        ShardedInvertedIndex::open(&inverted_path)?
+                    };
 
+                    log::info!(
+                        "Sharded index: {} shards, {} total minimizers",
+                        sharded.num_shards(),
+                        sharded.total_minimizers()
+                    );
+
+                    // Skip validation for Parquet indices (metadata is embedded)
+                    if !is_parquet {
                         sharded.validate_against_metadata(&metadata)?;
                         log::info!("Sharded index validated successfully");
+                    }
 
-                        if merge_join {
-                            log::info!("Starting merge-join classification with sequential shard loading (batch_size={})", effective_batch_size);
-                        } else {
-                            log::info!("Starting classification with sequential shard loading (batch_size={})", effective_batch_size);
-                        }
-
-                        while let Some((owned_records, headers)) =
-                            io.next_batch_records(effective_batch_size)?
-                        {
-                            batch_num += 1;
-                            let batch_read_count = owned_records.len();
-                            total_reads += batch_read_count;
-
-                            let batch_refs: Vec<QueryRecord> = owned_records
-                                .iter()
-                                .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
-                                .collect();
-
-                            let results = if merge_join {
-                                classify_batch_sharded_merge_join(
-                                    &sharded,
-                                    neg_mins.as_ref(),
-                                    &batch_refs,
-                                    threshold,
-                                )?
-                            } else {
-                                classify_batch_sharded_sequential(
-                                    &sharded,
-                                    neg_mins.as_ref(),
-                                    &batch_refs,
-                                    threshold,
-                                )?
-                            };
-
-                            let mut chunk_out = Vec::with_capacity(1024);
-                            for res in results {
-                                let header = &headers[res.query_id as usize];
-                                let bucket_name = metadata
-                                    .bucket_names
-                                    .get(&res.bucket_id)
-                                    .map(|s| s.as_str())
-                                    .unwrap_or("unknown");
-                                writeln!(
-                                    chunk_out,
-                                    "{}\t{}\t{:.4}",
-                                    header, bucket_name, res.score
-                                )
-                                .unwrap();
-                            }
-                            io.write(chunk_out)?;
-
-                            log::info!(
-                                "Processed batch {}: {} reads ({} total)",
-                                batch_num,
-                                batch_read_count,
-                                total_reads
-                            );
-                        }
-                    } else if inverted_path.exists() {
-                        // Legacy single-file inverted index (RYXI format) no longer supported
-                        return Err(anyhow!(
-                            "Legacy single-file inverted index format (RYXI) is no longer supported.\n\
-                             Re-create the inverted index with:\n  \
-                             rype index invert -i {}",
-                            index.display()
-                        ));
+                    if merge_join {
+                        log::info!("Starting merge-join classification with sequential shard loading (batch_size={})", effective_batch_size);
                     } else {
-                        return Err(anyhow!(
-                            "Inverted index not found: {:?}. Create it with 'rype index invert -i {:?}'",
-                            inverted_path, index
-                        ));
+                        log::info!(
+                            "Starting classification with sequential shard loading (batch_size={})",
+                            effective_batch_size
+                        );
+                    }
+
+                    while let Some((owned_records, headers)) =
+                        io.next_batch_records(effective_batch_size)?
+                    {
+                        batch_num += 1;
+                        let batch_read_count = owned_records.len();
+                        total_reads += batch_read_count;
+
+                        let batch_refs: Vec<QueryRecord> = owned_records
+                            .iter()
+                            .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                            .collect();
+
+                        let results = if merge_join {
+                            classify_batch_sharded_merge_join(
+                                &sharded,
+                                neg_mins.as_ref(),
+                                &batch_refs,
+                                threshold,
+                            )?
+                        } else {
+                            classify_batch_sharded_sequential(
+                                &sharded,
+                                neg_mins.as_ref(),
+                                &batch_refs,
+                                threshold,
+                            )?
+                        };
+
+                        let mut chunk_out = Vec::with_capacity(1024);
+                        for res in results {
+                            let header = &headers[res.query_id as usize];
+                            let bucket_name = metadata
+                                .bucket_names
+                                .get(&res.bucket_id)
+                                .map(|s| s.as_str())
+                                .unwrap_or("unknown");
+                            writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score)
+                                .unwrap();
+                        }
+                        io.write(chunk_out)?;
+
+                        log::info!(
+                            "Processed batch {}: {} reads ({} total)",
+                            batch_num,
+                            batch_read_count,
+                            total_reads
+                        );
                     }
 
                     log::info!("Classification complete: {} reads processed", total_reads);
@@ -2348,16 +2533,21 @@ fn build_index_from_config(
                 inv_shards.push(inv_shard_info);
             }
 
-            // Create inverted manifest
+            // Create inverted manifest with bucket metadata from main index
+            let main_metadata = manifest.to_metadata();
             let inv_manifest = ShardManifest {
                 k: manifest.k,
                 w: manifest.w,
                 salt: manifest.salt,
-                source_hash: InvertedIndex::compute_metadata_hash(&manifest.to_metadata()),
+                source_hash: InvertedIndex::compute_metadata_hash(&main_metadata),
                 total_minimizers: total_inv_minimizers,
                 total_bucket_ids: total_inv_bucket_ids,
                 has_overlapping_shards: true,
+                shard_format: ShardFormat::Legacy,
                 shards: inv_shards,
+                bucket_names: main_metadata.bucket_names,
+                bucket_sources: main_metadata.bucket_sources,
+                bucket_minimizer_counts: main_metadata.bucket_minimizer_counts,
             };
 
             let manifest_path = ShardManifest::manifest_path(&inverted_path);
@@ -2439,18 +2629,19 @@ fn build_index_from_config(
                 true, // is_last (and only) shard
             )?;
 
-            // Create manifest with single shard
+            // Create manifest with single shard and bucket metadata
+            let bucket_minimizer_counts: std::collections::HashMap<u32, usize> = final_index
+                .buckets
+                .iter()
+                .map(|(&id, mins)| (id, mins.len()))
+                .collect();
             let metadata = IndexMetadata {
                 k: final_index.k,
                 w: final_index.w,
                 salt: final_index.salt,
                 bucket_names: final_index.bucket_names.clone(),
                 bucket_sources: final_index.bucket_sources.clone(),
-                bucket_minimizer_counts: final_index
-                    .buckets
-                    .iter()
-                    .map(|(&id, mins)| (id, mins.len()))
-                    .collect(),
+                bucket_minimizer_counts: bucket_minimizer_counts.clone(),
             };
             let inv_manifest = ShardManifest {
                 k: final_index.k,
@@ -2460,7 +2651,11 @@ fn build_index_from_config(
                 total_minimizers: inv_shard_info.num_minimizers,
                 total_bucket_ids: inv_shard_info.num_bucket_ids,
                 has_overlapping_shards: true,
+                shard_format: ShardFormat::Legacy,
                 shards: vec![inv_shard_info],
+                bucket_names: final_index.bucket_names.clone(),
+                bucket_sources: final_index.bucket_sources.clone(),
+                bucket_minimizer_counts,
             };
 
             let manifest_path = ShardManifest::manifest_path(&inverted_path);

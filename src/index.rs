@@ -2,70 +2,20 @@
 //!
 //! The `Index` struct stores a collection of named buckets, each containing
 //! a set of minimizers extracted from reference sequences. It supports
-//! incremental building, merging, and serialization in the v5 format.
+//! incremental building and serialization in the v5 format.
 //!
-//! # Index Formats
+//! # Index Format
 //!
-//! Two formats are supported:
-//! - **Legacy** (`.ryidx` file): Single-file format with RYP5 header
-//! - **Parquet** (`.ryidx/` directory): Directory containing Parquet files (requires `parquet` feature)
-//!
-//! Format detection is automatic based on whether the path is a file or directory.
+//! The main index uses the single-file format (`.ryidx`):
+//! - Header: magic "RYP5", version 5, k, w, salt, num_buckets
+//! - Bucket metadata (uncompressed): for each bucket: minimizer_count, bucket_id, name, sources
+//! - Minimizers (zstd compressed stream): delta+varint encoded minimizers per bucket
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
-
-/// Index storage format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IndexFormat {
-    /// Legacy single-file format with RYP5 header and zstd-compressed minimizers.
-    Legacy,
-    /// Directory-based Parquet format with manifest.toml and .parquet files.
-    #[cfg(feature = "parquet")]
-    Parquet,
-}
-
-impl IndexFormat {
-    /// Detect the format of an index at the given path.
-    ///
-    /// Returns `Legacy` if path is a file, `Parquet` if path is a directory
-    /// containing a valid Parquet manifest (when parquet feature is enabled).
-    pub fn detect(path: &Path) -> Result<Self> {
-        if path.is_file() {
-            return Ok(IndexFormat::Legacy);
-        }
-
-        #[cfg(feature = "parquet")]
-        {
-            if crate::parquet_index::is_parquet_index(path) {
-                return Ok(IndexFormat::Parquet);
-            }
-        }
-
-        if path.is_dir() {
-            // Directory but not a valid Parquet index
-            #[cfg(feature = "parquet")]
-            {
-                return Err(anyhow!(
-                    "Directory '{}' is not a valid Parquet index (missing manifest.toml)",
-                    path.display()
-                ));
-            }
-            #[cfg(not(feature = "parquet"))]
-            {
-                return Err(anyhow!(
-                    "Directory-based indices require the 'parquet' feature. \
-                     Build with: cargo build --features parquet"
-                ));
-            }
-        }
-
-        Err(anyhow!("Index path does not exist: {}", path.display()))
-    }
-}
 
 use crate::constants::{MAX_BUCKET_SIZE, MAX_NUM_BUCKETS, MAX_STRING_LENGTH};
 use crate::encoding::{decode_varint, encode_varint, VarIntError};
@@ -159,39 +109,6 @@ impl Index {
             bucket.sort_unstable();
             bucket.dedup();
         }
-    }
-
-    /// Merge one bucket into another.
-    ///
-    /// Moves all minimizers and sources from the source bucket to the destination
-    /// bucket, then removes the source bucket.
-    ///
-    /// # Arguments
-    /// * `src_id` - Source bucket ID (will be removed)
-    /// * `dest_id` - Destination bucket ID (will contain merged data)
-    ///
-    /// # Errors
-    /// Returns an error if the source bucket does not exist.
-    pub fn merge_buckets(&mut self, src_id: u32, dest_id: u32) -> Result<()> {
-        let src_vec = self
-            .buckets
-            .remove(&src_id)
-            .ok_or_else(|| anyhow!("Source bucket {} does not exist", src_id))?;
-        self.bucket_names.remove(&src_id);
-
-        if let Some(mut src_sources) = self.bucket_sources.remove(&src_id) {
-            let dest_sources = self.bucket_sources.entry(dest_id).or_default();
-            dest_sources.append(&mut src_sources);
-            dest_sources.sort_unstable();
-            dest_sources.dedup();
-        }
-
-        let dest_vec = self.buckets.entry(dest_id).or_default();
-        dest_vec.extend(src_vec);
-        dest_vec.sort_unstable();
-        dest_vec.dedup();
-
-        Ok(())
     }
 
     /// Get the next available bucket ID.
@@ -311,99 +228,6 @@ impl Index {
         Ok(())
     }
 
-    /// Save the index to the specified format.
-    ///
-    /// # Arguments
-    /// * `path` - Output path
-    /// * `format` - Target format (Legacy or Parquet)
-    pub fn save_as(&self, path: &Path, format: IndexFormat) -> Result<()> {
-        match format {
-            IndexFormat::Legacy => self.save(path),
-            #[cfg(feature = "parquet")]
-            IndexFormat::Parquet => self.save_parquet(path),
-        }
-    }
-
-    /// Save the index as a Parquet-based directory.
-    ///
-    /// Creates the directory structure:
-    /// - `path/manifest.toml`: Index metadata
-    /// - `path/buckets.parquet`: Bucket names and sources
-    /// - `path/main.parquet`: (bucket_id, minimizer) data
-    #[cfg(feature = "parquet")]
-    pub fn save_parquet(&self, path: &Path) -> Result<()> {
-        use crate::parquet_index::{
-            create_index_directory, files, write_buckets_parquet, ParquetManifest,
-        };
-        use arrow::array::{ArrayRef, UInt32Array, UInt64Array};
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-        use parquet::arrow::ArrowWriter;
-        use parquet::basic::{Compression, Encoding};
-        use parquet::file::properties::{WriterProperties, WriterVersion};
-        use parquet::schema::types::ColumnPath;
-        use std::sync::Arc;
-
-        // Create directory structure
-        create_index_directory(path)?;
-
-        // Create and save manifest
-        let total_minimizers: u64 = self.buckets.values().map(|v| v.len() as u64).sum();
-        let mut manifest = ParquetManifest::new(self.k, self.w, self.salt);
-        manifest.num_buckets = self.buckets.len() as u32;
-        manifest.total_minimizers = total_minimizers;
-        manifest.save(path)?;
-
-        // Save bucket metadata
-        write_buckets_parquet(path, &self.bucket_names, &self.bucket_sources)?;
-
-        // Save main index data
-        let main_path = path.join(files::MAIN);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("bucket_id", DataType::UInt32, false),
-            Field::new("minimizer", DataType::UInt64, false),
-        ]));
-
-        let props = WriterProperties::builder()
-            .set_writer_version(WriterVersion::PARQUET_2_0)
-            .set_compression(Compression::ZSTD(Default::default()))
-            .set_column_encoding(ColumnPath::from("bucket_id"), Encoding::DELTA_BINARY_PACKED)
-            .set_column_dictionary_enabled(ColumnPath::from("bucket_id"), false)
-            .set_column_encoding(ColumnPath::from("minimizer"), Encoding::DELTA_BINARY_PACKED)
-            .set_column_dictionary_enabled(ColumnPath::from("minimizer"), false)
-            .set_max_row_group_size(100_000)
-            .build();
-
-        let file = std::fs::File::create(&main_path)?;
-        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
-
-        // Collect all (bucket_id, minimizer) pairs, sorted by bucket_id then minimizer
-        let mut rows: Vec<(u32, u64)> = Vec::new();
-        for (&bucket_id, minimizers) in &self.buckets {
-            for &min in minimizers {
-                rows.push((bucket_id, min));
-            }
-        }
-        rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-
-        // Write in chunks
-        let chunk_size = 100_000;
-        for chunk in rows.chunks(chunk_size) {
-            let bucket_ids: Vec<u32> = chunk.iter().map(|&(bid, _)| bid).collect();
-            let minimizers: Vec<u64> = chunk.iter().map(|&(_, min)| min).collect();
-
-            let bucket_id_array: ArrayRef = Arc::new(UInt32Array::from(bucket_ids));
-            let minimizer_array: ArrayRef = Arc::new(UInt64Array::from(minimizers));
-
-            let batch =
-                RecordBatch::try_new(schema.clone(), vec![bucket_id_array, minimizer_array])?;
-            writer.write(&batch)?;
-        }
-
-        writer.close()?;
-        Ok(())
-    }
-
     /// Save the index as a sharded format with memory budget-based sharding.
     ///
     /// This method creates multiple shard files based on the memory budget. Each shard
@@ -456,22 +280,10 @@ impl Index {
         builder.finish()
     }
 
-    /// Load an index from a file or directory.
-    ///
-    /// Automatically detects the format:
-    /// - If `path` is a file: loads as legacy format (RYP5)
-    /// - If `path` is a directory: loads as Parquet format (requires `parquet` feature)
-    pub fn load(path: &Path) -> Result<Self> {
-        let format = IndexFormat::detect(path)?;
-        match format {
-            IndexFormat::Legacy => Self::load_legacy(path),
-            #[cfg(feature = "parquet")]
-            IndexFormat::Parquet => Self::load_parquet(path),
-        }
-    }
-
     /// Load an index from a file (v5 format with delta+varint+zstd compressed minimizers).
-    pub fn load_legacy(path: &Path) -> Result<Self> {
+    ///
+    /// This is the primary method for loading a main index file (.ryidx).
+    pub fn load(path: &Path) -> Result<Self> {
         let mut reader = BufReader::new(File::open(path)?);
         let mut buf4 = [0u8; 4];
         let mut buf8 = [0u8; 8];
@@ -699,106 +511,6 @@ impl Index {
         })
     }
 
-    /// Load an index from a Parquet-based directory.
-    ///
-    /// The directory should contain:
-    /// - `manifest.toml`: Index metadata (k, w, salt, etc.)
-    /// - `buckets.parquet`: Bucket names and sources
-    /// - `main.parquet`: (bucket_id, minimizer) data
-    #[cfg(feature = "parquet")]
-    pub fn load_parquet(path: &Path) -> Result<Self> {
-        use crate::parquet_index::{files, read_buckets_parquet, ParquetManifest};
-
-        // Load manifest
-        let manifest = ParquetManifest::load(path)?;
-
-        // Load bucket metadata
-        let (bucket_names, bucket_sources) = read_buckets_parquet(path)?;
-
-        // Load main index data (bucket_id, minimizer pairs)
-        let main_path = path.join(files::MAIN);
-        if !main_path.exists() {
-            return Err(anyhow!(
-                "Main index file not found: {}",
-                main_path.display()
-            ));
-        }
-
-        let buckets = Self::load_main_parquet(&main_path)?;
-
-        Ok(Index {
-            k: manifest.k,
-            w: manifest.w,
-            salt: manifest.salt,
-            buckets,
-            bucket_names,
-            bucket_sources,
-        })
-    }
-
-    /// Load main index data from a Parquet file.
-    ///
-    /// Reads (bucket_id, minimizer) pairs and groups them into per-bucket vectors.
-    #[cfg(feature = "parquet")]
-    fn load_main_parquet(path: &Path) -> Result<HashMap<u32, Vec<u64>>> {
-        use arrow::array::{Array, UInt32Array, UInt64Array};
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-        use rayon::prelude::*;
-        use std::collections::HashMap;
-        use std::fs::File;
-
-        let file = File::open(path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        let metadata = builder.metadata().clone();
-        let num_row_groups = metadata.num_row_groups();
-
-        // Read all row groups in parallel
-        let results: Vec<Vec<(u32, u64)>> = (0..num_row_groups)
-            .into_par_iter()
-            .map(|rg_idx| {
-                let file = File::open(path).unwrap();
-                let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-                let reader = builder.with_row_groups(vec![rg_idx]).build().unwrap();
-
-                let mut pairs = Vec::new();
-                for batch in reader {
-                    let batch = batch.unwrap();
-                    let bucket_ids = batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<UInt32Array>()
-                        .unwrap();
-                    let minimizers = batch
-                        .column(1)
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .unwrap();
-
-                    for i in 0..batch.num_rows() {
-                        pairs.push((bucket_ids.value(i), minimizers.value(i)));
-                    }
-                }
-                pairs
-            })
-            .collect();
-
-        // Merge into buckets
-        let mut buckets: HashMap<u32, Vec<u64>> = HashMap::new();
-        for pairs in results {
-            for (bucket_id, minimizer) in pairs {
-                buckets.entry(bucket_id).or_default().push(minimizer);
-            }
-        }
-
-        // Sort and dedup each bucket (data should already be sorted, but ensure consistency)
-        for vec in buckets.values_mut() {
-            vec.sort_unstable();
-            vec.dedup();
-        }
-
-        Ok(buckets)
-    }
-
     /// Load only metadata from an index file (v5 format).
     ///
     /// This is much faster than load() because in v5 format all metadata is stored
@@ -973,32 +685,6 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_buckets_logic() -> Result<()> {
-        let mut index = Index::new(64, 50, 0).unwrap();
-
-        index.buckets.insert(10, vec![1, 2, 3]);
-        index.bucket_names.insert(10, "Source".into());
-        index.bucket_sources.insert(10, vec!["s1".into()]);
-
-        index.buckets.insert(20, vec![3, 4, 5]);
-        index.bucket_names.insert(20, "Dest".into());
-        index.bucket_sources.insert(20, vec!["d1".into()]);
-
-        index.merge_buckets(10, 20)?;
-
-        assert!(!index.buckets.contains_key(&10));
-        assert!(index.buckets.contains_key(&20));
-
-        let merged_vec = &index.buckets[&20];
-        assert_eq!(merged_vec, &vec![1, 2, 3, 4, 5]);
-
-        let merged_sources = &index.bucket_sources[&20];
-        assert_eq!(merged_sources.len(), 2);
-
-        Ok(())
-    }
-
-    #[test]
     fn test_index_load_invalid_format() {
         let file = NamedTempFile::new().unwrap();
         let path = file.path();
@@ -1062,36 +748,6 @@ mod tests {
         let result = index.next_id();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("overflow"));
-    }
-
-    #[test]
-    fn test_merge_buckets_nonexistent_source() {
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![1, 2, 3]);
-
-        let result = index.merge_buckets(999, 1);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("does not exist"));
-    }
-
-    #[test]
-    fn test_merge_buckets_updates_minimizer_count() -> Result<()> {
-        let mut index = Index::new(64, 50, 0).unwrap();
-
-        index.buckets.insert(10, vec![1, 2, 3]);
-        index.bucket_names.insert(10, "Source".into());
-
-        index.buckets.insert(20, vec![3, 4, 5]);
-        index.bucket_names.insert(20, "Dest".into());
-
-        assert_eq!(index.buckets[&20].len(), 3);
-
-        index.merge_buckets(10, 20)?;
-
-        assert_eq!(index.buckets[&20].len(), 5);
-        assert_eq!(index.buckets[&20], vec![1, 2, 3, 4, 5]);
-
-        Ok(())
     }
 
     #[test]
@@ -1372,80 +1028,5 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("Invalid K value"));
 
         Ok(())
-    }
-
-    #[cfg(feature = "parquet")]
-    #[test]
-    fn test_index_parquet_round_trip() {
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let parquet_path = tmp.path().join("test.ryidx");
-
-        // Create test index
-        let mut index = Index::new(64, 50, 0x12345).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300]);
-        index.buckets.insert(2, vec![400, 500]);
-        index.bucket_names.insert(1, "Bacteria".to_string());
-        index.bucket_names.insert(2, "Archaea".to_string());
-        index
-            .bucket_sources
-            .insert(1, vec!["ecoli.fna".to_string()]);
-        index
-            .bucket_sources
-            .insert(2, vec!["haloferax.fna".to_string()]);
-
-        // Save as Parquet
-        index.save_parquet(&parquet_path).unwrap();
-
-        // Verify directory structure exists
-        assert!(parquet_path.is_dir());
-        assert!(parquet_path.join("manifest.toml").exists());
-        assert!(parquet_path.join("buckets.parquet").exists());
-        assert!(parquet_path.join("main.parquet").exists());
-
-        // Load back
-        let loaded = Index::load(&parquet_path).unwrap();
-
-        // Verify data matches
-        assert_eq!(loaded.k, 64);
-        assert_eq!(loaded.w, 50);
-        assert_eq!(loaded.salt, 0x12345);
-        assert_eq!(loaded.buckets.len(), 2);
-        assert_eq!(loaded.buckets.get(&1), Some(&vec![100u64, 200, 300]));
-        assert_eq!(loaded.buckets.get(&2), Some(&vec![400u64, 500]));
-        assert_eq!(loaded.bucket_names.get(&1), Some(&"Bacteria".to_string()));
-        assert_eq!(loaded.bucket_names.get(&2), Some(&"Archaea".to_string()));
-    }
-
-    #[cfg(feature = "parquet")]
-    #[test]
-    fn test_index_format_detection() {
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-
-        // Legacy file
-        let legacy_path = tmp.path().join("legacy.ryidx");
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100]);
-        index.bucket_names.insert(1, "test".to_string());
-        index.save(&legacy_path).unwrap();
-        assert_eq!(
-            IndexFormat::detect(&legacy_path).unwrap(),
-            IndexFormat::Legacy
-        );
-
-        // Parquet directory
-        let parquet_path = tmp.path().join("parquet.ryidx");
-        index.save_parquet(&parquet_path).unwrap();
-        assert_eq!(
-            IndexFormat::detect(&parquet_path).unwrap(),
-            IndexFormat::Parquet
-        );
-
-        // Non-existent path
-        let missing_path = tmp.path().join("missing.ryidx");
-        assert!(IndexFormat::detect(&missing_path).is_err());
     }
 }

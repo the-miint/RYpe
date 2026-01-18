@@ -10,7 +10,9 @@ use rype::c_api::{
     rype_index_num_shards, rype_index_salt, rype_index_w, rype_negative_set_create,
     rype_negative_set_free, rype_negative_set_size, rype_results_free, RypeIndex, RypeQuery,
 };
-use rype::{Index, InvertedIndex, MinimizerWorkspace, ShardManifest, ShardedMainIndexBuilder};
+use rype::{
+    Index, InvertedIndex, MinimizerWorkspace, ShardFormat, ShardManifest, ShardedMainIndexBuilder,
+};
 use std::ffi::CString;
 use std::ptr;
 use tempfile::tempdir;
@@ -247,7 +249,11 @@ fn test_unified_load_sharded_inverted_index() -> Result<()> {
         total_minimizers: inverted.num_minimizers(),
         total_bucket_ids: inverted.num_bucket_entries(),
         has_overlapping_shards: true,
+        shard_format: ShardFormat::Legacy,
         shards: vec![shard_info],
+        bucket_names: std::collections::HashMap::new(),
+        bucket_sources: std::collections::HashMap::new(),
+        bucket_minimizer_counts: std::collections::HashMap::new(),
     };
     let manifest_path = ShardManifest::manifest_path(&inverted_path);
     manifest.save(&manifest_path)?;
@@ -291,7 +297,11 @@ fn test_unified_classify_sharded_inverted_index() -> Result<()> {
         total_minimizers: inverted.num_minimizers(),
         total_bucket_ids: inverted.num_bucket_entries(),
         has_overlapping_shards: true,
+        shard_format: ShardFormat::Legacy,
         shards: vec![shard_info],
+        bucket_names: std::collections::HashMap::new(),
+        bucket_sources: std::collections::HashMap::new(),
+        bucket_minimizer_counts: std::collections::HashMap::new(),
     };
     let manifest_path = ShardManifest::manifest_path(&inverted_path);
     manifest.save(&manifest_path)?;
@@ -480,7 +490,11 @@ fn test_unified_results_consistent_across_formats() -> Result<()> {
         total_minimizers: inverted.num_minimizers(),
         total_bucket_ids: inverted.num_bucket_entries(),
         has_overlapping_shards: true,
+        shard_format: ShardFormat::Legacy,
         shards: vec![shard_info],
+        bucket_names: std::collections::HashMap::new(),
+        bucket_sources: std::collections::HashMap::new(),
+        bucket_minimizer_counts: std::collections::HashMap::new(),
     };
     let manifest_path = ShardManifest::manifest_path(&sharded_inv_path);
     manifest.save(&manifest_path)?;

@@ -808,6 +808,7 @@ fn accumulate_merge_join(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sharded::ShardFormat;
     use crate::workspace::MinimizerWorkspace;
 
     #[test]
@@ -899,7 +900,11 @@ mod tests {
             total_minimizers: inverted.num_minimizers(),
             total_bucket_ids: inverted.num_bucket_entries(),
             has_overlapping_shards: true,
+            shard_format: ShardFormat::Legacy,
             shards: vec![shard_info],
+            bucket_names: std::collections::HashMap::new(),
+            bucket_sources: std::collections::HashMap::new(),
+            bucket_minimizer_counts: std::collections::HashMap::new(),
         };
         let manifest_path = ShardManifest::manifest_path(&base_path);
         manifest.save(&manifest_path)?;
@@ -978,7 +983,11 @@ mod tests {
             total_minimizers: inverted.num_minimizers(),
             total_bucket_ids: inverted.num_bucket_entries(),
             has_overlapping_shards: true,
+            shard_format: ShardFormat::Legacy,
             shards: vec![shard_info],
+            bucket_names: std::collections::HashMap::new(),
+            bucket_sources: std::collections::HashMap::new(),
+            bucket_minimizer_counts: std::collections::HashMap::new(),
         };
         let manifest_path = ShardManifest::manifest_path(&base_path);
         manifest.save(&manifest_path)?;
@@ -1313,7 +1322,11 @@ mod tests {
             total_minimizers: inverted.num_minimizers(),
             total_bucket_ids: inverted.num_bucket_entries(),
             has_overlapping_shards: true,
+            shard_format: ShardFormat::Legacy,
             shards: vec![shard_info],
+            bucket_names: std::collections::HashMap::new(),
+            bucket_sources: std::collections::HashMap::new(),
+            bucket_minimizer_counts: std::collections::HashMap::new(),
         };
         let manifest_path = ShardManifest::manifest_path(&base_path);
         manifest.save(&manifest_path)?;
@@ -1375,7 +1388,11 @@ mod tests {
             total_minimizers: inverted.num_minimizers(),
             total_bucket_ids: inverted.num_bucket_entries(),
             has_overlapping_shards: true,
+            shard_format: ShardFormat::Legacy,
             shards: vec![shard_info],
+            bucket_names: std::collections::HashMap::new(),
+            bucket_sources: std::collections::HashMap::new(),
+            bucket_minimizer_counts: std::collections::HashMap::new(),
         };
         let manifest_path = ShardManifest::manifest_path(&base_path);
         manifest.save(&manifest_path)?;
@@ -1604,12 +1621,16 @@ mod tests {
             total_minimizers: inverted.num_minimizers(),
             total_bucket_ids: inverted.num_bucket_entries(),
             has_overlapping_shards: true,
+            shard_format: ShardFormat::Parquet,
             shards: vec![shard_info],
+            bucket_names: std::collections::HashMap::new(),
+            bucket_sources: std::collections::HashMap::new(),
+            bucket_minimizer_counts: std::collections::HashMap::new(),
         };
         let manifest_path = ShardManifest::manifest_path(&base_path);
         manifest.save(&manifest_path)?;
 
-        // Open with auto-detection (should detect Parquet)
+        // Open with auto-detection (should detect Parquet from manifest)
         let sharded = ShardedInvertedIndex::open(&base_path)?;
         assert_eq!(sharded.shard_format(), ShardFormat::Parquet);
 
@@ -1684,7 +1705,11 @@ mod tests {
             total_minimizers: inverted.num_minimizers(),
             total_bucket_ids: inverted.num_bucket_entries(),
             has_overlapping_shards: true,
+            shard_format: ShardFormat::Legacy,
             shards: vec![shard_info],
+            bucket_names: std::collections::HashMap::new(),
+            bucket_sources: std::collections::HashMap::new(),
+            bucket_minimizer_counts: std::collections::HashMap::new(),
         };
         let manifest_path = ShardManifest::manifest_path(&base_path);
         manifest.save(&manifest_path)?;
@@ -1756,7 +1781,11 @@ mod tests {
             total_minimizers: inverted.num_minimizers(),
             total_bucket_ids: inverted.num_bucket_entries(),
             has_overlapping_shards: true,
+            shard_format: ShardFormat::Legacy,
             shards: vec![legacy_shard_info],
+            bucket_names: std::collections::HashMap::new(),
+            bucket_sources: std::collections::HashMap::new(),
+            bucket_minimizer_counts: std::collections::HashMap::new(),
         };
         legacy_manifest.save(&ShardManifest::manifest_path(&legacy_base))?;
 
@@ -1772,7 +1801,11 @@ mod tests {
             total_minimizers: inverted.num_minimizers(),
             total_bucket_ids: inverted.num_bucket_entries(),
             has_overlapping_shards: true,
+            shard_format: ShardFormat::Parquet,
             shards: vec![parquet_shard_info],
+            bucket_names: std::collections::HashMap::new(),
+            bucket_sources: std::collections::HashMap::new(),
+            bucket_minimizer_counts: std::collections::HashMap::new(),
         };
         parquet_manifest.save(&ShardManifest::manifest_path(&parquet_base))?;
 

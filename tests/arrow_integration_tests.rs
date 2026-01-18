@@ -18,7 +18,8 @@ use rype::arrow::{
     COL_SEQUENCE,
 };
 use rype::{
-    classify_batch, Index, InvertedIndex, MinimizerWorkspace, ShardManifest, ShardedInvertedIndex,
+    classify_batch, Index, InvertedIndex, MinimizerWorkspace, ShardFormat, ShardManifest,
+    ShardedInvertedIndex,
 };
 
 /// Generate a DNA sequence of given length with a deterministic pattern.
@@ -308,7 +309,11 @@ fn test_arrow_with_inverted_index() -> Result<()> {
         total_minimizers: inverted.num_minimizers(),
         total_bucket_ids: inverted.num_bucket_entries(),
         has_overlapping_shards: true,
+        shard_format: ShardFormat::Legacy,
         shards: vec![shard_info],
+        bucket_names: std::collections::HashMap::new(),
+        bucket_sources: std::collections::HashMap::new(),
+        bucket_minimizer_counts: std::collections::HashMap::new(),
     };
     let manifest_path = ShardManifest::manifest_path(&inverted_path);
     manifest.save(&manifest_path)?;

@@ -66,6 +66,12 @@ cargo run --release -- classify run -i index.ryidx -1 reads_R1.fastq -2 reads_R2
 
 # Aggregate classification (for higher sensitivity)
 cargo run --release -- classify aggregate -i index.ryidx -1 reads.fastq -t 0.05
+
+# Create Parquet inverted index directly (recommended for large indices)
+cargo run --release --features parquet -- index create -o index.ryxdi -r ref.fasta --parquet
+
+# Classify using Parquet index (auto-detected)
+cargo run --release --features parquet -- classify run -i index.ryxdi -1 reads.fastq --use-inverted
 ```
 
 ## Architecture Overview
@@ -262,6 +268,51 @@ cargo run --release -- index invert -i sharded.ryidx
 
 # Classification with inverted index
 cargo run --release -- classify run -i index.ryidx --use-inverted -1 reads.fq
+```
+
+### Parquet Inverted Index (Direct Creation)
+
+For large indices, Parquet format can be created directly from reference sequences, bypassing the main index entirely:
+
+```
+index.ryxdi/
+├── manifest.toml           # TOML metadata (k, w, salt, bucket info)
+├── buckets.parquet         # (bucket_id, bucket_name, sources)
+└── inverted/
+    ├── shard.0.parquet     # (minimizer: u64, bucket_id: u32) sorted pairs
+    └── ...                 # Additional shards for large indices
+```
+
+**Manifest Format (TOML)**:
+```toml
+magic = "RYPE_PARQUET_V1"
+format_version = 1
+k = 64
+w = 50
+salt = "0x5555555555555555"  # Hex string for large values
+source_hash = "0xDEADBEEF"
+num_buckets = 10
+total_minimizers = 1000000
+
+[inverted]
+num_shards = 2
+total_entries = 5000000
+has_overlapping_shards = true  # Buckets may share minimizers across shards
+```
+
+**Benefits**:
+- Direct creation bypasses intermediate main index (saves memory)
+- Parquet provides efficient columnar storage with DELTA_BINARY_PACKED encoding
+- Streaming k-way merge enables building large indices with bounded memory
+- Human-readable TOML manifest for easy inspection
+
+**Usage**:
+```bash
+# Create Parquet inverted index directly from references
+cargo run --release --features parquet -- index create -o index.ryxdi -r refs.fa --parquet
+
+# Classify using Parquet index (auto-detected by directory format)
+cargo run --release --features parquet -- classify run -i index.ryxdi -1 reads.fq --use-inverted
 ```
 
 **Memory Benefits**:

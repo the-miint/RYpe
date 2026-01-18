@@ -11,7 +11,7 @@ use tempfile::tempdir;
 use rype::{
     classify_batch, classify_batch_sharded_main, classify_batch_sharded_merge_join,
     classify_batch_sharded_sequential, HitResult, Index, IndexMetadata, InvertedIndex,
-    MainIndexManifest, MainIndexShard, MinimizerWorkspace, QueryRecord, ShardManifest,
+    MainIndexManifest, MainIndexShard, MinimizerWorkspace, QueryRecord, ShardFormat, ShardManifest,
     ShardedInvertedIndex, ShardedMainIndex,
 };
 
@@ -268,7 +268,11 @@ fn test_sharded_inverted_from_non_sharded_main() -> Result<()> {
         total_minimizers: inverted.num_minimizers(),
         total_bucket_ids: inverted.num_bucket_entries(),
         has_overlapping_shards: true,
+        shard_format: ShardFormat::Legacy,
         shards: vec![shard_info],
+        bucket_names: HashMap::new(),
+        bucket_sources: HashMap::new(),
+        bucket_minimizer_counts: HashMap::new(),
     };
     let manifest_path = ShardManifest::manifest_path(&inverted_path);
     manifest.save(&manifest_path)?;
@@ -450,7 +454,11 @@ fn test_inverted_from_sharded_main() -> Result<()> {
         total_minimizers,
         total_bucket_ids,
         has_overlapping_shards: true,
+        shard_format: ShardFormat::Legacy,
         shards: inv_shards,
+        bucket_names: HashMap::new(),
+        bucket_sources: HashMap::new(),
+        bucket_minimizer_counts: HashMap::new(),
     };
 
     eprintln!("\n=== Manifest ===");
@@ -785,7 +793,11 @@ fn test_user_scenario_sharded_inverted_from_sharded_main() -> Result<()> {
         total_minimizers,
         total_bucket_ids,
         has_overlapping_shards: true,
+        shard_format: ShardFormat::Legacy,
         shards: inv_shards,
+        bucket_names: HashMap::new(),
+        bucket_sources: HashMap::new(),
+        bucket_minimizer_counts: HashMap::new(),
     };
 
     let manifest_path = ShardManifest::manifest_path(&inverted_path);
