@@ -7,9 +7,9 @@
 // Hot path: index-based iteration avoids iterator overhead in inner loops
 #![allow(clippy::needless_range_loop)]
 
+use super::encoding::{base_to_bit, reverse_complement};
+use super::workspace::MinimizerWorkspace;
 use crate::constants::ESTIMATED_MINIMIZERS_PER_SEQUENCE;
-use crate::encoding::{base_to_bit, reverse_complement};
-use crate::workspace::MinimizerWorkspace;
 
 /// Strand indicator for minimizer origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

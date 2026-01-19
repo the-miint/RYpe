@@ -15,15 +15,15 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use super::main::Index;
+use super::sharded::ShardInfo;
 use crate::constants::{
     MAX_INVERTED_BUCKET_IDS, MAX_INVERTED_MINIMIZERS, MAX_READS, PARQUET_BATCH_SIZE,
     QUERY_HASHSET_THRESHOLD, RC_FLAG_BIT, READ_BUF_SIZE, READ_INDEX_MASK, SHARD_MAGIC,
     SHARD_VERSION, WRITE_BUF_SIZE,
 };
-use crate::encoding::{decode_varint, encode_varint, VarIntError, MAX_VARINT_BYTES};
-use crate::index::Index;
-use crate::sharded::ShardInfo;
-use crate::sharded_main::MainIndexShard;
+use crate::core::encoding::{decode_varint, encode_varint, VarIntError, MAX_VARINT_BYTES};
+use crate::indices::sharded_main::MainIndexShard;
 use crate::types::IndexMetadata;
 
 /// CSR-format inverted index for fast minimizer → bucket lookups.
@@ -711,7 +711,7 @@ impl InvertedIndex {
         &self,
         path: &Path,
         shard_id: u32,
-        options: Option<&crate::parquet_index::ParquetWriteOptions>,
+        options: Option<&super::parquet::ParquetWriteOptions>,
     ) -> Result<ShardInfo> {
         use anyhow::Context;
         use arrow::array::{ArrayRef, UInt32Builder, UInt64Builder};
@@ -1353,7 +1353,7 @@ impl InvertedIndex {
         salt: u64,
         source_hash: u64,
         query_minimizers: &[u64],
-        options: Option<&crate::parquet_index::ParquetReadOptions>,
+        options: Option<&super::parquet::ParquetReadOptions>,
     ) -> Result<Self> {
         use anyhow::Context;
         use arrow::array::{Array, UInt32Array, UInt64Array};
@@ -1670,6 +1670,44 @@ impl InvertedIndex {
             bucket_ids: bucket_ids_out,
         })
     }
+
+    /// Accumulate hits for a single matching minimizer pair.
+    ///
+    /// This method encapsulates access to internal CSR arrays, allowing callers
+    /// to accumulate hits without directly accessing the internal representation.
+    ///
+    /// # Arguments
+    /// * `query_idx` - The query inverted index
+    /// * `qi` - Index into query_idx.minimizers for the matching minimizer
+    /// * `ri` - Index into self.minimizers for the matching minimizer
+    /// * `accumulators` - Per-read accumulators mapping bucket_id -> (fwd_hits, rc_hits)
+    #[inline]
+    pub fn accumulate_hits_for_match(
+        &self,
+        query_idx: &QueryInvertedIndex,
+        qi: usize,
+        ri: usize,
+        accumulators: &mut [HashMap<u32, (u32, u32)>],
+    ) {
+        let q_start = query_idx.offsets[qi] as usize;
+        let q_end = query_idx.offsets[qi + 1] as usize;
+        let r_start = self.offsets[ri] as usize;
+        let r_end = self.offsets[ri + 1] as usize;
+
+        for &packed in &query_idx.read_ids[q_start..q_end] {
+            let (read_idx, is_rc) = QueryInvertedIndex::unpack_read_id(packed);
+            for &bucket_id in &self.bucket_ids[r_start..r_end] {
+                let entry = accumulators[read_idx as usize]
+                    .entry(bucket_id)
+                    .or_insert((0, 0));
+                if is_rc {
+                    entry.1 += 1;
+                } else {
+                    entry.0 += 1;
+                }
+            }
+        }
+    }
 }
 
 /// Query inverted index for merge-join classification.
@@ -1858,7 +1896,7 @@ impl QueryInvertedIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::Index;
+    use crate::indices::main::Index;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -2101,7 +2139,7 @@ mod tests {
 
     #[test]
     fn test_build_from_shard() {
-        use crate::sharded_main::MainIndexShard;
+        use crate::indices::sharded_main::MainIndexShard;
 
         // Create a main index shard with some buckets
         let mut shard = MainIndexShard {
@@ -2135,7 +2173,7 @@ mod tests {
 
     #[test]
     fn test_build_from_shard_empty() {
-        use crate::sharded_main::MainIndexShard;
+        use crate::indices::sharded_main::MainIndexShard;
 
         let shard = MainIndexShard {
             k: 64,
@@ -2157,7 +2195,7 @@ mod tests {
 
     #[test]
     fn test_build_from_shard_single_bucket() {
-        use crate::sharded_main::MainIndexShard;
+        use crate::indices::sharded_main::MainIndexShard;
 
         let mut shard = MainIndexShard {
             k: 32,
@@ -2181,7 +2219,7 @@ mod tests {
 
     #[test]
     fn test_build_from_shard_high_overlap() {
-        use crate::sharded_main::MainIndexShard;
+        use crate::indices::sharded_main::MainIndexShard;
 
         // All buckets share all minimizers (maximum overlap)
         let mut shard = MainIndexShard {
@@ -2214,7 +2252,7 @@ mod tests {
 
     #[test]
     fn test_build_from_shard_matches_build_from_index() {
-        use crate::sharded_main::MainIndexShard;
+        use crate::indices::sharded_main::MainIndexShard;
 
         // Create identical data as both Index and MainIndexShard
         let mut index = Index::new(64, 50, 0x1234).unwrap();
@@ -3130,7 +3168,7 @@ mod tests {
     /// via the `AsBytes` trait, so the bit pattern must be preserved.
     #[test]
     fn test_bloom_filter_high_value_minimizers() -> Result<()> {
-        use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};
+        use crate::indices::parquet::{ParquetReadOptions, ParquetWriteOptions};
         use tempfile::TempDir;
 
         let tmp = TempDir::new()?;
@@ -3192,7 +3230,7 @@ mod tests {
     /// Test that bloom filter correctly rejects minimizers that are NOT in the file.
     #[test]
     fn test_bloom_filter_rejects_absent_minimizers() -> Result<()> {
-        use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};
+        use crate::indices::parquet::{ParquetReadOptions, ParquetWriteOptions};
         use tempfile::TempDir;
 
         let tmp = TempDir::new()?;
@@ -3266,7 +3304,7 @@ mod tests {
     /// Test bloom filter graceful fallback when file has no bloom filters.
     #[test]
     fn test_bloom_filter_graceful_fallback() -> Result<()> {
-        use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};
+        use crate::indices::parquet::{ParquetReadOptions, ParquetWriteOptions};
         use tempfile::TempDir;
 
         let tmp = TempDir::new()?;
@@ -3316,7 +3354,7 @@ mod tests {
     /// Test bloom filter with empty query (edge case).
     #[test]
     fn test_bloom_filter_empty_query() -> Result<()> {
-        use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};
+        use crate::indices::parquet::{ParquetReadOptions, ParquetWriteOptions};
         use tempfile::TempDir;
 
         let tmp = TempDir::new()?;
@@ -3374,7 +3412,7 @@ mod tests {
     /// Test that bloom filter accepts values that ARE present (no false negatives).
     #[test]
     fn test_bloom_filter_no_false_negatives() -> Result<()> {
-        use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};
+        use crate::indices::parquet::{ParquetReadOptions, ParquetWriteOptions};
         use tempfile::TempDir;
 
         let tmp = TempDir::new()?;

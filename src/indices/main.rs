@@ -17,15 +17,15 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use super::sharded_main::{plan_shards, MainIndexManifest, ShardedMainIndexBuilder};
 use crate::constants::{
     BUCKET_SOURCE_DELIM, MAX_BUCKET_SIZE, MAX_NUM_BUCKETS, MAX_STRING_LENGTH, READ_BUF_SIZE,
     SINGLE_FILE_INDEX_MAGIC, SINGLE_FILE_INDEX_VERSION, WRITE_BUF_SIZE,
 };
-use crate::encoding::{decode_varint, encode_varint, VarIntError};
-use crate::extraction::extract_into;
-use crate::sharded_main::{plan_shards, MainIndexManifest, ShardedMainIndexBuilder};
+use crate::core::encoding::{decode_varint, encode_varint, VarIntError};
+use crate::core::extraction::extract_into;
+use crate::core::workspace::MinimizerWorkspace;
 use crate::types::IndexMetadata;
-use crate::workspace::MinimizerWorkspace;
 
 /// Primary index for storing minimizer buckets.
 ///

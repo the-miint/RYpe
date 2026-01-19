@@ -1299,12 +1299,12 @@ mod tests {
     #[test]
     fn test_streaming_parquet_matches_traditional() {
         use crate::classify::classify_batch_sharded_sequential;
-        use crate::extraction::extract_into;
-        use crate::index::Index;
-        use crate::inverted::InvertedIndex;
-        use crate::sharded::{ShardFormat, ShardManifest, ShardedInvertedIndex};
+        use crate::core::extraction::extract_into;
+        use crate::core::workspace::MinimizerWorkspace;
+        use crate::indices::inverted::InvertedIndex;
+        use crate::indices::main::Index;
+        use crate::indices::sharded::{ShardFormat, ShardManifest, ShardedInvertedIndex};
         use crate::types::QueryRecord;
-        use crate::workspace::MinimizerWorkspace;
 
         let tmp = TempDir::new().unwrap();
         let streaming_dir = tmp.path().join("streaming.ryxdi");
@@ -1523,8 +1523,8 @@ mod tests {
 
     #[test]
     fn test_parquet_write_with_zstd() {
-        use crate::extraction::extract_into;
-        use crate::workspace::MinimizerWorkspace;
+        use crate::core::extraction::extract_into;
+        use crate::core::workspace::MinimizerWorkspace;
 
         let tmp = TempDir::new().unwrap();
         let index_dir = tmp.path().join("zstd_test.ryxdi");
@@ -1572,8 +1572,8 @@ mod tests {
 
     #[test]
     fn test_parquet_write_with_bloom_filter() {
-        use crate::extraction::extract_into;
-        use crate::workspace::MinimizerWorkspace;
+        use crate::core::extraction::extract_into;
+        use crate::core::workspace::MinimizerWorkspace;
         use parquet::file::reader::FileReader;
 
         let tmp = TempDir::new().unwrap();

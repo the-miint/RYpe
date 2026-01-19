@@ -14,10 +14,10 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use super::inverted::InvertedIndex;
 use crate::constants::{
     MANIFEST_MAGIC, MANIFEST_VERSION, MAX_INVERTED_BUCKET_IDS, MAX_INVERTED_MINIMIZERS, MAX_SHARDS,
 };
-use crate::inverted::InvertedIndex;
 use crate::types::IndexMetadata;
 
 /// Format for inverted index shard files.
@@ -549,13 +549,13 @@ impl ShardedInvertedIndex {
     /// This is for indices created with `--parquet` flag where the directory
     /// contains manifest.toml instead of .manifest binary file.
     pub fn open_parquet(base_path: &Path) -> Result<Self> {
-        use crate::parquet_index::{self, ParquetManifest};
+        use super::parquet::ParquetManifest;
 
         // Load Parquet manifest
         let parquet_manifest = ParquetManifest::load(base_path)?;
 
         // Load bucket metadata from buckets.parquet
-        let (bucket_names, bucket_sources) = parquet_index::read_buckets_parquet(base_path)?;
+        let (bucket_names, bucket_sources) = super::parquet::read_buckets_parquet(base_path)?;
 
         // Convert to ShardManifest format
         let inverted = parquet_manifest
@@ -693,7 +693,7 @@ impl ShardedInvertedIndex {
         &self,
         shard_id: u32,
         query_minimizers: &[u64],
-        options: Option<&crate::parquet_index::ParquetReadOptions>,
+        options: Option<&super::parquet::ParquetReadOptions>,
     ) -> Result<InvertedIndex> {
         let path = self.shard_path(shard_id);
         match self.shard_format {
@@ -757,7 +757,7 @@ impl ShardedInvertedIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::Index;
+    use crate::indices::main::Index;
     use tempfile::NamedTempFile;
 
     #[test]

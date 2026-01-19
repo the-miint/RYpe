@@ -22,7 +22,7 @@ use crate::constants::{
     MAX_BUCKET_SIZE, MAX_MAIN_SHARDS, MAX_NUM_BUCKETS, MAX_SOURCES_PER_BUCKET, MAX_STRING_LENGTH,
     MAX_STRING_TABLE_BYTES, MAX_STRING_TABLE_ENTRIES, READ_BUF_SIZE, WRITE_BUF_SIZE,
 };
-use crate::encoding::{decode_varint, encode_varint, VarIntError};
+use crate::core::encoding::{decode_varint, encode_varint, VarIntError};
 use crate::types::IndexMetadata;
 
 /// Information about a single shard in a sharded main index.

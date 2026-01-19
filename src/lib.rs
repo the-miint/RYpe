@@ -26,70 +26,91 @@
 // Internal modules
 mod classify;
 mod constants;
-mod encoding;
+mod core;
 mod error;
-mod extraction;
-mod index;
-mod inverted;
-mod sharded;
-mod sharded_main;
+mod indices;
 mod types;
-mod workspace;
 
 // Public modules
 pub mod c_api;
 pub mod config;
 pub mod memory;
 
+// ============================================================================
+// Timing utilities (cross-cutting concern)
+// ============================================================================
+
+/// Controls whether timing diagnostics are printed to stderr.
+///
+/// Set to `true` to enable timing output for classification operations.
+/// This is useful for debugging and performance analysis.
+pub static ENABLE_TIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Print timing info to stderr if [`ENABLE_TIMING`] is enabled.
+#[inline]
+pub fn log_timing(phase: &str, elapsed_ms: u128) {
+    if ENABLE_TIMING.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[TIMING] {}: {}ms", phase, elapsed_ms);
+    }
+}
+
 // Arrow FFI integration (optional feature for exporting RecordBatches)
 #[cfg(feature = "arrow-ffi")]
 pub mod arrow;
 
-// Parquet-based index format
-pub mod parquet_index;
+// ============================================================================
+// Essential types (commonly used in most workflows)
+// ============================================================================
 
-// Re-export Parquet types
-pub use parquet_index::{
+// Core types
+pub use error::{Result as RypeResult, RypeError};
+pub use types::{HitResult, IndexMetadata, QueryRecord};
+
+// Primary index types
+pub use indices::{Index, InvertedIndex, ShardedInvertedIndex, ShardedMainIndex};
+
+// Minimizer extraction
+pub use core::{extract_into, get_paired_minimizers_into, MinimizerWorkspace, Strand};
+
+// Classification functions
+pub use classify::{
+    aggregate_batch, classify_batch, classify_batch_merge_join, classify_batch_sharded_main,
+    classify_batch_sharded_merge_join, classify_batch_sharded_sequential,
+};
+
+// ============================================================================
+// Specialized types (for advanced use cases - consider using qualified paths)
+// e.g., `rype::indices::sharded::ShardManifest` or `rype::parquet_index::ParquetWriteOptions`
+// ============================================================================
+
+// Core utilities (low-level extraction)
+pub use core::{
+    base_to_bit, count_hits, extract_dual_strand_into, extract_with_positions,
+    MinimizerWithPosition,
+};
+
+// Sharded index internals
+pub use indices::{
+    // Main index internals
+    estimate_bucket_bytes,
+    plan_shards,
+    MainIndexManifest,
+    MainIndexShard,
+    MainIndexShardInfo,
+    // Inverted index internals
+    QueryInvertedIndex,
+    ShardFormat,
+    ShardInfo,
+    ShardManifest,
+    ShardedMainIndexBuilder,
+};
+
+// Parquet index types (also available via `rype::parquet_index::*`)
+pub use indices::{
     compute_source_hash, create_parquet_inverted_index, is_parquet_index, BucketData,
     BucketMetadata, InvertedManifest, InvertedShardInfo, ParquetCompression, ParquetManifest,
     ParquetReadOptions, ParquetWriteOptions,
 };
 
-// Re-export types
-pub use types::{HitResult, IndexMetadata, QueryRecord};
-
-// Re-export error types
-pub use error::{Result as RypeResult, RypeError};
-
-// Re-export workspace
-pub use workspace::MinimizerWorkspace;
-
-// Re-export encoding utilities (only public function)
-pub use encoding::base_to_bit;
-
-// Re-export extraction functions and types
-pub use extraction::{
-    count_hits, extract_dual_strand_into, extract_into, extract_with_positions,
-    get_paired_minimizers_into, MinimizerWithPosition, Strand,
-};
-
-// Re-export index
-pub use index::Index;
-
-// Re-export inverted index
-pub use inverted::{InvertedIndex, QueryInvertedIndex};
-
-// Re-export sharded index types
-pub use sharded::{ShardFormat, ShardInfo, ShardManifest, ShardedInvertedIndex};
-
-// Re-export sharded main index types
-pub use sharded_main::{
-    estimate_bucket_bytes, plan_shards, MainIndexManifest, MainIndexShard, MainIndexShardInfo,
-    ShardedMainIndex, ShardedMainIndexBuilder,
-};
-
-// Re-export classification functions
-pub use classify::{
-    aggregate_batch, classify_batch, classify_batch_merge_join, classify_batch_sharded_main,
-    classify_batch_sharded_merge_join, classify_batch_sharded_sequential, ENABLE_TIMING,
-};
+// Re-export parquet module for qualified access
+pub use indices::parquet as parquet_index;
