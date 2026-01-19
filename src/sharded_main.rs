@@ -16,28 +16,14 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::constants::{MAX_BUCKET_SIZE, MAX_NUM_BUCKETS, MAX_STRING_LENGTH};
+use crate::constants::{
+    BUCKET_SOURCE_DELIM, BYTES_PER_MINIMIZER_COMPRESSED, BYTES_PER_MINIMIZER_MEMORY,
+    MAIN_MANIFEST_MAGIC, MAIN_MANIFEST_VERSION, MAIN_SHARD_MAGIC, MAIN_SHARD_VERSION,
+    MAX_BUCKET_SIZE, MAX_MAIN_SHARDS, MAX_NUM_BUCKETS, MAX_SOURCES_PER_BUCKET, MAX_STRING_LENGTH,
+    MAX_STRING_TABLE_BYTES, MAX_STRING_TABLE_ENTRIES, READ_BUF_SIZE, WRITE_BUF_SIZE,
+};
 use crate::encoding::{decode_varint, encode_varint, VarIntError};
 use crate::types::IndexMetadata;
-
-/// Maximum number of shards allowed (DoS protection)
-pub const MAX_MAIN_SHARDS: u32 = 10_000;
-
-/// Maximum total size of the string table in bytes (DoS protection)
-/// 100MB should be plenty for even very large indices
-pub const MAX_STRING_TABLE_BYTES: usize = 100_000_000;
-
-/// Maximum number of unique filenames in string table (DoS protection)
-pub const MAX_STRING_TABLE_ENTRIES: u32 = 10_000_000;
-
-/// Maximum number of sources per bucket (DoS protection)
-pub const MAX_SOURCES_PER_BUCKET: usize = 100_000_000;
-
-/// Bytes per minimizer for compressed output estimation (delta+varint+zstd)
-pub const BYTES_PER_MINIMIZER_COMPRESSED: usize = 4;
-
-/// Bytes per minimizer for in-memory estimation (u64 = 8 bytes)
-pub const BYTES_PER_MINIMIZER_MEMORY: usize = 8;
 
 /// Information about a single shard in a sharded main index.
 #[derive(Debug, Clone)]
@@ -85,8 +71,8 @@ impl MainIndexManifest {
         let mut writer = BufWriter::new(File::create(&temp_path)?);
 
         // Header
-        writer.write_all(b"RYPM")?;
-        writer.write_all(&2u32.to_le_bytes())?; // Version 2
+        writer.write_all(MAIN_MANIFEST_MAGIC)?;
+        writer.write_all(&MAIN_MANIFEST_VERSION.to_le_bytes())?;
 
         writer.write_all(&(self.k as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
@@ -159,7 +145,7 @@ impl MainIndexManifest {
 
         // Header
         reader.read_exact(&mut buf4)?;
-        if &buf4 != b"RYPM" {
+        if &buf4 != MAIN_MANIFEST_MAGIC {
             return Err(anyhow!(
                 "Invalid main index manifest format (expected RYPM)"
             ));
@@ -167,12 +153,13 @@ impl MainIndexManifest {
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != 2 {
+        if version != MAIN_MANIFEST_VERSION {
             return Err(anyhow!(
-                "Unsupported main index manifest version: {} (expected 2).\n\
+                "Unsupported main index manifest version: {} (expected {}).\n\
                  Version 1 manifests are no longer supported. Re-create the sharded index:\n  \
                  rype index shard -i <single-file.ryidx> -o <output.ryidx> --max-shard-size <size>",
-                version
+                version,
+                MAIN_MANIFEST_VERSION
             ));
         }
 
@@ -365,9 +352,6 @@ impl MainIndexManifest {
     }
 }
 
-/// Delimiter used to separate filename from sequence name in source strings.
-pub const SOURCE_DELIM: &str = "::";
-
 /// A single loaded shard containing a subset of buckets.
 ///
 /// Shards now store both minimizers and sources (v2 format).
@@ -398,8 +382,8 @@ impl MainIndexShard {
         let mut writer = BufWriter::new(File::create(&temp_path)?);
 
         // Header (uncompressed)
-        writer.write_all(b"RYPS")?;
-        writer.write_all(&2u32.to_le_bytes())?; // Version 2
+        writer.write_all(MAIN_SHARD_MAGIC)?;
+        writer.write_all(&MAIN_SHARD_VERSION.to_le_bytes())?;
         writer.write_all(&(self.k as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
         writer.write_all(&self.salt.to_le_bytes())?;
@@ -414,7 +398,7 @@ impl MainIndexShard {
         for bucket_id in self.buckets.keys() {
             let sources = self.bucket_sources.get(bucket_id).unwrap_or(&empty_sources);
             for source in sources {
-                let filename = source.split(SOURCE_DELIM).next().unwrap_or(source);
+                let filename = source.split(BUCKET_SOURCE_DELIM).next().unwrap_or(source);
                 if !filename_to_idx.contains_key(filename) {
                     // Check for string table overflow
                     let idx = u32::try_from(filenames.len()).map_err(|_| {
@@ -438,7 +422,6 @@ impl MainIndexShard {
         // Compressed stream
         let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
 
-        const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024;
         let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
         let mut varint_buf = [0u8; 10];
 
@@ -485,7 +468,7 @@ impl MainIndexShard {
 
             // Sources with string deduplication
             for source in sources {
-                let mut parts = source.splitn(2, SOURCE_DELIM);
+                let mut parts = source.splitn(2, BUCKET_SOURCE_DELIM);
                 let filename = parts.next().unwrap_or(source);
                 let seqname = parts.next().unwrap_or("");
 
@@ -549,18 +532,19 @@ impl MainIndexShard {
 
         // Header
         reader.read_exact(&mut buf4)?;
-        if &buf4 != b"RYPS" {
+        if &buf4 != MAIN_SHARD_MAGIC {
             return Err(anyhow!("Invalid main index shard format (expected RYPS)"));
         }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != 2 {
+        if version != MAIN_SHARD_VERSION {
             return Err(anyhow!(
-                "Unsupported main index shard version: {} (expected 2).\n\
+                "Unsupported main index shard version: {} (expected {}).\n\
                  Version 1 shards are no longer supported. Re-create the sharded index:\n  \
                  rype index shard -i <single-file.ryidx> -o <output.ryidx> --max-shard-size <size>",
-                version
+                version,
+                MAIN_SHARD_VERSION
             ));
         }
 
@@ -596,7 +580,6 @@ impl MainIndexShard {
         let mut decoder = zstd::stream::read::Decoder::new(reader)
             .map_err(|e| anyhow!("Failed to create zstd decoder: {}", e))?;
 
-        const READ_BUF_SIZE: usize = 8 * 1024 * 1024;
         let mut read_buf = vec![0u8; READ_BUF_SIZE];
         let mut buf_pos = 0usize;
         let mut buf_len = 0usize;
@@ -879,7 +862,7 @@ impl MainIndexShard {
                 let source = if seqname.is_empty() {
                     filename.clone()
                 } else {
-                    format!("{}{}{}", filename, SOURCE_DELIM, seqname)
+                    format!("{}{}{}", filename, BUCKET_SOURCE_DELIM, seqname)
                 };
                 sources.push(source);
             }
@@ -1676,7 +1659,7 @@ mod tests {
 
         // Write a v1 manifest (magic + version 1)
         let mut data = Vec::new();
-        data.extend_from_slice(b"RYPM");
+        data.extend_from_slice(MAIN_MANIFEST_MAGIC);
         data.extend_from_slice(&1u32.to_le_bytes());
         std::fs::write(path, data).unwrap();
 
@@ -1702,7 +1685,7 @@ mod tests {
 
         // Write a v1 shard (magic + version 1)
         let mut data = Vec::new();
-        data.extend_from_slice(b"RYPS");
+        data.extend_from_slice(MAIN_SHARD_MAGIC);
         data.extend_from_slice(&1u32.to_le_bytes());
         std::fs::write(path, data).unwrap();
 

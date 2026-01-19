@@ -14,7 +14,9 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::constants::{MAX_INVERTED_BUCKET_IDS, MAX_INVERTED_MINIMIZERS};
+use crate::constants::{
+    MANIFEST_MAGIC, MANIFEST_VERSION, MAX_INVERTED_BUCKET_IDS, MAX_INVERTED_MINIMIZERS, MAX_SHARDS,
+};
 use crate::inverted::InvertedIndex;
 use crate::types::IndexMetadata;
 
@@ -97,15 +99,12 @@ pub struct ShardManifest {
 }
 
 impl ShardManifest {
-    /// Maximum allowed shards in a manifest (prevents DoS via huge allocations)
-    const MAX_SHARDS: u32 = 10_000;
-
     /// Save the manifest to a file (v5 format with shard_format and bucket metadata).
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
 
-        writer.write_all(b"RYXM")?;
-        writer.write_all(&5u32.to_le_bytes())?; // Version 5 with shard_format
+        writer.write_all(MANIFEST_MAGIC)?;
+        writer.write_all(&MANIFEST_VERSION.to_le_bytes())?;
 
         writer.write_all(&(self.k as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
@@ -194,13 +193,13 @@ impl ShardManifest {
         let mut buf8 = [0u8; 8];
 
         reader.read_exact(&mut buf4)?;
-        if &buf4 != b"RYXM" {
+        if &buf4 != MANIFEST_MAGIC {
             return Err(anyhow!("Invalid shard manifest format (expected RYXM)"));
         }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if !matches!(version, 3..=5) {
+        if !matches!(version, 3..=MANIFEST_VERSION) {
             return Err(anyhow!(
                 "Unsupported inverted index manifest version: {} (expected 3, 4, or 5).\n\
                  This inverted index was created with an incompatible version. Regenerate it:\n  \
@@ -270,11 +269,11 @@ impl ShardManifest {
         reader.read_exact(&mut buf4)?;
         let num_shards = u32::from_le_bytes(buf4);
 
-        if num_shards > Self::MAX_SHARDS {
+        if num_shards > MAX_SHARDS {
             return Err(anyhow!(
                 "Too many shards: {} (max {})",
                 num_shards,
-                Self::MAX_SHARDS
+                MAX_SHARDS
             ));
         }
 
@@ -549,7 +548,6 @@ impl ShardedInvertedIndex {
     ///
     /// This is for indices created with `--parquet` flag where the directory
     /// contains manifest.toml instead of .manifest binary file.
-    #[cfg(feature = "parquet")]
     pub fn open_parquet(base_path: &Path) -> Result<Self> {
         use crate::parquet_index::{self, ParquetManifest};
 
@@ -662,25 +660,13 @@ impl ShardedInvertedIndex {
         let path = self.shard_path(shard_id);
         match self.shard_format {
             ShardFormat::Legacy => InvertedIndex::load_shard(&path),
-            ShardFormat::Parquet => {
-                #[cfg(feature = "parquet")]
-                {
-                    InvertedIndex::load_shard_parquet_with_params(
-                        &path,
-                        self.manifest.k,
-                        self.manifest.w,
-                        self.manifest.salt,
-                        self.manifest.source_hash,
-                    )
-                }
-                #[cfg(not(feature = "parquet"))]
-                {
-                    Err(anyhow!(
-                        "Parquet shard format requires --features parquet: {}",
-                        path.display()
-                    ))
-                }
-            }
+            ShardFormat::Parquet => InvertedIndex::load_shard_parquet_with_params(
+                &path,
+                self.manifest.k,
+                self.manifest.w,
+                self.manifest.salt,
+                self.manifest.source_hash,
+            ),
         }
     }
 
@@ -703,7 +689,6 @@ impl ShardedInvertedIndex {
     /// * `shard_id` - The shard to load
     /// * `query_minimizers` - Sorted slice of query minimizers
     /// * `options` - Parquet read options (None = default behavior without bloom filters)
-    #[cfg(feature = "parquet")]
     pub fn load_shard_for_query(
         &self,
         shard_id: u32,
@@ -726,28 +711,6 @@ impl ShardedInvertedIndex {
                 query_minimizers,
                 options,
             ),
-        }
-    }
-
-    /// An InvertedIndex containing only minimizers present in the query set.
-    /// (non-Parquet version for backward compatibility)
-    #[cfg(not(feature = "parquet"))]
-    pub fn load_shard_for_query(
-        &self,
-        shard_id: u32,
-        query_minimizers: &[u64],
-    ) -> Result<InvertedIndex> {
-        let path = self.shard_path(shard_id);
-        match self.shard_format {
-            ShardFormat::Legacy => {
-                // Legacy format doesn't support row group filtering
-                // Load full shard (caller will filter during merge-join)
-                InvertedIndex::load_shard(&path)
-            }
-            ShardFormat::Parquet => Err(anyhow!(
-                "Parquet shard format requires --features parquet: {}",
-                path.display()
-            )),
         }
     }
 
@@ -941,7 +904,7 @@ mod tests {
 
         // Write v3 format data
         let mut data = Vec::new();
-        data.extend_from_slice(b"RYXM"); // Magic
+        data.extend_from_slice(MANIFEST_MAGIC); // Magic
         data.extend_from_slice(&3u32.to_le_bytes()); // Version 3
         data.extend_from_slice(&64u64.to_le_bytes()); // k
         data.extend_from_slice(&50u64.to_le_bytes()); // w
@@ -1065,7 +1028,7 @@ mod tests {
         let path = file.path();
 
         let mut data = Vec::new();
-        data.extend_from_slice(b"RYXM");
+        data.extend_from_slice(MANIFEST_MAGIC);
         data.extend_from_slice(&99u32.to_le_bytes());
         std::fs::write(path, data).unwrap();
 
@@ -1084,7 +1047,7 @@ mod tests {
 
         // Write a v2 manifest (magic + version 2)
         let mut data = Vec::new();
-        data.extend_from_slice(b"RYXM");
+        data.extend_from_slice(MANIFEST_MAGIC);
         data.extend_from_slice(&2u32.to_le_bytes());
         std::fs::write(path, data).unwrap();
 

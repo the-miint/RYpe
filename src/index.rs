@@ -17,7 +17,10 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::constants::{MAX_BUCKET_SIZE, MAX_NUM_BUCKETS, MAX_STRING_LENGTH};
+use crate::constants::{
+    BUCKET_SOURCE_DELIM, MAX_BUCKET_SIZE, MAX_NUM_BUCKETS, MAX_STRING_LENGTH, READ_BUF_SIZE,
+    SINGLE_FILE_INDEX_MAGIC, SINGLE_FILE_INDEX_VERSION, WRITE_BUF_SIZE,
+};
 use crate::encoding::{decode_varint, encode_varint, VarIntError};
 use crate::extraction::extract_into;
 use crate::sharded_main::{plan_shards, MainIndexManifest, ShardedMainIndexBuilder};
@@ -45,8 +48,8 @@ pub struct Index {
 }
 
 impl Index {
-    /// Delimiter used for source names.
-    pub const BUCKET_SOURCE_DELIM: &'static str = "::";
+    /// Delimiter used for source names (re-exported from constants).
+    pub const BUCKET_SOURCE_DELIM: &'static str = BUCKET_SOURCE_DELIM;
 
     /// Create a new empty index.
     ///
@@ -137,8 +140,8 @@ impl Index {
     /// ~65% compression compared to raw u64 storage.
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
-        writer.write_all(b"RYP5")?;
-        writer.write_all(&5u32.to_le_bytes())?; // Version 5
+        writer.write_all(SINGLE_FILE_INDEX_MAGIC)?;
+        writer.write_all(&SINGLE_FILE_INDEX_VERSION.to_le_bytes())?;
         writer.write_all(&(self.k as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
         writer.write_all(&(self.salt).to_le_bytes())?;
@@ -184,7 +187,6 @@ impl Index {
         // Write all minimizers with delta+varint encoding (zstd compressed stream)
         let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
 
-        const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024;
         let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
         let mut varint_buf = [0u8; 10]; // Max 10 bytes for u64 varint
 
@@ -289,18 +291,17 @@ impl Index {
         let mut buf8 = [0u8; 8];
 
         reader.read_exact(&mut buf4)?;
-        if &buf4 != b"RYP5" {
+        if &buf4 != SINGLE_FILE_INDEX_MAGIC {
             return Err(anyhow!("Invalid Index Format (Expected RYP5)"));
         }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        const SUPPORTED_VERSION: u32 = 5;
-        if version != SUPPORTED_VERSION {
+        if version != SINGLE_FILE_INDEX_VERSION {
             return Err(anyhow!(
                 "Unsupported index version: {} (expected {})",
                 version,
-                SUPPORTED_VERSION
+                SINGLE_FILE_INDEX_VERSION
             ));
         }
 
@@ -387,7 +388,6 @@ impl Index {
             .map_err(|e| anyhow!("Failed to create zstd decoder: {}", e))?;
 
         // Read buffer - we read in chunks and decode varints from the buffer
-        const READ_BUF_SIZE: usize = 8 * 1024 * 1024;
         let mut read_buf = vec![0u8; READ_BUF_SIZE];
         let mut buf_pos = 0usize;
         let mut buf_len = 0usize;
@@ -522,18 +522,17 @@ impl Index {
         let mut buf8 = [0u8; 8];
 
         reader.read_exact(&mut buf4)?;
-        if &buf4 != b"RYP5" {
+        if &buf4 != SINGLE_FILE_INDEX_MAGIC {
             return Err(anyhow!("Invalid Index Format (Expected RYP5)"));
         }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        const SUPPORTED_VERSION: u32 = 5;
-        if version != SUPPORTED_VERSION {
+        if version != SINGLE_FILE_INDEX_VERSION {
             return Err(anyhow!(
                 "Unsupported index version: {} (expected {})",
                 version,
-                SUPPORTED_VERSION
+                SINGLE_FILE_INDEX_VERSION
             ));
         }
 

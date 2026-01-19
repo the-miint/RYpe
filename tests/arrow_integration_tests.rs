@@ -3,7 +3,7 @@
 //! These tests verify end-to-end functionality of the Arrow integration,
 //! including consistency with the regular API and streaming behavior.
 
-#![cfg(feature = "arrow")]
+#![cfg(feature = "arrow-ffi")]
 
 use anyhow::Result;
 use arrow::array::{Array, BinaryArray, Float64Array, Int64Array, UInt32Array};

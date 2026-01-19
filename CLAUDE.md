@@ -111,6 +111,34 @@ Implementation uses monotonic deque for O(n) time complexity (see `extract_into(
 **HitResult** (src/lib.rs:40-45):
 - Classification result: query_id, bucket_id, score
 
+### Constants Module (src/constants.rs)
+
+Centralized constants for consistency and maintainability:
+
+**Binary Format Identifiers:**
+- `SINGLE_FILE_INDEX_MAGIC` (b"RYP5") - Single-file .ryidx format
+- `MAIN_MANIFEST_MAGIC` (b"RYPM") - Sharded main index manifest
+- `MAIN_SHARD_MAGIC` (b"RYPS") - Sharded main index shards
+- `MANIFEST_MAGIC` (b"RYXM") - Inverted index manifest
+- `SHARD_MAGIC` (b"RYXS") - Inverted index shards
+
+**Version Numbers:**
+- `SINGLE_FILE_INDEX_VERSION` = 5 - Current single-file format
+- `MAIN_MANIFEST_VERSION` = 2 - Sharded main manifest
+- `MAIN_SHARD_VERSION` = 2 - Sharded main shards
+- `MANIFEST_VERSION` = 5 - Inverted manifest (supports 3-5)
+- `SHARD_VERSION` = 1 - Inverted shards
+
+**Safety Limits:**
+- `MAX_BUCKET_SIZE`, `MAX_NUM_BUCKETS`, `MAX_STRING_LENGTH` - DoS protection
+- `MAX_SHARDS`, `MAX_MAIN_SHARDS` - Shard count limits
+- `MAX_READS` - Bit-packing limit (2^31 - 1)
+
+**Performance Tuning:**
+- `GALLOP_THRESHOLD` = 16 - Merge-join vs galloping switch point
+- `QUERY_HASHSET_THRESHOLD` = 1000 - Linear vs HashSet lookup
+- `PARQUET_BATCH_SIZE`, `DEFAULT_ROW_GROUP_SIZE` - Parquet I/O sizing
+
 ### Core Algorithms
 
 **Minimizer Extraction** (src/lib.rs:78-169):

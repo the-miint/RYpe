@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::constants::{ESTIMATED_BUCKETS_PER_READ, GALLOP_THRESHOLD};
 use crate::extraction::{count_hits, get_paired_minimizers_into};
 use crate::index::Index;
 use crate::inverted::{InvertedIndex, QueryInvertedIndex};
@@ -164,7 +165,6 @@ pub fn classify_batch(
 ///
 /// # Returns
 /// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
-#[cfg(feature = "parquet")]
 pub fn classify_batch_sharded_sequential(
     sharded: &ShardedInvertedIndex,
     negative_mins: Option<&HashSet<u64>>,
@@ -262,101 +262,6 @@ pub fn classify_batch_sharded_sequential(
     Ok(results)
 }
 
-/// Classify a batch of records against a sharded inverted index (non-Parquet version).
-#[cfg(not(feature = "parquet"))]
-pub fn classify_batch_sharded_sequential(
-    sharded: &ShardedInvertedIndex,
-    negative_mins: Option<&HashSet<u64>>,
-    records: &[QueryRecord],
-    threshold: f64,
-) -> Result<Vec<HitResult>> {
-    let t_start = Instant::now();
-    let manifest = sharded.manifest();
-
-    let t_extract = Instant::now();
-    let processed: Vec<_> = records
-        .par_iter()
-        .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
-            let (ha, hb) =
-                get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
-            let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
-            (*id, fa, fb)
-        })
-        .collect();
-    log_timing("sequential: extraction", t_extract.elapsed().as_millis());
-
-    let all_hits: Vec<Mutex<HashMap<u32, (usize, usize)>>> = (0..processed.len())
-        .map(|_| Mutex::new(HashMap::new()))
-        .collect();
-
-    // Build sorted unique minimizers for filtered loading
-    let mut all_minimizers: Vec<u64> = processed
-        .iter()
-        .flat_map(|(_, fwd, rc)| fwd.iter().chain(rc.iter()).copied())
-        .collect();
-    all_minimizers.sort_unstable();
-    all_minimizers.dedup();
-
-    let mut total_shard_load_ms = 0u128;
-    let mut total_shard_query_ms = 0u128;
-
-    for shard_info in &manifest.shards {
-        let t_load = Instant::now();
-        let shard = sharded.load_shard_for_query(shard_info.shard_id, &all_minimizers)?;
-        total_shard_load_ms += t_load.elapsed().as_millis();
-
-        let t_query = Instant::now();
-        processed
-            .par_iter()
-            .enumerate()
-            .for_each(|(idx, (_, fwd_mins, rc_mins))| {
-                let fwd_hits = shard.get_bucket_hits(fwd_mins);
-                let rc_hits = shard.get_bucket_hits(rc_mins);
-
-                let mut hits = all_hits[idx].lock().unwrap();
-                for (bucket_id, count) in fwd_hits {
-                    hits.entry(bucket_id).or_insert((0, 0)).0 += count;
-                }
-                for (bucket_id, count) in rc_hits {
-                    hits.entry(bucket_id).or_insert((0, 0)).1 += count;
-                }
-            });
-        total_shard_query_ms += t_query.elapsed().as_millis();
-    }
-    log_timing("sequential: shard_load_total", total_shard_load_ms);
-    log_timing("sequential: shard_query_total", total_shard_query_ms);
-
-    let t_score = Instant::now();
-    let results: Vec<HitResult> = processed
-        .iter()
-        .enumerate()
-        .flat_map(|(idx, (query_id, fwd_mins, rc_mins))| {
-            let fwd_total = fwd_mins.len();
-            let rc_total = rc_mins.len();
-            let hits = all_hits[idx].lock().unwrap();
-
-            hits.iter()
-                .filter_map(|(&bucket_id, &(fwd_count, rc_count))| {
-                    let score = compute_score(fwd_count, fwd_total, rc_count, rc_total);
-                    if score >= threshold {
-                        Some(HitResult {
-                            query_id: *query_id,
-                            bucket_id,
-                            score,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    log_timing("sequential: scoring", t_score.elapsed().as_millis());
-    log_timing("sequential: total", t_start.elapsed().as_millis());
-
-    Ok(results)
-}
-
 /// Classify a batch of records against a sharded inverted index using merge-join.
 ///
 /// Builds a QueryInvertedIndex once, then processes each shard sequentially
@@ -374,7 +279,6 @@ pub fn classify_batch_sharded_sequential(
 ///
 /// # Returns
 /// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
-#[cfg(feature = "parquet")]
 pub fn classify_batch_sharded_merge_join(
     sharded: &ShardedInvertedIndex,
     negative_mins: Option<&HashSet<u64>>,
@@ -449,92 +353,6 @@ pub fn classify_batch_sharded_merge_join(
     log_timing("merge_join: merge_join_total", total_merge_join_ms);
 
     // Score and filter
-    let t_score = Instant::now();
-    let mut results = Vec::new();
-    for (read_idx, buckets) in accumulators.into_iter().enumerate() {
-        let fwd_total = query_idx.fwd_counts[read_idx] as usize;
-        let rc_total = query_idx.rc_counts[read_idx] as usize;
-        let query_id = query_ids[read_idx];
-
-        for (bucket_id, (fwd_hits, rc_hits)) in buckets {
-            let score = compute_score(fwd_hits as usize, fwd_total, rc_hits as usize, rc_total);
-            if score >= threshold {
-                results.push(HitResult {
-                    query_id,
-                    bucket_id,
-                    score,
-                });
-            }
-        }
-    }
-    log_timing("merge_join: scoring", t_score.elapsed().as_millis());
-    log_timing("merge_join: total", t_start.elapsed().as_millis());
-
-    Ok(results)
-}
-
-/// Classify a batch of records against a sharded inverted index using merge-join (non-Parquet version).
-#[cfg(not(feature = "parquet"))]
-pub fn classify_batch_sharded_merge_join(
-    sharded: &ShardedInvertedIndex,
-    negative_mins: Option<&HashSet<u64>>,
-    records: &[QueryRecord],
-    threshold: f64,
-) -> Result<Vec<HitResult>> {
-    let t_start = Instant::now();
-
-    if records.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let manifest = sharded.manifest();
-
-    let t_extract = Instant::now();
-    let extracted: Vec<_> = records
-        .par_iter()
-        .map_init(MinimizerWorkspace::new, |ws, (_, s1, s2)| {
-            let (ha, hb) =
-                get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
-            filter_negative_mins(ha, hb, negative_mins)
-        })
-        .collect();
-    log_timing("merge_join: extraction", t_extract.elapsed().as_millis());
-
-    let query_ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
-
-    let t_build_idx = Instant::now();
-    let query_idx = QueryInvertedIndex::build(&extracted);
-    log_timing(
-        "merge_join: build_query_index",
-        t_build_idx.elapsed().as_millis(),
-    );
-
-    let num_reads = query_idx.num_reads();
-    if num_reads == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut accumulators: Vec<HashMap<u32, (u32, u32)>> = (0..num_reads)
-        .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
-        .collect();
-
-    let mut total_shard_load_ms = 0u128;
-    let mut total_merge_join_ms = 0u128;
-
-    let query_minimizers = query_idx.minimizers();
-
-    for shard_info in &manifest.shards {
-        let t_load = Instant::now();
-        let shard = sharded.load_shard_for_query(shard_info.shard_id, query_minimizers)?;
-        total_shard_load_ms += t_load.elapsed().as_millis();
-
-        let t_merge = Instant::now();
-        accumulate_merge_join(&query_idx, &shard, &mut accumulators);
-        total_merge_join_ms += t_merge.elapsed().as_millis();
-    }
-    log_timing("merge_join: shard_load_total", total_shard_load_ms);
-    log_timing("merge_join: merge_join_total", total_merge_join_ms);
-
     let t_score = Instant::now();
     let mut results = Vec::new();
     for (read_idx, buckets) in accumulators.into_iter().enumerate() {
@@ -746,22 +564,6 @@ pub fn aggregate_batch(
         })
         .collect()
 }
-
-/// Threshold for switching from merge-join to galloping search.
-///
-/// When one index is more than GALLOP_THRESHOLD times larger than the other,
-/// galloping search (exponential probe + binary search) is used instead of
-/// pure merge-join. The value 16 is chosen because:
-/// - Below 16:1, merge-join's sequential access beats galloping's binary searches
-/// - Above 16:1, galloping's O(Q*log(R/Q)) is significantly faster than O(Q+R)
-/// - 16 is a power of 2, making the threshold check cheap
-///
-/// This threshold is empirically reasonable but may benefit from tuning
-/// based on actual workload characteristics (cache sizes, hit rates, etc.).
-const GALLOP_THRESHOLD: usize = 16;
-
-/// Estimated number of buckets each read will hit (for HashMap pre-allocation).
-const ESTIMATED_BUCKETS_PER_READ: usize = 4;
 
 /// Compute the dual-strand classification score.
 ///
@@ -1773,7 +1575,6 @@ mod tests {
 
     // ==================== Parquet Shard Classification Tests ====================
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_classify_batch_sharded_sequential_parquet() -> anyhow::Result<()> {
         use crate::sharded::{ShardFormat, ShardManifest};
@@ -1857,7 +1658,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_classify_batch_sharded_merge_join_parquet() -> anyhow::Result<()> {
         use crate::sharded::{ShardFormat, ShardManifest};
@@ -1931,7 +1731,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_classify_parquet_matches_legacy() -> anyhow::Result<()> {
         use crate::sharded::ShardManifest;

@@ -15,7 +15,6 @@ use rype::memory::{
     calculate_batch_config, detect_available_memory, format_bytes, parse_byte_suffix, MemoryConfig,
     MemorySource, ReadMemoryProfile,
 };
-#[cfg(feature = "parquet")]
 use rype::parquet_index;
 use rype::{
     aggregate_batch, classify_batch, classify_batch_sharded_main,
@@ -66,16 +65,7 @@ fn parse_bloom_fpp(s: &str) -> Result<f64, String> {
 fn parse_shard_format(s: &str) -> Result<String, String> {
     match s.to_lowercase().as_str() {
         "legacy" | "ryxs" => Ok("legacy".to_string()),
-        "parquet" | "pq" => {
-            #[cfg(feature = "parquet")]
-            {
-                Ok("parquet".to_string())
-            }
-            #[cfg(not(feature = "parquet"))]
-            {
-                Err("Parquet format requires --features parquet".to_string())
-            }
-        }
+        "parquet" | "pq" => Ok("parquet".to_string()),
         _ => Err(format!(
             "Unknown format '{}'. Valid options: legacy, parquet",
             s
@@ -104,7 +94,6 @@ fn sanitize_bucket_name(name: &str) -> String {
 /// - Single-file indices (.ryidx)
 fn load_index_metadata(path: &Path) -> Result<IndexMetadata> {
     // Check for Parquet format first (directory with manifest.toml)
-    #[cfg(feature = "parquet")]
     if rype::is_parquet_index(path) {
         let manifest = rype::ParquetManifest::load(path)?;
         let (bucket_names, bucket_sources) = rype::parquet_index::read_buckets_parquet(path)?;
@@ -737,7 +726,6 @@ fn add_reference_file_to_index(
 ///
 /// This bypasses the main index entirely and streams (minimizer, bucket_id)
 /// pairs directly to Parquet format.
-#[cfg(feature = "parquet")]
 #[allow(clippy::too_many_arguments)]
 fn create_parquet_index_from_refs(
     output: &Path,
@@ -961,38 +949,29 @@ fn main() -> Result<()> {
 
                 if parquet {
                     // Create Parquet inverted index directly
-                    #[cfg(feature = "parquet")]
-                    {
-                        // Build ParquetWriteOptions from CLI flags
-                        let parquet_options = parquet_index::ParquetWriteOptions {
-                            row_group_size: parquet_row_group_size,
-                            compression: if parquet_zstd {
-                                parquet_index::ParquetCompression::Zstd
-                            } else {
-                                parquet_index::ParquetCompression::Snappy
-                            },
-                            bloom_filter_enabled: parquet_bloom_filter,
-                            bloom_filter_fpp: parquet_bloom_fpp,
-                            write_page_statistics: true,
-                        };
+                    // Build ParquetWriteOptions from CLI flags
+                    let parquet_options = parquet_index::ParquetWriteOptions {
+                        row_group_size: parquet_row_group_size,
+                        compression: if parquet_zstd {
+                            parquet_index::ParquetCompression::Zstd
+                        } else {
+                            parquet_index::ParquetCompression::Snappy
+                        },
+                        bloom_filter_enabled: parquet_bloom_filter,
+                        bloom_filter_fpp: parquet_bloom_fpp,
+                        write_page_statistics: true,
+                    };
 
-                        create_parquet_index_from_refs(
-                            &output,
-                            &reference,
-                            kmer_size,
-                            window,
-                            salt,
-                            separate_buckets,
-                            max_shard_size,
-                            Some(&parquet_options),
-                        )?;
-                    }
-                    #[cfg(not(feature = "parquet"))]
-                    {
-                        return Err(anyhow!(
-                            "--parquet requires building with --features parquet"
-                        ));
-                    }
+                    create_parquet_index_from_refs(
+                        &output,
+                        &reference,
+                        kmer_size,
+                        window,
+                        salt,
+                        separate_buckets,
+                        max_shard_size,
+                        Some(&parquet_options),
+                    )?;
                 } else {
                     // Legacy: create main index
                     let mut index = Index::new(kmer_size, window, salt)?;
@@ -1346,7 +1325,6 @@ fn main() -> Result<()> {
                 let use_parquet = format == "parquet";
 
                 // Build ParquetWriteOptions from CLI flags (used when format=parquet)
-                #[cfg(feature = "parquet")]
                 let parquet_options = parquet_index::ParquetWriteOptions {
                     row_group_size: parquet_row_group_size,
                     compression: if parquet_zstd {
@@ -1360,7 +1338,6 @@ fn main() -> Result<()> {
                 };
 
                 // For Parquet format, create the inverted directory
-                #[cfg(feature = "parquet")]
                 if use_parquet {
                     let inverted_dir = output_path.join("inverted");
                     std::fs::create_dir_all(&inverted_dir).with_context(|| {
@@ -1417,24 +1394,17 @@ fn main() -> Result<()> {
                             // Save as inverted shard with same ID
                             let is_last = idx == num_shards - 1;
                             let inv_shard_info = if use_parquet {
-                                #[cfg(feature = "parquet")]
-                                {
-                                    let inv_shard_path = ShardManifest::shard_path_parquet(
-                                        &output_path,
-                                        shard_info.shard_id,
-                                    );
-                                    let info = inverted.save_shard_parquet(
-                                        &inv_shard_path,
-                                        shard_info.shard_id,
-                                        Some(&parquet_options),
-                                    )?;
-                                    created_files.push(inv_shard_path);
-                                    info
-                                }
-                                #[cfg(not(feature = "parquet"))]
-                                {
-                                    anyhow::bail!("Parquet format requires --features parquet");
-                                }
+                                let inv_shard_path = ShardManifest::shard_path_parquet(
+                                    &output_path,
+                                    shard_info.shard_id,
+                                );
+                                let info = inverted.save_shard_parquet(
+                                    &inv_shard_path,
+                                    shard_info.shard_id,
+                                    Some(&parquet_options),
+                                )?;
+                                created_files.push(inv_shard_path);
+                                info
                             } else {
                                 let inv_shard_path =
                                     ShardManifest::shard_path(&output_path, shard_info.shard_id);
@@ -1498,21 +1468,14 @@ fn main() -> Result<()> {
                     (|| -> Result<ShardManifest> {
                         // Save as single shard (shard_id = 0)
                         let inv_shard_info = if use_parquet {
-                            #[cfg(feature = "parquet")]
-                            {
-                                let shard_path = ShardManifest::shard_path_parquet(&output_path, 0);
-                                let info = inverted.save_shard_parquet(
-                                    &shard_path,
-                                    0,
-                                    Some(&parquet_options),
-                                )?;
-                                created_files.push(shard_path);
-                                info
-                            }
-                            #[cfg(not(feature = "parquet"))]
-                            {
-                                anyhow::bail!("Parquet format requires --features parquet");
-                            }
+                            let shard_path = ShardManifest::shard_path_parquet(&output_path, 0);
+                            let info = inverted.save_shard_parquet(
+                                &shard_path,
+                                0,
+                                Some(&parquet_options),
+                            )?;
+                            created_files.push(shard_path);
+                            info
                         } else {
                             let shard_path = ShardManifest::shard_path(&output_path, 0);
                             let info = inverted.save_shard(
@@ -1988,33 +1951,23 @@ fn main() -> Result<()> {
                     // Use inverted index path - detect format:
                     // 1. Parquet format: directory with manifest.toml
                     // 2. Legacy RYXS: .ryxdi.manifest file
-                    #[cfg(feature = "parquet")]
                     let is_parquet = rype::is_parquet_index(&index);
-                    #[cfg(not(feature = "parquet"))]
-                    let is_parquet = false;
 
                     let (inverted_path, metadata) = if is_parquet {
                         // Parquet index passed directly - load metadata from it
-                        #[cfg(feature = "parquet")]
-                        {
-                            log::info!("Detected Parquet index at {:?}", index);
-                            let manifest = rype::ParquetManifest::load(&index)?;
-                            let (bucket_names, bucket_sources) =
-                                rype::parquet_index::read_buckets_parquet(&index)?;
-                            let metadata = IndexMetadata {
-                                k: manifest.k,
-                                w: manifest.w,
-                                salt: manifest.salt,
-                                bucket_names,
-                                bucket_sources,
-                                bucket_minimizer_counts: HashMap::new(), // Not stored in Parquet manifest
-                            };
-                            (index.clone(), metadata)
-                        }
-                        #[cfg(not(feature = "parquet"))]
-                        {
-                            unreachable!()
-                        }
+                        log::info!("Detected Parquet index at {:?}", index);
+                        let manifest = rype::ParquetManifest::load(&index)?;
+                        let (bucket_names, bucket_sources) =
+                            rype::parquet_index::read_buckets_parquet(&index)?;
+                        let metadata = IndexMetadata {
+                            k: manifest.k,
+                            w: manifest.w,
+                            salt: manifest.salt,
+                            bucket_names,
+                            bucket_sources,
+                            bucket_minimizer_counts: HashMap::new(), // Not stored in Parquet manifest
+                        };
+                        (index.clone(), metadata)
                     } else {
                         // Legacy: derive inverted path from main index
                         let inverted_path = index.with_extension("ryxdi");
@@ -2033,15 +1986,8 @@ fn main() -> Result<()> {
 
                     // Load sharded inverted index - use format-appropriate loader
                     let sharded = if is_parquet {
-                        #[cfg(feature = "parquet")]
-                        {
-                            log::info!("Loading Parquet inverted index from {:?}", inverted_path);
-                            ShardedInvertedIndex::open_parquet(&inverted_path)?
-                        }
-                        #[cfg(not(feature = "parquet"))]
-                        {
-                            return Err(anyhow!("Parquet index requires --features parquet"));
-                        }
+                        log::info!("Loading Parquet inverted index from {:?}", inverted_path);
+                        ShardedInvertedIndex::open_parquet(&inverted_path)?
                     } else {
                         let manifest_path = ShardManifest::manifest_path(&inverted_path);
                         if !manifest_path.exists() {
@@ -2070,7 +2016,6 @@ fn main() -> Result<()> {
                     }
 
                     // Build read options for Parquet indices
-                    #[cfg(feature = "parquet")]
                     let read_options = if use_bloom_filter {
                         log::info!("Bloom filter row group filtering enabled");
                         Some(parquet_index::ParquetReadOptions::with_bloom_filter())
@@ -2099,7 +2044,6 @@ fn main() -> Result<()> {
                             .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                             .collect();
 
-                        #[cfg(feature = "parquet")]
                         let results = if merge_join {
                             classify_batch_sharded_merge_join(
                                 &sharded,
@@ -2115,22 +2059,6 @@ fn main() -> Result<()> {
                                 &batch_refs,
                                 threshold,
                                 read_options.as_ref(),
-                            )?
-                        };
-                        #[cfg(not(feature = "parquet"))]
-                        let results = if merge_join {
-                            classify_batch_sharded_merge_join(
-                                &sharded,
-                                neg_mins.as_ref(),
-                                &batch_refs,
-                                threshold,
-                            )?
-                        } else {
-                            classify_batch_sharded_sequential(
-                                &sharded,
-                                neg_mins.as_ref(),
-                                &batch_refs,
-                                threshold,
                             )?
                         };
 

@@ -15,7 +15,11 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::constants::{MAX_INVERTED_BUCKET_IDS, MAX_INVERTED_MINIMIZERS};
+use crate::constants::{
+    MAX_INVERTED_BUCKET_IDS, MAX_INVERTED_MINIMIZERS, MAX_READS, PARQUET_BATCH_SIZE,
+    QUERY_HASHSET_THRESHOLD, RC_FLAG_BIT, READ_BUF_SIZE, READ_INDEX_MASK, SHARD_MAGIC,
+    SHARD_VERSION, WRITE_BUF_SIZE,
+};
 use crate::encoding::{decode_varint, encode_varint, VarIntError, MAX_VARINT_BYTES};
 use crate::index::Index;
 use crate::sharded::ShardInfo;
@@ -361,8 +365,8 @@ impl InvertedIndex {
         let mut writer = BufWriter::new(File::create(path)?);
         let max_bucket_id = shard_bucket_ids.iter().copied().max().unwrap_or(0);
 
-        writer.write_all(b"RYXS")?;
-        writer.write_all(&1u32.to_le_bytes())?;
+        writer.write_all(SHARD_MAGIC)?;
+        writer.write_all(&SHARD_VERSION.to_le_bytes())?;
         writer.write_all(&(self.k as u64).to_le_bytes())?;
         writer.write_all(&(self.w as u64).to_le_bytes())?;
         writer.write_all(&self.salt.to_le_bytes())?;
@@ -376,7 +380,6 @@ impl InvertedIndex {
 
         let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
 
-        const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024;
         let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
 
         let flush_buf = |buf: &mut Vec<u8>,
@@ -464,23 +467,13 @@ impl InvertedIndex {
     pub fn load_shard(path: &Path) -> Result<Self> {
         // Detect format based on extension
         if path.extension().map(|e| e == "parquet").unwrap_or(false) {
-            #[cfg(feature = "parquet")]
-            {
-                return Err(anyhow!(
-                    "Parquet shards must be loaded via ShardedInvertedIndex::load_shard() \
-                     which provides parameters from the manifest. \
-                     Use load_shard_parquet_with_params() directly if you have the parameters. \
-                     Path: {}",
-                    path.display()
-                ));
-            }
-            #[cfg(not(feature = "parquet"))]
-            {
-                return Err(anyhow!(
-                    "Parquet shard format requires --features parquet: {}",
-                    path.display()
-                ));
-            }
+            return Err(anyhow!(
+                "Parquet shards must be loaded via ShardedInvertedIndex::load_shard() \
+                 which provides parameters from the manifest. \
+                 Use load_shard_parquet_with_params() directly if you have the parameters. \
+                 Path: {}",
+                path.display()
+            ));
         }
         Self::load_shard_legacy(path)
     }
@@ -492,16 +485,17 @@ impl InvertedIndex {
         let mut buf8 = [0u8; 8];
 
         reader.read_exact(&mut buf4)?;
-        if &buf4 != b"RYXS" {
+        if &buf4 != SHARD_MAGIC {
             return Err(anyhow!("Invalid shard format (expected RYXS)"));
         }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != 1 {
+        if version != SHARD_VERSION {
             return Err(anyhow!(
-                "Unsupported shard version: {} (expected 1)",
-                version
+                "Unsupported shard version: {} (expected {})",
+                version,
+                SHARD_VERSION
             ));
         }
 
@@ -549,7 +543,6 @@ impl InvertedIndex {
 
         let mut decoder = zstd::stream::read::Decoder::new(reader)?;
 
-        const READ_BUF_SIZE: usize = 8 * 1024 * 1024;
         let mut read_buf = vec![0u8; READ_BUF_SIZE];
         let mut buf_pos = 0;
         let mut buf_len = 0;
@@ -714,7 +707,6 @@ impl InvertedIndex {
     ///
     /// # Returns
     /// ShardInfo describing the written shard.
-    #[cfg(feature = "parquet")]
     pub fn save_shard_parquet(
         &self,
         path: &Path,
@@ -756,9 +748,8 @@ impl InvertedIndex {
         let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
         // Stream from CSR format in batches without materializing all pairs
-        const BATCH_SIZE: usize = 100_000;
-        let mut minimizer_builder = UInt64Builder::with_capacity(BATCH_SIZE);
-        let mut bucket_id_builder = UInt32Builder::with_capacity(BATCH_SIZE);
+        let mut minimizer_builder = UInt64Builder::with_capacity(PARQUET_BATCH_SIZE);
+        let mut bucket_id_builder = UInt32Builder::with_capacity(PARQUET_BATCH_SIZE);
         let mut pairs_in_batch = 0;
 
         for (i, &minimizer) in self.minimizers.iter().enumerate() {
@@ -770,7 +761,7 @@ impl InvertedIndex {
                 bucket_id_builder.append_value(bucket_id);
                 pairs_in_batch += 1;
 
-                if pairs_in_batch >= BATCH_SIZE {
+                if pairs_in_batch >= PARQUET_BATCH_SIZE {
                     // Flush batch
                     let minimizer_array: ArrayRef = Arc::new(minimizer_builder.finish());
                     let bucket_id_array: ArrayRef = Arc::new(bucket_id_builder.finish());
@@ -782,8 +773,8 @@ impl InvertedIndex {
                     writer.write(&batch)?;
 
                     // Reset builders for next batch
-                    minimizer_builder = UInt64Builder::with_capacity(BATCH_SIZE);
-                    bucket_id_builder = UInt32Builder::with_capacity(BATCH_SIZE);
+                    minimizer_builder = UInt64Builder::with_capacity(PARQUET_BATCH_SIZE);
+                    bucket_id_builder = UInt32Builder::with_capacity(PARQUET_BATCH_SIZE);
                     pairs_in_batch = 0;
                 }
             }
@@ -826,7 +817,6 @@ impl InvertedIndex {
     /// # Memory
     /// Uses a shared Bytes buffer to avoid opening N file descriptors.
     /// Peak memory usage is 2x the Parquet file size (buffer + decoded pairs).
-    #[cfg(feature = "parquet")]
     pub fn load_shard_parquet_with_params(
         path: &Path,
         k: usize,
@@ -1025,7 +1015,6 @@ impl InvertedIndex {
     ///
     /// # Returns
     /// A partial InvertedIndex containing only minimizers in the overlapping range.
-    #[cfg(feature = "parquet")]
     pub fn load_shard_parquet_filtered(
         path: &Path,
         k: usize,
@@ -1232,7 +1221,6 @@ impl InvertedIndex {
     ///
     /// Returns a list of (row_group_index, min_minimizer, max_minimizer) tuples.
     /// This can be used to plan which row groups to load for a query.
-    #[cfg(feature = "parquet")]
     pub fn get_parquet_row_group_stats(path: &Path) -> Result<Vec<(usize, u64, u64)>> {
         use parquet::file::reader::FileReader;
         use parquet::file::serialized_reader::SerializedFileReader;
@@ -1289,7 +1277,6 @@ impl InvertedIndex {
     /// # Note
     /// Bloom filters only work with individual value checks, not range queries.
     /// This is used by load_shard_parquet_for_query() which has individual minimizers.
-    #[cfg(feature = "parquet")]
     fn bloom_filter_may_contain_any(
         bloom_filter: Option<&parquet::bloom_filter::Sbbf>,
         query_minimizers: &[u64],
@@ -1319,7 +1306,6 @@ impl InvertedIndex {
     ///
     /// # Returns
     /// Vector of row group indices that contain at least one query minimizer.
-    #[cfg(feature = "parquet")]
     pub fn find_matching_row_groups(
         query_minimizers: &[u64],
         row_group_stats: &[(usize, u64, u64)],
@@ -1360,7 +1346,6 @@ impl InvertedIndex {
     ///
     /// # Returns
     /// A partial InvertedIndex containing only data from matching row groups.
-    #[cfg(feature = "parquet")]
     pub fn load_shard_parquet_for_query(
         path: &Path,
         k: usize,
@@ -1381,11 +1366,6 @@ impl InvertedIndex {
         use std::fs::File;
 
         let use_bloom_filter = options.map(|o| o.use_bloom_filter).unwrap_or(false);
-
-        // For small query sets, binary search on sorted array is O(log n) and faster than
-        // HashSet lookup which is O(1) but has higher constant factors (hashing + probe).
-        // Empirically, break-even point is ~1000 elements on modern CPUs.
-        const QUERY_HASHSET_THRESHOLD: usize = 1000;
 
         // Validate query_minimizers is sorted - required for binary search correctness
         // in find_matching_row_groups() and row-level filtering.
@@ -1722,9 +1702,9 @@ impl QueryInvertedIndex {
     /// Bit 31 = strand (0=fwd, 1=rc), bits 0-30 = read index.
     #[inline]
     pub fn pack_read_id(read_idx: u32, is_rc: bool) -> u32 {
-        debug_assert!(read_idx <= 0x7FFFFFFF, "Read index exceeds 31 bits");
+        debug_assert!(read_idx <= READ_INDEX_MASK, "Read index exceeds 31 bits");
         if is_rc {
-            read_idx | 0x80000000
+            read_idx | RC_FLAG_BIT
         } else {
             read_idx
         }
@@ -1733,8 +1713,8 @@ impl QueryInvertedIndex {
     /// Unpack a read_id entry into (read_index, is_rc).
     #[inline]
     pub fn unpack_read_id(packed: u32) -> (u32, bool) {
-        let is_rc = (packed & 0x80000000) != 0;
-        let read_idx = packed & 0x7FFFFFFF;
+        let is_rc = (packed & RC_FLAG_BIT) != 0;
+        let read_idx = packed & READ_INDEX_MASK;
         (read_idx, is_rc)
     }
 
@@ -1769,7 +1749,7 @@ impl QueryInvertedIndex {
     }
 
     /// Maximum number of reads supported (31 bits, bit 31 reserved for strand flag).
-    pub const MAX_READS: usize = 0x7FFFFFFF;
+    pub const MAX_READS: usize = MAX_READS;
 
     /// Build from extracted minimizers: Vec<(fwd_mins, rc_mins)> per read.
     ///
@@ -2647,7 +2627,6 @@ mod tests {
 
     // ==================== Parquet I/O Tests ====================
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_inverted_parquet_roundtrip() -> Result<()> {
         use tempfile::TempDir;
@@ -2706,7 +2685,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_inverted_parquet_empty() -> Result<()> {
         use tempfile::TempDir;
@@ -2728,7 +2706,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_inverted_parquet_large_values() -> Result<()> {
         use tempfile::TempDir;
@@ -2773,7 +2750,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_inverted_parquet_load_shard_requires_params() -> Result<()> {
         use tempfile::TempDir;
@@ -2811,7 +2787,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_inverted_parquet_many_buckets() -> Result<()> {
         use tempfile::TempDir;
@@ -2852,7 +2827,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_load_parquet_for_query_basic() -> Result<()> {
         use tempfile::TempDir;
@@ -2901,7 +2875,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_load_parquet_for_query_empty_query() -> Result<()> {
         use tempfile::TempDir;
@@ -2934,7 +2907,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_load_parquet_for_query_no_matches() -> Result<()> {
         use tempfile::TempDir;
@@ -2968,7 +2940,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_load_parquet_for_query_multiple_row_groups() -> Result<()> {
         use tempfile::TempDir;
@@ -3022,7 +2993,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_load_parquet_for_query_unsorted_input() -> Result<()> {
         use tempfile::TempDir;
@@ -3061,7 +3031,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_load_parquet_for_query_large_query_set() -> Result<()> {
         use tempfile::TempDir;
@@ -3100,7 +3069,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_load_parquet_for_query_boundary_conditions() -> Result<()> {
         use tempfile::TempDir;
@@ -3160,7 +3128,6 @@ mod tests {
     /// This verifies that `bloom_filter_may_contain_any()` correctly handles u64 values
     /// that would be negative if interpreted as i64. The bloom filter uses raw bytes
     /// via the `AsBytes` trait, so the bit pattern must be preserved.
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_bloom_filter_high_value_minimizers() -> Result<()> {
         use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};
@@ -3223,7 +3190,6 @@ mod tests {
     }
 
     /// Test that bloom filter correctly rejects minimizers that are NOT in the file.
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_bloom_filter_rejects_absent_minimizers() -> Result<()> {
         use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};
@@ -3298,7 +3264,6 @@ mod tests {
     }
 
     /// Test bloom filter graceful fallback when file has no bloom filters.
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_bloom_filter_graceful_fallback() -> Result<()> {
         use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};
@@ -3349,7 +3314,6 @@ mod tests {
     }
 
     /// Test bloom filter with empty query (edge case).
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_bloom_filter_empty_query() -> Result<()> {
         use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};
@@ -3393,7 +3357,6 @@ mod tests {
     }
 
     /// Test bloom_filter_may_contain_any helper directly with edge cases.
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_bloom_filter_may_contain_any_helper() {
         // Test with None bloom filter (should return true - conservative fallback)
@@ -3409,7 +3372,6 @@ mod tests {
     }
 
     /// Test that bloom filter accepts values that ARE present (no false negatives).
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_bloom_filter_no_false_negatives() -> Result<()> {
         use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};

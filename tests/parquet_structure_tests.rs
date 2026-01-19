@@ -6,8 +6,6 @@
 //! - No duplicate (minimizer, bucket_id) pairs
 //! - Manifest counts match actual data
 
-#![cfg(feature = "parquet")]
-
 use anyhow::Result;
 use arrow::array::{Array, UInt32Array, UInt64Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;

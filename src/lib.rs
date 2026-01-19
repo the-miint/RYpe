@@ -40,16 +40,14 @@ pub mod c_api;
 pub mod config;
 pub mod memory;
 
-// Arrow integration (optional feature)
-#[cfg(feature = "arrow")]
+// Arrow FFI integration (optional feature for exporting RecordBatches)
+#[cfg(feature = "arrow-ffi")]
 pub mod arrow;
 
-// Parquet-based index format (optional feature)
-#[cfg(feature = "parquet")]
+// Parquet-based index format
 pub mod parquet_index;
 
-// Re-export Parquet types when feature is enabled
-#[cfg(feature = "parquet")]
+// Re-export Parquet types
 pub use parquet_index::{
     compute_source_hash, create_parquet_inverted_index, is_parquet_index, BucketData,
     BucketMetadata, InvertedManifest, InvertedShardInfo, ParquetCompression, ParquetManifest,

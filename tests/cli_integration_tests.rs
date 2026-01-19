@@ -788,7 +788,6 @@ fn test_readme_bash_examples() -> Result<()> {
 /// Test that CLI rejects invalid --parquet-bloom-fpp values.
 /// This tests the clap value_parser validation.
 #[test]
-#[cfg(feature = "parquet")]
 fn test_cli_rejects_invalid_bloom_fpp() -> Result<()> {
     use std::process::Command;
 
@@ -796,7 +795,7 @@ fn test_cli_rejects_invalid_bloom_fpp() -> Result<()> {
 
     // Build the binary first
     let status = Command::new("cargo")
-        .args(["build", "--features", "parquet"])
+        .args(["build"])
         .current_dir(manifest_dir)
         .status()?;
     assert!(status.success(), "Failed to build rype binary");

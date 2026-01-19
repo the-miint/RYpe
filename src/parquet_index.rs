@@ -20,6 +20,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+use crate::constants::DEFAULT_ROW_GROUP_SIZE;
+
 /// Serialize u64 as hex string for TOML compatibility (i64 overflow).
 mod hex_u64 {
     use serde::{self, Deserialize, Deserializer, Serializer};
@@ -127,7 +129,7 @@ pub struct ParquetWriteOptions {
 impl Default for ParquetWriteOptions {
     fn default() -> Self {
         Self {
-            row_group_size: 100_000,
+            row_group_size: DEFAULT_ROW_GROUP_SIZE,
             compression: ParquetCompression::Snappy,
             bloom_filter_enabled: false,
             bloom_filter_fpp: 0.05,
@@ -136,7 +138,6 @@ impl Default for ParquetWriteOptions {
     }
 }
 
-#[cfg(feature = "parquet")]
 impl ParquetWriteOptions {
     /// Validate options. Returns error if any values are out of bounds.
     ///
@@ -471,7 +472,6 @@ pub fn create_index_directory(path: &Path) -> Result<()> {
 // Buckets Parquet I/O (requires parquet feature)
 // ============================================================================
 
-#[cfg(feature = "parquet")]
 mod parquet_io {
     use super::*;
     use arrow::array::{
@@ -611,16 +611,15 @@ mod parquet_io {
     }
 }
 
-#[cfg(feature = "parquet")]
 pub use parquet_io::{read_buckets_parquet, write_buckets_parquet};
 
 // ============================================================================
 // Streaming Parquet Index Creation
 // ============================================================================
 
-#[cfg(feature = "parquet")]
 mod streaming {
     use super::*;
+    use crate::constants::{MIN_ENTRIES_PER_PARALLEL_PARTITION, PARQUET_BATCH_SIZE};
     use anyhow::Context;
     use arrow::array::ArrayRef;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -630,26 +629,11 @@ mod streaming {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     use std::fs::File;
-
-    /// Minimum entries per parallel partition before parallel sharding is enabled.
-    ///
-    /// When total_entries > MIN_ENTRIES_PER_PARALLEL_PARTITION * num_cpus and
-    /// multiple CPUs are available, parallel range-partitioned sharding is used.
-    /// This ensures each parallel worker has enough data to amortize the overhead
-    /// of spawning threads and coordinating output file renaming.
-    ///
-    /// Lower values enable more parallelism for smaller indices at the cost of
-    /// higher coordination overhead. Higher values prefer sequential processing
-    /// but may leave CPUs idle on large indices.
-    const MIN_ENTRIES_PER_PARALLEL_PARTITION: usize = 1_000_000;
     use std::path::PathBuf;
     use std::sync::Arc;
 
     /// K-way merge heap entry: (Reverse((minimizer, bucket_id)), bucket_index, position)
     type MergeHeapEntry = (Reverse<(u64, u32)>, usize, usize);
-
-    /// Row group / batch size for Parquet writing.
-    const BATCH_SIZE: usize = 100_000;
 
     /// Create a Parquet inverted index directly from bucket data.
     ///
@@ -835,8 +819,8 @@ mod streaming {
         let mut current_shard_max: u64 = 0;
 
         // Batching buffers
-        let mut minimizer_batch: Vec<u64> = Vec::with_capacity(BATCH_SIZE);
-        let mut bucket_id_batch: Vec<u32> = Vec::with_capacity(BATCH_SIZE);
+        let mut minimizer_batch: Vec<u64> = Vec::with_capacity(PARQUET_BATCH_SIZE);
+        let mut bucket_id_batch: Vec<u32> = Vec::with_capacity(PARQUET_BATCH_SIZE);
 
         // FIX #1: No deduplication needed - buckets are validated as sorted/deduped
         // Each (minimizer, bucket_id) pair is unique by construction
@@ -887,7 +871,7 @@ mod streaming {
             current_shard_max = minimizer; // Sorted order guarantees this is always >= previous
 
             // Flush batch if full
-            if minimizer_batch.len() >= BATCH_SIZE {
+            if minimizer_batch.len() >= PARQUET_BATCH_SIZE {
                 if let Some(ref mut writer) = current_writer {
                     writer.write_batch(&minimizer_batch, &bucket_id_batch)?;
                 }
@@ -1094,8 +1078,8 @@ mod streaming {
         let mut current_shard_min: u64 = 0;
         let mut current_shard_max: u64 = 0;
 
-        let mut minimizer_batch: Vec<u64> = Vec::with_capacity(BATCH_SIZE);
-        let mut bucket_id_batch: Vec<u32> = Vec::with_capacity(BATCH_SIZE);
+        let mut minimizer_batch: Vec<u64> = Vec::with_capacity(PARQUET_BATCH_SIZE);
+        let mut bucket_id_batch: Vec<u32> = Vec::with_capacity(PARQUET_BATCH_SIZE);
 
         while let Some((Reverse((minimizer, bucket_id)), bucket_idx, pos)) = heap.pop() {
             let need_new_shard = if let Some(ref writer) = current_writer {
@@ -1138,7 +1122,7 @@ mod streaming {
             current_shard_entries += 1;
             current_shard_max = minimizer; // Sorted order guarantees this is always >= previous
 
-            if minimizer_batch.len() >= BATCH_SIZE {
+            if minimizer_batch.len() >= PARQUET_BATCH_SIZE {
                 if let Some(ref mut writer) = current_writer {
                     writer.write_batch(&minimizer_batch, &bucket_id_batch)?;
                 }
@@ -1224,7 +1208,6 @@ mod streaming {
     }
 }
 
-#[cfg(feature = "parquet")]
 pub use streaming::{compute_source_hash, create_parquet_inverted_index};
 
 // ============================================================================
@@ -1282,7 +1265,6 @@ mod tests {
         assert!(is_parquet_index(&valid_dir));
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_buckets_parquet_round_trip() {
         let tmp = TempDir::new().unwrap();
@@ -1314,7 +1296,6 @@ mod tests {
 
     /// Test that streaming Parquet creation produces identical classification results
     /// as the traditional Index → InvertedIndex → save_shard_parquet path.
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_streaming_parquet_matches_traditional() {
         use crate::classify::classify_batch_sharded_sequential;
@@ -1540,7 +1521,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_parquet_write_with_zstd() {
         use crate::extraction::extract_into;
@@ -1590,7 +1570,6 @@ mod tests {
         assert!(is_parquet_index(&index_dir));
     }
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn test_parquet_write_with_bloom_filter() {
         use crate::extraction::extract_into;

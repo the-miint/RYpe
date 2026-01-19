@@ -6,6 +6,7 @@
 //! designed to be called from C code.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use crate::constants::MAX_SEQUENCE_LENGTH;
 use crate::memory::{detect_available_memory, parse_byte_suffix};
 use crate::{
     classify_batch, classify_batch_sharded_main, classify_batch_sharded_sequential, Index,
@@ -18,15 +19,15 @@ use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::slice;
 
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ffi")]
 use crate::arrow::{
     classify_arrow_batch, classify_arrow_batch_sharded, classify_arrow_batch_sharded_main,
 };
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ffi")]
 use arrow::ffi::FFI_ArrowSchema;
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ffi")]
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ffi")]
 use arrow::record_batch::RecordBatch;
 
 // --- Unified Index Type ---
@@ -243,13 +244,6 @@ fn clear_last_error() {
 fn is_valid_ptr<T>(ptr: *const T) -> bool {
     !ptr.is_null() && (ptr as usize) % std::mem::align_of::<T>() == 0
 }
-
-// Maximum sequence length: 2GB (fits in isize on 64-bit, u32::MAX on 32-bit)
-const MAX_SEQUENCE_LENGTH: usize = if cfg!(target_pointer_width = "64") {
-    2_000_000_000 // 2GB
-} else {
-    i32::MAX as usize // ~2.1GB
-};
 
 /// Validates a RypeQuery for safety invariants
 /// Returns Err with error message if invalid
@@ -838,16 +832,8 @@ pub extern "C" fn rype_classify_with_negative(
                     .map_err(|e| format!("Sharded main classification failed: {}", e))
             }
             RypeIndex::ShardedInverted(idx) => {
-                #[cfg(feature = "parquet")]
-                {
-                    classify_batch_sharded_sequential(idx, neg_mins, &rust_queries, threshold, None)
-                        .map_err(|e| format!("Sharded inverted classification failed: {}", e))
-                }
-                #[cfg(not(feature = "parquet"))]
-                {
-                    classify_batch_sharded_sequential(idx, neg_mins, &rust_queries, threshold)
-                        .map_err(|e| format!("Sharded inverted classification failed: {}", e))
-                }
+                classify_batch_sharded_sequential(idx, neg_mins, &rust_queries, threshold, None)
+                    .map_err(|e| format!("Sharded inverted classification failed: {}", e))
             }
         };
 
@@ -991,7 +977,7 @@ mod layout_tests {
 // - Multiple threads can share the same RypeIndex
 // - Each thread must use its own FFI_ArrowArrayStream for input/output
 
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ffi")]
 mod arrow_ffi {
     use super::*;
     use arrow::datatypes::SchemaRef;
@@ -1304,7 +1290,7 @@ mod arrow_ffi {
 }
 
 // Re-export Arrow FFI functions at module level when feature is enabled
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ffi")]
 pub use arrow_ffi::*;
 
 #[cfg(test)]
@@ -1414,7 +1400,7 @@ mod c_api_tests {
 }
 
 // Arrow FFI tests
-#[cfg(all(test, feature = "arrow"))]
+#[cfg(all(test, feature = "arrow-ffi"))]
 mod arrow_ffi_tests {
     use super::*;
     use crate::{Index, MinimizerWorkspace};
