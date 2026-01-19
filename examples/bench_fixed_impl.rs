@@ -44,7 +44,7 @@ fn main() -> Result<()> {
         parquet_path.display()
     );
     let t2 = Instant::now();
-    let shard_info = index.save_shard_parquet(&parquet_path, 0)?;
+    let shard_info = index.save_shard_parquet(&parquet_path, 0, None)?;
     let save_ms = t2.elapsed().as_millis();
     let parquet_size = std::fs::metadata(&parquet_path)?.len();
     println!(

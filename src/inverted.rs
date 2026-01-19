@@ -710,19 +710,25 @@ impl InvertedIndex {
     /// # Arguments
     /// * `path` - Output path (should end in .parquet)
     /// * `shard_id` - Shard identifier for manifest
+    /// * `options` - Optional Parquet write options (compression, bloom filters, etc.)
     ///
     /// # Returns
     /// ShardInfo describing the written shard.
     #[cfg(feature = "parquet")]
-    pub fn save_shard_parquet(&self, path: &Path, shard_id: u32) -> Result<ShardInfo> {
+    pub fn save_shard_parquet(
+        &self,
+        path: &Path,
+        shard_id: u32,
+        options: Option<&crate::parquet_index::ParquetWriteOptions>,
+    ) -> Result<ShardInfo> {
         use anyhow::Context;
         use arrow::array::{ArrayRef, UInt32Builder, UInt64Builder};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use parquet::arrow::ArrowWriter;
-        use parquet::basic::{Compression, Encoding};
-        use parquet::file::properties::{WriterProperties, WriterVersion};
         use std::sync::Arc;
+
+        let opts = options.cloned().unwrap_or_default();
 
         if self.minimizers.is_empty() {
             // Empty shard - don't create file
@@ -742,30 +748,8 @@ impl InvertedIndex {
             Field::new("bucket_id", DataType::UInt32, false),
         ]));
 
-        // Writer properties: Snappy (fast), DELTA_BINARY_PACKED for both columns.
-        // DELTA_BINARY_PACKED works well for bucket_ids because they cluster within
-        // row groups (same minimizer range → similar bucket distribution).
-        let props = WriterProperties::builder()
-            .set_writer_version(WriterVersion::PARQUET_2_0)
-            .set_compression(Compression::SNAPPY)
-            .set_column_encoding(
-                parquet::schema::types::ColumnPath::new(vec!["minimizer".to_string()]),
-                Encoding::DELTA_BINARY_PACKED,
-            )
-            .set_column_dictionary_enabled(
-                parquet::schema::types::ColumnPath::new(vec!["minimizer".to_string()]),
-                false,
-            )
-            .set_column_encoding(
-                parquet::schema::types::ColumnPath::new(vec!["bucket_id".to_string()]),
-                Encoding::DELTA_BINARY_PACKED,
-            )
-            .set_column_dictionary_enabled(
-                parquet::schema::types::ColumnPath::new(vec!["bucket_id".to_string()]),
-                false,
-            )
-            .set_max_row_group_size(100_000)
-            .build();
+        // DRY: Use ParquetWriteOptions::to_writer_properties() as single source of truth
+        let props = opts.to_writer_properties();
 
         let file = std::fs::File::create(path)
             .with_context(|| format!("Failed to create Parquet shard: {}", path.display()))?;
@@ -2564,7 +2548,7 @@ mod tests {
         let original_bucket_ids = inverted.bucket_ids().to_vec();
 
         // Save as Parquet
-        let shard_info = inverted.save_shard_parquet(&path, 0)?;
+        let shard_info = inverted.save_shard_parquet(&path, 0, None)?;
 
         assert_eq!(shard_info.shard_id, 0);
         assert_eq!(shard_info.num_minimizers, inverted.num_minimizers());
@@ -2614,7 +2598,7 @@ mod tests {
         let inverted = InvertedIndex::build_from_index(&index);
 
         // Save as Parquet
-        let shard_info = inverted.save_shard_parquet(&path, 0)?;
+        let shard_info = inverted.save_shard_parquet(&path, 0, None)?;
         assert_eq!(shard_info.num_minimizers, 0);
         assert_eq!(shard_info.num_bucket_ids, 0);
 
@@ -2650,7 +2634,7 @@ mod tests {
         let inverted = InvertedIndex::build_from_index(&index);
 
         // Save and load
-        inverted.save_shard_parquet(&path, 0)?;
+        inverted.save_shard_parquet(&path, 0, None)?;
         let loaded = InvertedIndex::load_shard_parquet_with_params(
             &path,
             inverted.k,
@@ -2683,7 +2667,7 @@ mod tests {
         let inverted = InvertedIndex::build_from_index(&index);
 
         // Save as Parquet
-        inverted.save_shard_parquet(&parquet_path, 0)?;
+        inverted.save_shard_parquet(&parquet_path, 0, None)?;
 
         // load_shard should error for Parquet files (they need manifest parameters)
         let result = InvertedIndex::load_shard(&parquet_path);
@@ -2728,7 +2712,7 @@ mod tests {
         let inverted = InvertedIndex::build_from_index(&index);
 
         // Save and load
-        inverted.save_shard_parquet(&path, 0)?;
+        inverted.save_shard_parquet(&path, 0, None)?;
         let loaded = InvertedIndex::load_shard_parquet_with_params(
             &path,
             inverted.k,
@@ -2767,7 +2751,7 @@ mod tests {
         let inverted = InvertedIndex::build_from_index(&index);
 
         // Save as Parquet
-        inverted.save_shard_parquet(&path, 0)?;
+        inverted.save_shard_parquet(&path, 0, None)?;
 
         // Query for specific minimizers - should only return matching entries
         let query_minimizers = vec![200, 300, 500]; // sorted
@@ -2809,7 +2793,7 @@ mod tests {
         index.bucket_names.insert(1, "A".into());
 
         let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_shard_parquet(&path, 0)?;
+        inverted.save_shard_parquet(&path, 0, None)?;
 
         // Empty query should return empty result without reading row groups
         let loaded = InvertedIndex::load_shard_parquet_for_query(
@@ -2841,7 +2825,7 @@ mod tests {
         index.bucket_names.insert(1, "A".into());
 
         let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_shard_parquet(&path, 0)?;
+        inverted.save_shard_parquet(&path, 0, None)?;
 
         // Query for minimizers not in the file - should return empty
         let query_minimizers = vec![1000, 2000, 3000]; // sorted, but not in file
@@ -2883,7 +2867,7 @@ mod tests {
         }
 
         let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_shard_parquet(&path, 0)?;
+        inverted.save_shard_parquet(&path, 0, None)?;
 
         // Query for minimizers from different row groups
         // First row group: bucket 0 minimizers (0-99999)
@@ -2927,7 +2911,7 @@ mod tests {
         index.bucket_names.insert(1, "A".into());
 
         let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_shard_parquet(&path, 0)?;
+        inverted.save_shard_parquet(&path, 0, None)?;
 
         // Unsorted query should fail with clear error
         let unsorted_query = vec![300, 100, 200]; // NOT sorted
@@ -2966,7 +2950,7 @@ mod tests {
         index.bucket_names.insert(1, "big".into());
 
         let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_shard_parquet(&path, 0)?;
+        inverted.save_shard_parquet(&path, 0, None)?;
 
         // Query with >1000 minimizers to exercise HashSet code path
         let query_minimizers: Vec<u64> = (0..2000).map(|i| i as u64 * 10).collect();
@@ -3003,7 +2987,7 @@ mod tests {
         index.bucket_names.insert(1, "A".into());
 
         let inverted = InvertedIndex::build_from_index(&index);
-        inverted.save_shard_parquet(&path, 0)?;
+        inverted.save_shard_parquet(&path, 0, None)?;
 
         // Test query at exact boundaries
         let query_minimizers = vec![100, 1000]; // exactly min and max

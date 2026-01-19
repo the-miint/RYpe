@@ -61,6 +61,154 @@ pub mod files {
     }
 }
 
+// ============================================================================
+// Parquet Write Options
+// ============================================================================
+
+/// Compression codec for Parquet files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ParquetCompression {
+    /// Snappy compression (fast, moderate ratio). Default.
+    #[default]
+    Snappy,
+    /// Zstd compression (slower, better ratio).
+    Zstd,
+}
+
+/// Configuration options for Parquet file writing.
+///
+/// Use `Default::default()` to get the current behavior (Snappy, 100K row groups,
+/// no bloom filters). Pass custom options to enable advanced features.
+///
+/// # Example
+/// ```ignore
+/// let opts = ParquetWriteOptions {
+///     compression: ParquetCompression::Zstd,
+///     bloom_filter_enabled: true,
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Debug, Clone)]
+pub struct ParquetWriteOptions {
+    /// Maximum rows per row group. Default: 100,000.
+    ///
+    /// # Performance trade-offs
+    ///
+    /// **Smaller row groups** (10K-50K):
+    /// - Better read performance when filtering specific minimizer ranges
+    /// - More memory efficient during reads (less data loaded per group)
+    /// - Higher metadata overhead (more groups = more index entries)
+    /// - Slightly worse compression (less data to find patterns in)
+    ///
+    /// **Larger row groups** (500K-1M):
+    /// - Better compression ratios (more data for pattern detection)
+    /// - Lower metadata overhead
+    /// - Higher memory usage during reads
+    /// - Slower random access within a shard
+    ///
+    /// For most workloads, the default (100K) balances read performance and
+    /// compression. Increase for indices that will be scanned linearly;
+    /// decrease for indices with highly selective range queries.
+    pub row_group_size: usize,
+
+    /// Compression codec. Default: Snappy.
+    pub compression: ParquetCompression,
+
+    /// Enable bloom filters for faster lookups. Default: false.
+    pub bloom_filter_enabled: bool,
+
+    /// Bloom filter false positive probability. Default: 0.05 (5%).
+    pub bloom_filter_fpp: f64,
+
+    /// Write page-level statistics. Default: true.
+    pub write_page_statistics: bool,
+}
+
+impl Default for ParquetWriteOptions {
+    fn default() -> Self {
+        Self {
+            row_group_size: 100_000,
+            compression: ParquetCompression::Snappy,
+            bloom_filter_enabled: false,
+            bloom_filter_fpp: 0.05,
+            write_page_statistics: true,
+        }
+    }
+}
+
+#[cfg(feature = "parquet")]
+impl ParquetWriteOptions {
+    /// Validate options. Returns error if any values are out of bounds.
+    ///
+    /// Checks:
+    /// - `bloom_filter_fpp` must be in (0.0, 1.0)
+    /// - `row_group_size` must be > 0
+    pub fn validate(&self) -> Result<()> {
+        if self.bloom_filter_fpp <= 0.0 || self.bloom_filter_fpp >= 1.0 {
+            anyhow::bail!(
+                "bloom_filter_fpp must be in (0.0, 1.0), got {}",
+                self.bloom_filter_fpp
+            );
+        }
+        if self.row_group_size == 0 {
+            anyhow::bail!("row_group_size must be > 0");
+        }
+        Ok(())
+    }
+
+    /// Convert options to parquet WriterProperties.
+    ///
+    /// This is the single source of truth for building WriterProperties,
+    /// ensuring DRY across all Parquet write paths.
+    ///
+    /// # Panics
+    /// Panics if options are invalid. Call `validate()` first to get a Result.
+    pub fn to_writer_properties(&self) -> parquet::file::properties::WriterProperties {
+        // Panic on invalid options - caller should validate first
+        self.validate()
+            .expect("Invalid ParquetWriteOptions - call validate() first");
+        use parquet::basic::{Compression, Encoding};
+        use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
+        use parquet::schema::types::ColumnPath;
+
+        let compression = match self.compression {
+            ParquetCompression::Snappy => Compression::SNAPPY,
+            ParquetCompression::Zstd => Compression::ZSTD(parquet::basic::ZstdLevel::default()),
+        };
+
+        let statistics = if self.write_page_statistics {
+            EnabledStatistics::Page
+        } else {
+            EnabledStatistics::None
+        };
+
+        let minimizer_col = ColumnPath::new(vec!["minimizer".to_string()]);
+        let bucket_id_col = ColumnPath::new(vec!["bucket_id".to_string()]);
+
+        let mut builder = WriterProperties::builder()
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_compression(compression)
+            .set_statistics_enabled(statistics)
+            .set_max_row_group_size(self.row_group_size)
+            // Minimizer column: delta encoding, no dictionary
+            .set_column_encoding(minimizer_col.clone(), Encoding::DELTA_BINARY_PACKED)
+            .set_column_dictionary_enabled(minimizer_col.clone(), false)
+            // Bucket ID column: delta encoding, no dictionary
+            .set_column_encoding(bucket_id_col.clone(), Encoding::DELTA_BINARY_PACKED)
+            .set_column_dictionary_enabled(bucket_id_col.clone(), false);
+
+        if self.bloom_filter_enabled {
+            builder = builder
+                .set_column_bloom_filter_enabled(minimizer_col.clone(), true)
+                .set_column_bloom_filter_fpp(minimizer_col, self.bloom_filter_fpp)
+                .set_column_bloom_filter_enabled(bucket_id_col.clone(), true)
+                .set_column_bloom_filter_fpp(bucket_id_col, self.bloom_filter_fpp);
+        }
+
+        builder.build()
+    }
+}
+
 /// Manifest containing index metadata.
 ///
 /// Stored as TOML for human readability and easy inspection.
@@ -209,7 +357,7 @@ pub struct BucketMetadata {
 }
 
 /// Bucket data with minimizers for building inverted index.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BucketData {
     pub bucket_id: u32,
     pub bucket_name: String,
@@ -441,12 +589,23 @@ mod streaming {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
-    use parquet::basic::{Compression, Encoding};
-    use parquet::file::properties::{WriterProperties, WriterVersion};
     use rayon::prelude::*;
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     use std::fs::File;
+
+    /// Minimum entries per parallel partition before parallel sharding is enabled.
+    ///
+    /// When total_entries > MIN_ENTRIES_PER_PARALLEL_PARTITION * num_cpus and
+    /// multiple CPUs are available, parallel range-partitioned sharding is used.
+    /// This ensures each parallel worker has enough data to amortize the overhead
+    /// of spawning threads and coordinating output file renaming.
+    ///
+    /// Lower values enable more parallelism for smaller indices at the cost of
+    /// higher coordination overhead. Higher values prefer sequential processing
+    /// but may leave CPUs idle on large indices.
+    const MIN_ENTRIES_PER_PARALLEL_PARTITION: usize = 1_000_000;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     /// K-way merge heap entry: (Reverse((minimizer, bucket_id)), bucket_index, position)
@@ -467,6 +626,7 @@ mod streaming {
     /// * `w` - Window size
     /// * `salt` - Hash salt
     /// * `max_shard_bytes` - Optional max shard size in bytes (target, not exact limit)
+    /// * `options` - Optional Parquet write options (compression, bloom filters, etc.)
     ///
     /// # Returns
     /// The manifest describing the created index.
@@ -480,8 +640,12 @@ mod streaming {
         w: usize,
         salt: u64,
         max_shard_bytes: Option<usize>,
+        options: Option<&ParquetWriteOptions>,
     ) -> Result<ParquetManifest> {
-        // FIX #1: Validate bucket data upfront - buckets must be sorted and deduplicated
+        let opts = options.cloned().unwrap_or_default();
+        opts.validate().context("Invalid ParquetWriteOptions")?;
+
+        // Validate bucket data upfront - buckets must be sorted and deduplicated
         for bucket in &buckets {
             bucket.validate().with_context(|| {
                 format!(
@@ -512,8 +676,12 @@ mod streaming {
 
         // Stream inverted pairs to Parquet shards
         // FIX #2: Pass max_shard_bytes with clear semantics (target, not exact)
-        let shard_infos =
-            stream_to_parquet_shards(output_dir, buckets, max_shard_bytes.unwrap_or(usize::MAX))?;
+        let shard_infos = stream_to_parquet_shards(
+            output_dir,
+            buckets,
+            max_shard_bytes.unwrap_or(usize::MAX),
+            &opts,
+        )?;
 
         // Compute total entries
         let total_entries: u64 = shard_infos.iter().map(|s| s.num_entries).sum();
@@ -570,6 +738,7 @@ mod streaming {
         output_dir: &Path,
         buckets: Vec<BucketData>,
         max_shard_bytes: usize,
+        options: &ParquetWriteOptions,
     ) -> Result<Vec<InvertedShardInfo>> {
         if buckets.is_empty() || buckets.iter().all(|b| b.minimizers.is_empty()) {
             // Empty index - create single empty shard info
@@ -585,17 +754,16 @@ mod streaming {
         let total_entries: usize = buckets.iter().map(|b| b.minimizers.len()).sum();
         let num_cpus = rayon::current_num_threads();
 
-        // Heuristic: use parallel sharding if we have enough data and multiple cores
-        // Each parallel shard should have at least 1M entries to amortize overhead
-        let min_entries_per_shard = 1_000_000;
-        let use_parallel = total_entries > min_entries_per_shard * num_cpus && num_cpus > 1;
+        // Use parallel sharding if we have enough data and multiple cores
+        let use_parallel =
+            total_entries > MIN_ENTRIES_PER_PARALLEL_PARTITION * num_cpus && num_cpus > 1;
 
         if use_parallel && max_shard_bytes < usize::MAX {
             // Parallel: partition minimizer space and process ranges in parallel
-            stream_to_shards_parallel(output_dir, buckets, max_shard_bytes, num_cpus)
+            stream_to_shards_parallel(output_dir, buckets, max_shard_bytes, num_cpus, options)
         } else {
             // Sequential: single k-way merge
-            stream_to_shards_sequential(output_dir, buckets, max_shard_bytes)
+            stream_to_shards_sequential(output_dir, buckets, max_shard_bytes, options)
         }
     }
 
@@ -604,6 +772,7 @@ mod streaming {
         output_dir: &Path,
         buckets: Vec<BucketData>,
         max_shard_bytes: usize,
+        options: &ParquetWriteOptions,
     ) -> Result<Vec<InvertedShardInfo>> {
         // Prepare bucket data for k-way merge
         let bucket_slices: Vec<(u32, &[u64])> = buckets
@@ -668,7 +837,7 @@ mod streaming {
                 let shard_path = output_dir
                     .join(files::INVERTED_DIR)
                     .join(files::inverted_shard(current_shard_id));
-                current_writer = Some(ShardWriter::new(&shard_path)?);
+                current_writer = Some(ShardWriter::new(&shard_path, options)?);
                 current_shard_entries = 0;
                 current_shard_min = minimizer;
                 // Note: current_shard_max will be set below when adding to batch
@@ -727,31 +896,33 @@ mod streaming {
         buckets: Vec<BucketData>,
         max_shard_bytes: usize,
         num_partitions: usize,
+        options: &ParquetWriteOptions,
     ) -> Result<Vec<InvertedShardInfo>> {
         // Compute range boundaries by sampling minimizers
         let range_boundaries = compute_range_boundaries(&buckets, num_partitions);
 
         // Process each range in parallel
-        let partition_results: Vec<Result<Vec<InvertedShardInfo>>> = range_boundaries
+        let partition_results: Vec<Result<Vec<(InvertedShardInfo, PathBuf)>>> = range_boundaries
             .par_windows(2)
             .enumerate()
             .map(|(partition_idx, window)| {
                 let range_start = window[0];
                 let range_end = window[1];
 
-                // Filter bucket data to this range
-                let filtered_buckets: Vec<(u32, Vec<u64>)> = buckets
+                // Filter bucket data to this range using binary search (O(log n) per bucket)
+                // instead of linear filter (O(n) per bucket). Uses slices to avoid copying.
+                let filtered_buckets: Vec<(u32, &[u64])> = buckets
                     .iter()
-                    .map(|b| {
-                        let filtered: Vec<u64> = b
-                            .minimizers
-                            .iter()
-                            .copied()
-                            .filter(|&m| m >= range_start && m < range_end)
-                            .collect();
-                        (b.bucket_id, filtered)
+                    .filter_map(|b| {
+                        // Binary search for range bounds (buckets are sorted)
+                        let start = b.minimizers.partition_point(|&m| m < range_start);
+                        let end = b.minimizers.partition_point(|&m| m < range_end);
+                        if start < end {
+                            Some((b.bucket_id, &b.minimizers[start..end]))
+                        } else {
+                            None
+                        }
                     })
-                    .filter(|(_, mins)| !mins.is_empty())
                     .collect();
 
                 if filtered_buckets.is_empty() {
@@ -761,35 +932,51 @@ mod streaming {
                 // Process this partition
                 process_partition(
                     output_dir,
-                    filtered_buckets,
+                    &filtered_buckets,
                     partition_idx as u32,
                     num_partitions as u32,
                     max_shard_bytes,
+                    options,
                 )
             })
             .collect();
 
-        // Collect and renumber shard infos
-        let mut all_shards: Vec<InvertedShardInfo> = Vec::new();
+        // Collect shard infos with their file paths
+        let mut all_shards_with_paths: Vec<(InvertedShardInfo, PathBuf)> = Vec::new();
         for result in partition_results {
-            let mut partition_shards = result?;
-            // Renumber shard IDs to be globally unique
-            let base_id = all_shards.len() as u32;
-            for shard in &mut partition_shards {
-                shard.shard_id += base_id;
-            }
-            all_shards.extend(partition_shards);
+            let partition_shards = result?;
+            all_shards_with_paths.extend(partition_shards);
         }
 
         // Sort by min_minimizer to ensure consistent ordering
-        all_shards.sort_by_key(|s| s.min_minimizer);
+        all_shards_with_paths.sort_by_key(|(s, _)| s.min_minimizer);
 
-        // Renumber sequentially
-        for (i, shard) in all_shards.iter_mut().enumerate() {
-            shard.shard_id = i as u32;
+        // Rename files to canonical names (shard.0.parquet, shard.1.parquet, ...)
+        // and update shard IDs to match
+        let mut final_shards: Vec<InvertedShardInfo> =
+            Vec::with_capacity(all_shards_with_paths.len());
+        for (new_id, (mut shard_info, old_path)) in all_shards_with_paths.into_iter().enumerate() {
+            let new_id = new_id as u32;
+            let new_path = output_dir
+                .join(files::INVERTED_DIR)
+                .join(files::inverted_shard(new_id));
+
+            // Rename file from partition-specific name to canonical name
+            if old_path != new_path {
+                std::fs::rename(&old_path, &new_path).with_context(|| {
+                    format!(
+                        "Failed to rename shard {} -> {}",
+                        old_path.display(),
+                        new_path.display()
+                    )
+                })?;
+            }
+
+            shard_info.shard_id = new_id;
+            final_shards.push(shard_info);
         }
 
-        Ok(all_shards)
+        Ok(final_shards)
     }
 
     /// Compute range boundaries for parallel partitioning.
@@ -803,7 +990,7 @@ mod streaming {
 
         for bucket in buckets {
             for &min in &bucket.minimizers {
-                if rand_sample(sample_rate) {
+                if rand_sample(min, sample_rate) {
                     samples.push(min);
                 }
             }
@@ -824,41 +1011,35 @@ mod streaming {
         boundaries
     }
 
-    /// Simple deterministic sampling based on value
-    fn rand_sample(rate: f64) -> bool {
+    /// Deterministic sampling based on the minimizer value itself.
+    ///
+    /// This is thread-safe and produces consistent results: the same minimizer
+    /// will always be sampled or not sampled, regardless of which thread processes it.
+    /// This is critical for correct range boundary computation in parallel sharding.
+    fn rand_sample(minimizer: u64, rate: f64) -> bool {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        use std::time::SystemTime;
 
-        static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let seed = *SEED.get_or_init(|| {
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(42)
-        });
-
+        // Hash the minimizer value to get a pseudo-random but deterministic decision
         let mut hasher = DefaultHasher::new();
-        seed.hash(&mut hasher);
-        std::thread::current().id().hash(&mut hasher);
+        minimizer.hash(&mut hasher);
         let hash = hasher.finish();
 
         (hash as f64 / u64::MAX as f64) < rate
     }
 
     /// Process a single partition of the minimizer space.
+    /// Returns shard infos paired with their file paths (for later renaming).
     fn process_partition(
         output_dir: &Path,
-        filtered_buckets: Vec<(u32, Vec<u64>)>,
+        filtered_buckets: &[(u32, &[u64])],
         partition_idx: u32,
         _total_partitions: u32,
         max_shard_bytes: usize,
-    ) -> Result<Vec<InvertedShardInfo>> {
-        // K-way merge for this partition
-        let bucket_slices: Vec<(u32, &[u64])> = filtered_buckets
-            .iter()
-            .map(|(id, mins)| (*id, mins.as_slice()))
-            .collect();
+        options: &ParquetWriteOptions,
+    ) -> Result<Vec<(InvertedShardInfo, PathBuf)>> {
+        // K-way merge for this partition (buckets already sliced)
+        let bucket_slices: Vec<(u32, &[u64])> = filtered_buckets.to_vec();
 
         let mut heap: BinaryHeap<MergeHeapEntry> = BinaryHeap::with_capacity(bucket_slices.len());
 
@@ -868,9 +1049,10 @@ mod streaming {
             }
         }
 
-        let mut shard_infos: Vec<InvertedShardInfo> = Vec::new();
+        let mut shard_infos: Vec<(InvertedShardInfo, PathBuf)> = Vec::new();
         let mut local_shard_id: u32 = 0;
         let mut current_writer: Option<ShardWriter> = None;
+        let mut current_shard_path: PathBuf = PathBuf::new();
         let mut current_shard_entries: u64 = 0;
         let mut current_shard_min: u64 = 0;
         let mut current_shard_max: u64 = 0;
@@ -893,19 +1075,22 @@ mod streaming {
                         bucket_id_batch.clear();
                     }
                     writer.finish()?;
-                    shard_infos.push(InvertedShardInfo {
-                        shard_id: local_shard_id,
-                        min_minimizer: current_shard_min,
-                        max_minimizer: current_shard_max,
-                        num_entries: current_shard_entries,
-                    });
+                    shard_infos.push((
+                        InvertedShardInfo {
+                            shard_id: local_shard_id,
+                            min_minimizer: current_shard_min,
+                            max_minimizer: current_shard_max,
+                            num_entries: current_shard_entries,
+                        },
+                        current_shard_path.clone(),
+                    ));
                     local_shard_id += 1;
                 }
 
-                // Use partition index in filename to avoid conflicts
+                // Use partition index in filename to avoid conflicts during parallel writes
                 let shard_name = format!("shard.{}.{}.parquet", partition_idx, local_shard_id);
-                let shard_path = output_dir.join(files::INVERTED_DIR).join(&shard_name);
-                current_writer = Some(ShardWriter::new(&shard_path)?);
+                current_shard_path = output_dir.join(files::INVERTED_DIR).join(&shard_name);
+                current_writer = Some(ShardWriter::new(&current_shard_path, options)?);
                 current_shard_entries = 0;
                 current_shard_min = minimizer;
                 // Note: current_shard_max will be set below
@@ -941,12 +1126,15 @@ mod streaming {
                 writer.write_batch(&minimizer_batch, &bucket_id_batch)?;
             }
             writer.finish()?;
-            shard_infos.push(InvertedShardInfo {
-                shard_id: local_shard_id,
-                min_minimizer: current_shard_min,
-                max_minimizer: current_shard_max,
-                num_entries: current_shard_entries,
-            });
+            shard_infos.push((
+                InvertedShardInfo {
+                    shard_id: local_shard_id,
+                    min_minimizer: current_shard_min,
+                    max_minimizer: current_shard_max,
+                    num_entries: current_shard_entries,
+                },
+                current_shard_path,
+            ));
         }
 
         Ok(shard_infos)
@@ -959,33 +1147,14 @@ mod streaming {
     }
 
     impl ShardWriter {
-        fn new(path: &Path) -> Result<Self> {
+        fn new(path: &Path, options: &ParquetWriteOptions) -> Result<Self> {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("minimizer", DataType::UInt64, false),
                 Field::new("bucket_id", DataType::UInt32, false),
             ]));
 
-            let props = WriterProperties::builder()
-                .set_writer_version(WriterVersion::PARQUET_2_0)
-                .set_compression(Compression::SNAPPY)
-                .set_column_encoding(
-                    parquet::schema::types::ColumnPath::new(vec!["minimizer".to_string()]),
-                    Encoding::DELTA_BINARY_PACKED,
-                )
-                .set_column_dictionary_enabled(
-                    parquet::schema::types::ColumnPath::new(vec!["minimizer".to_string()]),
-                    false,
-                )
-                .set_column_encoding(
-                    parquet::schema::types::ColumnPath::new(vec!["bucket_id".to_string()]),
-                    Encoding::DELTA_BINARY_PACKED,
-                )
-                .set_column_dictionary_enabled(
-                    parquet::schema::types::ColumnPath::new(vec!["bucket_id".to_string()]),
-                    false,
-                )
-                .set_max_row_group_size(BATCH_SIZE)
-                .build();
+            // DRY: Use ParquetWriteOptions::to_writer_properties() as single source of truth
+            let props = options.to_writer_properties();
 
             let file = File::create(path)
                 .with_context(|| format!("Failed to create shard: {}", path.display()))?;
@@ -1173,7 +1342,7 @@ mod tests {
         ];
 
         let streaming_manifest =
-            create_parquet_inverted_index(&streaming_dir, buckets, k, w, salt, None).unwrap();
+            create_parquet_inverted_index(&streaming_dir, buckets, k, w, salt, None, None).unwrap();
 
         // === Create traditional Parquet index ===
         // Build Index the traditional way
@@ -1194,7 +1363,9 @@ mod tests {
         // Save as traditional Parquet shard
         create_index_directory(&traditional_dir).unwrap();
         let trad_shard_path = traditional_dir.join("inverted").join("shard.0.parquet");
-        let trad_shard_info = inverted.save_shard_parquet(&trad_shard_path, 0).unwrap();
+        let trad_shard_info = inverted
+            .save_shard_parquet(&trad_shard_path, 0, None)
+            .unwrap();
 
         // Create manifest for traditional
         let trad_manifest = ShardManifest {
@@ -1292,6 +1463,161 @@ mod tests {
                 .iter()
                 .any(|r| r.query_id == 2 && r.bucket_id == 3),
             "Query 2 should match bucket 3"
+        );
+    }
+
+    // ========================================================================
+    // ParquetWriteOptions TDD tests (Phase 1)
+    // ========================================================================
+
+    #[test]
+    fn test_parquet_write_options_default() {
+        let opts = ParquetWriteOptions::default();
+        // Defaults must match current behavior exactly
+        assert_eq!(opts.row_group_size, 100_000);
+        assert!(!opts.bloom_filter_enabled);
+        assert!((opts.bloom_filter_fpp - 0.05).abs() < 0.001);
+        assert!(opts.write_page_statistics);
+        assert!(matches!(opts.compression, ParquetCompression::Snappy));
+    }
+
+    #[test]
+    fn test_parquet_write_options_to_writer_properties() {
+        let opts = ParquetWriteOptions {
+            bloom_filter_enabled: true,
+            compression: ParquetCompression::Zstd,
+            ..Default::default()
+        };
+        // Should compile and produce valid WriterProperties
+        let props = opts.to_writer_properties();
+        // WriterProperties doesn't expose getters, but we verify it doesn't panic
+        // and produces the correct compression codec
+        assert_eq!(
+            props.compression(&parquet::schema::types::ColumnPath::new(vec![])),
+            parquet::basic::Compression::ZSTD(parquet::basic::ZstdLevel::default())
+        );
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_parquet_write_with_zstd() {
+        use crate::extraction::extract_into;
+        use crate::workspace::MinimizerWorkspace;
+
+        let tmp = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("zstd_test.ryxdi");
+
+        // Create test data
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let k = 32;
+        let w = 10;
+        let salt = 0x1234u64;
+
+        let mut ws = MinimizerWorkspace::new();
+        extract_into(seq, k, w, salt, &mut ws);
+        let mut mins = std::mem::take(&mut ws.buffer);
+        mins.sort_unstable();
+        mins.dedup();
+
+        let buckets = vec![BucketData {
+            bucket_id: 1,
+            bucket_name: "test".to_string(),
+            sources: vec!["test.fa".to_string()],
+            minimizers: mins,
+        }];
+
+        // Create with zstd compression
+        let options = ParquetWriteOptions {
+            compression: ParquetCompression::Zstd,
+            ..Default::default()
+        };
+
+        let manifest = create_parquet_inverted_index(
+            &index_dir,
+            buckets.clone(),
+            k,
+            w,
+            salt,
+            None,
+            Some(&options),
+        )
+        .unwrap();
+
+        // Verify we can read it back (data integrity)
+        assert!(manifest.inverted.as_ref().unwrap().num_shards > 0);
+        assert!(is_parquet_index(&index_dir));
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_parquet_write_with_bloom_filter() {
+        use crate::extraction::extract_into;
+        use crate::workspace::MinimizerWorkspace;
+        use parquet::file::reader::FileReader;
+
+        let tmp = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("bloom_test.ryxdi");
+
+        // Create test data
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let k = 32;
+        let w = 10;
+        let salt = 0x1234u64;
+
+        let mut ws = MinimizerWorkspace::new();
+        extract_into(seq, k, w, salt, &mut ws);
+        let mut mins = std::mem::take(&mut ws.buffer);
+        mins.sort_unstable();
+        mins.dedup();
+
+        let buckets = vec![BucketData {
+            bucket_id: 1,
+            bucket_name: "test".to_string(),
+            sources: vec!["test.fa".to_string()],
+            minimizers: mins,
+        }];
+
+        // Create with bloom filter enabled
+        let options = ParquetWriteOptions {
+            bloom_filter_enabled: true,
+            bloom_filter_fpp: 0.01,
+            ..Default::default()
+        };
+
+        let manifest = create_parquet_inverted_index(
+            &index_dir,
+            buckets.clone(),
+            k,
+            w,
+            salt,
+            None,
+            Some(&options),
+        )
+        .unwrap();
+
+        assert!(manifest.inverted.as_ref().unwrap().num_shards > 0);
+
+        // Verify bloom filter metadata exists in the parquet file
+        // We check this by reading the file metadata
+        let shard_path = index_dir.join("inverted").join("shard.0.parquet");
+        let file = std::fs::File::open(&shard_path).unwrap();
+        let reader = parquet::file::reader::SerializedFileReader::new(file).unwrap();
+        let metadata = reader.metadata();
+
+        // Check that at least one row group has bloom filter metadata
+        let mut has_bloom_filter = false;
+        for rg in 0..metadata.num_row_groups() {
+            let rg_meta = metadata.row_group(rg);
+            for col in 0..rg_meta.num_columns() {
+                if rg_meta.column(col).bloom_filter_offset().is_some() {
+                    has_bloom_filter = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            has_bloom_filter,
+            "Bloom filter should be present in Parquet file"
         );
     }
 }

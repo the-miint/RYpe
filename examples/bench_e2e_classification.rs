@@ -105,7 +105,7 @@ fn main() -> Result<()> {
             let legacy_shard = legacy_sharded.load_shard(shard_info.shard_id)?;
             let parquet_shard_path =
                 parquet_inverted_dir.join(format!("shard.{}.parquet", shard_info.shard_id));
-            legacy_shard.save_shard_parquet(&parquet_shard_path, shard_info.shard_id)?;
+            legacy_shard.save_shard_parquet(&parquet_shard_path, shard_info.shard_id, None)?;
         }
 
         // Create manifest for Parquet shards (copy from legacy)

@@ -1611,7 +1611,7 @@ mod tests {
 
         // Save as Parquet shard
         let shard_path = ShardManifest::shard_path_parquet(&base_path, 0);
-        let shard_info = inverted.save_shard_parquet(&shard_path, 0)?;
+        let shard_info = inverted.save_shard_parquet(&shard_path, 0, None)?;
 
         let manifest = ShardManifest {
             k: inverted.k,
@@ -1695,7 +1695,7 @@ mod tests {
 
         // Save as Parquet shard
         let shard_path = ShardManifest::shard_path_parquet(&base_path, 0);
-        let shard_info = inverted.save_shard_parquet(&shard_path, 0)?;
+        let shard_info = inverted.save_shard_parquet(&shard_path, 0, None)?;
 
         let manifest = ShardManifest {
             k: inverted.k,
@@ -1791,7 +1791,7 @@ mod tests {
 
         // Save as Parquet shard
         let parquet_shard_path = ShardManifest::shard_path_parquet(&parquet_base, 0);
-        let parquet_shard_info = inverted.save_shard_parquet(&parquet_shard_path, 0)?;
+        let parquet_shard_info = inverted.save_shard_parquet(&parquet_shard_path, 0, None)?;
 
         let parquet_manifest = ShardManifest {
             k: inverted.k,

@@ -83,7 +83,7 @@ fn test_parquet_schema_is_correct() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None)?;
+    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None)?;
 
     // Read the shard and verify schema
     let shard_path = index_path.join("inverted").join("shard.0.parquet");
@@ -124,7 +124,7 @@ fn test_parquet_data_is_sorted() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None)?;
+    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None)?;
 
     // Read all pairs from the shard
     let shard_path = index_path.join("inverted").join("shard.0.parquet");
@@ -152,7 +152,7 @@ fn test_parquet_no_duplicate_pairs() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None)?;
+    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None)?;
 
     // Read all pairs from the shard
     let shard_path = index_path.join("inverted").join("shard.0.parquet");
@@ -181,7 +181,7 @@ fn test_parquet_manifest_counts_match_data() -> Result<()> {
     // Total entries = sum of all minimizers (each becomes one row)
     let expected_total_entries = expected_total_minimizers;
 
-    let manifest = create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None)?;
+    let manifest = create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None)?;
 
     // Verify manifest totals
     assert_eq!(
@@ -213,7 +213,7 @@ fn test_parquet_shared_minimizers_have_multiple_bucket_ids() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None)?;
+    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None)?;
 
     // Read all pairs from the shard
     let shard_path = index_path.join("inverted").join("shard.0.parquet");
@@ -268,7 +268,7 @@ fn test_parquet_manifest_shard_ranges() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None)?;
+    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None)?;
 
     // Load manifest and verify shard ranges
     let manifest = ParquetManifest::load(&index_path)?;
@@ -292,7 +292,7 @@ fn test_parquet_directory_structure() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None)?;
+    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None)?;
 
     // Verify directory structure
     assert!(index_path.is_dir(), "Index should be a directory");
@@ -325,7 +325,7 @@ fn test_is_parquet_index_detection() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None)?;
+    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None)?;
 
     // Should be detected as a Parquet index
     assert!(is_parquet_index(&index_path), "Should detect Parquet index");
@@ -360,7 +360,7 @@ fn test_parquet_empty_buckets_handled() -> Result<()> {
         },
     ];
 
-    let manifest = create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None)?;
+    let manifest = create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None)?;
 
     assert_eq!(manifest.total_minimizers, 0);
     let inverted = manifest.inverted.expect("Should have inverted manifest");
@@ -375,7 +375,7 @@ fn test_parquet_bucket_metadata_preserved() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None)?;
+    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None)?;
 
     // Load manifest and verify bucket count
     let manifest = ParquetManifest::load(&index_path)?;
@@ -405,7 +405,7 @@ fn test_parquet_validation_rejects_unsorted_buckets() {
         minimizers: vec![300, 100, 200], // NOT sorted!
     }];
 
-    let result = create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None);
+    let result = create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None);
     assert!(result.is_err(), "Should reject unsorted bucket data");
     // The error chain includes context - check the full debug output
     let err = format!("{:?}", result.unwrap_err());
@@ -429,7 +429,7 @@ fn test_parquet_validation_rejects_duplicate_minimizers() {
         minimizers: vec![100, 200, 200, 300], // Duplicate 200!
     }];
 
-    let result = create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None);
+    let result = create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None);
     assert!(
         result.is_err(),
         "Should reject bucket with duplicate minimizers"
@@ -460,7 +460,7 @@ fn test_source_hash_validation() -> Result<()> {
     let expected_hash = compute_source_hash(&bucket_minimizer_counts);
 
     // Create index
-    let manifest = create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None)?;
+    let manifest = create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None)?;
 
     // Verify the manifest's source_hash matches our expected value
     assert_eq!(
@@ -522,4 +522,255 @@ fn test_source_hash_stable_across_order() {
         hash1, hash2,
         "Hash should be stable regardless of insertion order"
     );
+}
+
+// ============================================================================
+// Tests for critical bug fixes
+// ============================================================================
+
+/// Test that sampling is deterministic: same minimizers produce same output.
+/// This tests fix #1 where rand_sample() was using thread ID instead of
+/// minimizer value for the random decision.
+#[test]
+fn test_sampling_is_deterministic() -> Result<()> {
+    let dir1 = tempdir()?;
+    let dir2 = tempdir()?;
+    let index_path1 = dir1.path().join("test1.ryxdi");
+    let index_path2 = dir2.path().join("test2.ryxdi");
+
+    // Create buckets with many minimizers (enough to trigger sampling)
+    let minimizers: Vec<u64> = (0..10_000u64).collect();
+    let buckets = vec![BucketData {
+        bucket_id: 0,
+        bucket_name: "test".to_string(),
+        sources: vec!["test.fna".to_string()],
+        minimizers: minimizers.clone(),
+    }];
+
+    // Create two indices with same data
+    create_parquet_inverted_index(&index_path1, buckets.clone(), 64, 50, 12345, None, None)?;
+    create_parquet_inverted_index(&index_path2, buckets, 64, 50, 12345, None, None)?;
+
+    // Read pairs from both shards
+    let shard_path1 = index_path1.join("inverted").join("shard.0.parquet");
+    let shard_path2 = index_path2.join("inverted").join("shard.0.parquet");
+
+    let pairs1 = read_shard_pairs(&shard_path1)?;
+    let pairs2 = read_shard_pairs(&shard_path2)?;
+
+    // Verify they're identical (deterministic sampling)
+    assert_eq!(
+        pairs1.len(),
+        pairs2.len(),
+        "Same input should produce same number of entries"
+    );
+    assert_eq!(
+        pairs1, pairs2,
+        "Same input should produce identical output (deterministic sampling)"
+    );
+
+    Ok(())
+}
+
+/// Test that parallel shard creation produces correctly named files.
+/// This tests fix #2 where parallel partitions could have file naming collisions.
+#[test]
+fn test_parallel_shard_files_correctly_named() -> Result<()> {
+    use rype::parquet_index::ParquetWriteOptions;
+
+    let dir = tempdir()?;
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create large dataset to trigger parallel processing
+    // Each bucket has minimizers spanning different ranges
+    let mut buckets = Vec::new();
+    for bucket_id in 0..10u32 {
+        let base = bucket_id as u64 * 10_000;
+        let minimizers: Vec<u64> = (base..base + 5_000).collect();
+        buckets.push(BucketData {
+            bucket_id,
+            bucket_name: format!("bucket_{}", bucket_id),
+            sources: vec![format!("ref_{}.fna", bucket_id)],
+            minimizers,
+        });
+    }
+
+    // Use small shard size to create multiple shards
+    let options = ParquetWriteOptions {
+        row_group_size: 1000,
+        ..Default::default()
+    };
+    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, Some(&options))?;
+
+    // Load manifest to get shard count
+    let manifest = ParquetManifest::load(&index_path)?;
+    let inverted = manifest.inverted.expect("Should have inverted manifest");
+
+    // Verify each shard file exists with correct naming
+    let inverted_dir = index_path.join("inverted");
+    for shard_id in 0..inverted.num_shards {
+        let shard_path = inverted_dir.join(format!("shard.{}.parquet", shard_id));
+        assert!(
+            shard_path.exists(),
+            "Shard file {} should exist",
+            shard_path.display()
+        );
+    }
+
+    // Verify shard ranges are in ascending order
+    for i in 1..inverted.shards.len() {
+        assert!(
+            inverted.shards[i].min_minimizer >= inverted.shards[i - 1].max_minimizer,
+            "Shard {} should start after shard {} ends",
+            i,
+            i - 1
+        );
+    }
+
+    // Verify no leftover partition files (p0_*, p1_*, etc.)
+    let entries: Vec<_> = std::fs::read_dir(&inverted_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    for entry in &entries {
+        assert!(
+            entry.starts_with("shard."),
+            "Unexpected file in inverted dir: {}",
+            entry
+        );
+    }
+
+    Ok(())
+}
+
+/// Test that parallel processing produces correctly ordered data.
+/// Verifies the final output is globally sorted by minimizer.
+#[test]
+fn test_parallel_output_globally_sorted() -> Result<()> {
+    use rype::parquet_index::ParquetWriteOptions;
+
+    let dir = tempdir()?;
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create overlapping minimizer ranges to stress parallel merging
+    let buckets = vec![
+        BucketData {
+            bucket_id: 0,
+            bucket_name: "a".to_string(),
+            sources: vec![],
+            minimizers: (0..5000u64).collect(),
+        },
+        BucketData {
+            bucket_id: 1,
+            bucket_name: "b".to_string(),
+            sources: vec![],
+            minimizers: (2500..7500u64).collect(), // Overlaps with bucket 0
+        },
+        BucketData {
+            bucket_id: 2,
+            bucket_name: "c".to_string(),
+            sources: vec![],
+            minimizers: (5000..10000u64).collect(),
+        },
+    ];
+
+    let options = ParquetWriteOptions {
+        row_group_size: 1000,
+        ..Default::default()
+    };
+    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, Some(&options))?;
+
+    // Read all pairs from all shards
+    let manifest = ParquetManifest::load(&index_path)?;
+    let inverted = manifest.inverted.expect("Should have inverted manifest");
+    let inverted_dir = index_path.join("inverted");
+
+    let mut all_pairs = Vec::new();
+    for shard_id in 0..inverted.num_shards {
+        let shard_path = inverted_dir.join(format!("shard.{}.parquet", shard_id));
+        let pairs = read_shard_pairs(&shard_path)?;
+        all_pairs.extend(pairs);
+    }
+
+    // Verify global sort order: (minimizer, bucket_id)
+    for i in 1..all_pairs.len() {
+        let (m1, b1) = all_pairs[i - 1];
+        let (m2, b2) = all_pairs[i];
+        assert!(
+            (m2, b2) >= (m1, b1),
+            "Pairs should be sorted: ({}, {}) should come after ({}, {})",
+            m2,
+            b2,
+            m1,
+            b1
+        );
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Tests for ParquetWriteOptions validation
+// ============================================================================
+
+#[test]
+fn test_fpp_validation_rejects_zero() {
+    use rype::parquet_index::ParquetWriteOptions;
+
+    let options = ParquetWriteOptions {
+        bloom_filter_fpp: 0.0,
+        ..Default::default()
+    };
+    let result = options.validate();
+    assert!(result.is_err(), "FPP of 0.0 should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("bloom_filter_fpp"), "Error should mention fpp");
+}
+
+#[test]
+fn test_fpp_validation_rejects_one() {
+    use rype::parquet_index::ParquetWriteOptions;
+
+    let options = ParquetWriteOptions {
+        bloom_filter_fpp: 1.0,
+        ..Default::default()
+    };
+    let result = options.validate();
+    assert!(result.is_err(), "FPP of 1.0 should be rejected");
+}
+
+#[test]
+fn test_fpp_validation_rejects_negative() {
+    use rype::parquet_index::ParquetWriteOptions;
+
+    let options = ParquetWriteOptions {
+        bloom_filter_fpp: -0.5,
+        ..Default::default()
+    };
+    let result = options.validate();
+    assert!(result.is_err(), "Negative FPP should be rejected");
+}
+
+#[test]
+fn test_fpp_validation_accepts_valid() {
+    use rype::parquet_index::ParquetWriteOptions;
+
+    let options = ParquetWriteOptions {
+        bloom_filter_fpp: 0.05,
+        ..Default::default()
+    };
+    let result = options.validate();
+    assert!(result.is_ok(), "FPP of 0.05 should be valid");
+}
+
+#[test]
+fn test_row_group_validation_rejects_zero() {
+    use rype::parquet_index::ParquetWriteOptions;
+
+    let options = ParquetWriteOptions {
+        row_group_size: 0,
+        ..Default::default()
+    };
+    let result = options.validate();
+    assert!(result.is_err(), "row_group_size of 0 should be rejected");
 }

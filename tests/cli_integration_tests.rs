@@ -784,3 +784,85 @@ fn test_readme_bash_examples() -> Result<()> {
 
     Ok(())
 }
+
+/// Test that CLI rejects invalid --parquet-bloom-fpp values.
+/// This tests the clap value_parser validation.
+#[test]
+#[cfg(feature = "parquet")]
+fn test_cli_rejects_invalid_bloom_fpp() -> Result<()> {
+    use std::process::Command;
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+
+    // Build the binary first
+    let status = Command::new("cargo")
+        .args(["build", "--features", "parquet"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+
+    // Test invalid FPP values: 0.0, 1.0, 2.0
+    // (Note: negative values like -0.5 are interpreted as flags by the shell)
+    let invalid_values = ["0.0", "1.0", "2.0"];
+
+    for fpp in &invalid_values {
+        let output = Command::new(&binary)
+            .args([
+                "index",
+                "create",
+                "-o",
+                "test.ryxdi",
+                "-r",
+                "nonexistent.fa",
+                "--parquet",
+                &format!("--parquet-bloom-fpp={}", fpp),
+            ])
+            .output()?;
+
+        // Should fail with an error about FPP
+        assert!(
+            !output.status.success(),
+            "CLI should reject --parquet-bloom-fpp={}",
+            fpp
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("bloom_filter_fpp") || stderr.contains("(0.0, 1.0)"),
+            "Error should mention FPP validation for {}: {}",
+            fpp,
+            stderr
+        );
+    }
+
+    // Test that valid FPP is accepted (will fail on missing file, not validation)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            "test.ryxdi",
+            "-r",
+            "nonexistent.fa",
+            "--parquet",
+            "--parquet-bloom-fpp",
+            "0.05",
+        ])
+        .output()?;
+
+    // If it fails, it should be because of missing file, not FPP validation
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("bloom_filter_fpp")
+                || stderr.contains("file")
+                || stderr.contains("not found"),
+            "Valid FPP should not cause validation error: {}",
+            stderr
+        );
+    }
+
+    Ok(())
+}

@@ -15,6 +15,8 @@ use rype::memory::{
     calculate_batch_config, detect_available_memory, format_bytes, parse_byte_suffix, MemoryConfig,
     MemorySource, ReadMemoryProfile,
 };
+#[cfg(feature = "parquet")]
+use rype::parquet_index;
 use rype::{
     aggregate_batch, classify_batch, classify_batch_sharded_main,
     classify_batch_sharded_merge_join, classify_batch_sharded_sequential, extract_into,
@@ -44,6 +46,20 @@ fn parse_shard_size_arg(s: &str) -> Result<usize, String> {
         Ok(None) => Err("'auto' not supported for shard size".to_string()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// Parse bloom filter false positive probability, validating range (0.0, 1.0).
+fn parse_bloom_fpp(s: &str) -> Result<f64, String> {
+    let fpp: f64 = s
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid number", s))?;
+    if fpp <= 0.0 || fpp >= 1.0 {
+        return Err(format!(
+            "bloom_filter_fpp must be in (0.0, 1.0), got {}",
+            fpp
+        ));
+    }
+    Ok(fpp)
 }
 
 /// Parse shard format argument ("legacy" or "parquet")
@@ -235,6 +251,26 @@ enum IndexCommands {
         /// This is the recommended format for large indices.
         #[arg(long)]
         parquet: bool,
+
+        /// Parquet row group size (rows per group). Larger = better compression.
+        /// Only used when --parquet is specified.
+        #[arg(long, default_value_t = 100_000)]
+        parquet_row_group_size: usize,
+
+        /// Use Zstd compression instead of Snappy for Parquet files.
+        /// Better compression ratio but slower. Only used with --parquet.
+        #[arg(long)]
+        parquet_zstd: bool,
+
+        /// Enable bloom filters in Parquet files for faster lookups.
+        /// Increases file size slightly. Only used with --parquet.
+        #[arg(long)]
+        parquet_bloom_filter: bool,
+
+        /// Bloom filter false positive probability (0.0-1.0).
+        /// Lower = more accurate but larger files. Only used with --parquet-bloom-filter.
+        #[arg(long, default_value = "0.05", value_parser = parse_bloom_fpp)]
+        parquet_bloom_fpp: f64,
     },
 
     /// Show index statistics and bucket information
@@ -373,6 +409,26 @@ USAGE:
         /// Output format for inverted index shards
         #[arg(long, default_value = "legacy", value_parser = parse_shard_format)]
         format: String,
+
+        /// Parquet row group size (rows per group). Larger = better compression.
+        /// Only used when --format=parquet is specified.
+        #[arg(long, default_value_t = 100_000)]
+        parquet_row_group_size: usize,
+
+        /// Use Zstd compression instead of Snappy for Parquet files.
+        /// Better compression ratio but slower. Only used with --format=parquet.
+        #[arg(long)]
+        parquet_zstd: bool,
+
+        /// Enable bloom filters in Parquet files for faster lookups.
+        /// Increases file size slightly. Only used with --format=parquet.
+        #[arg(long)]
+        parquet_bloom_filter: bool,
+
+        /// Bloom filter false positive probability (0.0-1.0).
+        /// Lower = more accurate but larger files. Only used with --parquet-bloom-filter.
+        #[arg(long, default_value = "0.05", value_parser = parse_bloom_fpp)]
+        parquet_bloom_fpp: f64,
     },
 
     /// Show detailed minimizer statistics for compression analysis
@@ -674,6 +730,7 @@ fn add_reference_file_to_index(
 /// This bypasses the main index entirely and streams (minimizer, bucket_id)
 /// pairs directly to Parquet format.
 #[cfg(feature = "parquet")]
+#[allow(clippy::too_many_arguments)]
 fn create_parquet_index_from_refs(
     output: &Path,
     references: &[PathBuf],
@@ -682,6 +739,7 @@ fn create_parquet_index_from_refs(
     salt: u64,
     separate_buckets: bool,
     max_shard_bytes: Option<usize>,
+    options: Option<&parquet_index::ParquetWriteOptions>,
 ) -> Result<()> {
     use rype::{create_parquet_inverted_index, extract_into, BucketData};
 
@@ -771,7 +829,8 @@ fn create_parquet_index_from_refs(
     );
 
     // Create the Parquet index
-    let manifest = create_parquet_inverted_index(output, buckets, k, w, salt, max_shard_bytes)?;
+    let manifest =
+        create_parquet_inverted_index(output, buckets, k, w, salt, max_shard_bytes, options)?;
 
     log::info!("Created Parquet inverted index:");
     log::info!("  Buckets: {}", manifest.num_buckets);
@@ -883,6 +942,10 @@ fn main() -> Result<()> {
                 separate_buckets,
                 max_shard_size,
                 parquet,
+                parquet_row_group_size,
+                parquet_zstd,
+                parquet_bloom_filter,
+                parquet_bloom_fpp,
             } => {
                 if !matches!(kmer_size, 16 | 32 | 64) {
                     return Err(anyhow!("K must be 16, 32, or 64 (got {})", kmer_size));
@@ -892,6 +955,19 @@ fn main() -> Result<()> {
                     // Create Parquet inverted index directly
                     #[cfg(feature = "parquet")]
                     {
+                        // Build ParquetWriteOptions from CLI flags
+                        let parquet_options = parquet_index::ParquetWriteOptions {
+                            row_group_size: parquet_row_group_size,
+                            compression: if parquet_zstd {
+                                parquet_index::ParquetCompression::Zstd
+                            } else {
+                                parquet_index::ParquetCompression::Snappy
+                            },
+                            bloom_filter_enabled: parquet_bloom_filter,
+                            bloom_filter_fpp: parquet_bloom_fpp,
+                            write_page_statistics: true,
+                        };
+
                         create_parquet_index_from_refs(
                             &output,
                             &reference,
@@ -900,6 +976,7 @@ fn main() -> Result<()> {
                             salt,
                             separate_buckets,
                             max_shard_size,
+                            Some(&parquet_options),
                         )?;
                     }
                     #[cfg(not(feature = "parquet"))]
@@ -1249,9 +1326,30 @@ fn main() -> Result<()> {
                 bucket_add_from_config(&config)?;
             }
 
-            IndexCommands::Invert { index, format } => {
+            IndexCommands::Invert {
+                index,
+                format,
+                parquet_row_group_size,
+                parquet_zstd,
+                parquet_bloom_filter,
+                parquet_bloom_fpp,
+            } => {
                 let output_path = index.with_extension("ryxdi");
                 let use_parquet = format == "parquet";
+
+                // Build ParquetWriteOptions from CLI flags (used when format=parquet)
+                #[cfg(feature = "parquet")]
+                let parquet_options = parquet_index::ParquetWriteOptions {
+                    row_group_size: parquet_row_group_size,
+                    compression: if parquet_zstd {
+                        parquet_index::ParquetCompression::Zstd
+                    } else {
+                        parquet_index::ParquetCompression::Snappy
+                    },
+                    bloom_filter_enabled: parquet_bloom_filter,
+                    bloom_filter_fpp: parquet_bloom_fpp,
+                    write_page_statistics: true,
+                };
 
                 // For Parquet format, create the inverted directory
                 #[cfg(feature = "parquet")]
@@ -1317,8 +1415,11 @@ fn main() -> Result<()> {
                                         &output_path,
                                         shard_info.shard_id,
                                     );
-                                    let info = inverted
-                                        .save_shard_parquet(&inv_shard_path, shard_info.shard_id)?;
+                                    let info = inverted.save_shard_parquet(
+                                        &inv_shard_path,
+                                        shard_info.shard_id,
+                                        Some(&parquet_options),
+                                    )?;
                                     created_files.push(inv_shard_path);
                                     info
                                 }
@@ -1392,7 +1493,11 @@ fn main() -> Result<()> {
                             #[cfg(feature = "parquet")]
                             {
                                 let shard_path = ShardManifest::shard_path_parquet(&output_path, 0);
-                                let info = inverted.save_shard_parquet(&shard_path, 0)?;
+                                let info = inverted.save_shard_parquet(
+                                    &shard_path,
+                                    0,
+                                    Some(&parquet_options),
+                                )?;
                                 created_files.push(shard_path);
                                 info
                             }

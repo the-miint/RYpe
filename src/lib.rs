@@ -52,7 +52,8 @@ pub mod parquet_index;
 #[cfg(feature = "parquet")]
 pub use parquet_index::{
     compute_source_hash, create_parquet_inverted_index, is_parquet_index, BucketData,
-    BucketMetadata, InvertedManifest, InvertedShardInfo, ParquetManifest,
+    BucketMetadata, InvertedManifest, InvertedShardInfo, ParquetCompression, ParquetManifest,
+    ParquetWriteOptions,
 };
 
 // Re-export types

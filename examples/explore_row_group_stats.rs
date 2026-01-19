@@ -21,7 +21,7 @@ fn main() -> Result<()> {
     let index = InvertedIndex::load_shard(shard_path)?;
 
     println!("Saving as Parquet: {}", parquet_path.display());
-    index.save_shard_parquet(&parquet_path, 0)?;
+    index.save_shard_parquet(&parquet_path, 0, None)?;
 
     // Explore the statistics
     println!("\n=== Row Group Statistics ===\n");

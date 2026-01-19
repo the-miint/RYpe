@@ -22,7 +22,7 @@ fn main() -> Result<()> {
     // Load legacy and save as Parquet
     println!("1. Preparing test data...");
     let legacy = InvertedIndex::load_shard(shard_path)?;
-    legacy.save_shard_parquet(&parquet_path, 0)?;
+    legacy.save_shard_parquet(&parquet_path, 0, None)?;
 
     let all_mins = legacy.minimizers();
     let num_mins = all_mins.len();
