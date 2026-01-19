@@ -553,6 +553,12 @@ WHEN TO USE 'run' vs 'aggregate':
         #[arg(short = 'M', long)]
         merge_join: bool,
 
+        /// Use bloom filters for row group filtering (requires --use-inverted with Parquet index).
+        /// Reduces I/O by rejecting row groups that definitely don't contain query minimizers.
+        /// Only effective if index was built with --parquet-bloom-filter.
+        #[arg(long)]
+        use_bloom_filter: bool,
+
         /// Print timing diagnostics to stderr for performance analysis.
         #[arg(long)]
         timing: bool,
@@ -581,6 +587,8 @@ WHEN TO USE 'run' vs 'aggregate':
         use_inverted: bool,
         #[arg(short = 'M', long)]
         merge_join: bool,
+        #[arg(long)]
+        use_bloom_filter: bool,
         #[arg(long)]
         timing: bool,
     },
@@ -1831,6 +1839,7 @@ fn main() -> Result<()> {
                 output,
                 use_inverted,
                 merge_join,
+                use_bloom_filter,
                 timing,
             }
             | ClassifyCommands::Batch {
@@ -1844,10 +1853,15 @@ fn main() -> Result<()> {
                 output,
                 use_inverted,
                 merge_join,
+                use_bloom_filter,
                 timing,
             } => {
                 if merge_join && !use_inverted {
                     return Err(anyhow!("--merge-join requires --use-inverted"));
+                }
+
+                if use_bloom_filter && !use_inverted {
+                    return Err(anyhow!("--use-bloom-filter requires --use-inverted"));
                 }
 
                 // Enable timing diagnostics if requested
@@ -2055,6 +2069,15 @@ fn main() -> Result<()> {
                         log::info!("Sharded index validated successfully");
                     }
 
+                    // Build read options for Parquet indices
+                    #[cfg(feature = "parquet")]
+                    let read_options = if use_bloom_filter {
+                        log::info!("Bloom filter row group filtering enabled");
+                        Some(parquet_index::ParquetReadOptions::with_bloom_filter())
+                    } else {
+                        None
+                    };
+
                     if merge_join {
                         log::info!("Starting merge-join classification with sequential shard loading (batch_size={})", effective_batch_size);
                     } else {
@@ -2076,6 +2099,25 @@ fn main() -> Result<()> {
                             .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                             .collect();
 
+                        #[cfg(feature = "parquet")]
+                        let results = if merge_join {
+                            classify_batch_sharded_merge_join(
+                                &sharded,
+                                neg_mins.as_ref(),
+                                &batch_refs,
+                                threshold,
+                                read_options.as_ref(),
+                            )?
+                        } else {
+                            classify_batch_sharded_sequential(
+                                &sharded,
+                                neg_mins.as_ref(),
+                                &batch_refs,
+                                threshold,
+                                read_options.as_ref(),
+                            )?
+                        };
+                        #[cfg(not(feature = "parquet"))]
                         let results = if merge_join {
                             classify_batch_sharded_merge_join(
                                 &sharded,

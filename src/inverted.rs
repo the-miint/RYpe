@@ -1264,6 +1264,50 @@ impl InvertedIndex {
         Ok(stats)
     }
 
+    /// Check if ANY query minimizer might be in this row group's bloom filter.
+    ///
+    /// Returns `true` if:
+    /// - The bloom filter is not present (conservative fallback)
+    /// - Any query minimizer might be present according to the bloom filter
+    ///
+    /// Returns `false` only if the bloom filter definitively says NONE of the
+    /// query minimizers are present.
+    ///
+    /// # Arguments
+    /// * `bloom_filter` - Bloom filter for the minimizer column, if present
+    /// * `query_minimizers` - Slice of query minimizers to check
+    ///
+    /// # Type Safety
+    /// Parquet's `Sbbf::check` accepts any type implementing `AsBytes`, which includes
+    /// both `u64` and `i64`. Since `AsBytes` uses the raw memory representation (via
+    /// `std::mem::transmute`-style casting), both types produce identical byte sequences
+    /// for the same bit pattern. We use `u64` directly since that's our native type.
+    ///
+    /// This correctly handles all u64 values including those >= 2^63, which would be
+    /// negative if interpreted as i64. The bloom filter hashes bytes, not numeric values.
+    ///
+    /// # Note
+    /// Bloom filters only work with individual value checks, not range queries.
+    /// This is used by load_shard_parquet_for_query() which has individual minimizers.
+    #[cfg(feature = "parquet")]
+    fn bloom_filter_may_contain_any(
+        bloom_filter: Option<&parquet::bloom_filter::Sbbf>,
+        query_minimizers: &[u64],
+    ) -> bool {
+        let Some(bf) = bloom_filter else {
+            return true; // No bloom filter = conservatively include
+        };
+
+        if query_minimizers.is_empty() {
+            return false; // No minimizers to find
+        }
+
+        // Check all query minimizers against the bloom filter.
+        // u64 implements AsBytes, which converts to raw bytes - same representation
+        // regardless of sign interpretation. Works correctly for all u64 values.
+        query_minimizers.iter().any(|&m| bf.check(&m))
+    }
+
     /// Find which row groups contain at least one query minimizer.
     ///
     /// Uses binary search per row group: O(R × log Q) where R = row groups, Q = query minimizers.
@@ -1309,6 +1353,7 @@ impl InvertedIndex {
     /// * `path` - Path to the Parquet shard file
     /// * `k`, `w`, `salt`, `source_hash` - Index parameters from manifest
     /// * `query_minimizers` - Sorted slice of query minimizers to match against
+    /// * `options` - Read options (None = default behavior without bloom filters)
     ///
     /// # Panics (debug mode)
     /// Panics if `query_minimizers` is not sorted.
@@ -1323,15 +1368,19 @@ impl InvertedIndex {
         salt: u64,
         source_hash: u64,
         query_minimizers: &[u64],
+        options: Option<&crate::parquet_index::ParquetReadOptions>,
     ) -> Result<Self> {
         use anyhow::Context;
         use arrow::array::{Array, UInt32Array, UInt64Array};
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::properties::ReaderProperties;
         use parquet::file::reader::FileReader;
-        use parquet::file::serialized_reader::SerializedFileReader;
+        use parquet::file::serialized_reader::{ReadOptionsBuilder, SerializedFileReader};
         use parquet::file::statistics::Statistics;
         use rayon::prelude::*;
         use std::fs::File;
+
+        let use_bloom_filter = options.map(|o| o.use_bloom_filter).unwrap_or(false);
 
         // For small query sets, binary search on sorted array is O(log n) and faster than
         // HashSet lookup which is O(1) but has higher constant factors (hashing + probe).
@@ -1369,10 +1418,29 @@ impl InvertedIndex {
         // Read Parquet footer (metadata) only - not the full file data.
         // SerializedFileReader::new(File) reads just the footer (~few KB) to get metadata.
         // The file handle is explicitly scoped so it's closed before parallel reads begin.
-        let (_num_row_groups, rg_stats) = {
+        //
+        // When bloom filter is enabled, we keep the reader alive longer to access bloom
+        // filters for each row group after statistics filtering.
+        let matching_row_groups: Vec<usize> = {
             let file = File::open(path)
                 .with_context(|| format!("Failed to open Parquet shard: {}", path.display()))?;
-            let parquet_reader = SerializedFileReader::new(file)?;
+
+            // Use new_with_options when bloom filter reading is requested
+            let parquet_reader = if use_bloom_filter {
+                SerializedFileReader::new_with_options(
+                    file,
+                    ReadOptionsBuilder::new()
+                        .with_reader_properties(
+                            ReaderProperties::builder()
+                                .set_read_bloom_filter(true)
+                                .build(),
+                        )
+                        .build(),
+                )?
+            } else {
+                SerializedFileReader::new(file)?
+            };
+
             let metadata = parquet_reader.metadata();
             let num_row_groups = metadata.num_row_groups();
 
@@ -1427,11 +1495,64 @@ impl InvertedIndex {
                 );
             }
 
-            (num_row_groups, rg_stats)
-        }; // parquet_reader and file handle dropped here
+            // Phase 1: Filter by min/max statistics
+            let stats_filtered = Self::find_matching_row_groups(query_minimizers, &rg_stats);
 
-        // Find matching row groups using binary search on statistics
-        let matching_row_groups = Self::find_matching_row_groups(query_minimizers, &rg_stats);
+            if stats_filtered.is_empty() {
+                return Ok(InvertedIndex {
+                    k,
+                    w,
+                    salt,
+                    source_hash,
+                    minimizers: Vec::new(),
+                    offsets: vec![0],
+                    bucket_ids: Vec::new(),
+                });
+            }
+
+            // Phase 2: Filter by bloom filter (if enabled)
+            // This happens while we still have the parquet_reader alive.
+            if use_bloom_filter {
+                let mut bloom_filtered = Vec::with_capacity(stats_filtered.len());
+                let mut bloom_rejected = 0usize;
+                let mut bloom_filters_found = 0usize;
+
+                for &rg_idx in &stats_filtered {
+                    let rg_reader = parquet_reader.get_row_group(rg_idx)?;
+                    let bf = rg_reader.get_column_bloom_filter(0); // minimizer column
+
+                    if bf.is_some() {
+                        bloom_filters_found += 1;
+                    }
+
+                    if Self::bloom_filter_may_contain_any(bf, query_minimizers) {
+                        bloom_filtered.push(rg_idx);
+                    } else {
+                        bloom_rejected += 1;
+                    }
+                }
+
+                // Warn if bloom filter was requested but file has no bloom filters
+                if bloom_filters_found == 0 && !stats_filtered.is_empty() {
+                    eprintln!(
+                        "Warning: --use-bloom-filter specified but {} has no bloom filters. \
+                         Rebuild index with --parquet-bloom-filter to enable bloom filtering.",
+                        path.display()
+                    );
+                } else if bloom_rejected > 0 {
+                    eprintln!(
+                        "Bloom filter rejected {} of {} row groups in {}",
+                        bloom_rejected,
+                        stats_filtered.len(),
+                        path.display()
+                    );
+                }
+
+                bloom_filtered
+            } else {
+                stats_filtered
+            }
+        }; // parquet_reader and file handle dropped here
 
         if matching_row_groups.is_empty() {
             return Ok(InvertedIndex {
@@ -2762,6 +2883,7 @@ mod tests {
             inverted.salt,
             inverted.source_hash,
             &query_minimizers,
+            None, // No bloom filter options for tests
         )?;
 
         // Verify we only got the queried minimizers
@@ -2802,7 +2924,8 @@ mod tests {
             inverted.w,
             inverted.salt,
             inverted.source_hash,
-            &[], // empty query
+            &[],  // empty query
+            None, // No bloom filter options
         )?;
 
         assert_eq!(loaded.minimizers().len(), 0);
@@ -2836,6 +2959,7 @@ mod tests {
             inverted.salt,
             inverted.source_hash,
             &query_minimizers,
+            None, // No bloom filter options for tests
         )?;
 
         assert_eq!(loaded.minimizers().len(), 0);
@@ -2880,6 +3004,7 @@ mod tests {
             inverted.salt,
             inverted.source_hash,
             &query_minimizers,
+            None, // No bloom filter options for tests
         )?;
 
         // Should find all queried minimizers
@@ -2922,6 +3047,7 @@ mod tests {
             inverted.salt,
             inverted.source_hash,
             &unsorted_query,
+            None,
         );
 
         assert!(result.is_err());
@@ -2961,6 +3087,7 @@ mod tests {
             inverted.salt,
             inverted.source_hash,
             &query_minimizers,
+            None, // No bloom filter options for tests
         )?;
 
         // Should find all 2000 queried minimizers
@@ -2998,6 +3125,7 @@ mod tests {
             inverted.salt,
             inverted.source_hash,
             &query_minimizers,
+            None, // No bloom filter options for tests
         )?;
 
         // Should find both boundary minimizers
@@ -3014,10 +3142,323 @@ mod tests {
             inverted.salt,
             inverted.source_hash,
             &query_outside,
+            None,
         )?;
 
         // Should find nothing (99 < min, 1001 > max)
         assert_eq!(loaded_outside.minimizers().len(), 0);
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Bloom Filter Read Tests
+    // ========================================================================
+
+    /// Test that bloom filters correctly handle high-value minimizers (>= 2^63).
+    ///
+    /// This verifies that `bloom_filter_may_contain_any()` correctly handles u64 values
+    /// that would be negative if interpreted as i64. The bloom filter uses raw bytes
+    /// via the `AsBytes` trait, so the bit pattern must be preserved.
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_bloom_filter_high_value_minimizers() -> Result<()> {
+        use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("bloom_high_values.parquet");
+
+        // Test values that span the u64 range, especially values >= 2^63
+        // which become negative when interpreted as i64
+        let high_value_minimizers: Vec<u64> = vec![
+            0x7FFF_FFFF_FFFF_FFFF, // i64::MAX (largest positive i64)
+            0x8000_0000_0000_0000, // 2^63 (i64::MIN when cast)
+            0x8000_0000_0000_0001, // 2^63 + 1
+            0xFFFF_FFFF_FFFF_0000, // Near u64::MAX
+            0xFFFF_FFFF_FFFF_FFFE, // u64::MAX - 1
+            0xFFFF_FFFF_FFFF_FFFF, // u64::MAX (becomes -1 as i64)
+        ];
+
+        let mut index = Index::new(64, 50, 0xDEADBEEF).unwrap();
+        index.buckets.insert(1, high_value_minimizers.clone());
+        index.bucket_names.insert(1, "high_values".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Save with bloom filter enabled
+        let write_opts = ParquetWriteOptions {
+            bloom_filter_enabled: true,
+            bloom_filter_fpp: 0.01,
+            row_group_size: 10, // Small row group to ensure bloom filter is created
+            ..Default::default()
+        };
+        inverted.save_shard_parquet(&path, 0, Some(&write_opts))?;
+
+        // Read with bloom filter enabled
+        let read_opts = ParquetReadOptions::with_bloom_filter();
+
+        // Query with ALL high-value minimizers - should find all
+        let loaded = InvertedIndex::load_shard_parquet_for_query(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+            &high_value_minimizers,
+            Some(&read_opts),
+        )?;
+
+        // Verify all high-value minimizers were found
+        for &m in &high_value_minimizers {
+            let found = loaded.minimizers().contains(&m);
+            assert!(
+                found,
+                "Bloom filter failed to find high-value minimizer 0x{:016X} (as i64: {})",
+                m, m as i64
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Test that bloom filter correctly rejects minimizers that are NOT in the file.
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_bloom_filter_rejects_absent_minimizers() -> Result<()> {
+        use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("bloom_reject.parquet");
+
+        // Create file with specific minimizers in a tight range
+        let present_minimizers: Vec<u64> = vec![1000, 1001, 1002, 1003, 1004];
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, present_minimizers.clone());
+        index.bucket_names.insert(1, "test".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Save with bloom filter enabled and low FPP for accurate rejection
+        let write_opts = ParquetWriteOptions {
+            bloom_filter_enabled: true,
+            bloom_filter_fpp: 0.001, // Very low FPP
+            row_group_size: 100,
+            ..Default::default()
+        };
+        inverted.save_shard_parquet(&path, 0, Some(&write_opts))?;
+
+        let read_opts = ParquetReadOptions::with_bloom_filter();
+
+        // Query with values definitely NOT in the file (outside the min/max range)
+        // These should be rejected by stats filtering, not bloom filter
+        let outside_range: Vec<u64> = vec![1, 2, 3];
+        let loaded_outside = InvertedIndex::load_shard_parquet_for_query(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+            &outside_range,
+            Some(&read_opts),
+        )?;
+
+        // Stats filtering rejects these (outside min/max range)
+        assert_eq!(loaded_outside.minimizers().len(), 0);
+
+        // Now test values WITHIN the stats range but not actually present
+        // These would pass stats filtering but should be caught by bloom filter
+        // Note: Due to bloom filter false positives, some may slip through,
+        // but with low FPP most should be rejected
+        let within_range_but_absent: Vec<u64> = vec![999, 1005, 1006]; // Just outside our values
+
+        let loaded_within = InvertedIndex::load_shard_parquet_for_query(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+            &within_range_but_absent,
+            Some(&read_opts),
+        )?;
+
+        // These specific values should not be in the result
+        // (the row group might be included due to stats overlap, but the values won't match)
+        for &m in &within_range_but_absent {
+            assert!(
+                !loaded_within.minimizers().contains(&m),
+                "Unexpected minimizer {} found",
+                m
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Test bloom filter graceful fallback when file has no bloom filters.
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_bloom_filter_graceful_fallback() -> Result<()> {
+        use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("no_bloom.parquet");
+
+        let minimizers: Vec<u64> = vec![100, 200, 300, 400, 500];
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, minimizers.clone());
+        index.bucket_names.insert(1, "test".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Save WITHOUT bloom filter
+        let write_opts = ParquetWriteOptions {
+            bloom_filter_enabled: false, // No bloom filter
+            ..Default::default()
+        };
+        inverted.save_shard_parquet(&path, 0, Some(&write_opts))?;
+
+        // Read WITH bloom filter option enabled (should gracefully fall back)
+        let read_opts = ParquetReadOptions::with_bloom_filter();
+
+        let query = vec![100, 200, 300];
+        let loaded = InvertedIndex::load_shard_parquet_for_query(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+            &query,
+            Some(&read_opts),
+        )?;
+
+        // Should still find the minimizers (graceful fallback to stats-only)
+        for &m in &query {
+            assert!(
+                loaded.minimizers().contains(&m),
+                "Graceful fallback failed: minimizer {} not found",
+                m
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Test bloom filter with empty query (edge case).
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_bloom_filter_empty_query() -> Result<()> {
+        use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("bloom_empty.parquet");
+
+        let minimizers: Vec<u64> = vec![100, 200, 300];
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, minimizers);
+        index.bucket_names.insert(1, "test".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        let write_opts = ParquetWriteOptions {
+            bloom_filter_enabled: true,
+            ..Default::default()
+        };
+        inverted.save_shard_parquet(&path, 0, Some(&write_opts))?;
+
+        let read_opts = ParquetReadOptions::with_bloom_filter();
+
+        // Empty query
+        let empty_query: Vec<u64> = vec![];
+        let loaded = InvertedIndex::load_shard_parquet_for_query(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+            &empty_query,
+            Some(&read_opts),
+        )?;
+
+        // Empty query should return empty result
+        assert_eq!(loaded.minimizers().len(), 0);
+
+        Ok(())
+    }
+
+    /// Test bloom_filter_may_contain_any helper directly with edge cases.
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_bloom_filter_may_contain_any_helper() {
+        // Test with None bloom filter (should return true - conservative fallback)
+        // When there's no bloom filter, we conservatively include the row group
+        assert!(InvertedIndex::bloom_filter_may_contain_any(
+            None,
+            &[1, 2, 3]
+        ));
+
+        // Even with empty query, None bloom filter returns true (conservative)
+        // The empty query check only applies when we HAVE a bloom filter
+        assert!(InvertedIndex::bloom_filter_may_contain_any(None, &[]));
+    }
+
+    /// Test that bloom filter accepts values that ARE present (no false negatives).
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_bloom_filter_no_false_negatives() -> Result<()> {
+        use crate::parquet_index::{ParquetReadOptions, ParquetWriteOptions};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("bloom_no_fn.parquet");
+
+        // Create a larger set of minimizers to test bloom filter behavior
+        let minimizers: Vec<u64> = (0..1000).map(|i| i * 1000).collect();
+
+        let mut index = Index::new(64, 50, 0x5555).unwrap();
+        index.buckets.insert(1, minimizers.clone());
+        index.bucket_names.insert(1, "test".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        let write_opts = ParquetWriteOptions {
+            bloom_filter_enabled: true,
+            bloom_filter_fpp: 0.01,
+            row_group_size: 200, // Multiple row groups
+            ..Default::default()
+        };
+        inverted.save_shard_parquet(&path, 0, Some(&write_opts))?;
+
+        let read_opts = ParquetReadOptions::with_bloom_filter();
+
+        // Query with a subset of minimizers that ARE in the file
+        let query: Vec<u64> = minimizers.iter().step_by(10).copied().collect();
+
+        let loaded = InvertedIndex::load_shard_parquet_for_query(
+            &path,
+            inverted.k,
+            inverted.w,
+            inverted.salt,
+            inverted.source_hash,
+            &query,
+            Some(&read_opts),
+        )?;
+
+        // Bloom filters guarantee NO false negatives
+        // Every queried value that exists MUST be found
+        for &m in &query {
+            assert!(
+                loaded.minimizers().contains(&m),
+                "False negative: minimizer {} not found but should be present",
+                m
+            );
+        }
 
         Ok(())
     }

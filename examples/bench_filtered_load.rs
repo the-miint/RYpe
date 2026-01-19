@@ -89,6 +89,7 @@ fn main() -> Result<()> {
                 legacy.salt,
                 0,
                 &query_mins,
+                None,
             )?;
             filtered_times.push(t.elapsed().as_micros());
             filtered_result = Some(filtered);
@@ -144,6 +145,7 @@ fn main() -> Result<()> {
                 legacy.salt,
                 0,
                 &query_mins,
+                None,
             )?;
             filtered_times.push(t.elapsed().as_micros());
             filtered_result = Some(filtered);
@@ -178,6 +180,7 @@ fn main() -> Result<()> {
             legacy.salt,
             0,
             &tiny_query,
+            None,
         )?;
         tiny_times.push(t.elapsed().as_micros());
     }

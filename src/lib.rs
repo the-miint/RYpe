@@ -53,7 +53,7 @@ pub mod parquet_index;
 pub use parquet_index::{
     compute_source_hash, create_parquet_inverted_index, is_parquet_index, BucketData,
     BucketMetadata, InvertedManifest, InvertedShardInfo, ParquetCompression, ParquetManifest,
-    ParquetWriteOptions,
+    ParquetReadOptions, ParquetWriteOptions,
 };
 
 // Re-export types

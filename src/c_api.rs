@@ -838,8 +838,16 @@ pub extern "C" fn rype_classify_with_negative(
                     .map_err(|e| format!("Sharded main classification failed: {}", e))
             }
             RypeIndex::ShardedInverted(idx) => {
-                classify_batch_sharded_sequential(idx, neg_mins, &rust_queries, threshold)
-                    .map_err(|e| format!("Sharded inverted classification failed: {}", e))
+                #[cfg(feature = "parquet")]
+                {
+                    classify_batch_sharded_sequential(idx, neg_mins, &rust_queries, threshold, None)
+                        .map_err(|e| format!("Sharded inverted classification failed: {}", e))
+                }
+                #[cfg(not(feature = "parquet"))]
+                {
+                    classify_batch_sharded_sequential(idx, neg_mins, &rust_queries, threshold)
+                        .map_err(|e| format!("Sharded inverted classification failed: {}", e))
+                }
             }
         };
 

@@ -180,9 +180,9 @@ pub fn classify_arrow_batch_sharded(
 ) -> Result<RecordBatch, ArrowClassifyError> {
     let records = batch_to_records(batch)?;
     let hits = if use_merge_join {
-        classify_batch_sharded_merge_join(sharded, negative_mins, &records, threshold)
+        classify_batch_sharded_merge_join(sharded, negative_mins, &records, threshold, None)
     } else {
-        classify_batch_sharded_sequential(sharded, negative_mins, &records, threshold)
+        classify_batch_sharded_sequential(sharded, negative_mins, &records, threshold, None)
     }
     .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
     hits_to_record_batch(hits)

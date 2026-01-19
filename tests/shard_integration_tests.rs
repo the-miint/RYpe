@@ -298,8 +298,9 @@ fn test_sharded_inverted_from_non_sharded_main() -> Result<()> {
     // Compare results: direct vs sharded inverted
     let results_direct = classify_batch(&index, None, &records, threshold);
     let results_sequential =
-        classify_batch_sharded_sequential(&sharded, None, &records, threshold)?;
-    let results_merge = classify_batch_sharded_merge_join(&sharded, None, &records, threshold)?;
+        classify_batch_sharded_sequential(&sharded, None, &records, threshold, None)?;
+    let results_merge =
+        classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None)?;
 
     eprintln!("\n=== Results ===");
     eprintln!("Direct: {} results", results_direct.len());
@@ -497,11 +498,11 @@ fn test_inverted_from_sharded_main() -> Result<()> {
 
             eprintln!("\nClassifying with sharded sequential...");
             let results_sharded_seq =
-                classify_batch_sharded_sequential(&sharded_inv, None, &records, threshold)?;
+                classify_batch_sharded_sequential(&sharded_inv, None, &records, threshold, None)?;
 
             eprintln!("Classifying with sharded merge-join...");
             let results_sharded_merge =
-                classify_batch_sharded_merge_join(&sharded_inv, None, &records, threshold)?;
+                classify_batch_sharded_merge_join(&sharded_inv, None, &records, threshold, None)?;
 
             eprintln!("\n=== Results ===");
             eprintln!("Ground truth: {} results", results_ground_truth.len());
@@ -814,7 +815,7 @@ fn test_user_scenario_sharded_inverted_from_sharded_main() -> Result<()> {
 
             let results_truth = classify_batch(&index, None, &records, threshold);
             let results_sharded =
-                classify_batch_sharded_merge_join(&sharded, None, &records, threshold)?;
+                classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None)?;
 
             eprintln!("\n=== Classification Results ===");
             eprintln!("Ground truth: {} results", results_truth.len());

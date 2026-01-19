@@ -209,6 +209,43 @@ impl ParquetWriteOptions {
     }
 }
 
+// ============================================================================
+// Parquet Read Options
+// ============================================================================
+
+/// Configuration options for reading Parquet inverted index files.
+///
+/// Use `Default::default()` to get backward-compatible behavior (no bloom filter usage).
+/// Pass custom options to enable bloom filter row group filtering.
+///
+/// # Example
+/// ```ignore
+/// let opts = ParquetReadOptions {
+///     use_bloom_filter: true,
+/// };
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct ParquetReadOptions {
+    /// Use bloom filters for row group filtering if available. Default: false.
+    ///
+    /// When true, row groups are rejected if the bloom filter definitively indicates
+    /// that none of the query minimizers are present. This can significantly reduce
+    /// I/O for sparse queries.
+    ///
+    /// Falls back gracefully when bloom filters are not present in the file.
+    /// Requires the index to have been built with `--parquet-bloom-filter`.
+    pub use_bloom_filter: bool,
+}
+
+impl ParquetReadOptions {
+    /// Create options with bloom filter enabled.
+    pub fn with_bloom_filter() -> Self {
+        Self {
+            use_bloom_filter: true,
+        }
+    }
+}
+
 /// Manifest containing index metadata.
 ///
 /// Stored as TOML for human readability and easy inspection.
@@ -1404,11 +1441,16 @@ mod tests {
         let threshold = 0.1;
 
         let results_streaming =
-            classify_batch_sharded_sequential(&streaming_sharded, None, &records, threshold)
+            classify_batch_sharded_sequential(&streaming_sharded, None, &records, threshold, None)
                 .unwrap();
-        let results_traditional =
-            classify_batch_sharded_sequential(&traditional_sharded, None, &records, threshold)
-                .unwrap();
+        let results_traditional = classify_batch_sharded_sequential(
+            &traditional_sharded,
+            None,
+            &records,
+            threshold,
+            None,
+        )
+        .unwrap();
 
         // Sort results for comparison (order may differ)
         let mut sorted_streaming = results_streaming.clone();

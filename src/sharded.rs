@@ -698,6 +698,40 @@ impl ShardedInvertedIndex {
     ///
     /// # Returns
     /// An InvertedIndex containing only minimizers present in the query set.
+    ///
+    /// # Arguments
+    /// * `shard_id` - The shard to load
+    /// * `query_minimizers` - Sorted slice of query minimizers
+    /// * `options` - Parquet read options (None = default behavior without bloom filters)
+    #[cfg(feature = "parquet")]
+    pub fn load_shard_for_query(
+        &self,
+        shard_id: u32,
+        query_minimizers: &[u64],
+        options: Option<&crate::parquet_index::ParquetReadOptions>,
+    ) -> Result<InvertedIndex> {
+        let path = self.shard_path(shard_id);
+        match self.shard_format {
+            ShardFormat::Legacy => {
+                // Legacy format doesn't support row group filtering or bloom filters
+                // Load full shard (caller will filter during merge-join)
+                InvertedIndex::load_shard(&path)
+            }
+            ShardFormat::Parquet => InvertedIndex::load_shard_parquet_for_query(
+                &path,
+                self.manifest.k,
+                self.manifest.w,
+                self.manifest.salt,
+                self.manifest.source_hash,
+                query_minimizers,
+                options,
+            ),
+        }
+    }
+
+    /// An InvertedIndex containing only minimizers present in the query set.
+    /// (non-Parquet version for backward compatibility)
+    #[cfg(not(feature = "parquet"))]
     pub fn load_shard_for_query(
         &self,
         shard_id: u32,
@@ -710,26 +744,10 @@ impl ShardedInvertedIndex {
                 // Load full shard (caller will filter during merge-join)
                 InvertedIndex::load_shard(&path)
             }
-            ShardFormat::Parquet => {
-                #[cfg(feature = "parquet")]
-                {
-                    InvertedIndex::load_shard_parquet_for_query(
-                        &path,
-                        self.manifest.k,
-                        self.manifest.w,
-                        self.manifest.salt,
-                        self.manifest.source_hash,
-                        query_minimizers,
-                    )
-                }
-                #[cfg(not(feature = "parquet"))]
-                {
-                    Err(anyhow!(
-                        "Parquet shard format requires --features parquet: {}",
-                        path.display()
-                    ))
-                }
-            }
+            ShardFormat::Parquet => Err(anyhow!(
+                "Parquet shard format requires --features parquet: {}",
+                path.display()
+            )),
         }
     }
 

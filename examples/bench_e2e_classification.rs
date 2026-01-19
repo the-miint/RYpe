@@ -153,7 +153,7 @@ fn main() -> Result<()> {
 
         let t_classify = Instant::now();
         let results =
-            classify_batch_sharded_merge_join(&legacy_sharded, None, &batch_refs, threshold)?;
+            classify_batch_sharded_merge_join(&legacy_sharded, None, &batch_refs, threshold, None)?;
         legacy_classify_time_ms += t_classify.elapsed().as_millis();
         legacy_hits += results.len();
     }
@@ -191,8 +191,13 @@ fn main() -> Result<()> {
             .collect();
 
         let t_classify = Instant::now();
-        let results =
-            classify_batch_sharded_merge_join(&parquet_sharded, None, &batch_refs, threshold)?;
+        let results = classify_batch_sharded_merge_join(
+            &parquet_sharded,
+            None,
+            &batch_refs,
+            threshold,
+            None,
+        )?;
         parquet_classify_time_ms += t_classify.elapsed().as_millis();
         parquet_hits += results.len();
     }
