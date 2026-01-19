@@ -27,6 +27,7 @@
 mod classify;
 mod constants;
 mod encoding;
+mod error;
 mod extraction;
 mod index;
 mod inverted;
@@ -56,6 +57,9 @@ pub use parquet_index::{
 
 // Re-export types
 pub use types::{HitResult, IndexMetadata, QueryRecord};
+
+// Re-export error types
+pub use error::{Result as RypeResult, RypeError};
 
 // Re-export workspace
 pub use workspace::MinimizerWorkspace;
