@@ -7,7 +7,7 @@
 //! - `ShardedMainIndex`: Sharded main index for large datasets
 //! - Parquet-based index format support
 
-pub mod inverted;
+mod inverted;
 pub mod main;
 pub mod parquet;
 pub mod sharded;

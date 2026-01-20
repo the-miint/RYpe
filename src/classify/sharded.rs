@@ -12,9 +12,9 @@ use std::time::Instant;
 use crate::constants::ESTIMATED_BUCKETS_PER_READ;
 use crate::core::extraction::get_paired_minimizers_into;
 use crate::core::workspace::MinimizerWorkspace;
-use crate::indices::inverted::QueryInvertedIndex;
 use crate::indices::sharded::ShardedInvertedIndex;
 use crate::indices::sharded_main::ShardedMainIndex;
+use crate::indices::QueryInvertedIndex;
 use crate::types::{HitResult, QueryRecord};
 
 use crate::log_timing;
@@ -377,9 +377,9 @@ pub fn classify_batch_sharded_main(
 mod tests {
     use super::*;
     use crate::classify::batch::classify_batch;
-    use crate::indices::inverted::InvertedIndex;
     use crate::indices::main::Index;
     use crate::indices::sharded::{ShardFormat, ShardManifest};
+    use crate::indices::InvertedIndex;
 
     #[test]
     fn test_classify_batch_sharded_sequential_matches_regular() -> anyhow::Result<()> {

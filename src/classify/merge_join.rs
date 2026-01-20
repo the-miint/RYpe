@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use crate::constants::{ESTIMATED_BUCKETS_PER_READ, GALLOP_THRESHOLD};
-use crate::indices::inverted::{InvertedIndex, QueryInvertedIndex};
+use crate::indices::{InvertedIndex, QueryInvertedIndex};
 use crate::types::HitResult;
 
 use super::scoring::compute_score;

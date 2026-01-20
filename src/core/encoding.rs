@@ -59,9 +59,6 @@ pub(crate) fn reverse_complement(kmer: u64, k: usize) -> u64 {
 
 // --- VARINT ENCODING (LEB128) ---
 
-/// Maximum number of bytes needed to encode a u64 as LEB128 varint.
-pub(crate) const MAX_VARINT_BYTES: usize = 10;
-
 /// Error type for varint decoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VarIntError {
