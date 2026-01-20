@@ -21,7 +21,7 @@ mod shard_parquet;
 // Re-export public types
 pub use query::QueryInvertedIndex;
 
-use anyhow::{anyhow, Result};
+use crate::error::{Result, RypeError};
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -237,26 +237,21 @@ impl InvertedIndex {
     /// Validate that this inverted index matches the given metadata.
     pub fn validate_against_metadata(&self, metadata: &IndexMetadata) -> Result<()> {
         if self.k != metadata.k || self.w != metadata.w || self.salt != metadata.salt {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "Inverted index parameters don't match source index.\n  \
                  Inverted: K={}, W={}, salt=0x{:x}\n  \
                  Source:   K={}, W={}, salt=0x{:x}",
-                self.k,
-                self.w,
-                self.salt,
-                metadata.k,
-                metadata.w,
-                metadata.salt
-            ));
+                self.k, self.w, self.salt, metadata.k, metadata.w, metadata.salt
+            )));
         }
 
         let expected_hash = Self::compute_metadata_hash(metadata);
         if self.source_hash != expected_hash {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "Inverted index is stale (hash 0x{:016x} != expected 0x{:016x}). \
                  The source index has been modified. Regenerate with 'rype index invert -i <index.ryidx>'",
                 self.source_hash, expected_hash
-            ));
+            )));
         }
 
         Ok(())
@@ -332,6 +327,7 @@ impl InvertedIndex {
 mod tests {
     use super::*;
     use crate::indices::main::Index;
+    use anyhow::Result;
     use tempfile::NamedTempFile;
 
     #[test]

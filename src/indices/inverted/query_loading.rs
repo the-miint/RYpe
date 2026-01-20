@@ -1,6 +1,6 @@
 //! Query-aware Parquet loading with bloom filter support.
 
-use anyhow::{anyhow, Context, Result};
+use crate::error::{Result, RypeError};
 use std::path::Path;
 
 use super::InvertedIndex;
@@ -125,17 +125,17 @@ impl InvertedIndex {
         // Validate query_minimizers is sorted - required for binary search correctness
         // in find_matching_row_groups() and row-level filtering.
         if !query_minimizers.is_empty() && !query_minimizers.windows(2).all(|w| w[0] <= w[1]) {
-            return Err(anyhow!(
-                "query_minimizers must be sorted in ascending order"
+            return Err(RypeError::validation(
+                "query_minimizers must be sorted in ascending order",
             ));
         }
 
         // Validate k value
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "Invalid K value for Parquet shard: {} (must be 16, 32, or 64)",
                 k
-            ));
+            )));
         }
 
         if query_minimizers.is_empty() {
@@ -157,8 +157,8 @@ impl InvertedIndex {
         // When bloom filter is enabled, we keep the reader alive longer to access bloom
         // filters for each row group after statistics filtering.
         let matching_row_groups: Vec<usize> = {
-            let file = File::open(path)
-                .with_context(|| format!("Failed to open Parquet shard: {}", path.display()))?;
+            let file =
+                File::open(path).map_err(|e| RypeError::io(path, "open Parquet shard", e))?;
 
             // Use new_with_options when bloom filter reading is requested
             let parquet_reader = if use_bloom_filter {
@@ -336,13 +336,17 @@ impl InvertedIndex {
                         .column(0)
                         .as_any()
                         .downcast_ref::<UInt64Array>()
-                        .context("Expected UInt64Array for minimizer column")?;
+                        .ok_or_else(|| {
+                            RypeError::format(&path, "Expected UInt64Array for minimizer column")
+                        })?;
 
                     let bid_col = batch
                         .column(1)
                         .as_any()
                         .downcast_ref::<UInt32Array>()
-                        .context("Expected UInt32Array for bucket_id column")?;
+                        .ok_or_else(|| {
+                            RypeError::format(&path, "Expected UInt32Array for bucket_id column")
+                        })?;
 
                     for i in 0..batch.num_rows() {
                         let m = min_col.value(i);
@@ -367,8 +371,15 @@ impl InvertedIndex {
         let mut all_pairs: Vec<(u64, u32)> = Vec::new();
 
         for (idx, result) in matching_row_groups.iter().zip(row_group_results) {
-            let pairs = result.with_context(|| {
-                format!("Failed to read row group {} from {}", idx, path.display())
+            let pairs = result.map_err(|e| {
+                RypeError::io(
+                    path.clone(),
+                    "read row group",
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("row group {}: {}", idx, e),
+                    ),
+                )
             })?;
             all_pairs.extend(pairs);
         }
@@ -430,6 +441,7 @@ mod tests {
     use super::*;
     use crate::indices::main::Index;
     use crate::indices::parquet::{ParquetReadOptions, ParquetWriteOptions};
+    use anyhow::Result;
     use tempfile::TempDir;
 
     #[test]

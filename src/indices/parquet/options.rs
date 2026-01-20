@@ -4,6 +4,7 @@
 //! including compression settings and bloom filter configuration.
 
 use crate::constants::DEFAULT_ROW_GROUP_SIZE;
+use crate::error::{Result, RypeError};
 
 /// Serialize u64 as hex string for TOML compatibility (i64 overflow).
 pub mod hex_u64 {
@@ -103,15 +104,17 @@ impl ParquetWriteOptions {
     /// Checks:
     /// - `bloom_filter_fpp` must be in (0.0, 1.0)
     /// - `row_group_size` must be > 0
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.bloom_filter_fpp <= 0.0 || self.bloom_filter_fpp >= 1.0 {
-            anyhow::bail!(
+            return Err(RypeError::validation(format!(
                 "bloom_filter_fpp must be in (0.0, 1.0), got {}",
                 self.bloom_filter_fpp
-            );
+            )));
         }
         if self.row_group_size == 0 {
-            anyhow::bail!("row_group_size must be > 0");
+            return Err(RypeError::validation(
+                "row_group_size must be > 0".to_string(),
+            ));
         }
         Ok(())
     }

@@ -1,6 +1,6 @@
 //! Parquet format for shard serialization.
 
-use anyhow::{anyhow, Context, Result};
+use crate::error::{Result, RypeError};
 use std::path::Path;
 
 use super::InvertedIndex;
@@ -67,7 +67,7 @@ impl InvertedIndex {
         let props = opts.to_writer_properties();
 
         let file = std::fs::File::create(path)
-            .with_context(|| format!("Failed to create Parquet shard: {}", path.display()))?;
+            .map_err(|e| RypeError::io(path, "create Parquet shard", e))?;
         let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
         // Stream from CSR format in batches without materializing all pairs
@@ -156,15 +156,15 @@ impl InvertedIndex {
 
         // Validate k value (same as legacy format)
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "Invalid K value for Parquet shard: {} (must be 16, 32, or 64)",
                 k
-            ));
+            )));
         }
 
         // Read entire file into memory once (avoids N file opens)
-        let mut file = File::open(path)
-            .with_context(|| format!("Failed to open Parquet shard: {}", path.display()))?;
+        let mut file =
+            File::open(path).map_err(|e| RypeError::io(path, "open Parquet shard", e))?;
         let file_size = file.metadata()?.len() as usize;
         let mut buffer = Vec::with_capacity(file_size);
         file.read_to_end(&mut buffer)?;
@@ -202,13 +202,17 @@ impl InvertedIndex {
                         .column(0)
                         .as_any()
                         .downcast_ref::<UInt64Array>()
-                        .context("Expected UInt64Array for minimizer column")?;
+                        .ok_or_else(|| {
+                            RypeError::format(path, "Expected UInt64Array for minimizer column")
+                        })?;
 
                     let bid_col = batch
                         .column(1)
                         .as_any()
                         .downcast_ref::<UInt32Array>()
-                        .context("Expected UInt32Array for bucket_id column")?;
+                        .ok_or_else(|| {
+                            RypeError::format(path, "Expected UInt32Array for bucket_id column")
+                        })?;
 
                     for i in 0..batch.num_rows() {
                         pairs.push((min_col.value(i), bid_col.value(i)));
@@ -257,11 +261,12 @@ impl InvertedIndex {
         for (i, (&m, &b)) in all_minimizers.iter().zip(all_bucket_ids.iter()).enumerate() {
             // Validation: minimizers must be non-decreasing
             if m < prev_min {
-                return Err(anyhow!(
-                    "Parquet shard has unsorted minimizers at row {}: {} < {} (corrupt file?)",
-                    i,
-                    m,
-                    prev_min
+                return Err(RypeError::format(
+                    path,
+                    format!(
+                        "Parquet shard has unsorted minimizers at row {}: {} < {} (corrupt file?)",
+                        i, m, prev_min
+                    ),
                 ));
             }
             prev_min = m;
@@ -280,31 +285,33 @@ impl InvertedIndex {
 
         // Validation: offsets must be monotonically increasing
         if offsets.windows(2).any(|w| w[0] > w[1]) {
-            return Err(anyhow!(
-                "Parquet shard has invalid CSR offsets: first offset must be 0 and offsets must be monotonic"
+            return Err(RypeError::format(
+                path,
+                "Parquet shard has invalid CSR offsets: first offset must be 0 and offsets must be monotonic",
             ));
         }
 
         // Validation: minimizers must be strictly increasing (after grouping)
         if minimizers.windows(2).any(|w| w[0] >= w[1]) {
-            return Err(anyhow!(
-                "Parquet shard has duplicate minimizers after merge (corrupt file?)"
+            return Err(RypeError::format(
+                path,
+                "Parquet shard has duplicate minimizers after merge (corrupt file?)",
             ));
         }
 
         // Validation: size limits (same as legacy format)
         if minimizers.len() > MAX_INVERTED_MINIMIZERS {
-            return Err(anyhow!(
-                "Parquet shard has too many minimizers: {} (limit: {})",
+            return Err(RypeError::overflow(
+                "Parquet shard minimizers",
+                MAX_INVERTED_MINIMIZERS,
                 minimizers.len(),
-                MAX_INVERTED_MINIMIZERS
             ));
         }
         if bucket_ids_out.len() > MAX_INVERTED_BUCKET_IDS {
-            return Err(anyhow!(
-                "Parquet shard has too many bucket IDs: {} (limit: {})",
+            return Err(RypeError::overflow(
+                "Parquet shard bucket IDs",
+                MAX_INVERTED_BUCKET_IDS,
                 bucket_ids_out.len(),
-                MAX_INVERTED_BUCKET_IDS
             ));
         }
 
@@ -363,6 +370,7 @@ impl InvertedIndex {
 mod tests {
     use super::*;
     use crate::indices::main::Index;
+    use anyhow::Result;
     use tempfile::TempDir;
 
     #[test]

@@ -3,7 +3,7 @@
 //! This module provides efficient streaming creation of Parquet inverted indices
 //! using k-way merge, supporting both sequential and parallel sharding.
 
-use anyhow::{Context, Result};
+use crate::error::{Result, RypeError};
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -57,15 +57,15 @@ pub fn create_parquet_inverted_index(
     options: Option<&ParquetWriteOptions>,
 ) -> Result<ParquetManifest> {
     let opts = options.cloned().unwrap_or_default();
-    opts.validate().context("Invalid ParquetWriteOptions")?;
+    opts.validate()?;
 
     // Validate bucket data upfront - buckets must be sorted and deduplicated
     for bucket in &buckets {
-        bucket.validate().with_context(|| {
-            format!(
-                "Invalid bucket data for bucket '{}' (id={})",
-                bucket.bucket_name, bucket.bucket_id
-            )
+        bucket.validate().map_err(|e| {
+            RypeError::validation(format!(
+                "invalid bucket data for bucket '{}' (id={}): {}",
+                bucket.bucket_name, bucket.bucket_id, e
+            ))
         })?;
     }
 
@@ -366,11 +366,14 @@ fn stream_to_shards_parallel(
 
         // Rename file from partition-specific name to canonical name
         if old_path != new_path {
-            std::fs::rename(&old_path, &new_path).with_context(|| {
-                format!(
-                    "Failed to rename shard {} -> {}",
-                    old_path.display(),
-                    new_path.display()
+            std::fs::rename(&old_path, &new_path).map_err(|e| {
+                RypeError::io(
+                    old_path.clone(),
+                    "rename shard",
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("{} -> {}: {}", old_path.display(), new_path.display(), e),
+                    ),
                 )
             })?;
         }
@@ -558,8 +561,8 @@ impl ShardWriter {
         // DRY: Use ParquetWriteOptions::to_writer_properties() as single source of truth
         let props = options.to_writer_properties();
 
-        let file = File::create(path)
-            .with_context(|| format!("Failed to create shard: {}", path.display()))?;
+        let file =
+            File::create(path).map_err(|e| RypeError::io(path.to_path_buf(), "create shard", e))?;
         let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
         Ok(Self { writer, schema })

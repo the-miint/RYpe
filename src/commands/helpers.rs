@@ -96,7 +96,7 @@ pub fn load_index_metadata(path: &Path) -> Result<IndexMetadata> {
         Ok(manifest.to_metadata())
     } else {
         // Single-file index
-        Index::load_metadata(path)
+        Ok(Index::load_metadata(path)?)
     }
 }
 

@@ -3,7 +3,7 @@
 //! This module contains the manifest format and related utility functions
 //! for Parquet-based inverted index directories.
 
-use anyhow::{Context, Result};
+use crate::error::{Result, RypeError};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -114,10 +114,10 @@ impl ParquetManifest {
     /// Save manifest to the index directory.
     pub fn save(&self, index_dir: &Path) -> Result<()> {
         let path = index_dir.join(files::MANIFEST);
-        let toml_str =
-            toml::to_string_pretty(self).context("Failed to serialize manifest to TOML")?;
-        fs::write(&path, toml_str)
-            .with_context(|| format!("Failed to write manifest: {}", path.display()))?;
+        let toml_str = toml::to_string_pretty(self)
+            .map_err(|e| RypeError::encoding(format!("serialize manifest: {}", e)))?;
+        fs::write(&path, &toml_str)
+            .map_err(|e| RypeError::io(path.clone(), "write manifest", e))?;
         Ok(())
     }
 
@@ -125,24 +125,28 @@ impl ParquetManifest {
     pub fn load(index_dir: &Path) -> Result<Self> {
         let path = index_dir.join(files::MANIFEST);
         let toml_str = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read manifest: {}", path.display()))?;
+            .map_err(|e| RypeError::io(path.clone(), "read manifest", e))?;
         let manifest: Self = toml::from_str(&toml_str)
-            .with_context(|| format!("Failed to parse manifest: {}", path.display()))?;
+            .map_err(|e| RypeError::format(path.clone(), format!("parse manifest: {}", e)))?;
 
         // Validate magic and version
         if manifest.magic != FORMAT_MAGIC {
-            anyhow::bail!(
-                "Invalid manifest magic: expected '{}', got '{}'",
-                FORMAT_MAGIC,
-                manifest.magic
-            );
+            return Err(RypeError::format(
+                path,
+                format!(
+                    "invalid manifest magic: expected '{}', got '{}'",
+                    FORMAT_MAGIC, manifest.magic
+                ),
+            ));
         }
         if manifest.format_version > FORMAT_VERSION {
-            anyhow::bail!(
-                "Unsupported format version: {} (max supported: {})",
-                manifest.format_version,
-                FORMAT_VERSION
-            );
+            return Err(RypeError::format(
+                path,
+                format!(
+                    "unsupported format version: {} (max supported: {})",
+                    manifest.format_version, FORMAT_VERSION
+                ),
+            ));
         }
 
         Ok(manifest)
@@ -176,21 +180,19 @@ impl BucketData {
         for i in 1..self.minimizers.len() {
             if self.minimizers[i] <= self.minimizers[i - 1] {
                 if self.minimizers[i] == self.minimizers[i - 1] {
-                    anyhow::bail!(
-                        "Bucket {} has duplicate minimizer at position {}: {:#x}",
-                        self.bucket_id,
-                        i,
-                        self.minimizers[i]
-                    );
+                    return Err(RypeError::validation(format!(
+                        "bucket {} has duplicate minimizer at position {}: {:#x}",
+                        self.bucket_id, i, self.minimizers[i]
+                    )));
                 } else {
-                    anyhow::bail!(
-                        "Bucket {} has unsorted minimizers at positions {}-{}: {:#x} > {:#x}",
+                    return Err(RypeError::validation(format!(
+                        "bucket {} has unsorted minimizers at positions {}-{}: {:#x} > {:#x}",
                         self.bucket_id,
                         i - 1,
                         i,
                         self.minimizers[i - 1],
                         self.minimizers[i]
-                    );
+                    )));
                 }
             }
         }
@@ -218,16 +220,12 @@ pub fn is_parquet_index(path: &Path) -> bool {
 pub fn create_index_directory(path: &Path) -> Result<()> {
     // Create main directory
     fs::create_dir_all(path)
-        .with_context(|| format!("Failed to create index directory: {}", path.display()))?;
+        .map_err(|e| RypeError::io(path.to_path_buf(), "create index directory", e))?;
 
     // Create inverted subdirectory
     let inverted_dir = path.join(files::INVERTED_DIR);
-    fs::create_dir_all(&inverted_dir).with_context(|| {
-        format!(
-            "Failed to create inverted directory: {}",
-            inverted_dir.display()
-        )
-    })?;
+    fs::create_dir_all(&inverted_dir)
+        .map_err(|e| RypeError::io(inverted_dir.clone(), "create inverted directory", e))?;
 
     Ok(())
 }

@@ -10,7 +10,7 @@
 //! - Sharding is by memory budget, not by minimizer count
 //! - 1:1 correspondence possible with inverted index shards
 
-use anyhow::{anyhow, Context, Result};
+use crate::error::{Result, RypeError};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -122,7 +122,9 @@ impl MainIndexManifest {
         writer.flush()?;
 
         // fsync to ensure data is persisted to disk
-        let file = writer.into_inner()?;
+        let file = writer
+            .into_inner()
+            .map_err(|e| RypeError::io(path, "flush buffer", e.into_error()))?;
         file.sync_all()?;
 
         // Drop the file handle before rename
@@ -146,30 +148,33 @@ impl MainIndexManifest {
         // Header
         reader.read_exact(&mut buf4)?;
         if &buf4 != MAIN_MANIFEST_MAGIC {
-            return Err(anyhow!(
-                "Invalid main index manifest format (expected RYPM)"
+            return Err(RypeError::format(
+                path,
+                "Invalid main index manifest format (expected RYPM)",
             ));
         }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
         if version != MAIN_MANIFEST_VERSION {
-            return Err(anyhow!(
-                "Unsupported main index manifest version: {} (expected {}).\n\
-                 Version 1 manifests are no longer supported. Re-create the sharded index:\n  \
-                 rype index shard -i <single-file.ryidx> -o <output.ryidx> --max-shard-size <size>",
-                version,
-                MAIN_MANIFEST_VERSION
+            return Err(RypeError::format(
+                path,
+                format!(
+                    "Unsupported main index manifest version: {} (expected {}).\n\
+                     Version 1 manifests are no longer supported. Re-create the sharded index:\n  \
+                     rype index shard -i <single-file.ryidx> -o <output.ryidx> --max-shard-size <size>",
+                    version, MAIN_MANIFEST_VERSION
+                ),
             ));
         }
 
         reader.read_exact(&mut buf8)?;
         let k = u64::from_le_bytes(buf8) as usize;
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "Invalid K value in manifest: {} (must be 16, 32, or 64)",
                 k
-            ));
+            )));
         }
 
         reader.read_exact(&mut buf8)?;
@@ -181,20 +186,20 @@ impl MainIndexManifest {
         reader.read_exact(&mut buf4)?;
         let num_buckets = u32::from_le_bytes(buf4);
         if num_buckets > MAX_NUM_BUCKETS {
-            return Err(anyhow!(
-                "Number of buckets {} exceeds maximum {}",
-                num_buckets,
-                MAX_NUM_BUCKETS
+            return Err(RypeError::overflow(
+                "number of buckets",
+                MAX_NUM_BUCKETS as usize,
+                num_buckets as usize,
             ));
         }
 
         reader.read_exact(&mut buf4)?;
         let num_shards = u32::from_le_bytes(buf4);
         if num_shards > MAX_MAIN_SHARDS {
-            return Err(anyhow!(
-                "Number of shards {} exceeds maximum {}",
-                num_shards,
-                MAX_MAIN_SHARDS
+            return Err(RypeError::overflow(
+                "number of shards",
+                MAX_MAIN_SHARDS as usize,
+                num_shards as usize,
             ));
         }
 
@@ -216,11 +221,10 @@ impl MainIndexManifest {
             reader.read_exact(&mut buf8)?;
             let minimizer_count = u64::from_le_bytes(buf8) as usize;
             if minimizer_count > MAX_BUCKET_SIZE {
-                return Err(anyhow!(
-                    "Bucket {} minimizer count {} exceeds maximum {}",
-                    bucket_id,
+                return Err(RypeError::overflow(
+                    format!("bucket {} minimizer count", bucket_id),
+                    MAX_BUCKET_SIZE,
                     minimizer_count,
-                    MAX_BUCKET_SIZE
                 ));
             }
 
@@ -228,15 +232,16 @@ impl MainIndexManifest {
             reader.read_exact(&mut buf8)?;
             let name_len = u64::from_le_bytes(buf8) as usize;
             if name_len > MAX_STRING_LENGTH {
-                return Err(anyhow!(
-                    "Bucket name length {} exceeds maximum {}",
+                return Err(RypeError::overflow(
+                    "bucket name length",
+                    MAX_STRING_LENGTH,
                     name_len,
-                    MAX_STRING_LENGTH
                 ));
             }
             let mut name_buf = vec![0u8; name_len];
             reader.read_exact(&mut name_buf)?;
-            let name = String::from_utf8(name_buf)?;
+            let name = String::from_utf8(name_buf)
+                .map_err(|e| RypeError::encoding(format!("Invalid UTF-8 in bucket name: {}", e)))?;
 
             bucket_names.insert(bucket_id, name);
             bucket_minimizer_counts.insert(bucket_id, minimizer_count);
@@ -266,11 +271,14 @@ impl MainIndexManifest {
                 .collect();
 
             if bucket_ids.len() != bucket_count as usize {
-                return Err(anyhow!(
-                    "Shard {} bucket count mismatch: expected {}, found {}",
-                    shard_id,
-                    bucket_count,
-                    bucket_ids.len()
+                return Err(RypeError::format(
+                    path,
+                    format!(
+                        "Shard {} bucket count mismatch: expected {}, found {}",
+                        shard_id,
+                        bucket_count,
+                        bucket_ids.len()
+                    ),
                 ));
             }
 
@@ -285,10 +293,12 @@ impl MainIndexManifest {
         // Validate shard IDs are sequential
         for (i, shard) in shards.iter().enumerate() {
             if shard.shard_id != i as u32 {
-                return Err(anyhow!(
-                    "Invalid manifest: shard IDs not sequential (expected {}, found {})",
-                    i,
-                    shard.shard_id
+                return Err(RypeError::format(
+                    path,
+                    format!(
+                        "Invalid manifest: shard IDs not sequential (expected {}, found {})",
+                        i, shard.shard_id
+                    ),
                 ));
             }
         }
@@ -296,10 +306,12 @@ impl MainIndexManifest {
         // Validate total minimizers
         let sum_minimizers: usize = shards.iter().map(|s| s.num_minimizers).sum();
         if sum_minimizers != total_minimizers {
-            return Err(anyhow!(
-                "Invalid manifest: shard minimizer counts sum to {}, expected {}",
-                sum_minimizers,
-                total_minimizers
+            return Err(RypeError::format(
+                path,
+                format!(
+                    "Invalid manifest: shard minimizer counts sum to {}, expected {}",
+                    sum_minimizers, total_minimizers
+                ),
             ));
         }
 
@@ -402,15 +414,17 @@ impl MainIndexShard {
                 if !filename_to_idx.contains_key(filename) {
                     // Check for string table overflow
                     let idx = u32::try_from(filenames.len()).map_err(|_| {
-                        anyhow!(
-                            "String table overflow: more than {} unique filenames",
-                            u32::MAX
+                        RypeError::overflow(
+                            "string table unique filenames",
+                            u32::MAX as usize,
+                            filenames.len(),
                         )
                     })?;
                     if idx >= MAX_STRING_TABLE_ENTRIES {
-                        return Err(anyhow!(
-                            "String table overflow: more than {} unique filenames",
-                            MAX_STRING_TABLE_ENTRIES
+                        return Err(RypeError::overflow(
+                            "string table entries",
+                            MAX_STRING_TABLE_ENTRIES as usize,
+                            idx as usize,
                         ));
                     }
                     filename_to_idx.insert(filename.to_string(), idx);
@@ -437,9 +451,10 @@ impl MainIndexShard {
 
         // Write string table (with overflow check)
         let num_filenames = u32::try_from(filenames.len()).map_err(|_| {
-            anyhow!(
-                "String table overflow: more than {} unique filenames",
-                u32::MAX
+            RypeError::overflow(
+                "string table unique filenames",
+                u32::MAX as usize,
+                filenames.len(),
             )
         })?;
         write_buf.extend_from_slice(&num_filenames.to_le_bytes());
@@ -508,7 +523,9 @@ impl MainIndexShard {
         flush_buf(&mut write_buf, &mut encoder)?;
 
         let writer = encoder.finish()?;
-        let file = writer.into_inner()?;
+        let file = writer
+            .into_inner()
+            .map_err(|e| RypeError::io(path, "flush buffer", e.into_error()))?;
 
         // fsync to ensure data is persisted to disk
         file.sync_all()?;
@@ -533,28 +550,33 @@ impl MainIndexShard {
         // Header
         reader.read_exact(&mut buf4)?;
         if &buf4 != MAIN_SHARD_MAGIC {
-            return Err(anyhow!("Invalid main index shard format (expected RYPS)"));
+            return Err(RypeError::format(
+                path,
+                "Invalid main index shard format (expected RYPS)",
+            ));
         }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
         if version != MAIN_SHARD_VERSION {
-            return Err(anyhow!(
-                "Unsupported main index shard version: {} (expected {}).\n\
-                 Version 1 shards are no longer supported. Re-create the sharded index:\n  \
-                 rype index shard -i <single-file.ryidx> -o <output.ryidx> --max-shard-size <size>",
-                version,
-                MAIN_SHARD_VERSION
+            return Err(RypeError::format(
+                path,
+                format!(
+                    "Unsupported main index shard version: {} (expected {}).\n\
+                     Version 1 shards are no longer supported. Re-create the sharded index:\n  \
+                     rype index shard -i <single-file.ryidx> -o <output.ryidx> --max-shard-size <size>",
+                    version, MAIN_SHARD_VERSION
+                ),
             ));
         }
 
         reader.read_exact(&mut buf8)?;
         let k = u64::from_le_bytes(buf8) as usize;
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "Invalid K value in shard: {} (must be 16, 32, or 64)",
                 k
-            ));
+            )));
         }
 
         reader.read_exact(&mut buf8)?;
@@ -569,16 +591,16 @@ impl MainIndexShard {
         reader.read_exact(&mut buf4)?;
         let num_buckets = u32::from_le_bytes(buf4);
         if num_buckets > MAX_NUM_BUCKETS {
-            return Err(anyhow!(
-                "Number of buckets {} exceeds maximum {}",
-                num_buckets,
-                MAX_NUM_BUCKETS
+            return Err(RypeError::overflow(
+                "number of buckets",
+                MAX_NUM_BUCKETS as usize,
+                num_buckets as usize,
             ));
         }
 
         // Compressed stream
         let mut decoder = zstd::stream::read::Decoder::new(reader)
-            .map_err(|e| anyhow!("Failed to create zstd decoder: {}", e))?;
+            .map_err(|e| RypeError::io(path, "create zstd decoder", e))?;
 
         let mut read_buf = vec![0u8; READ_BUF_SIZE];
         let mut buf_pos = 0usize;
@@ -597,7 +619,7 @@ impl MainIndexShard {
                     while buf_len < need {
                         let n = decoder.read(&mut read_buf[buf_len..])?;
                         if n == 0 {
-                            return Err(anyhow!("Unexpected end of compressed data"));
+                            return Err(RypeError::encoding("Unexpected end of compressed data"));
                         }
                         buf_len += n;
                     }
@@ -611,7 +633,7 @@ impl MainIndexShard {
                     buf_pos = 0;
                     let n = decoder.read(&mut read_buf)?;
                     if n == 0 {
-                        return Err(anyhow!("Unexpected end of compressed data"));
+                        return Err(RypeError::encoding("Unexpected end of compressed data"));
                     }
                     buf_len = n;
                 } else if buf_len - buf_pos < 10 {
@@ -631,10 +653,10 @@ impl MainIndexShard {
 
         // Validate string table entry count
         if num_filenames > MAX_STRING_TABLE_ENTRIES {
-            return Err(anyhow!(
-                "String table has {} entries, exceeds maximum {}",
-                num_filenames,
-                MAX_STRING_TABLE_ENTRIES
+            return Err(RypeError::overflow(
+                "string table entries",
+                MAX_STRING_TABLE_ENTRIES as usize,
+                num_filenames as usize,
             ));
         }
 
@@ -655,18 +677,18 @@ impl MainIndexShard {
                         buf_pos = 0;
                         let n = decoder.read(&mut read_buf[buf_len..])?;
                         if n == 0 {
-                            return Err(anyhow!(
+                            return Err(RypeError::encoding(format!(
                                 "Truncated varint at filename {} length",
                                 filename_idx
-                            ));
+                            )));
                         }
                         buf_len += n;
                     }
                     Err(VarIntError::Overflow(bytes)) => {
-                        return Err(anyhow!(
+                        return Err(RypeError::encoding(format!(
                             "Malformed varint at filename {} length: exceeded 10 bytes (consumed {})",
                             filename_idx, bytes
-                        ));
+                        )));
                     }
                 }
             };
@@ -674,32 +696,34 @@ impl MainIndexShard {
 
             // Validate string length with overflow-safe conversion
             let str_len = usize::try_from(str_len).map_err(|_| {
-                anyhow!(
-                    "Filename {} length {} overflows usize",
-                    filename_idx,
-                    str_len
+                RypeError::overflow(
+                    format!("filename {} length", filename_idx),
+                    usize::MAX,
+                    str_len as usize,
                 )
             })?;
 
             if str_len > MAX_STRING_LENGTH {
-                return Err(anyhow!(
-                    "Filename length {} exceeds maximum {}",
+                return Err(RypeError::overflow(
+                    "filename length",
+                    MAX_STRING_LENGTH,
                     str_len,
-                    MAX_STRING_LENGTH
                 ));
             }
 
             // Track total bytes for DoS protection
             total_string_bytes = total_string_bytes.saturating_add(str_len);
             if total_string_bytes > MAX_STRING_TABLE_BYTES {
-                return Err(anyhow!(
-                    "String table exceeds {} bytes limit",
-                    MAX_STRING_TABLE_BYTES
+                return Err(RypeError::overflow(
+                    "string table bytes",
+                    MAX_STRING_TABLE_BYTES,
+                    total_string_bytes,
                 ));
             }
 
             ensure_bytes!(str_len);
-            let name = String::from_utf8(read_buf[buf_pos..buf_pos + str_len].to_vec())?;
+            let name = String::from_utf8(read_buf[buf_pos..buf_pos + str_len].to_vec())
+                .map_err(|e| RypeError::encoding(format!("Invalid UTF-8 in filename: {}", e)))?;
             buf_pos += str_len;
             filenames.push(name);
         }
@@ -720,19 +744,18 @@ impl MainIndexShard {
             buf_pos += 8;
 
             let minimizer_count = usize::try_from(minimizer_count_u64).map_err(|_| {
-                anyhow!(
-                    "Bucket {} minimizer count {} overflows usize",
-                    bucket_id,
-                    minimizer_count_u64
+                RypeError::overflow(
+                    format!("bucket {} minimizer count", bucket_id),
+                    usize::MAX,
+                    minimizer_count_u64 as usize,
                 )
             })?;
 
             if minimizer_count > MAX_BUCKET_SIZE {
-                return Err(anyhow!(
-                    "Bucket {} size {} exceeds maximum {}",
-                    bucket_id,
+                return Err(RypeError::overflow(
+                    format!("bucket {} size", bucket_id),
+                    MAX_BUCKET_SIZE,
                     minimizer_count,
-                    MAX_BUCKET_SIZE
                 ));
             }
 
@@ -743,19 +766,18 @@ impl MainIndexShard {
             buf_pos += 8;
 
             let source_count = usize::try_from(source_count_u64).map_err(|_| {
-                anyhow!(
-                    "Bucket {} source count {} overflows usize",
-                    bucket_id,
-                    source_count_u64
+                RypeError::overflow(
+                    format!("bucket {} source count", bucket_id),
+                    usize::MAX,
+                    source_count_u64 as usize,
                 )
             })?;
 
             if source_count > MAX_SOURCES_PER_BUCKET {
-                return Err(anyhow!(
-                    "Bucket {} has {} sources, exceeds maximum {}",
-                    bucket_id,
+                return Err(RypeError::overflow(
+                    format!("bucket {} sources", bucket_id),
+                    MAX_SOURCES_PER_BUCKET,
                     source_count,
-                    MAX_SOURCES_PER_BUCKET
                 ));
             }
 
@@ -772,38 +794,39 @@ impl MainIndexShard {
                             buf_pos = 0;
                             let n = decoder.read(&mut read_buf[buf_len..])?;
                             if n == 0 {
-                                return Err(anyhow!(
+                                return Err(RypeError::encoding(format!(
                                     "Truncated varint at bucket {} source {} filename index",
-                                    bucket_id,
-                                    source_idx
-                                ));
+                                    bucket_id, source_idx
+                                )));
                             }
                             buf_len += n;
                         }
                         Err(VarIntError::Overflow(bytes)) => {
-                            return Err(anyhow!(
+                            return Err(RypeError::encoding(format!(
                                 "Malformed varint at bucket {} source {} filename index: exceeded 10 bytes (consumed {})",
                                 bucket_id, source_idx, bytes
-                            ));
+                            )));
                         }
                     }
                 };
                 buf_pos += consumed;
 
                 let filename_idx = usize::try_from(filename_idx_raw).map_err(|_| {
-                    anyhow!(
-                        "Bucket {} source {} filename index {} overflows usize",
-                        bucket_id,
-                        source_idx,
-                        filename_idx_raw
+                    RypeError::overflow(
+                        format!("bucket {} source {} filename index", bucket_id, source_idx),
+                        usize::MAX,
+                        filename_idx_raw as usize,
                     )
                 })?;
 
                 // Validate filename index is in bounds
                 if filename_idx >= filenames.len() {
-                    return Err(anyhow!(
-                        "Bucket {} source {} has invalid filename index {} (string table has {} entries)",
-                        bucket_id, source_idx, filename_idx, filenames.len()
+                    return Err(RypeError::format(
+                        path,
+                        format!(
+                            "Bucket {} source {} has invalid filename index {} (string table has {} entries)",
+                            bucket_id, source_idx, filename_idx, filenames.len()
+                        ),
                     ));
                 }
 
@@ -818,43 +841,42 @@ impl MainIndexShard {
                             buf_pos = 0;
                             let n = decoder.read(&mut read_buf[buf_len..])?;
                             if n == 0 {
-                                return Err(anyhow!(
+                                return Err(RypeError::encoding(format!(
                                     "Truncated varint at bucket {} source {} seqname length",
-                                    bucket_id,
-                                    source_idx
-                                ));
+                                    bucket_id, source_idx
+                                )));
                             }
                             buf_len += n;
                         }
                         Err(VarIntError::Overflow(bytes)) => {
-                            return Err(anyhow!(
+                            return Err(RypeError::encoding(format!(
                                 "Malformed varint at bucket {} source {} seqname length: exceeded 10 bytes (consumed {})",
                                 bucket_id, source_idx, bytes
-                            ));
+                            )));
                         }
                     }
                 };
                 buf_pos += consumed;
 
                 let seqname_len = usize::try_from(seqname_len_raw).map_err(|_| {
-                    anyhow!(
-                        "Bucket {} source {} seqname length {} overflows usize",
-                        bucket_id,
-                        source_idx,
-                        seqname_len_raw
+                    RypeError::overflow(
+                        format!("bucket {} source {} seqname length", bucket_id, source_idx),
+                        usize::MAX,
+                        seqname_len_raw as usize,
                     )
                 })?;
 
                 if seqname_len > MAX_STRING_LENGTH {
-                    return Err(anyhow!(
-                        "Seqname length {} exceeds maximum {}",
+                    return Err(RypeError::overflow(
+                        "seqname length",
+                        MAX_STRING_LENGTH,
                         seqname_len,
-                        MAX_STRING_LENGTH
                     ));
                 }
 
                 ensure_bytes!(seqname_len);
-                let seqname = String::from_utf8(read_buf[buf_pos..buf_pos + seqname_len].to_vec())?;
+                let seqname = String::from_utf8(read_buf[buf_pos..buf_pos + seqname_len].to_vec())
+                    .map_err(|e| RypeError::encoding(format!("Invalid UTF-8 in seqname: {}", e)))?;
                 buf_pos += seqname_len;
 
                 // Reconstruct full source string (bounds already validated above)
@@ -888,31 +910,31 @@ impl MainIndexShard {
                                 buf_pos = 0;
                                 let n = decoder.read(&mut read_buf[buf_len..])?;
                                 if n == 0 {
-                                    return Err(anyhow!(
+                                    return Err(RypeError::encoding(format!(
                                         "Truncated varint at bucket {} minimizer {}",
-                                        bucket_id,
-                                        i
-                                    ));
+                                        bucket_id, i
+                                    )));
                                 }
                                 buf_len += n;
                             }
                             Err(VarIntError::Overflow(bytes)) => {
-                                return Err(anyhow!(
+                                return Err(RypeError::encoding(format!(
                                     "Malformed varint at bucket {} minimizer {}: exceeded 10 bytes (consumed {})",
                                     bucket_id, i, bytes
-                                ));
+                                )));
                             }
                         }
                     };
                     buf_pos += consumed;
 
                     let val = prev.checked_add(delta).ok_or_else(|| {
-                        anyhow!(
-                            "Minimizer overflow at bucket {} index {} (prev={}, delta={})",
-                            bucket_id,
-                            i,
-                            prev,
-                            delta
+                        RypeError::overflow(
+                            format!(
+                                "minimizer at bucket {} index {} (prev={}, delta={})",
+                                bucket_id, i, prev, delta
+                            ),
+                            u64::MAX as usize,
+                            (prev as u128 + delta as u128) as usize,
                         )
                     })?;
                     minimizers.push(val);
@@ -997,11 +1019,11 @@ impl ShardedMainIndex {
     /// Load a specific shard by ID.
     pub fn load_shard(&self, shard_id: u32) -> Result<MainIndexShard> {
         if shard_id as usize >= self.manifest.shards.len() {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "Shard ID {} out of range (max {})",
                 shard_id,
                 self.manifest.shards.len() - 1
-            ));
+            )));
         }
         let shard_path = MainIndexManifest::shard_path(&self.base_path, shard_id);
         MainIndexShard::load(&shard_path)
@@ -1023,7 +1045,10 @@ impl ShardedMainIndex {
         minimizers: Vec<u64>,
     ) -> Result<()> {
         if self.manifest.bucket_names.contains_key(&bucket_id) {
-            return Err(anyhow!("Bucket {} already exists in the index", bucket_id));
+            return Err(RypeError::validation(format!(
+                "Bucket {} already exists in the index",
+                bucket_id
+            )));
         }
 
         // Create new shard with sources
@@ -1088,14 +1113,19 @@ impl ShardedMainIndex {
         new_minimizers: Vec<u64>,
     ) -> Result<()> {
         if !self.manifest.bucket_names.contains_key(&bucket_id) {
-            return Err(anyhow!("Bucket {} does not exist in the index", bucket_id));
+            return Err(RypeError::validation(format!(
+                "Bucket {} does not exist in the index",
+                bucket_id
+            )));
         }
 
         let shard_id = *self
             .manifest
             .bucket_to_shard
             .get(&bucket_id)
-            .ok_or_else(|| anyhow!("Bucket {} not mapped to any shard", bucket_id))?;
+            .ok_or_else(|| {
+                RypeError::validation(format!("Bucket {} not mapped to any shard", bucket_id))
+            })?;
 
         // Load the shard
         let shard_path = MainIndexManifest::shard_path(&self.base_path, shard_id);
@@ -1152,7 +1182,9 @@ impl ShardedMainIndex {
             .manifest
             .bucket_to_shard
             .get(&bucket_id)
-            .ok_or_else(|| anyhow!("Bucket {} not found in index", bucket_id))?;
+            .ok_or_else(|| {
+                RypeError::validation(format!("Bucket {} not found in index", bucket_id))
+            })?;
 
         let shard = self.load_shard(shard_id)?;
         Ok(shard
@@ -1173,7 +1205,7 @@ impl ShardedMainIndex {
             .unwrap_or(0);
         max_id
             .checked_add(1)
-            .ok_or_else(|| anyhow!("Bucket ID overflow: maximum ID {} reached", max_id))
+            .ok_or_else(|| RypeError::overflow("bucket ID", u32::MAX as usize, max_id as usize + 1))
     }
 }
 
@@ -1291,7 +1323,10 @@ impl ShardedMainIndexBuilder {
         max_shard_bytes: usize,
     ) -> Result<Self> {
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!("K must be 16, 32, or 64 (got {})", k));
+            return Err(RypeError::validation(format!(
+                "K must be 16, 32, or 64 (got {})",
+                k
+            )));
         }
 
         Ok(ShardedMainIndexBuilder {
@@ -1432,21 +1467,11 @@ impl ShardedMainIndexBuilder {
         // Atomically commit: rename all temp files to final paths
         // Shards first, then manifest (manifest signals completion)
         for (temp_path, final_path) in &self.pending_shard_renames {
-            std::fs::rename(temp_path, final_path).with_context(|| {
-                format!(
-                    "Failed to rename {} to {}",
-                    temp_path.display(),
-                    final_path.display()
-                )
-            })?;
+            std::fs::rename(temp_path, final_path)
+                .map_err(|e| RypeError::io(final_path.clone(), "rename shard", e))?;
         }
-        std::fs::rename(&manifest_temp, &manifest_path).with_context(|| {
-            format!(
-                "Failed to rename manifest {} to {}",
-                manifest_temp.display(),
-                manifest_path.display()
-            )
-        })?;
+        std::fs::rename(&manifest_temp, &manifest_path)
+            .map_err(|e| RypeError::io(manifest_path.clone(), "rename manifest", e))?;
 
         Ok(manifest)
     }
@@ -1470,6 +1495,7 @@ impl ShardedMainIndexBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
     use tempfile::NamedTempFile;
 
     #[test]

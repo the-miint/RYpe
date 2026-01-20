@@ -3,7 +3,7 @@
 //! This module handles reading and writing bucket metadata (names and sources)
 //! to Parquet format within the index directory.
 
-use anyhow::{Context, Result};
+use crate::error::{Result, RypeError};
 use arrow::array::{
     Array, ArrayRef, ListArray, ListBuilder, StringArray, StringBuilder, UInt32Array,
 };
@@ -45,8 +45,8 @@ pub fn write_buckets_parquet(
         .set_compression(Compression::ZSTD(Default::default()))
         .build();
 
-    let file = File::create(&path)
-        .with_context(|| format!("Failed to create buckets file: {}", path.display()))?;
+    let file =
+        File::create(&path).map_err(|e| RypeError::io(path.clone(), "create buckets file", e))?;
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
     // Collect and sort buckets by ID
@@ -97,8 +97,8 @@ pub fn read_buckets_parquet(
 ) -> Result<(HashMap<u32, String>, HashMap<u32, Vec<String>>)> {
     let path = index_dir.join(files::BUCKETS);
 
-    let file = File::open(&path)
-        .with_context(|| format!("Failed to open buckets file: {}", path.display()))?;
+    let file =
+        File::open(&path).map_err(|e| RypeError::io(path.clone(), "open buckets file", e))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let reader = builder.build()?;
 
@@ -111,17 +111,29 @@ pub fn read_buckets_parquet(
             .column(0)
             .as_any()
             .downcast_ref::<UInt32Array>()
-            .context("Expected UInt32Array for bucket_id")?;
+            .ok_or_else(|| {
+                RypeError::format(
+                    path.clone(),
+                    "expected UInt32Array for bucket_id".to_string(),
+                )
+            })?;
         let names = batch
             .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
-            .context("Expected StringArray for bucket_name")?;
+            .ok_or_else(|| {
+                RypeError::format(
+                    path.clone(),
+                    "expected StringArray for bucket_name".to_string(),
+                )
+            })?;
         let sources_list = batch
             .column(2)
             .as_any()
             .downcast_ref::<ListArray>()
-            .context("Expected ListArray for sources")?;
+            .ok_or_else(|| {
+                RypeError::format(path.clone(), "expected ListArray for sources".to_string())
+            })?;
 
         for i in 0..batch.num_rows() {
             let bucket_id = bucket_ids.value(i);
@@ -131,7 +143,12 @@ pub fn read_buckets_parquet(
             let sources_str = sources_array
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .context("Expected StringArray for sources items")?;
+                .ok_or_else(|| {
+                    RypeError::format(
+                        path.clone(),
+                        "expected StringArray for sources items".to_string(),
+                    )
+                })?;
             let sources: Vec<String> = (0..sources_str.len())
                 .map(|j| sources_str.value(j).to_string())
                 .collect();

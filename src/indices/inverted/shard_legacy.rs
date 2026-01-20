@@ -1,6 +1,6 @@
 //! Legacy RYXS binary format for shard serialization.
 
-use anyhow::{anyhow, Result};
+use crate::error::{Result, RypeError};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -25,11 +25,10 @@ impl InvertedIndex {
     ) -> Result<ShardInfo> {
         let end_idx = end_idx.min(self.minimizers.len());
         if start_idx >= end_idx {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "Invalid shard range: start {} >= end {}",
-                start_idx,
-                end_idx
-            ));
+                start_idx, end_idx
+            )));
         }
 
         let shard_minimizers = &self.minimizers[start_idx..end_idx];
@@ -158,13 +157,13 @@ impl InvertedIndex {
     pub fn load_shard(path: &Path) -> Result<Self> {
         // Detect format based on extension
         if path.extension().map(|e| e == "parquet").unwrap_or(false) {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "Parquet shards must be loaded via ShardedInvertedIndex::load_shard() \
                  which provides parameters from the manifest. \
                  Use load_shard_parquet_with_params() directly if you have the parameters. \
                  Path: {}",
                 path.display()
-            ));
+            )));
         }
         Self::load_shard_legacy(path)
     }
@@ -177,26 +176,31 @@ impl InvertedIndex {
 
         reader.read_exact(&mut buf4)?;
         if &buf4 != SHARD_MAGIC {
-            return Err(anyhow!("Invalid shard format (expected RYXS)"));
+            return Err(RypeError::format(
+                path,
+                "Invalid shard format (expected RYXS)",
+            ));
         }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
         if version != SHARD_VERSION {
-            return Err(anyhow!(
-                "Unsupported shard version: {} (expected {})",
-                version,
-                SHARD_VERSION
+            return Err(RypeError::format(
+                path,
+                format!(
+                    "Unsupported shard version: {} (expected {})",
+                    version, SHARD_VERSION
+                ),
             ));
         }
 
         reader.read_exact(&mut buf8)?;
         let k = u64::from_le_bytes(buf8) as usize;
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "Invalid K value in shard: {} (must be 16, 32, or 64)",
                 k
-            ));
+            )));
         }
 
         reader.read_exact(&mut buf8)?;
@@ -222,14 +226,18 @@ impl InvertedIndex {
         let num_bucket_ids = u64::from_le_bytes(buf8) as usize;
 
         if num_minimizers > MAX_INVERTED_MINIMIZERS {
-            return Err(anyhow!(
-                "Shard exceeds maximum minimizer count: {} (limit: {}). Split the index into more shards.",
+            return Err(RypeError::overflow(
+                "shard minimizer count",
+                MAX_INVERTED_MINIMIZERS,
                 num_minimizers,
-                MAX_INVERTED_MINIMIZERS
             ));
         }
         if num_bucket_ids > MAX_INVERTED_BUCKET_IDS {
-            return Err(anyhow!("Shard has too many bucket IDs: {}", num_bucket_ids));
+            return Err(RypeError::overflow(
+                "shard bucket IDs",
+                MAX_INVERTED_BUCKET_IDS,
+                num_bucket_ids,
+            ));
         }
 
         let mut decoder = zstd::stream::read::Decoder::new(reader)?;
@@ -252,7 +260,7 @@ impl InvertedIndex {
                     }
                     let n = decoder.read(&mut read_buf[buf_len..])?;
                     if n == 0 {
-                        return Err(anyhow!("Unexpected end of shard data"));
+                        return Err(RypeError::encoding("Unexpected end of shard data"));
                     }
                     buf_len += n;
                 }
@@ -269,16 +277,21 @@ impl InvertedIndex {
         }
 
         if !offsets.is_empty() && offsets[0] != 0 {
-            return Err(anyhow!("Invalid shard: first offset must be 0"));
+            return Err(RypeError::format(
+                path,
+                "Invalid shard: first offset must be 0",
+            ));
         }
         if offsets.windows(2).any(|w| w[0] > w[1]) {
-            return Err(anyhow!(
-                "Invalid shard: offsets not monotonically increasing"
+            return Err(RypeError::format(
+                path,
+                "Invalid shard: offsets not monotonically increasing",
             ));
         }
         if !offsets.is_empty() && *offsets.last().unwrap() as usize != num_bucket_ids {
-            return Err(anyhow!(
-                "Invalid shard: final offset doesn't match bucket_ids count"
+            return Err(RypeError::format(
+                path,
+                "Invalid shard: final offset doesn't match bucket_ids count",
             ));
         }
 
@@ -307,39 +320,38 @@ impl InvertedIndex {
                             buf_pos = 0;
                             let n = decoder.read(&mut read_buf[buf_len..])?;
                             if n == 0 {
-                                return Err(anyhow!(
+                                return Err(RypeError::encoding(format!(
                                     "Truncated varint at minimizer {} (EOF with continuation bit set, buf_len={})",
                                     i, buf_len
-                                ));
+                                )));
                             }
                             buf_len += n;
                         }
                         Err(VarIntError::Overflow(bytes)) => {
-                            return Err(anyhow!(
+                            return Err(RypeError::encoding(format!(
                                 "Malformed varint at minimizer {}: exceeded 10 bytes (consumed {})",
-                                i,
-                                bytes
-                            ));
+                                i, bytes
+                            )));
                         }
                     }
                 };
                 buf_pos += consumed;
 
                 let val = prev.checked_add(delta).ok_or_else(|| {
-                    anyhow!(
-                        "Minimizer overflow at index {} (prev={}, delta={})",
-                        i,
-                        prev,
-                        delta
+                    RypeError::overflow(
+                        format!("minimizer at index {} (prev={}, delta={})", i, prev, delta),
+                        u64::MAX as usize,
+                        (prev as u128 + delta as u128) as usize,
                     )
                 })?;
 
                 if val <= prev && i > 0 {
-                    return Err(anyhow!(
-                        "Minimizers not strictly increasing at index {} (prev={}, val={})",
-                        i,
-                        prev,
-                        val
+                    return Err(RypeError::format(
+                        path,
+                        format!(
+                            "Minimizers not strictly increasing at index {} (prev={}, val={})",
+                            i, prev, val
+                        ),
                     ));
                 }
 
@@ -387,6 +399,7 @@ impl InvertedIndex {
 mod tests {
     use super::*;
     use crate::indices::main::Index;
+    use anyhow::Result;
     use tempfile::NamedTempFile;
 
     #[test]

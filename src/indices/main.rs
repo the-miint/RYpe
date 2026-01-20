@@ -11,7 +11,7 @@
 //! - Bucket metadata (uncompressed): for each bucket: minimizer_count, bucket_id, name, sources
 //! - Minimizers (zstd compressed stream): delta+varint encoded minimizers per bucket
 
-use anyhow::{anyhow, Result};
+use crate::error::{Result, RypeError};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -62,7 +62,10 @@ impl Index {
     /// Returns an error if k is not 16, 32, or 64.
     pub fn new(k: usize, w: usize, salt: u64) -> Result<Self> {
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!("K must be 16, 32, or 64 (got {})", k));
+            return Err(RypeError::validation(format!(
+                "K must be 16, 32, or 64 (got {})",
+                k
+            )));
         }
         Ok(Index {
             k,
@@ -124,7 +127,7 @@ impl Index {
         let max_id = self.buckets.keys().max().copied().unwrap_or(0);
         max_id
             .checked_add(1)
-            .ok_or_else(|| anyhow!("Bucket ID overflow: maximum ID {} reached", max_id))
+            .ok_or_else(|| RypeError::overflow("bucket ID", u32::MAX as usize, max_id as usize))
     }
 
     /// Save the index to a file (v5 format with delta+varint+zstd compressed minimizers).
@@ -286,31 +289,38 @@ impl Index {
     ///
     /// This is the primary method for loading a main index file (.ryidx).
     pub fn load(path: &Path) -> Result<Self> {
-        let mut reader = BufReader::new(File::open(path)?);
+        let mut reader = BufReader::new(
+            File::open(path).map_err(|e| RypeError::io(path.to_path_buf(), "open index", e))?,
+        );
         let mut buf4 = [0u8; 4];
         let mut buf8 = [0u8; 8];
 
         reader.read_exact(&mut buf4)?;
         if &buf4 != SINGLE_FILE_INDEX_MAGIC {
-            return Err(anyhow!("Invalid Index Format (Expected RYP5)"));
+            return Err(RypeError::format(
+                path.to_path_buf(),
+                "invalid magic (expected RYP5)".to_string(),
+            ));
         }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
         if version != SINGLE_FILE_INDEX_VERSION {
-            return Err(anyhow!(
-                "Unsupported index version: {} (expected {})",
-                version,
-                SINGLE_FILE_INDEX_VERSION
+            return Err(RypeError::format(
+                path.to_path_buf(),
+                format!(
+                    "unsupported index version: {} (expected {})",
+                    version, SINGLE_FILE_INDEX_VERSION
+                ),
             ));
         }
 
         reader.read_exact(&mut buf8)?;
         let k = u64::from_le_bytes(buf8) as usize;
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!(
-                "Invalid K value in index: {} (must be 16, 32, or 64)",
-                k
+            return Err(RypeError::format(
+                path.to_path_buf(),
+                format!("invalid K value: {} (must be 16, 32, or 64)", k),
             ));
         }
         reader.read_exact(&mut buf8)?;
@@ -320,10 +330,10 @@ impl Index {
         reader.read_exact(&mut buf4)?;
         let num = u32::from_le_bytes(buf4);
         if num > MAX_NUM_BUCKETS {
-            return Err(anyhow!(
-                "Number of buckets {} exceeds maximum {}",
-                num,
-                MAX_NUM_BUCKETS
+            return Err(RypeError::overflow(
+                "number of buckets",
+                MAX_NUM_BUCKETS as usize,
+                num as usize,
             ));
         }
 
@@ -337,11 +347,7 @@ impl Index {
             reader.read_exact(&mut buf8)?;
             let vec_len = u64::from_le_bytes(buf8) as usize;
             if vec_len > MAX_BUCKET_SIZE {
-                return Err(anyhow!(
-                    "Bucket size {} exceeds maximum {}",
-                    vec_len,
-                    MAX_BUCKET_SIZE
-                ));
+                return Err(RypeError::overflow("bucket size", MAX_BUCKET_SIZE, vec_len));
             }
 
             reader.read_exact(&mut buf4)?;
@@ -350,15 +356,19 @@ impl Index {
             reader.read_exact(&mut buf8)?;
             let name_len = u64::from_le_bytes(buf8) as usize;
             if name_len > MAX_STRING_LENGTH {
-                return Err(anyhow!(
-                    "Bucket name length {} exceeds maximum {}",
+                return Err(RypeError::overflow(
+                    "bucket name length",
+                    MAX_STRING_LENGTH,
                     name_len,
-                    MAX_STRING_LENGTH
                 ));
             }
             let mut nbuf = vec![0u8; name_len];
             reader.read_exact(&mut nbuf)?;
-            names.insert(id, String::from_utf8(nbuf)?);
+            names.insert(
+                id,
+                String::from_utf8(nbuf)
+                    .map_err(|e| RypeError::encoding(format!("bucket name: {}", e)))?,
+            );
 
             reader.read_exact(&mut buf8)?;
             let src_count = u64::from_le_bytes(buf8) as usize;
@@ -367,15 +377,18 @@ impl Index {
                 reader.read_exact(&mut buf8)?;
                 let slen = u64::from_le_bytes(buf8) as usize;
                 if slen > MAX_STRING_LENGTH {
-                    return Err(anyhow!(
-                        "Source string length {} exceeds maximum {}",
+                    return Err(RypeError::overflow(
+                        "source string length",
+                        MAX_STRING_LENGTH,
                         slen,
-                        MAX_STRING_LENGTH
                     ));
                 }
                 let mut sbuf = vec![0u8; slen];
                 reader.read_exact(&mut sbuf)?;
-                src_list.push(String::from_utf8(sbuf)?);
+                src_list.push(
+                    String::from_utf8(sbuf)
+                        .map_err(|e| RypeError::encoding(format!("source string: {}", e)))?,
+                );
             }
             sources.insert(id, src_list);
 
@@ -384,8 +397,13 @@ impl Index {
         }
 
         // Read all minimizers with delta+varint decoding (zstd compressed stream)
-        let mut decoder = zstd::stream::read::Decoder::new(reader)
-            .map_err(|e| anyhow!("Failed to create zstd decoder: {}", e))?;
+        let mut decoder = zstd::stream::read::Decoder::new(reader).map_err(|e| {
+            RypeError::io(
+                path.to_path_buf(),
+                "create zstd decoder",
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+            )
+        })?;
 
         // Read buffer - we read in chunks and decode varints from the buffer
         let mut read_buf = vec![0u8; READ_BUF_SIZE];
@@ -415,7 +433,10 @@ impl Index {
                         while buf_len < need {
                             let n = decoder.read(&mut read_buf[buf_len..])?;
                             if n == 0 {
-                                return Err(anyhow!("Unexpected end of compressed data"));
+                                return Err(RypeError::format(
+                                    path.to_path_buf(),
+                                    "unexpected end of compressed data".to_string(),
+                                ));
                             }
                             buf_len += n;
                         }
@@ -431,7 +452,10 @@ impl Index {
                         buf_pos = 0;
                         let n = decoder.read(&mut read_buf)?;
                         if n == 0 {
-                            return Err(anyhow!("Unexpected end of compressed data"));
+                            return Err(RypeError::format(
+                                path.to_path_buf(),
+                                "unexpected end of compressed data".to_string(),
+                            ));
                         }
                         buf_len = n;
                     } else if buf_len - buf_pos < 10 {
@@ -468,31 +492,28 @@ impl Index {
                             buf_pos = 0;
                             let n = decoder.read(&mut read_buf[buf_len..])?;
                             if n == 0 {
-                                return Err(anyhow!(
-                                    "Truncated varint at bucket {} minimizer {} (EOF with continuation bit set)",
+                                return Err(RypeError::encoding(format!(
+                                    "truncated varint at bucket {} minimizer {} (EOF with continuation bit set)",
                                     id, i
-                                ));
+                                )));
                             }
                             buf_len += n;
                         }
                         Err(VarIntError::Overflow(bytes)) => {
-                            return Err(anyhow!(
-                                "Malformed varint at bucket {} minimizer {}: exceeded 10 bytes (consumed {})",
+                            return Err(RypeError::encoding(format!(
+                                "malformed varint at bucket {} minimizer {}: exceeded 10 bytes (consumed {})",
                                 id, i, bytes
-                            ));
+                            )));
                         }
                     }
                 };
                 buf_pos += consumed;
 
                 let val = prev.checked_add(delta).ok_or_else(|| {
-                    anyhow!(
-                        "Minimizer overflow at bucket {} index {} (prev={}, delta={})",
-                        id,
-                        i,
-                        prev,
-                        delta
-                    )
+                    RypeError::encoding(format!(
+                        "minimizer overflow at bucket {} index {} (prev={}, delta={})",
+                        id, i, prev, delta
+                    ))
                 })?;
                 vec.push(val);
                 prev = val;
@@ -517,31 +538,38 @@ impl Index {
     /// uncompressed before the compressed minimizers, so we can read just the metadata
     /// section and stop without touching the compressed data.
     pub fn load_metadata(path: &Path) -> Result<IndexMetadata> {
-        let mut reader = BufReader::new(File::open(path)?);
+        let mut reader = BufReader::new(
+            File::open(path).map_err(|e| RypeError::io(path.to_path_buf(), "open index", e))?,
+        );
         let mut buf4 = [0u8; 4];
         let mut buf8 = [0u8; 8];
 
         reader.read_exact(&mut buf4)?;
         if &buf4 != SINGLE_FILE_INDEX_MAGIC {
-            return Err(anyhow!("Invalid Index Format (Expected RYP5)"));
+            return Err(RypeError::format(
+                path.to_path_buf(),
+                "invalid magic (expected RYP5)".to_string(),
+            ));
         }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
         if version != SINGLE_FILE_INDEX_VERSION {
-            return Err(anyhow!(
-                "Unsupported index version: {} (expected {})",
-                version,
-                SINGLE_FILE_INDEX_VERSION
+            return Err(RypeError::format(
+                path.to_path_buf(),
+                format!(
+                    "unsupported index version: {} (expected {})",
+                    version, SINGLE_FILE_INDEX_VERSION
+                ),
             ));
         }
 
         reader.read_exact(&mut buf8)?;
         let k = u64::from_le_bytes(buf8) as usize;
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!(
-                "Invalid K value in index: {} (must be 16, 32, or 64)",
-                k
+            return Err(RypeError::format(
+                path.to_path_buf(),
+                format!("invalid K value: {} (must be 16, 32, or 64)", k),
             ));
         }
         reader.read_exact(&mut buf8)?;
@@ -551,10 +579,10 @@ impl Index {
         reader.read_exact(&mut buf4)?;
         let num = u32::from_le_bytes(buf4);
         if num > MAX_NUM_BUCKETS {
-            return Err(anyhow!(
-                "Number of buckets {} exceeds maximum {}",
-                num,
-                MAX_NUM_BUCKETS
+            return Err(RypeError::overflow(
+                "number of buckets",
+                MAX_NUM_BUCKETS as usize,
+                num as usize,
             ));
         }
 
@@ -568,11 +596,7 @@ impl Index {
             reader.read_exact(&mut buf8)?;
             let vec_len = u64::from_le_bytes(buf8) as usize;
             if vec_len > MAX_BUCKET_SIZE {
-                return Err(anyhow!(
-                    "Bucket size {} exceeds maximum {}",
-                    vec_len,
-                    MAX_BUCKET_SIZE
-                ));
+                return Err(RypeError::overflow("bucket size", MAX_BUCKET_SIZE, vec_len));
             }
 
             reader.read_exact(&mut buf4)?;
@@ -581,15 +605,19 @@ impl Index {
             reader.read_exact(&mut buf8)?;
             let name_len = u64::from_le_bytes(buf8) as usize;
             if name_len > MAX_STRING_LENGTH {
-                return Err(anyhow!(
-                    "Bucket name length {} exceeds maximum {}",
+                return Err(RypeError::overflow(
+                    "bucket name length",
+                    MAX_STRING_LENGTH,
                     name_len,
-                    MAX_STRING_LENGTH
                 ));
             }
             let mut nbuf = vec![0u8; name_len];
             reader.read_exact(&mut nbuf)?;
-            names.insert(id, String::from_utf8(nbuf)?);
+            names.insert(
+                id,
+                String::from_utf8(nbuf)
+                    .map_err(|e| RypeError::encoding(format!("bucket name: {}", e)))?,
+            );
 
             reader.read_exact(&mut buf8)?;
             let src_count = u64::from_le_bytes(buf8) as usize;
@@ -598,15 +626,18 @@ impl Index {
                 reader.read_exact(&mut buf8)?;
                 let slen = u64::from_le_bytes(buf8) as usize;
                 if slen > MAX_STRING_LENGTH {
-                    return Err(anyhow!(
-                        "Source string length {} exceeds maximum {}",
+                    return Err(RypeError::overflow(
+                        "source string length",
+                        MAX_STRING_LENGTH,
                         slen,
-                        MAX_STRING_LENGTH
                     ));
                 }
                 let mut sbuf = vec![0u8; slen];
                 reader.read_exact(&mut sbuf)?;
-                src_list.push(String::from_utf8(sbuf)?);
+                src_list.push(
+                    String::from_utf8(sbuf)
+                        .map_err(|e| RypeError::encoding(format!("source string: {}", e)))?,
+                );
             }
             sources.insert(id, src_list);
 
@@ -691,10 +722,7 @@ mod tests {
 
         let result = Index::load(path);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid Index Format"));
+        assert!(result.unwrap_err().to_string().contains("invalid magic"));
     }
 
     #[test]
@@ -711,7 +739,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Unsupported index version"));
+            .contains("unsupported index version"));
     }
 
     #[test]
@@ -736,7 +764,7 @@ mod tests {
 
         let result = Index::load(path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
+        assert!(result.unwrap_err().to_string().contains("Overflow"));
     }
 
     #[test]
@@ -746,7 +774,7 @@ mod tests {
 
         let result = index.next_id();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("overflow"));
+        assert!(result.unwrap_err().to_string().contains("Overflow"));
     }
 
     #[test]
@@ -1024,7 +1052,7 @@ mod tests {
 
         let result = Index::load(path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid K value"));
+        assert!(result.unwrap_err().to_string().contains("invalid K value"));
 
         Ok(())
     }
