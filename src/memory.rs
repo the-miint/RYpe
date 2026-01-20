@@ -5,7 +5,7 @@
 //! - Platform-specific memory detection
 //! - Batch size calculation based on memory constraints
 
-use anyhow::{anyhow, Result};
+use crate::error::{Result, RypeError};
 
 /// Parse a byte size string with optional suffix.
 ///
@@ -35,7 +35,10 @@ pub fn parse_byte_suffix(s: &str) -> Result<Option<usize>> {
         .unwrap_or(s.len());
 
     if numeric_end == 0 {
-        return Err(anyhow!("Invalid byte size: '{}' (no numeric value)", s));
+        return Err(RypeError::validation(format!(
+            "Invalid byte size: '{}' (no numeric value)",
+            s
+        )));
     }
 
     let numeric_part = &s[..numeric_end];
@@ -43,10 +46,13 @@ pub fn parse_byte_suffix(s: &str) -> Result<Option<usize>> {
 
     let value: f64 = numeric_part
         .parse()
-        .map_err(|_| anyhow!("Invalid numeric value: '{}'", numeric_part))?;
+        .map_err(|_| RypeError::validation(format!("Invalid numeric value: '{}'", numeric_part)))?;
 
     if value < 0.0 {
-        return Err(anyhow!("Byte size cannot be negative: {}", value));
+        return Err(RypeError::validation(format!(
+            "Byte size cannot be negative: {}",
+            value
+        )));
     }
 
     let multiplier: u64 = match suffix_part.to_ascii_uppercase().as_str() {
@@ -56,19 +62,19 @@ pub fn parse_byte_suffix(s: &str) -> Result<Option<usize>> {
         "G" | "GB" => 1024 * 1024 * 1024,
         "T" | "TB" => 1024 * 1024 * 1024 * 1024,
         _ => {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "Unknown byte suffix: '{}' (use B, K, M, G, or T)",
                 suffix_part
-            ))
+            )))
         }
     };
 
     let result = value * multiplier as f64;
     if !result.is_finite() || result < 0.0 || result > usize::MAX as f64 {
-        return Err(anyhow!(
+        return Err(RypeError::validation(format!(
             "Byte size overflow: '{}' exceeds maximum representable value",
             s
-        ));
+        )));
     }
     let bytes = result.round() as usize;
     Ok(Some(bytes))

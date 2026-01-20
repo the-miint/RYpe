@@ -545,7 +545,7 @@ fn test_inverted_from_sharded_main() -> Result<()> {
         Err(e) => {
             eprintln!("\n!!! FAILED TO LOAD SHARDED INVERTED INDEX !!!");
             eprintln!("Error: {}", e);
-            return Err(e);
+            return Err(e.into());
         }
     }
 
@@ -839,7 +839,7 @@ fn test_user_scenario_sharded_inverted_from_sharded_main() -> Result<()> {
             eprintln!("\nThis demonstrates the bug: the manifest validation fails");
             eprintln!("because minimizer ranges are not contiguous when built from");
             eprintln!("bucket-partitioned main shards.");
-            return Err(e);
+            return Err(e.into());
         }
     }
 

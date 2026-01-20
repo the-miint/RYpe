@@ -8,7 +8,7 @@
 //! read. For large indices, sharding enables memory-efficient classification by loading
 //! one shard at a time.
 
-use anyhow::{anyhow, Result};
+use crate::error::{Result, RypeError};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -194,26 +194,31 @@ impl ShardManifest {
 
         reader.read_exact(&mut buf4)?;
         if &buf4 != MANIFEST_MAGIC {
-            return Err(anyhow!("Invalid shard manifest format (expected RYXM)"));
+            return Err(RypeError::format(
+                path,
+                "Invalid shard manifest format (expected RYXM)",
+            ));
         }
 
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
         if !matches!(version, 3..=MANIFEST_VERSION) {
-            return Err(anyhow!(
-                "Unsupported inverted index manifest version: {} (expected 3, 4, or 5).\n\
-                 This inverted index was created with an incompatible version. Regenerate it:\n  \
-                 rype index invert -i <main-index.ryidx>",
-                version
+            return Err(RypeError::format(
+                path,
+                format!(
+                    "Unsupported inverted index manifest version: {} (expected 3, 4, or 5). \
+                     Regenerate it: rype index invert -i <main-index.ryidx>",
+                    version
+                ),
             ));
         }
 
         reader.read_exact(&mut buf8)?;
         let k = u64::from_le_bytes(buf8) as usize;
         if !matches!(k, 16 | 32 | 64) {
-            return Err(anyhow!(
-                "Invalid K value in manifest: {} (must be 16, 32, or 64)",
-                k
+            return Err(RypeError::format(
+                path,
+                format!("Invalid K value in manifest: {} (must be 16, 32, or 64)", k),
             ));
         }
 
@@ -229,20 +234,20 @@ impl ShardManifest {
         reader.read_exact(&mut buf8)?;
         let total_minimizers = u64::from_le_bytes(buf8) as usize;
         if total_minimizers > MAX_INVERTED_MINIMIZERS {
-            return Err(anyhow!(
-                "Invalid total_minimizers in manifest: {} (hard-coded limit: {} as defensive sanity check)",
+            return Err(RypeError::overflow(
+                "total_minimizers in manifest",
+                MAX_INVERTED_MINIMIZERS,
                 total_minimizers,
-                MAX_INVERTED_MINIMIZERS
             ));
         }
 
         reader.read_exact(&mut buf8)?;
         let total_bucket_ids = u64::from_le_bytes(buf8) as usize;
         if total_bucket_ids > MAX_INVERTED_BUCKET_IDS {
-            return Err(anyhow!(
-                "Invalid total_bucket_ids in manifest: {} (max {})",
+            return Err(RypeError::overflow(
+                "total_bucket_ids in manifest",
+                MAX_INVERTED_BUCKET_IDS,
                 total_bucket_ids,
-                MAX_INVERTED_BUCKET_IDS
             ));
         }
 
@@ -256,9 +261,9 @@ impl ShardManifest {
                 0 => ShardFormat::Legacy,
                 1 => ShardFormat::Parquet,
                 other => {
-                    return Err(anyhow!(
-                        "Invalid shard_format value in manifest: {} (expected 0 or 1)",
-                        other
+                    return Err(RypeError::format(
+                        path,
+                        format!("Invalid shard_format value: {} (expected 0 or 1)", other),
                     ));
                 }
             }
@@ -270,10 +275,10 @@ impl ShardManifest {
         let num_shards = u32::from_le_bytes(buf4);
 
         if num_shards > MAX_SHARDS {
-            return Err(anyhow!(
-                "Too many shards: {} (max {})",
-                num_shards,
-                MAX_SHARDS
+            return Err(RypeError::overflow(
+                "number of shards",
+                MAX_SHARDS as usize,
+                num_shards as usize,
             ));
         }
 
@@ -312,10 +317,13 @@ impl ShardManifest {
             // Check shard IDs are sequential
             for i in 1..shards.len() {
                 if shards[i].shard_id != shards[i - 1].shard_id + 1 {
-                    return Err(anyhow!(
-                        "Invalid manifest: shard IDs not sequential (shard {} followed by {})",
-                        shards[i - 1].shard_id,
-                        shards[i].shard_id
+                    return Err(RypeError::format(
+                        path,
+                        format!(
+                            "shard IDs not sequential (shard {} followed by {})",
+                            shards[i - 1].shard_id,
+                            shards[i].shard_id
+                        ),
                     ));
                 }
             }
@@ -324,17 +332,21 @@ impl ShardManifest {
             let sum_minimizers: usize = shards.iter().map(|s| s.num_minimizers).sum();
             let sum_bucket_ids: usize = shards.iter().map(|s| s.num_bucket_ids).sum();
             if sum_minimizers != total_minimizers {
-                return Err(anyhow!(
-                    "Invalid manifest: shard minimizer counts sum to {}, expected {}",
-                    sum_minimizers,
-                    total_minimizers
+                return Err(RypeError::format(
+                    path,
+                    format!(
+                        "shard minimizer counts sum to {}, expected {}",
+                        sum_minimizers, total_minimizers
+                    ),
                 ));
             }
             if sum_bucket_ids != total_bucket_ids {
-                return Err(anyhow!(
-                    "Invalid manifest: shard bucket_id counts sum to {}, expected {}",
-                    sum_bucket_ids,
-                    total_bucket_ids
+                return Err(RypeError::format(
+                    path,
+                    format!(
+                        "shard bucket_id counts sum to {}, expected {}",
+                        sum_bucket_ids, total_bucket_ids
+                    ),
                 ));
             }
         }
@@ -344,10 +356,10 @@ impl ShardManifest {
             reader.read_exact(&mut buf4)?;
             let num_buckets = u32::from_le_bytes(buf4);
             if num_buckets > MAX_NUM_BUCKETS {
-                return Err(anyhow!(
-                    "Number of buckets {} exceeds maximum {}",
-                    num_buckets,
-                    MAX_NUM_BUCKETS
+                return Err(RypeError::overflow(
+                    "number of buckets",
+                    MAX_NUM_BUCKETS as usize,
+                    num_buckets as usize,
                 ));
             }
 
@@ -363,15 +375,17 @@ impl ShardManifest {
                 reader.read_exact(&mut buf8)?;
                 let name_len = u64::from_le_bytes(buf8) as usize;
                 if name_len > MAX_STRING_LENGTH {
-                    return Err(anyhow!(
-                        "Bucket name length {} exceeds maximum {}",
+                    return Err(RypeError::overflow(
+                        "bucket name length",
+                        MAX_STRING_LENGTH,
                         name_len,
-                        MAX_STRING_LENGTH
                     ));
                 }
                 let mut name_buf = vec![0u8; name_len];
                 reader.read_exact(&mut name_buf)?;
-                let name = String::from_utf8(name_buf)?;
+                let name = String::from_utf8(name_buf).map_err(|e| {
+                    RypeError::format(path, format!("invalid UTF-8 in bucket name: {}", e))
+                })?;
                 bucket_names.insert(bucket_id, name);
 
                 // Read minimizer count
@@ -387,15 +401,18 @@ impl ShardManifest {
                     reader.read_exact(&mut buf8)?;
                     let src_len = u64::from_le_bytes(buf8) as usize;
                     if src_len > MAX_STRING_LENGTH {
-                        return Err(anyhow!(
-                            "Source string length {} exceeds maximum {}",
+                        return Err(RypeError::overflow(
+                            "source string length",
+                            MAX_STRING_LENGTH,
                             src_len,
-                            MAX_STRING_LENGTH
                         ));
                     }
                     let mut src_buf = vec![0u8; src_len];
                     reader.read_exact(&mut src_buf)?;
-                    sources.push(String::from_utf8(src_buf)?);
+                    let src = String::from_utf8(src_buf).map_err(|e| {
+                        RypeError::format(path, format!("invalid UTF-8 in source string: {}", e))
+                    })?;
+                    sources.push(src);
                 }
                 bucket_sources.insert(bucket_id, sources);
             }
@@ -515,10 +532,17 @@ impl ShardedInvertedIndex {
             } else if legacy_path.exists() {
                 ShardFormat::Legacy
             } else {
-                return Err(anyhow!(
-                    "No shard file found at {} or {}",
-                    parquet_path.display(),
-                    legacy_path.display()
+                return Err(RypeError::io(
+                    &legacy_path,
+                    "open shard",
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "No shard file found at {} or {}",
+                            parquet_path.display(),
+                            legacy_path.display()
+                        ),
+                    ),
                 ));
             }
         } else {
@@ -552,16 +576,18 @@ impl ShardedInvertedIndex {
         use super::parquet::ParquetManifest;
 
         // Load Parquet manifest
-        let parquet_manifest = ParquetManifest::load(base_path)?;
+        let parquet_manifest = ParquetManifest::load(base_path)
+            .map_err(|e| RypeError::format(base_path, e.to_string()))?;
 
         // Load bucket metadata from buckets.parquet
-        let (bucket_names, bucket_sources) = super::parquet::read_buckets_parquet(base_path)?;
+        let (bucket_names, bucket_sources) = super::parquet::read_buckets_parquet(base_path)
+            .map_err(|e| RypeError::format(base_path, e.to_string()))?;
 
         // Convert to ShardManifest format
         let inverted = parquet_manifest
             .inverted
             .as_ref()
-            .ok_or_else(|| anyhow!("Parquet index missing inverted section in manifest"))?;
+            .ok_or_else(|| RypeError::format(base_path, "missing inverted section in manifest"))?;
 
         let shards: Vec<ShardInfo> = inverted
             .shards
@@ -659,14 +685,16 @@ impl ShardedInvertedIndex {
     pub fn load_shard(&self, shard_id: u32) -> Result<InvertedIndex> {
         let path = self.shard_path(shard_id);
         match self.shard_format {
-            ShardFormat::Legacy => InvertedIndex::load_shard(&path),
+            ShardFormat::Legacy => InvertedIndex::load_shard(&path)
+                .map_err(|e| RypeError::format(&path, e.to_string())),
             ShardFormat::Parquet => InvertedIndex::load_shard_parquet_with_params(
                 &path,
                 self.manifest.k,
                 self.manifest.w,
                 self.manifest.salt,
                 self.manifest.source_hash,
-            ),
+            )
+            .map_err(|e| RypeError::format(&path, e.to_string())),
         }
     }
 
@@ -701,6 +729,7 @@ impl ShardedInvertedIndex {
                 // Legacy format doesn't support row group filtering or bloom filters
                 // Load full shard (caller will filter during merge-join)
                 InvertedIndex::load_shard(&path)
+                    .map_err(|e| RypeError::format(&path, e.to_string()))
             }
             ShardFormat::Parquet => InvertedIndex::load_shard_parquet_for_query(
                 &path,
@@ -710,7 +739,8 @@ impl ShardedInvertedIndex {
                 self.manifest.source_hash,
                 query_minimizers,
                 options,
-            ),
+            )
+            .map_err(|e| RypeError::format(&path, e.to_string())),
         }
     }
 
@@ -722,31 +752,28 @@ impl ShardedInvertedIndex {
     /// Validate against Index metadata.
     pub fn validate_against_metadata(&self, metadata: &IndexMetadata) -> Result<()> {
         if self.manifest.k != metadata.k {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "K mismatch: sharded index has K={}, metadata has K={}",
-                self.manifest.k,
-                metadata.k
-            ));
+                self.manifest.k, metadata.k
+            )));
         }
         if self.manifest.w != metadata.w {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "W mismatch: sharded index has W={}, metadata has W={}",
-                self.manifest.w,
-                metadata.w
-            ));
+                self.manifest.w, metadata.w
+            )));
         }
         if self.manifest.salt != metadata.salt {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "Salt mismatch: sharded index has salt={:#x}, metadata has salt={:#x}",
-                self.manifest.salt,
-                metadata.salt
-            ));
+                self.manifest.salt, metadata.salt
+            )));
         }
 
         let expected_hash = InvertedIndex::compute_metadata_hash(metadata);
         if self.manifest.source_hash != expected_hash {
-            return Err(anyhow!(
-                "Source hash mismatch: sharded index is stale or was built from different source"
+            return Err(RypeError::validation(
+                "Source hash mismatch: sharded index is stale or was built from different source",
             ));
         }
 
@@ -761,7 +788,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn test_shard_manifest_save_load_roundtrip() -> Result<()> {
+    fn test_shard_manifest_save_load_roundtrip() -> anyhow::Result<()> {
         let file = NamedTempFile::new()?;
         let path = file.path().to_path_buf();
 
@@ -833,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_manifest_v4_roundtrip_with_metadata() -> Result<()> {
+    fn test_shard_manifest_v4_roundtrip_with_metadata() -> anyhow::Result<()> {
         let file = NamedTempFile::new()?;
         let path = file.path().to_path_buf();
 
@@ -940,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_manifest_overlapping_roundtrip() -> Result<()> {
+    fn test_shard_manifest_overlapping_roundtrip() -> anyhow::Result<()> {
         // Test round-trip for bucket-partitioned (overlapping) shards
         let file = NamedTempFile::new()?;
         let path = file.path().to_path_buf();
@@ -1078,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sharded_inverted_index_open() -> Result<()> {
+    fn test_sharded_inverted_index_open() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let base_path = dir.path().join("test.ryxdi");
 

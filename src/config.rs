@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use crate::error::{Result, RypeError};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -34,20 +34,23 @@ pub struct BucketDefinition {
 }
 
 pub fn parse_config(path: &Path) -> Result<ConfigFile> {
-    let contents = fs::read_to_string(path)
-        .context(format!("Failed to read config file: {}", path.display()))?;
+    let contents =
+        fs::read_to_string(path).map_err(|e| RypeError::io(path, "read config file", e))?;
 
-    let config: ConfigFile = toml::from_str(&contents).context("Failed to parse TOML config")?;
+    let config: ConfigFile = toml::from_str(&contents)
+        .map_err(|e| RypeError::validation(format!("Failed to parse TOML config: {}", e)))?;
 
     if config.buckets.is_empty() {
-        return Err(anyhow!("Config must define at least one bucket"));
+        return Err(RypeError::validation(
+            "Config must define at least one bucket",
+        ));
     }
 
     if !matches!(config.index.k, 16 | 32 | 64) {
-        return Err(anyhow!(
+        return Err(RypeError::validation(format!(
             "Config error: k must be 16, 32, or 64 (got {})",
             config.index.k
-        ));
+        )));
     }
 
     Ok(config)
@@ -56,16 +59,22 @@ pub fn parse_config(path: &Path) -> Result<ConfigFile> {
 pub fn validate_config(config: &ConfigFile, config_dir: &Path) -> Result<()> {
     for (bucket_name, bucket_def) in &config.buckets {
         if bucket_def.files.is_empty() {
-            return Err(anyhow!("Bucket '{}' has no files", bucket_name));
+            return Err(RypeError::validation(format!(
+                "Bucket '{}' has no files",
+                bucket_name
+            )));
         }
 
         for file_path in &bucket_def.files {
             let abs_path = resolve_path(config_dir, file_path);
             if !abs_path.exists() {
-                return Err(anyhow!(
-                    "File not found for bucket '{}': {}",
-                    bucket_name,
-                    abs_path.display()
+                return Err(RypeError::io(
+                    &abs_path,
+                    "validate config",
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("File not found for bucket '{}'", bucket_name),
+                    ),
                 ));
             }
         }
@@ -139,25 +148,25 @@ pub struct FileList {
 }
 
 pub fn parse_bucket_add_config(path: &Path) -> Result<BucketAddConfig> {
-    let contents = fs::read_to_string(path)
-        .context(format!("Failed to read config file: {}", path.display()))?;
+    let contents =
+        fs::read_to_string(path).map_err(|e| RypeError::io(path, "read config file", e))?;
 
-    let config: BucketAddConfig =
-        toml::from_str(&contents).context("Failed to parse TOML config")?;
+    let config: BucketAddConfig = toml::from_str(&contents)
+        .map_err(|e| RypeError::validation(format!("Failed to parse TOML config: {}", e)))?;
 
     // Validate threshold for best_bin mode
     if let AssignmentSettings::BestBin { threshold, .. } = &config.assignment {
         if *threshold < 0.0 || *threshold > 1.0 {
-            return Err(anyhow!(
+            return Err(RypeError::validation(format!(
                 "Config error: threshold must be between 0.0 and 1.0 (got {})",
                 threshold
-            ));
+            )));
         }
     }
 
     if config.files.paths.is_empty() {
-        return Err(anyhow!(
-            "Config must specify at least one file in [files].paths"
+        return Err(RypeError::validation(
+            "Config must specify at least one file in [files].paths",
         ));
     }
 
@@ -168,14 +177,22 @@ pub fn validate_bucket_add_config(config: &BucketAddConfig, config_dir: &Path) -
     // Check target index exists
     let index_path = resolve_path(config_dir, &config.target.index);
     if !index_path.exists() {
-        return Err(anyhow!("Target index not found: {}", index_path.display()));
+        return Err(RypeError::io(
+            &index_path,
+            "validate config",
+            std::io::Error::new(std::io::ErrorKind::NotFound, "Target index not found"),
+        ));
     }
 
     // Check all file paths exist
     for file_path in &config.files.paths {
         let abs_path = resolve_path(config_dir, file_path);
         if !abs_path.exists() {
-            return Err(anyhow!("File not found: {}", abs_path.display()));
+            return Err(RypeError::io(
+                &abs_path,
+                "validate config",
+                std::io::Error::new(std::io::ErrorKind::NotFound, "File not found"),
+            ));
         }
     }
 
