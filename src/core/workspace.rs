@@ -3,9 +3,10 @@
 //! The workspace pattern avoids repeated allocations in hot loops by providing
 //! pre-allocated buffers that can be reused across multiple extraction calls.
 
-use std::collections::VecDeque;
-
-use crate::constants::{DEFAULT_DEQUE_CAPACITY, ESTIMATED_MINIMIZERS_PER_SEQUENCE};
+use super::ring_buffer::RingBuffer;
+use crate::constants::{
+    DEFAULT_DEQUE_CAPACITY, ESTIMATED_MINIMIZERS_PER_SEQUENCE, RING_BUFFER_SIZE,
+};
 
 /// Workspace for minimizer extraction algorithms.
 ///
@@ -22,10 +23,10 @@ use crate::constants::{DEFAULT_DEQUE_CAPACITY, ESTIMATED_MINIMIZERS_PER_SEQUENCE
 /// // Results will be in ws.buffer after extraction
 /// ```
 pub struct MinimizerWorkspace {
-    /// Monotonic deque for forward strand k-mer hashes
-    pub(crate) q_fwd: VecDeque<(usize, u64)>,
-    /// Monotonic deque for reverse complement k-mer hashes
-    pub(crate) q_rc: VecDeque<(usize, u64)>,
+    /// Monotonic deque for forward strand k-mer hashes (array-backed for cache locality)
+    pub(crate) q_fwd: RingBuffer<(usize, u64), RING_BUFFER_SIZE>,
+    /// Monotonic deque for reverse complement k-mer hashes (array-backed for cache locality)
+    pub(crate) q_rc: RingBuffer<(usize, u64), RING_BUFFER_SIZE>,
     /// Output buffer for extracted minimizers
     pub buffer: Vec<u64>,
     /// Estimated minimizers per sequence for pre-allocation.
@@ -36,12 +37,12 @@ pub struct MinimizerWorkspace {
 impl MinimizerWorkspace {
     /// Create a new workspace with default capacity.
     ///
-    /// The default capacity is sized for typical window sizes (up to 128).
-    /// Uses `ESTIMATED_MINIMIZERS_PER_SEQUENCE` (32) for pre-allocation.
+    /// The ring buffers are stack-allocated with fixed size for cache locality.
+    /// Uses `ESTIMATED_MINIMIZERS_PER_SEQUENCE` (32) for output buffer pre-allocation.
     pub fn new() -> Self {
         Self {
-            q_fwd: VecDeque::with_capacity(DEFAULT_DEQUE_CAPACITY),
-            q_rc: VecDeque::with_capacity(DEFAULT_DEQUE_CAPACITY),
+            q_fwd: RingBuffer::new(),
+            q_rc: RingBuffer::new(),
             buffer: Vec::with_capacity(DEFAULT_DEQUE_CAPACITY),
             estimated_minimizers: ESTIMATED_MINIMIZERS_PER_SEQUENCE,
         }
@@ -56,8 +57,8 @@ impl MinimizerWorkspace {
     /// * `estimated_minimizers` - Expected minimizers per sequence (from `ReadMemoryProfile::minimizers_per_query`)
     pub fn with_estimate(estimated_minimizers: usize) -> Self {
         Self {
-            q_fwd: VecDeque::with_capacity(DEFAULT_DEQUE_CAPACITY),
-            q_rc: VecDeque::with_capacity(DEFAULT_DEQUE_CAPACITY),
+            q_fwd: RingBuffer::new(),
+            q_rc: RingBuffer::new(),
             buffer: Vec::with_capacity(DEFAULT_DEQUE_CAPACITY),
             estimated_minimizers: estimated_minimizers.max(ESTIMATED_MINIMIZERS_PER_SEQUENCE),
         }

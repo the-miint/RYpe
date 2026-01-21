@@ -57,6 +57,9 @@ pub fn extract_with_positions(
         return vec![];
     }
 
+    // Precompute mask outside hot loop - only lower k bits are valid
+    let k_mask = if k == 64 { u64::MAX } else { (1u64 << k) - 1 };
+
     let mut results = Vec::with_capacity(ws.estimated_minimizers * 2);
 
     let mut current_val: u64 = 0;
@@ -80,7 +83,7 @@ pub fn extract_with_positions(
         }
 
         valid_bases_count += 1;
-        current_val = (current_val << 1) | bit;
+        current_val = ((current_val << 1) | bit) & k_mask;
 
         if valid_bases_count >= k {
             let pos = i + 1 - k;
@@ -175,6 +178,9 @@ pub fn extract_into(seq: &[u8], k: usize, w: usize, salt: u64, ws: &mut Minimize
         return;
     }
 
+    // Precompute mask outside hot loop - only lower k bits are valid
+    let k_mask = if k == 64 { u64::MAX } else { (1u64 << k) - 1 };
+
     let mut current_val: u64 = 0;
     let mut last_min: Option<u64> = None;
     let mut valid_bases_count = 0;
@@ -192,7 +198,7 @@ pub fn extract_into(seq: &[u8], k: usize, w: usize, salt: u64, ws: &mut Minimize
         }
 
         valid_bases_count += 1;
-        current_val = (current_val << 1) | bit;
+        current_val = ((current_val << 1) | bit) & k_mask;
 
         if valid_bases_count >= k {
             let pos = i + 1 - k;
@@ -258,6 +264,9 @@ pub fn extract_dual_strand_into(
         return (vec![], vec![]);
     }
 
+    // Precompute mask outside hot loop - only lower k bits are valid
+    let k_mask = if k == 64 { u64::MAX } else { (1u64 << k) - 1 };
+
     let mut fwd_mins = Vec::with_capacity(ws.estimated_minimizers);
     let mut rc_mins = Vec::with_capacity(ws.estimated_minimizers);
 
@@ -281,7 +290,7 @@ pub fn extract_dual_strand_into(
         }
 
         valid_bases_count += 1;
-        current_val = (current_val << 1) | bit;
+        current_val = ((current_val << 1) | bit) & k_mask;
 
         if valid_bases_count >= k {
             let pos = i + 1 - k;

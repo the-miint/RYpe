@@ -6,7 +6,7 @@ pub mod index;
 pub mod inspect;
 
 pub use args::{ClassifyCommands, Cli, Commands, IndexCommands, InspectCommands};
-pub use helpers::{load_index_metadata, sanitize_bucket_name, IoHandler};
+pub use helpers::{load_index_metadata, sanitize_bucket_name, PrefetchingIoHandler};
 pub use index::{
     add_reference_file_to_index, bucket_add_from_config, build_index_from_config,
     build_parquet_index_from_config, create_parquet_index_from_refs,

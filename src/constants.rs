@@ -108,6 +108,9 @@ pub(crate) const DEFAULT_ROW_GROUP_SIZE: usize = 100_000;
 /// Default capacity for minimizer deques (typical window size range).
 pub(crate) const DEFAULT_DEQUE_CAPACITY: usize = 128;
 
+/// Size of the fixed ring buffer for minimizer extraction (covers w up to ~200).
+pub(crate) const RING_BUFFER_SIZE: usize = 256;
+
 /// Estimated minimizers per sequence (conservative).
 pub(crate) const ESTIMATED_MINIMIZERS_PER_SEQUENCE: usize = 32;
 

@@ -4,9 +4,11 @@
 //! - RY-space encoding and varint utilities
 //! - Minimizer extraction algorithms
 //! - Reusable workspace for avoiding allocations in hot loops
+//! - Array-backed ring buffer for cache-efficient deque operations
 
 pub mod encoding;
 pub mod extraction;
+pub mod ring_buffer;
 pub mod workspace;
 
 // Re-export commonly used items at the core module level

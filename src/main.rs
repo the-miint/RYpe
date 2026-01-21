@@ -26,7 +26,7 @@ use commands::{
     add_reference_file_to_index, bucket_add_from_config, build_index_from_config,
     build_parquet_index_from_config, create_parquet_index_from_refs, inspect_matches,
     load_index_metadata, sanitize_bucket_name, ClassifyCommands, Cli, Commands, IndexCommands,
-    InspectCommands, IoHandler,
+    InspectCommands, PrefetchingIoHandler,
 };
 
 // CLI argument definitions moved to commands/args.rs
@@ -1169,7 +1169,8 @@ fn main() -> Result<()> {
 
                     log::info!("Metadata loaded: {} buckets", metadata.bucket_names.len());
 
-                    let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
+                    let mut io =
+                        PrefetchingIoHandler::new(&r1, r2.as_ref(), output, effective_batch_size)?;
                     io.write(b"read_id\tbucket_name\tscore\n".to_vec())?;
 
                     let mut total_reads = 0;
@@ -1228,9 +1229,7 @@ fn main() -> Result<()> {
                         );
                     }
 
-                    while let Some((owned_records, headers)) =
-                        io.next_batch_records(effective_batch_size)?
-                    {
+                    while let Some((owned_records, headers)) = io.next_batch()? {
                         batch_num += 1;
                         let batch_read_count = owned_records.len();
                         total_reads += batch_read_count;
@@ -1293,7 +1292,8 @@ fn main() -> Result<()> {
                     // Standard path - detect sharded vs single-file main index
                     let main_manifest_path = MainIndexManifest::manifest_path(&index);
 
-                    let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
+                    let mut io =
+                        PrefetchingIoHandler::new(&r1, r2.as_ref(), output, effective_batch_size)?;
                     io.write(b"read_id\tbucket_name\tscore\n".to_vec())?;
 
                     let mut total_reads = 0;
@@ -1314,9 +1314,7 @@ fn main() -> Result<()> {
 
                         log::info!("Starting classification with sequential main shard loading (batch_size={})", effective_batch_size);
 
-                        while let Some((owned_records, headers)) =
-                            io.next_batch_records(effective_batch_size)?
-                        {
+                        while let Some((owned_records, headers)) = io.next_batch()? {
                             batch_num += 1;
                             let batch_read_count = owned_records.len();
                             total_reads += batch_read_count;
@@ -1368,9 +1366,7 @@ fn main() -> Result<()> {
                             effective_batch_size
                         );
 
-                        while let Some((owned_records, headers)) =
-                            io.next_batch_records(effective_batch_size)?
-                        {
+                        while let Some((owned_records, headers)) = io.next_batch()? {
                             batch_num += 1;
                             let batch_read_count = owned_records.len();
                             total_reads += batch_read_count;
@@ -1528,7 +1524,8 @@ fn main() -> Result<()> {
                     }
                 };
 
-                let mut io = IoHandler::new(&r1, r2.as_ref(), output)?;
+                let mut io =
+                    PrefetchingIoHandler::new(&r1, r2.as_ref(), output, effective_batch_size)?;
                 io.write(b"query_name\tbucket_name\tscore\n".to_vec())?;
 
                 let mut total_reads = 0;
@@ -1539,7 +1536,7 @@ fn main() -> Result<()> {
                     effective_batch_size
                 );
 
-                while let Some((owned_records, _)) = io.next_batch_records(effective_batch_size)? {
+                while let Some((owned_records, _)) = io.next_batch()? {
                     batch_num += 1;
                     let batch_read_count = owned_records.len();
                     total_reads += batch_read_count;
