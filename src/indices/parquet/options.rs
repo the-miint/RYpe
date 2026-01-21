@@ -161,11 +161,17 @@ impl ParquetWriteOptions {
             .set_column_dictionary_enabled(bucket_id_col.clone(), false);
 
         if self.bloom_filter_enabled {
+            // Set NDV (number of distinct values) to row_group_size.
+            // Analysis shows ~99% of minimizers in a row group are unique, so NDV ≈ row_group_size.
+            // Without this, arrow-rs defaults to NDV=1,000,000 which creates 10x larger bloom filters.
+            let ndv = self.row_group_size as u64;
             builder = builder
                 .set_column_bloom_filter_enabled(minimizer_col.clone(), true)
-                .set_column_bloom_filter_fpp(minimizer_col, self.bloom_filter_fpp)
+                .set_column_bloom_filter_fpp(minimizer_col.clone(), self.bloom_filter_fpp)
+                .set_column_bloom_filter_ndv(minimizer_col, ndv)
                 .set_column_bloom_filter_enabled(bucket_id_col.clone(), true)
-                .set_column_bloom_filter_fpp(bucket_id_col, self.bloom_filter_fpp);
+                .set_column_bloom_filter_fpp(bucket_id_col.clone(), self.bloom_filter_fpp)
+                .set_column_bloom_filter_ndv(bucket_id_col, ndv);
         }
 
         builder.build()

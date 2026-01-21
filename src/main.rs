@@ -4,6 +4,7 @@ use needletail::parse_fastx_file;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use rype::memory::{
     calculate_batch_config, detect_available_memory, format_bytes, MemoryConfig, MemorySource,
@@ -12,8 +13,8 @@ use rype::memory::{
 use rype::parquet_index;
 use rype::{
     aggregate_batch, classify_batch, classify_batch_sharded_main,
-    classify_batch_sharded_merge_join, classify_batch_sharded_sequential, extract_into, Index,
-    IndexMetadata, InvertedIndex, MainIndexManifest, MainIndexShard, MinimizerWorkspace,
+    classify_batch_sharded_merge_join, classify_batch_sharded_sequential, extract_into, log_timing,
+    Index, IndexMetadata, InvertedIndex, MainIndexManifest, MainIndexShard, MinimizerWorkspace,
     QueryRecord, ShardFormat, ShardManifest, ShardedInvertedIndex, ShardedMainIndex, ENABLE_TIMING,
 };
 
@@ -22,8 +23,9 @@ mod logging;
 
 use commands::{
     add_reference_file_to_index, bucket_add_from_config, build_index_from_config,
-    create_parquet_index_from_refs, inspect_matches, load_index_metadata, sanitize_bucket_name,
-    ClassifyCommands, Cli, Commands, IndexCommands, InspectCommands, IoHandler,
+    build_parquet_index_from_config, create_parquet_index_from_refs, inspect_matches,
+    load_index_metadata, sanitize_bucket_name, ClassifyCommands, Cli, Commands, IndexCommands,
+    InspectCommands, IoHandler,
 };
 
 // CLI argument definitions moved to commands/args.rs
@@ -52,7 +54,13 @@ fn main() -> Result<()> {
                 parquet_zstd,
                 parquet_bloom_filter,
                 parquet_bloom_fpp,
+                timing,
             } => {
+                // Enable timing diagnostics if requested
+                if timing {
+                    ENABLE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
                 if !matches!(kmer_size, 16 | 32 | 64) {
                     return Err(anyhow!("K must be 16, 32, or 64 (got {})", kmer_size));
                 }
@@ -415,8 +423,27 @@ fn main() -> Result<()> {
                 config,
                 max_shard_size,
                 invert,
+                parquet,
+                parquet_bloom_filter,
+                parquet_bloom_fpp,
+                timing,
             } => {
-                build_index_from_config(&config, max_shard_size, invert)?;
+                // Enable timing diagnostics if requested
+                if timing {
+                    ENABLE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                if parquet {
+                    // Create parquet inverted index directly (bypasses main index)
+                    let options = parquet_index::ParquetWriteOptions {
+                        bloom_filter_enabled: parquet_bloom_filter,
+                        bloom_filter_fpp: parquet_bloom_fpp,
+                        ..Default::default()
+                    };
+                    build_parquet_index_from_config(&config, max_shard_size, Some(&options))?;
+                } else {
+                    build_index_from_config(&config, max_shard_size, invert)?;
+                }
             }
 
             IndexCommands::BucketAddConfig { config } => {
@@ -430,7 +457,14 @@ fn main() -> Result<()> {
                 parquet_zstd,
                 parquet_bloom_filter,
                 parquet_bloom_fpp,
+                timing,
             } => {
+                // Enable timing diagnostics if requested
+                if timing {
+                    ENABLE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                let t_total = Instant::now();
                 let output_path = index.with_extension("ryxdi");
                 let use_parquet = format == "parquet";
 
@@ -465,8 +499,13 @@ fn main() -> Result<()> {
                 let result: Result<ShardManifest> = if MainIndexManifest::is_sharded(&index) {
                     // Sharded main index: create 1:1 inverted shards
                     log::info!("Detected sharded main index, creating 1:1 inverted shards");
+                    let t_load_manifest = Instant::now();
                     let main_manifest =
                         MainIndexManifest::load(&MainIndexManifest::manifest_path(&index))?;
+                    log_timing(
+                        "invert: load_manifest",
+                        t_load_manifest.elapsed().as_millis(),
+                    );
                     log::info!(
                         "Main index has {} shards, {} buckets",
                         main_manifest.shards.len(),
@@ -490,9 +529,20 @@ fn main() -> Result<()> {
                             );
 
                             // Build inverted index from shard, dropping main shard immediately after
+                            let t_shard_load = Instant::now();
                             let inverted = {
                                 let main_shard = MainIndexShard::load(&shard_path)?;
-                                InvertedIndex::build_from_shard(&main_shard)
+                                log_timing(
+                                    &format!("invert: shard_{}_load", shard_info.shard_id),
+                                    t_shard_load.elapsed().as_millis(),
+                                );
+                                let t_build = Instant::now();
+                                let inv = InvertedIndex::build_from_shard(&main_shard);
+                                log_timing(
+                                    &format!("invert: shard_{}_build", shard_info.shard_id),
+                                    t_build.elapsed().as_millis(),
+                                );
+                                inv
                             };
 
                             log::info!(
@@ -502,6 +552,7 @@ fn main() -> Result<()> {
                             );
 
                             // Save as inverted shard with same ID
+                            let t_save = Instant::now();
                             let is_last = idx == num_shards - 1;
                             let inv_shard_info = if use_parquet {
                                 let inv_shard_path = ShardManifest::shard_path_parquet(
@@ -528,6 +579,10 @@ fn main() -> Result<()> {
                                 created_files.push(inv_shard_path);
                                 info
                             };
+                            log_timing(
+                                &format!("invert: shard_{}_save", shard_info.shard_id),
+                                t_save.elapsed().as_millis(),
+                            );
 
                             total_minimizers += inv_shard_info.num_minimizers;
                             total_bucket_ids += inv_shard_info.num_bucket_ids;
@@ -555,20 +610,29 @@ fn main() -> Result<()> {
                             bucket_minimizer_counts: main_metadata.bucket_minimizer_counts,
                         };
 
+                        let t_manifest_save = Instant::now();
                         let manifest_path = ShardManifest::manifest_path(&output_path);
                         inv_manifest.save(&manifest_path)?;
                         created_files.push(manifest_path);
+                        log_timing(
+                            "invert: manifest_save",
+                            t_manifest_save.elapsed().as_millis(),
+                        );
 
                         Ok(inv_manifest)
                     })()
                 } else {
                     // Non-sharded main index: treat as single shard, create 1-shard inverted
                     log::info!("Loading single-file index from {:?}", index);
+                    let t_load = Instant::now();
                     let idx = Index::load(&index)?;
+                    log_timing("invert: load_main_index", t_load.elapsed().as_millis());
                     log::info!("Index loaded: {} buckets", idx.buckets.len());
 
                     log::info!("Building inverted index...");
+                    let t_build = Instant::now();
                     let inverted = InvertedIndex::build_from_index(&idx);
+                    log_timing("invert: build_inverted", t_build.elapsed().as_millis());
                     log::info!(
                         "Inverted index built: {} unique minimizers, {} bucket entries",
                         inverted.num_minimizers(),
@@ -577,6 +641,7 @@ fn main() -> Result<()> {
 
                     (|| -> Result<ShardManifest> {
                         // Save as single shard (shard_id = 0)
+                        let t_save_shard = Instant::now();
                         let inv_shard_info = if use_parquet {
                             let shard_path = ShardManifest::shard_path_parquet(&output_path, 0);
                             let info = inverted.save_shard_parquet(
@@ -598,6 +663,7 @@ fn main() -> Result<()> {
                             created_files.push(shard_path);
                             info
                         };
+                        log_timing("invert: save_shard", t_save_shard.elapsed().as_millis());
 
                         // Create manifest with single shard and bucket metadata
                         let bucket_minimizer_counts: std::collections::HashMap<u32, usize> = idx
@@ -632,9 +698,14 @@ fn main() -> Result<()> {
                             bucket_minimizer_counts,
                         };
 
+                        let t_manifest_save = Instant::now();
                         let manifest_path = ShardManifest::manifest_path(&output_path);
                         inv_manifest.save(&manifest_path)?;
                         created_files.push(manifest_path);
+                        log_timing(
+                            "invert: manifest_save",
+                            t_manifest_save.elapsed().as_millis(),
+                        );
 
                         Ok(inv_manifest)
                     })()
@@ -651,6 +722,7 @@ fn main() -> Result<()> {
                                 shard.num_bucket_ids
                             );
                         }
+                        log_timing("invert: total", t_total.elapsed().as_millis());
                         log::info!("Done.");
                     }
                     Err(e) => {

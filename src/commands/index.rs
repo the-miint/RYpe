@@ -9,14 +9,17 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use std::time::Instant;
+
 use rype::config::{
     parse_bucket_add_config, parse_config, resolve_path, validate_bucket_add_config,
     validate_config, AssignmentSettings, BestBinFallback,
 };
 use rype::parquet_index;
 use rype::{
-    extract_into, Index, IndexMetadata, InvertedIndex, MainIndexManifest, MainIndexShard,
-    MinimizerWorkspace, ShardFormat, ShardManifest, ShardedMainIndex, ShardedMainIndexBuilder,
+    extract_into, log_timing, Index, IndexMetadata, InvertedIndex, MainIndexManifest,
+    MainIndexShard, MinimizerWorkspace, ShardFormat, ShardManifest, ShardedMainIndex,
+    ShardedMainIndexBuilder,
 };
 
 use super::helpers::sanitize_bucket_name;
@@ -197,6 +200,125 @@ pub fn create_parquet_index_from_refs(
     Ok(())
 }
 
+/// Create Parquet inverted index directly from a TOML config file.
+/// This bypasses the main index entirely, creating only the parquet inverted index.
+///
+/// Reuses `build_single_bucket` for minimizer extraction and `create_parquet_inverted_index`
+/// for the actual parquet file creation.
+pub fn build_parquet_index_from_config(
+    config_path: &Path,
+    cli_max_shard_size: Option<usize>,
+    options: Option<&parquet_index::ParquetWriteOptions>,
+) -> Result<()> {
+    use rype::{create_parquet_inverted_index, BucketData};
+
+    let t_total = Instant::now();
+
+    log::info!(
+        "Building Parquet index from config: {}",
+        config_path.display()
+    );
+
+    let cfg = parse_config(config_path)?;
+    let config_dir = config_path
+        .parent()
+        .ok_or_else(|| anyhow!("Invalid config path"))?;
+
+    log::info!("Validating file paths...");
+    validate_config(&cfg, config_dir)?;
+    log::info!("Validation successful.");
+
+    let max_shard_size = cli_max_shard_size.or(cfg.index.max_shard_size);
+
+    // Change output extension from .ryidx to .ryxdi for parquet inverted index
+    let output_path = cfg.index.output.with_extension("ryxdi");
+    let output_path = resolve_path(config_dir, &output_path);
+
+    log::info!(
+        "Creating Parquet inverted index at {:?} (K={}, W={}, salt={:#x})",
+        output_path,
+        cfg.index.k,
+        cfg.index.window,
+        cfg.index.salt
+    );
+
+    let mut bucket_names: Vec<_> = cfg.buckets.keys().cloned().collect();
+    bucket_names.sort();
+
+    const MAX_BUCKETS: usize = 100_000;
+    if bucket_names.len() > MAX_BUCKETS {
+        return Err(anyhow!(
+            "Too many buckets: {} exceeds maximum {}",
+            bucket_names.len(),
+            MAX_BUCKETS
+        ));
+    }
+
+    // Build buckets in parallel - reusing build_single_bucket
+    let t_build = Instant::now();
+    let bucket_results: Vec<_> = bucket_names
+        .par_iter()
+        .map(|bucket_name| {
+            build_single_bucket(
+                bucket_name,
+                &cfg.buckets[bucket_name].files,
+                config_dir,
+                cfg.index.k,
+                cfg.index.window,
+                cfg.index.salt,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    log_timing(
+        "parquet_index: bucket_building",
+        t_build.elapsed().as_millis(),
+    );
+
+    // Convert to BucketData format for create_parquet_inverted_index
+    let buckets: Vec<BucketData> = bucket_results
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (name, minimizers, sources))| BucketData {
+            bucket_id: (idx + 1) as u32,
+            bucket_name: sanitize_bucket_name(&name),
+            sources,
+            minimizers,
+        })
+        .collect();
+
+    let total_minimizers: usize = buckets.iter().map(|b| b.minimizers.len()).sum();
+    log::info!(
+        "Extracted minimizers from {} buckets ({} total)",
+        buckets.len(),
+        total_minimizers
+    );
+
+    // Create parquet index - reusing create_parquet_inverted_index
+    let t_write = Instant::now();
+    let manifest = create_parquet_inverted_index(
+        &output_path,
+        buckets,
+        cfg.index.k,
+        cfg.index.window,
+        cfg.index.salt,
+        max_shard_size,
+        options,
+    )?;
+    log_timing("parquet_index: write", t_write.elapsed().as_millis());
+
+    log::info!("Created Parquet inverted index:");
+    log::info!("  Buckets: {}", manifest.num_buckets);
+    if let Some(ref inv) = manifest.inverted {
+        log::info!("  Shards: {}", inv.num_shards);
+        log::info!("  Total entries: {}", inv.total_entries);
+    }
+
+    log_timing("parquet_index: total", t_total.elapsed().as_millis());
+    log::info!("Done.");
+
+    Ok(())
+}
+
 // ============================================================================
 // Config-based Index Building
 // ============================================================================
@@ -320,6 +442,7 @@ fn build_sharded_index_from_config(
     max_bytes: usize,
     should_invert: bool,
 ) -> Result<()> {
+    let t_total = Instant::now();
     let batch_size = rayon::current_num_threads();
     log::info!(
         "Building {} buckets in batches of {} (memory-efficient mode)...",
@@ -336,7 +459,9 @@ fn build_sharded_index_from_config(
     )?;
 
     let mut bucket_id = 1u32;
-    for chunk in bucket_names.chunks(batch_size) {
+    let mut total_build_ms = 0u128;
+    for (batch_idx, chunk) in bucket_names.chunks(batch_size).enumerate() {
+        let t_batch = Instant::now();
         let batch_results: Vec<_> = chunk
             .par_iter()
             .map(|bucket_name| {
@@ -356,13 +481,24 @@ fn build_sharded_index_from_config(
             bucket_id += 1;
         }
 
+        let batch_ms = t_batch.elapsed().as_millis();
+        total_build_ms += batch_ms;
+        log_timing(
+            &format!("index_sharded: batch_{}_building", batch_idx),
+            batch_ms,
+        );
+
         log::info!(
             "Completed batch, {} buckets processed so far",
             bucket_id - 1
         );
     }
+    log_timing("index_sharded: all_batches_building", total_build_ms);
 
+    let t_finish = Instant::now();
     let manifest = builder.finish()?;
+    log_timing("index_sharded: finish", t_finish.elapsed().as_millis());
+
     log::info!("Done! Sharded index saved successfully.");
     log::info!("\nFinal statistics:");
     log::info!("  Buckets: {}", bucket_id - 1);
@@ -370,8 +506,12 @@ fn build_sharded_index_from_config(
     log::info!("  Total minimizers: {}", manifest.total_minimizers);
 
     if should_invert {
+        let t_invert = Instant::now();
         create_inverted_from_sharded_main(&cfg.index.output, &manifest)?;
+        log_timing("index_sharded: invert", t_invert.elapsed().as_millis());
     }
+
+    log_timing("index_sharded: total", t_total.elapsed().as_millis());
 
     Ok(())
 }
@@ -382,8 +522,10 @@ fn build_single_index_from_config(
     bucket_names: &[String],
     should_invert: bool,
 ) -> Result<()> {
+    let t_total = Instant::now();
     log::info!("Building {} buckets in parallel...", bucket_names.len());
 
+    let t_build = Instant::now();
     let bucket_results: Vec<_> = bucket_names
         .par_iter()
         .map(|bucket_name| {
@@ -397,9 +539,11 @@ fn build_single_index_from_config(
             )
         })
         .collect::<Result<Vec<_>>>()?;
+    log_timing("index: bucket_building", t_build.elapsed().as_millis());
 
     log::info!("Processing complete. Merging buckets...");
 
+    let t_merge = Instant::now();
     let mut final_index = Index::new(cfg.index.k, cfg.index.window, cfg.index.salt)?;
     for (bucket_id, (bucket_name, minimizers, sources)) in bucket_results.into_iter().enumerate() {
         let new_id = (bucket_id + 1) as u32;
@@ -409,9 +553,12 @@ fn build_single_index_from_config(
         final_index.buckets.insert(new_id, minimizers);
         final_index.bucket_sources.insert(new_id, sources);
     }
+    log_timing("index: bucket_merging", t_merge.elapsed().as_millis());
 
     log::info!("Saving index to {}...", cfg.index.output.display());
+    let t_save = Instant::now();
     final_index.save(&cfg.index.output)?;
+    log_timing("index: save", t_save.elapsed().as_millis());
 
     log::info!("Done! Index saved successfully.");
     log::info!("\nFinal statistics:");
@@ -420,8 +567,12 @@ fn build_single_index_from_config(
     log::info!("  Total minimizers: {}", total_minimizers);
 
     if should_invert {
+        let t_invert = Instant::now();
         create_inverted_from_single_index(&cfg.index.output, &final_index)?;
+        log_timing("index: invert", t_invert.elapsed().as_millis());
     }
+
+    log_timing("index: total", t_total.elapsed().as_millis());
 
     Ok(())
 }
@@ -1192,4 +1343,201 @@ pub fn print_assignment_summary(assignments: &[FileAssignment]) {
         assignments.len(),
         by_bucket.len()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rype::BucketData;
+    use std::fs::File;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    /// Helper to create a simple FASTA file with one sequence
+    fn create_fasta_file(dir: &Path, name: &str, seq: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, ">seq1").unwrap();
+        file.write_all(seq).unwrap();
+        writeln!(file).unwrap();
+        path
+    }
+
+    /// Helper to create a config file for testing
+    fn create_test_config(
+        dir: &Path,
+        output_name: &str,
+        buckets: &[(&str, &[&str])],
+        k: usize,
+        window: usize,
+    ) -> PathBuf {
+        let config_path = dir.join("config.toml");
+        let mut content = format!(
+            r#"[index]
+k = {}
+window = {}
+salt = 0x5555555555555555
+output = "{}"
+
+"#,
+            k, window, output_name
+        );
+
+        for (bucket_name, files) in buckets {
+            let files_str: Vec<String> = files.iter().map(|f| format!("\"{}\"", f)).collect();
+            content.push_str(&format!(
+                "[buckets.{}]\nfiles = [{}]\n\n",
+                bucket_name,
+                files_str.join(", ")
+            ));
+        }
+
+        let mut file = File::create(&config_path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        config_path
+    }
+
+    #[test]
+    fn test_build_single_bucket_extracts_minimizers() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create a FASTA file with a sequence long enough for k=32, w=10
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let fasta_path = create_fasta_file(dir, "test.fa", seq);
+
+        let (name, minimizers, sources) = build_single_bucket(
+            "TestBucket",
+            &[fasta_path],
+            dir,
+            32, // k
+            10, // w
+            0x5555555555555555,
+        )
+        .unwrap();
+
+        assert_eq!(name, "TestBucket");
+        assert!(!minimizers.is_empty(), "Should extract some minimizers");
+        assert!(!sources.is_empty(), "Should have source labels");
+
+        // Verify minimizers are sorted and deduplicated
+        let mut sorted = minimizers.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            minimizers, sorted,
+            "Minimizers should be sorted and deduplicated"
+        );
+    }
+
+    #[test]
+    fn test_bucket_result_to_bucket_data_conversion() {
+        // Test that build_single_bucket output can be converted to BucketData
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let fasta_path = create_fasta_file(dir, "test.fa", seq);
+
+        let (name, minimizers, sources) =
+            build_single_bucket("TestBucket", &[fasta_path], dir, 32, 10, 0x5555555555555555)
+                .unwrap();
+
+        // Convert to BucketData (this is the reuse we want)
+        let bucket_data = BucketData {
+            bucket_id: 1,
+            bucket_name: sanitize_bucket_name(&name),
+            sources,
+            minimizers,
+        };
+
+        assert_eq!(bucket_data.bucket_id, 1);
+        assert!(!bucket_data.minimizers.is_empty());
+        assert!(bucket_data.validate().is_ok(), "BucketData should be valid");
+    }
+
+    #[test]
+    fn test_build_parquet_index_from_config_creates_index() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create test FASTA files
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq2 = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+
+        create_fasta_file(dir, "ref1.fa", seq1);
+        create_fasta_file(dir, "ref2.fa", seq2);
+
+        // Create config
+        let config_path = create_test_config(
+            dir,
+            "test_index.ryidx",
+            &[("Bucket1", &["ref1.fa"]), ("Bucket2", &["ref2.fa"])],
+            32,
+            10,
+        );
+
+        // Build parquet index
+        let result = build_parquet_index_from_config(&config_path, None, None);
+        assert!(result.is_ok(), "Should succeed: {:?}", result);
+
+        // Verify the parquet index was created
+        let output_path = dir.join("test_index.ryxdi");
+        assert!(output_path.exists(), "Parquet index directory should exist");
+
+        // Verify manifest exists
+        let manifest_path = output_path.join("manifest.toml");
+        assert!(manifest_path.exists(), "Manifest should exist");
+    }
+
+    #[test]
+    fn test_build_parquet_index_from_config_with_bloom_filter() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        create_fasta_file(dir, "ref.fa", seq);
+
+        let config_path = create_test_config(
+            dir,
+            "bloom_test.ryidx",
+            &[("TestBucket", &["ref.fa"])],
+            32,
+            10,
+        );
+
+        let options = parquet_index::ParquetWriteOptions {
+            bloom_filter_enabled: true,
+            bloom_filter_fpp: 0.05,
+            ..Default::default()
+        };
+
+        let result = build_parquet_index_from_config(&config_path, None, Some(&options));
+        assert!(
+            result.is_ok(),
+            "Should succeed with bloom filter: {:?}",
+            result
+        );
+
+        let output_path = dir.join("bloom_test.ryxdi");
+        assert!(output_path.exists());
+    }
+
+    #[test]
+    fn test_build_parquet_index_from_config_invalid_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create config referencing non-existent file
+        let config_path = create_test_config(
+            dir,
+            "test.ryidx",
+            &[("TestBucket", &["nonexistent.fa"])],
+            32,
+            10,
+        );
+
+        let result = build_parquet_index_from_config(&config_path, None, None);
+        assert!(result.is_err(), "Should fail with missing file");
+    }
 }

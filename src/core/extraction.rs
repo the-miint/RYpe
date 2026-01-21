@@ -9,7 +9,6 @@
 
 use super::encoding::{base_to_bit, reverse_complement};
 use super::workspace::MinimizerWorkspace;
-use crate::constants::ESTIMATED_MINIMIZERS_PER_SEQUENCE;
 
 /// Strand indicator for minimizer origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +57,7 @@ pub fn extract_with_positions(
         return vec![];
     }
 
-    let mut results = Vec::with_capacity(ESTIMATED_MINIMIZERS_PER_SEQUENCE * 2);
+    let mut results = Vec::with_capacity(ws.estimated_minimizers * 2);
 
     let mut current_val: u64 = 0;
     let mut valid_bases_count = 0;
@@ -259,8 +258,8 @@ pub fn extract_dual_strand_into(
         return (vec![], vec![]);
     }
 
-    let mut fwd_mins = Vec::with_capacity(ESTIMATED_MINIMIZERS_PER_SEQUENCE);
-    let mut rc_mins = Vec::with_capacity(ESTIMATED_MINIMIZERS_PER_SEQUENCE);
+    let mut fwd_mins = Vec::with_capacity(ws.estimated_minimizers);
+    let mut rc_mins = Vec::with_capacity(ws.estimated_minimizers);
 
     let mut current_val: u64 = 0;
     let mut valid_bases_count = 0;

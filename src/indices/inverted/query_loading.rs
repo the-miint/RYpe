@@ -58,13 +58,20 @@ impl InvertedIndex {
     ///
     /// # Arguments
     /// * `query_minimizers` - Sorted slice of query minimizers (caller must ensure sorted)
-    /// * `row_group_stats` - List of (row_group_idx, min, max) tuples
+    /// * `row_group_stats` - Array of (min, max) tuples indexed by row group index.
+    ///   Parquet min/max statistics are inclusive ranges `[min, max]`.
     ///
     /// # Returns
     /// Vector of row group indices that contain at least one query minimizer.
+    ///
+    /// # Note on Double Range Check
+    /// This function checks whether ANY query minimizer overlaps the row group range.
+    /// When bloom filters are enabled, the caller performs a SECOND range check to find
+    /// WHICH specific minimizers overlap, for scoped bloom filter checking. Both checks
+    /// serve different purposes and both are necessary.
     pub fn find_matching_row_groups(
         query_minimizers: &[u64],
-        row_group_stats: &[(usize, u64, u64)],
+        row_group_stats: &[(u64, u64)],
     ) -> Vec<usize> {
         if query_minimizers.is_empty() || row_group_stats.is_empty() {
             return Vec::new();
@@ -73,13 +80,14 @@ impl InvertedIndex {
         // For each row group, binary search to check if any query minimizer falls within its range
         let mut matching = Vec::new();
 
-        for &(rg_id, rg_min, rg_max) in row_group_stats {
+        for (rg_idx, &(rg_min, rg_max)) in row_group_stats.iter().enumerate() {
             // Find first query minimizer >= rg_min
             let start = query_minimizers.partition_point(|&m| m < rg_min);
 
             // If that minimizer exists and is <= rg_max, this row group matches
+            // (Parquet stats are inclusive, so we use <= for the max bound)
             if start < query_minimizers.len() && query_minimizers[start] <= rg_max {
-                matching.push(rg_id);
+                matching.push(rg_idx);
             }
         }
 
@@ -193,7 +201,8 @@ impl InvertedIndex {
 
             // Build row group stats from Parquet metadata.
             // Statistics (min/max) enable filtering row groups before reading data.
-            let mut rg_stats: Vec<(usize, u64, u64)> = Vec::with_capacity(num_row_groups);
+            // Array is indexed by row group index for O(1) lookup.
+            let mut rg_stats: Vec<(u64, u64)> = Vec::with_capacity(num_row_groups);
             let mut stats_missing_count = 0;
 
             for rg_idx in 0..num_row_groups {
@@ -210,7 +219,7 @@ impl InvertedIndex {
                     (0, u64::MAX)
                 };
 
-                rg_stats.push((rg_idx, rg_min, rg_max));
+                rg_stats.push((rg_min, rg_max));
             }
 
             // Warn if statistics are missing - this disables the row group filtering optimization
@@ -247,12 +256,30 @@ impl InvertedIndex {
 
             // Phase 2: Filter by bloom filter (if enabled)
             // This happens while we still have the parquet_reader alive.
+            //
+            // Why we do a SECOND range check here (after find_matching_row_groups):
+            // - Phase 1 checks: Does ANY query minimizer overlap this row group? (gate)
+            // - Phase 2 checks: WHICH query minimizers overlap? (scope bloom filter checks)
+            // Both are necessary - the first is O(1) per row group, the second gives us
+            // the exact slice to check against the bloom filter, reducing checks from
+            // O(Q * R) to O(sum of overlapping minimizers per row group).
+            //
+            // Parquet min/max statistics are inclusive ranges [min, max], so we use
+            // partition_point with <= for the max bound.
             if use_bloom_filter {
                 let mut bloom_filtered = Vec::with_capacity(stats_filtered.len());
-                let mut bloom_rejected = 0usize;
+                let mut bloom_rejected_count = 0usize;
                 let mut bloom_filters_found = 0usize;
 
                 for &rg_idx in &stats_filtered {
+                    // Get the min/max for this row group (indexed directly by rg_idx)
+                    let (rg_min, rg_max) = rg_stats[rg_idx];
+
+                    // Binary search to find query minimizers within [rg_min, rg_max]
+                    let start = query_minimizers.partition_point(|&m| m < rg_min);
+                    let end = query_minimizers.partition_point(|&m| m <= rg_max);
+                    let relevant_mins = &query_minimizers[start..end];
+
                     let rg_reader = parquet_reader.get_row_group(rg_idx)?;
                     let bf = rg_reader.get_column_bloom_filter(0); // minimizer column
 
@@ -260,10 +287,11 @@ impl InvertedIndex {
                         bloom_filters_found += 1;
                     }
 
-                    if Self::bloom_filter_may_contain_any(bf, query_minimizers) {
+                    // Check only the relevant minimizers against bloom filter
+                    if Self::bloom_filter_may_contain_any(bf, relevant_mins) {
                         bloom_filtered.push(rg_idx);
                     } else {
-                        bloom_rejected += 1;
+                        bloom_rejected_count += 1;
                     }
                 }
 
@@ -274,12 +302,20 @@ impl InvertedIndex {
                          Rebuild index with --parquet-bloom-filter to enable bloom filtering.",
                         path.display()
                     );
-                } else if bloom_rejected > 0 {
+                }
+
+                // Log filtering statistics when verbose mode is enabled
+                if std::env::var("RYPE_VERBOSE").is_ok() {
+                    let stats_rejected = num_row_groups - stats_filtered.len();
                     eprintln!(
-                        "Bloom filter rejected {} of {} row groups in {}",
-                        bloom_rejected,
+                        "[{}] {} RGs: {} passed stats ({} rejected), {} passed bloom ({} rejected, {} had BF)",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        num_row_groups,
                         stats_filtered.len(),
-                        path.display()
+                        stats_rejected,
+                        bloom_filtered.len(),
+                        bloom_rejected_count,
+                        bloom_filters_found
                     );
                 }
 

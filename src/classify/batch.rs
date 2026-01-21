@@ -3,12 +3,27 @@
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
+use crate::constants::ESTIMATED_MINIMIZERS_PER_SEQUENCE;
 use crate::core::extraction::{count_hits, get_paired_minimizers_into};
 use crate::core::workspace::MinimizerWorkspace;
 use crate::indices::main::Index;
 use crate::types::{HitResult, QueryRecord};
 
 use super::common::filter_negative_mins;
+
+/// Estimate minimizers per query from the first record in a batch.
+fn estimate_minimizers_from_records(records: &[QueryRecord], k: usize, w: usize) -> usize {
+    if records.is_empty() {
+        return ESTIMATED_MINIMIZERS_PER_SEQUENCE;
+    }
+    let (_, s1, s2) = &records[0];
+    let query_len = s1.len() + s2.map(|s| s.len()).unwrap_or(0);
+    if query_len <= k {
+        return ESTIMATED_MINIMIZERS_PER_SEQUENCE;
+    }
+    let estimate = ((query_len - k) / w + 1) * 2;
+    estimate.max(ESTIMATED_MINIMIZERS_PER_SEQUENCE)
+}
 
 /// Classify a batch of query records against an Index with optional negative filtering.
 ///
@@ -32,13 +47,18 @@ pub fn classify_batch(
     records: &[QueryRecord],
     threshold: f64,
 ) -> Vec<HitResult> {
+    let estimated_mins = estimate_minimizers_from_records(records, engine.k, engine.w);
     let processed: Vec<_> = records
         .par_iter()
-        .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
-            let (ha, hb) = get_paired_minimizers_into(s1, *s2, engine.k, engine.w, engine.salt, ws);
-            let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
-            (*id, fa, fb)
-        })
+        .map_init(
+            || MinimizerWorkspace::with_estimate(estimated_mins),
+            |ws, (id, s1, s2)| {
+                let (ha, hb) =
+                    get_paired_minimizers_into(s1, *s2, engine.k, engine.w, engine.salt, ws);
+                let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
+                (*id, fa, fb)
+            },
+        )
         .collect();
 
     let mut map_a: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -125,17 +145,21 @@ pub fn aggregate_batch(
 ) -> Vec<HitResult> {
     let mut global = HashSet::new();
 
+    let estimated_mins = estimate_minimizers_from_records(records, engine.k, engine.w);
     let batch_mins: Vec<Vec<u64>> = records
         .par_iter()
-        .map_init(MinimizerWorkspace::new, |ws, (_, s1, s2)| {
-            let (mut a, b) =
-                get_paired_minimizers_into(s1, *s2, engine.k, engine.w, engine.salt, ws);
-            a.extend(b);
-            if let Some(neg_set) = negative_mins {
-                a.retain(|m| !neg_set.contains(m));
-            }
-            a
-        })
+        .map_init(
+            || MinimizerWorkspace::with_estimate(estimated_mins),
+            |ws, (_, s1, s2)| {
+                let (mut a, b) =
+                    get_paired_minimizers_into(s1, *s2, engine.k, engine.w, engine.salt, ws);
+                a.extend(b);
+                if let Some(neg_set) = negative_mins {
+                    a.retain(|m| !neg_set.contains(m));
+                }
+                a
+            },
+        )
         .collect();
 
     for v in batch_mins {

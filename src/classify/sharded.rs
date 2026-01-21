@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::constants::ESTIMATED_BUCKETS_PER_READ;
+use crate::constants::{ESTIMATED_BUCKETS_PER_READ, ESTIMATED_MINIMIZERS_PER_SEQUENCE};
 use crate::core::extraction::get_paired_minimizers_into;
 use crate::core::workspace::MinimizerWorkspace;
 use crate::indices::sharded::ShardedInvertedIndex;
@@ -22,6 +22,28 @@ use crate::log_timing;
 use super::common::filter_negative_mins;
 use super::merge_join::accumulate_merge_join;
 use super::scoring::compute_score;
+
+/// Estimate minimizers per query from the first record in a batch.
+///
+/// Uses the formula: ((query_length - k) / w + 1) * 2 (for both strands).
+/// Falls back to ESTIMATED_MINIMIZERS_PER_SEQUENCE if the batch is empty or
+/// sequences are too short.
+fn estimate_minimizers_from_records(records: &[QueryRecord], k: usize, w: usize) -> usize {
+    if records.is_empty() {
+        return ESTIMATED_MINIMIZERS_PER_SEQUENCE;
+    }
+
+    let (_, s1, s2) = &records[0];
+    let query_len = s1.len() + s2.map(|s| s.len()).unwrap_or(0);
+
+    if query_len <= k {
+        return ESTIMATED_MINIMIZERS_PER_SEQUENCE;
+    }
+
+    // Estimate: (len - k) / w + 1 minimizers per strand, times 2 for both strands
+    let estimate = ((query_len - k) / w + 1) * 2;
+    estimate.max(ESTIMATED_MINIMIZERS_PER_SEQUENCE)
+}
 
 /// Classify a batch of records against a sharded inverted index.
 ///
@@ -48,14 +70,18 @@ pub fn classify_batch_sharded_sequential(
     let manifest = sharded.manifest();
 
     let t_extract = Instant::now();
+    let estimated_mins = estimate_minimizers_from_records(records, manifest.k, manifest.w);
     let processed: Vec<_> = records
         .par_iter()
-        .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
-            let (ha, hb) =
-                get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
-            let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
-            (*id, fa, fb)
-        })
+        .map_init(
+            || MinimizerWorkspace::with_estimate(estimated_mins),
+            |ws, (id, s1, s2)| {
+                let (ha, hb) =
+                    get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
+                let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
+                (*id, fa, fb)
+            },
+        )
         .collect();
     log_timing("sequential: extraction", t_extract.elapsed().as_millis());
 
@@ -168,13 +194,17 @@ pub fn classify_batch_sharded_merge_join(
 
     // Extract minimizers in parallel, filtering negatives if provided
     let t_extract = Instant::now();
+    let estimated_mins = estimate_minimizers_from_records(records, manifest.k, manifest.w);
     let extracted: Vec<_> = records
         .par_iter()
-        .map_init(MinimizerWorkspace::new, |ws, (_, s1, s2)| {
-            let (ha, hb) =
-                get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
-            filter_negative_mins(ha, hb, negative_mins)
-        })
+        .map_init(
+            || MinimizerWorkspace::with_estimate(estimated_mins),
+            |ws, (_, s1, s2)| {
+                let (ha, hb) =
+                    get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
+                filter_negative_mins(ha, hb, negative_mins)
+            },
+        )
         .collect();
     log_timing("merge_join: extraction", t_extract.elapsed().as_millis());
 
@@ -274,14 +304,18 @@ pub fn classify_batch_sharded_main(
     let manifest = sharded.manifest();
 
     // Extract minimizers for all queries (parallel), filtering negatives if provided
+    let estimated_mins = estimate_minimizers_from_records(records, manifest.k, manifest.w);
     let processed: Vec<_> = records
         .par_iter()
-        .map_init(MinimizerWorkspace::new, |ws, (id, s1, s2)| {
-            let (ha, hb) =
-                get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
-            let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
-            (*id, fa, fb)
-        })
+        .map_init(
+            || MinimizerWorkspace::with_estimate(estimated_mins),
+            |ws, (id, s1, s2)| {
+                let (ha, hb) =
+                    get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
+                let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
+                (*id, fa, fb)
+            },
+        )
         .collect();
 
     // Build inverted maps: minimizer → query indices

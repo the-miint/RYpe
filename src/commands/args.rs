@@ -150,6 +150,10 @@ pub enum IndexCommands {
         /// Lower = more accurate but larger files. Only used with --parquet-bloom-filter.
         #[arg(long, default_value = "0.05", value_parser = parse_bloom_fpp)]
         parquet_bloom_fpp: f64,
+
+        /// Print timing diagnostics to stderr for performance analysis.
+        #[arg(long)]
+        timing: bool,
     },
 
     /// Show index statistics and bucket information
@@ -240,6 +244,25 @@ INVERTED INDEX SHARDING:
         /// Create inverted index after building (overrides config)
         #[arg(short = 'I', long)]
         invert: bool,
+
+        /// Create Parquet inverted index directly (bypasses main index).
+        /// Output will be a directory (e.g., index.ryxdi/) containing Parquet files.
+        #[arg(long)]
+        parquet: bool,
+
+        /// Enable bloom filters in Parquet files for faster lookups.
+        /// Only used with --parquet.
+        #[arg(long)]
+        parquet_bloom_filter: bool,
+
+        /// Bloom filter false positive probability (0.0-1.0).
+        /// Only used with --parquet-bloom-filter.
+        #[arg(long, default_value = "0.05", value_parser = parse_bloom_fpp)]
+        parquet_bloom_fpp: f64,
+
+        /// Print timing diagnostics to stderr for performance analysis.
+        #[arg(long)]
+        timing: bool,
     },
 
     /// Add files to existing index using TOML config (see CONFIG FORMAT below)
@@ -308,6 +331,10 @@ USAGE:
         /// Lower = more accurate but larger files. Only used with --parquet-bloom-filter.
         #[arg(long, default_value = "0.05", value_parser = parse_bloom_fpp)]
         parquet_bloom_fpp: f64,
+
+        /// Print timing diagnostics to stderr for performance analysis.
+        #[arg(long)]
+        timing: bool,
     },
 
     /// Show detailed minimizer statistics for compression analysis
