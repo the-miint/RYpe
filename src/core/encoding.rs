@@ -37,6 +37,9 @@ pub fn base_to_bit(byte: u8) -> u64 {
 /// In RY space, complement is simply bitwise NOT. The reverse complement
 /// is computed by complementing and then reversing the bit order.
 ///
+/// Note: The hot path uses incremental reverse complement computation instead
+/// of this function. This is retained for verification tests and edge cases.
+///
 /// # Arguments
 /// * `kmer` - The k-mer value (rightmost K bits are significant)
 /// * `k` - K-mer size (must be 16, 32, or 64)
@@ -47,6 +50,7 @@ pub fn base_to_bit(byte: u8) -> u64 {
 /// # Panics
 /// Panics if k is not 16, 32, or 64.
 #[inline]
+#[allow(dead_code)] // Used in tests to verify incremental RC computation
 pub(crate) fn reverse_complement(kmer: u64, k: usize) -> u64 {
     let complement = !kmer;
     match k {

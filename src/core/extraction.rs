@@ -7,7 +7,7 @@
 // Hot path: index-based iteration avoids iterator overhead in inner loops
 #![allow(clippy::needless_range_loop)]
 
-use super::encoding::{base_to_bit, reverse_complement};
+use super::encoding::base_to_bit;
 use super::workspace::MinimizerWorkspace;
 
 /// Strand indicator for minimizer origin.
@@ -59,10 +59,15 @@ pub fn extract_with_positions(
 
     // Precompute mask outside hot loop - only lower k bits are valid
     let k_mask = if k == 64 { u64::MAX } else { (1u64 << k) - 1 };
+    // Shift amount for incremental reverse complement computation
+    let rc_shift = k - 1;
 
     let mut results = Vec::with_capacity(ws.estimated_minimizers * 2);
 
     let mut current_val: u64 = 0;
+    // Incremental reverse complement: avoids expensive reverse_bits() call per position
+    // When kmer' = (kmer << 1) | new_bit, then rc' = (rc >> 1) | (complement_bit << (k-1))
+    let mut current_rc: u64 = 0;
     let mut valid_bases_count = 0;
 
     // Track last output to avoid duplicates at same position (but allow same hash at different positions)
@@ -77,18 +82,22 @@ pub fn extract_with_positions(
             ws.q_fwd.clear();
             ws.q_rc.clear();
             current_val = 0;
+            current_rc = 0;
             last_fwd_pos = None;
             last_rc_pos = None;
             continue;
         }
 
         valid_bases_count += 1;
+        // Update forward k-mer
         current_val = ((current_val << 1) | bit) & k_mask;
+        // Update reverse complement incrementally: new bit's complement goes to MSB position
+        current_rc = (current_rc >> 1) | ((bit ^ 1) << rc_shift);
 
         if valid_bases_count >= k {
             let pos = i + 1 - k;
             let h_fwd = current_val ^ salt;
-            let h_rc = reverse_complement(current_val, k) ^ salt;
+            let h_rc = current_rc ^ salt;
 
             // Forward strand deque
             while let Some(&(p, _)) = ws.q_fwd.front() {
@@ -266,11 +275,16 @@ pub fn extract_dual_strand_into(
 
     // Precompute mask outside hot loop - only lower k bits are valid
     let k_mask = if k == 64 { u64::MAX } else { (1u64 << k) - 1 };
+    // Shift amount for incremental reverse complement computation
+    let rc_shift = k - 1;
 
     let mut fwd_mins = Vec::with_capacity(ws.estimated_minimizers);
     let mut rc_mins = Vec::with_capacity(ws.estimated_minimizers);
 
     let mut current_val: u64 = 0;
+    // Incremental reverse complement: avoids expensive reverse_bits() call per position
+    // When kmer' = (kmer << 1) | new_bit, then rc' = (rc >> 1) | (complement_bit << (k-1))
+    let mut current_rc: u64 = 0;
     let mut valid_bases_count = 0;
 
     let mut last_fwd: Option<u64> = None;
@@ -284,18 +298,22 @@ pub fn extract_dual_strand_into(
             ws.q_fwd.clear();
             ws.q_rc.clear();
             current_val = 0;
+            current_rc = 0;
             last_fwd = None;
             last_rc = None;
             continue;
         }
 
         valid_bases_count += 1;
+        // Update forward k-mer
         current_val = ((current_val << 1) | bit) & k_mask;
+        // Update reverse complement incrementally: new bit's complement goes to MSB position
+        current_rc = (current_rc >> 1) | ((bit ^ 1) << rc_shift);
 
         if valid_bases_count >= k {
             let pos = i + 1 - k;
             let h_fwd = current_val ^ salt;
-            let h_rc = reverse_complement(current_val, k) ^ salt;
+            let h_rc = current_rc ^ salt;
 
             // Forward strand deque
             while let Some(&(p, _)) = ws.q_fwd.front() {
@@ -674,6 +692,90 @@ mod tests {
 
         for m in &results {
             assert!(m.position + 32 <= seq.len());
+        }
+    }
+
+    /// Test that incremental reverse complement matches the full computation.
+    /// This verifies the optimization: rc' = (rc >> 1) | ((bit ^ 1) << (k-1))
+    #[test]
+    fn test_incremental_reverse_complement_correctness() {
+        use super::super::encoding::reverse_complement;
+
+        // Test for each supported k value
+        for k in [16, 32, 64] {
+            let k_mask = if k == 64 { u64::MAX } else { (1u64 << k) - 1 };
+            let rc_shift = k - 1;
+
+            // Test sequence with mixed purines/pyrimidines
+            let seq =
+                b"AGTCAGTCAGTCAGTCAGTCAGTCAGTCAGTCAGTCAGTCAGTCAGTCAGTCAGTCAGTCAGTCAGTCAGTCAGTCAGTC";
+
+            let mut current_val: u64 = 0;
+            let mut current_rc: u64 = 0;
+
+            for (i, &base) in seq.iter().enumerate() {
+                let bit = super::super::encoding::base_to_bit(base);
+                if bit == u64::MAX {
+                    continue;
+                }
+
+                // Update forward k-mer
+                current_val = ((current_val << 1) | bit) & k_mask;
+                // Update reverse complement incrementally
+                current_rc = (current_rc >> 1) | ((bit ^ 1) << rc_shift);
+
+                // Once we have k valid bases, verify the incremental RC matches full computation
+                if i + 1 >= k {
+                    let expected_rc = reverse_complement(current_val, k);
+                    assert_eq!(
+                        current_rc, expected_rc,
+                        "Incremental RC mismatch at position {} for k={}: got {:#x}, expected {:#x}",
+                        i, k, current_rc, expected_rc
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test incremental RC with invalid bases (N) that cause resets.
+    #[test]
+    fn test_incremental_rc_with_resets() {
+        use super::super::encoding::reverse_complement;
+
+        let k = 16;
+        let k_mask = (1u64 << k) - 1;
+        let rc_shift = k - 1;
+
+        // Sequence with N in the middle
+        let seq = b"AGTCAGTCAGTCAGTCNAGTCAGTCAGTCAGTC";
+
+        let mut current_val: u64 = 0;
+        let mut current_rc: u64 = 0;
+        let mut valid_bases = 0;
+
+        for (i, &base) in seq.iter().enumerate() {
+            let bit = super::super::encoding::base_to_bit(base);
+
+            if bit == u64::MAX {
+                // Reset on invalid base
+                current_val = 0;
+                current_rc = 0;
+                valid_bases = 0;
+                continue;
+            }
+
+            valid_bases += 1;
+            current_val = ((current_val << 1) | bit) & k_mask;
+            current_rc = (current_rc >> 1) | ((bit ^ 1) << rc_shift);
+
+            if valid_bases >= k {
+                let expected_rc = reverse_complement(current_val, k);
+                assert_eq!(
+                    current_rc, expected_rc,
+                    "Incremental RC mismatch after reset at position {}: got {:#x}, expected {:#x}",
+                    i, current_rc, expected_rc
+                );
+            }
         }
     }
 }

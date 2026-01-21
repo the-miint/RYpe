@@ -1229,15 +1229,25 @@ fn main() -> Result<()> {
                         );
                     }
 
-                    while let Some((owned_records, headers)) = io.next_batch()? {
+                    loop {
+                        let t_io_read = std::time::Instant::now();
+                        let batch_opt = io.next_batch()?;
+                        log_timing("batch: io_read", t_io_read.elapsed().as_millis());
+
+                        let Some((owned_records, headers)) = batch_opt else {
+                            break;
+                        };
+
                         batch_num += 1;
                         let batch_read_count = owned_records.len();
                         total_reads += batch_read_count;
 
+                        let t_convert = std::time::Instant::now();
                         let batch_refs: Vec<QueryRecord> = owned_records
                             .iter()
                             .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                             .collect();
+                        log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
 
                         let results = if parallel_rg {
                             classify_batch_sharded_parallel_rg(
@@ -1265,6 +1275,7 @@ fn main() -> Result<()> {
                             )?
                         };
 
+                        let t_format = std::time::Instant::now();
                         let mut chunk_out = Vec::with_capacity(1024);
                         for res in results {
                             let header = &headers[res.query_id as usize];
@@ -1276,7 +1287,11 @@ fn main() -> Result<()> {
                             writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score)
                                 .unwrap();
                         }
+                        log_timing("batch: format_output", t_format.elapsed().as_millis());
+
+                        let t_write = std::time::Instant::now();
                         io.write(chunk_out)?;
+                        log_timing("batch: io_write", t_write.elapsed().as_millis());
 
                         log::info!(
                             "Processed batch {}: {} reads ({} total)",
