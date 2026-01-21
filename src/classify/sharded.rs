@@ -20,7 +20,9 @@ use crate::types::{HitResult, QueryRecord};
 use crate::log_timing;
 
 use super::common::filter_negative_mins;
-use super::merge_join::accumulate_merge_join;
+use super::merge_join::{
+    accumulate_merge_join, merge_join_pairs_sparse, merge_sparse_hits, SparseHit,
+};
 use super::scoring::compute_score;
 
 /// Estimate minimizers per query from the first record in a batch.
@@ -235,6 +237,16 @@ pub fn classify_batch_sharded_merge_join(
     // Get query minimizers for filtered loading (Parquet only)
     let query_minimizers = query_idx.minimizers();
 
+    // Debug: show query minimizer statistics
+    if std::env::var("RYPE_DEBUG").is_ok() && !query_minimizers.is_empty() {
+        eprintln!(
+            "[DEBUG] Query minimizers: {} unique, range: {} to {}",
+            query_minimizers.len(),
+            query_minimizers[0],
+            query_minimizers[query_minimizers.len() - 1]
+        );
+    }
+
     // Process each shard sequentially
     for shard_info in &manifest.shards {
         let t_load = Instant::now();
@@ -275,6 +287,199 @@ pub fn classify_batch_sharded_merge_join(
     }
     log_timing("merge_join: scoring", t_score.elapsed().as_millis());
     log_timing("merge_join: total", t_start.elapsed().as_millis());
+
+    Ok(results)
+}
+
+/// Classify using parallel row group processing.
+///
+/// Each row group is processed independently in parallel:
+/// 1. Pre-filter RGs by query minimizer range (using column statistics)
+/// 2. Load matching RG pairs (pre-sorted within RG)
+/// 3. Merge-join pairs with query index, emitting sparse hits
+/// 4. Merge all sparse hits into final accumulators
+///
+/// This maximizes CPU utilization by processing only RGs that overlap with
+/// the query minimizer range, and by using sparse hit representation to
+/// minimize memory allocation.
+///
+/// # Memory Model
+///
+/// Peak memory is approximately:
+/// - Query index: O(total_query_minimizers)
+/// - Sparse hits: O(total_hits_across_all_RGs) - typically much smaller than reads × buckets
+/// - Final accumulators: O(num_reads × avg_buckets_per_read)
+///
+/// Unlike the merge-join approach which loads entire shards, this processes
+/// one RG at a time per thread, keeping per-thread memory bounded.
+///
+/// # Why read_options is Unused
+///
+/// The `read_options` parameter (bloom filter settings) is accepted for API
+/// consistency with other sharded classification functions but is intentionally
+/// unused. This function uses range-bounded filtering via Parquet column
+/// statistics instead of bloom filters - each row group's min/max is compared
+/// against the query minimizer range to skip non-overlapping RGs entirely.
+/// This is more effective than bloom filters for the per-RG access pattern.
+///
+/// # Requirements
+/// - Parquet shards only (Legacy format not supported)
+/// - Row groups must have column statistics
+///
+/// # Arguments
+/// * `sharded` - The sharded inverted index (must be Parquet format)
+/// * `negative_mins` - Optional set of minimizers to exclude from queries before scoring
+/// * `records` - Batch of query records
+/// * `threshold` - Minimum score threshold
+/// * `_read_options` - Unused; see "Why read_options is Unused" above
+///
+/// # Returns
+/// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
+pub fn classify_batch_sharded_parallel_rg(
+    sharded: &ShardedInvertedIndex,
+    negative_mins: Option<&HashSet<u64>>,
+    records: &[QueryRecord],
+    threshold: f64,
+    _read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
+) -> Result<Vec<HitResult>> {
+    use crate::indices::sharded::{ShardFormat, ShardManifest};
+    use crate::indices::{get_row_group_ranges, load_row_group_pairs};
+
+    let t_start = Instant::now();
+
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let manifest = sharded.manifest();
+
+    // Verify Parquet format
+    if manifest.shard_format != ShardFormat::Parquet {
+        return Err(anyhow::anyhow!(
+            "Parallel row group processing requires Parquet format shards"
+        ));
+    }
+
+    // Extract minimizers in parallel, filtering negatives if provided
+    let t_extract = Instant::now();
+    let estimated_mins = estimate_minimizers_from_records(records, manifest.k, manifest.w);
+    let extracted: Vec<_> = records
+        .par_iter()
+        .map_init(
+            || MinimizerWorkspace::with_estimate(estimated_mins),
+            |ws, (_, s1, s2)| {
+                let (ha, hb) =
+                    get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
+                filter_negative_mins(ha, hb, negative_mins)
+            },
+        )
+        .collect();
+    log_timing("parallel_rg: extraction", t_extract.elapsed().as_millis());
+
+    // Collect query IDs
+    let query_ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
+
+    // Build query inverted index (CSR format, built once, reused across all RGs)
+    let t_build_idx = Instant::now();
+    let query_idx = QueryInvertedIndex::build(&extracted);
+    log_timing(
+        "parallel_rg: build_query_index",
+        t_build_idx.elapsed().as_millis(),
+    );
+
+    let num_reads = query_idx.num_reads();
+    if num_reads == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Get sorted query minimizers and their range for pre-filtering
+    let query_minimizers = query_idx.minimizers();
+    let (query_min, query_max) = if query_minimizers.is_empty() {
+        return Ok(Vec::new());
+    } else {
+        (
+            query_minimizers[0],
+            query_minimizers[query_minimizers.len() - 1],
+        )
+    };
+
+    let mut total_rg_count = 0usize;
+
+    // Collect (shard_path, rg_idx) pairs that overlap with query range
+    let mut work_items: Vec<(std::path::PathBuf, usize)> = Vec::new();
+
+    let t_filter = Instant::now();
+    for shard_info in &manifest.shards {
+        let shard_path =
+            ShardManifest::shard_path_parquet(sharded.base_path(), shard_info.shard_id);
+
+        // Get RG ranges and pre-filter by query range
+        let rg_ranges = get_row_group_ranges(&shard_path)?;
+        total_rg_count += rg_ranges.len();
+
+        for (rg_idx, rg_min, rg_max) in rg_ranges {
+            // Check if RG range overlaps with query range
+            if rg_max >= query_min && rg_min <= query_max {
+                work_items.push((shard_path.clone(), rg_idx));
+            }
+        }
+    }
+    let filtered_rg_count = work_items.len();
+    log_timing("parallel_rg: rg_filter", t_filter.elapsed().as_millis());
+
+    // Process overlapping row groups in parallel, collecting sparse hits
+    let t_parallel = Instant::now();
+    let results: Result<Vec<Vec<SparseHit>>> = work_items
+        .into_par_iter()
+        .map(|(shard_path, rg_idx)| {
+            let pairs = load_row_group_pairs(&shard_path, rg_idx, query_minimizers)?;
+            if pairs.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(merge_join_pairs_sparse(&query_idx, &pairs))
+            }
+        })
+        .filter_map(|result: Result<Vec<SparseHit>>| match result {
+            Ok(hits) if hits.is_empty() => None,
+            Ok(hits) => Some(Ok(hits)),
+            Err(e) => Some(Err(e)),
+        })
+        .collect();
+
+    let all_sparse_hits = results?;
+    log_timing(
+        "parallel_rg: rg_process_total",
+        t_parallel.elapsed().as_millis(),
+    );
+
+    // Merge all sparse hits into final accumulators
+    let t_merge = Instant::now();
+    let final_accumulators = merge_sparse_hits(all_sparse_hits, num_reads);
+    log_timing("parallel_rg: merge_total", t_merge.elapsed().as_millis());
+    log_timing("parallel_rg: total_rg_count", total_rg_count as u128);
+    log_timing("parallel_rg: filtered_rg_count", filtered_rg_count as u128);
+
+    // Score and filter
+    let t_score = Instant::now();
+    let mut results = Vec::new();
+    for (read_idx, buckets) in final_accumulators.into_iter().enumerate() {
+        let fwd_total = query_idx.fwd_counts[read_idx] as usize;
+        let rc_total = query_idx.rc_counts[read_idx] as usize;
+        let query_id = query_ids[read_idx];
+
+        for (bucket_id, (fwd_hits, rc_hits)) in buckets {
+            let score = compute_score(fwd_hits as usize, fwd_total, rc_hits as usize, rc_total);
+            if score >= threshold {
+                results.push(HitResult {
+                    query_id,
+                    bucket_id,
+                    score,
+                });
+            }
+        }
+    }
+    log_timing("parallel_rg: scoring", t_score.elapsed().as_millis());
+    log_timing("parallel_rg: total", t_start.elapsed().as_millis());
 
     Ok(results)
 }
@@ -1074,6 +1279,99 @@ mod tests {
                 "Scores should match: {} vs {}",
                 leg.score,
                 pq.score
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_classify_batch_sharded_parallel_rg_matches_merge_join() -> anyhow::Result<()> {
+        use std::fs;
+
+        let dir = tempfile::tempdir()?;
+        let base_path = dir.path().join("test.ryxdi");
+
+        // Create inverted directory for Parquet shards
+        let inverted_dir = base_path.join("inverted");
+        fs::create_dir_all(&inverted_dir)?;
+
+        let mut index = Index::new(32, 10, 0x1234).unwrap();
+        let mut ws = MinimizerWorkspace::new();
+
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq2 = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+
+        index.add_record(1, "ref1", seq1, &mut ws);
+        index.add_record(2, "ref2", seq2, &mut ws);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+        index.finalize_bucket(1);
+        index.finalize_bucket(2);
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Save as Parquet shard
+        let shard_path = ShardManifest::shard_path_parquet(&base_path, 0);
+        let shard_info = inverted.save_shard_parquet(&shard_path, 0, None)?;
+
+        let manifest = ShardManifest {
+            k: inverted.k,
+            w: inverted.w,
+            salt: inverted.salt,
+            source_hash: 0,
+            total_minimizers: inverted.num_minimizers(),
+            total_bucket_ids: inverted.num_bucket_entries(),
+            has_overlapping_shards: true,
+            shard_format: ShardFormat::Parquet,
+            shards: vec![shard_info],
+            bucket_names: std::collections::HashMap::new(),
+            bucket_sources: std::collections::HashMap::new(),
+            bucket_minimizer_counts: std::collections::HashMap::new(),
+        };
+        let manifest_path = ShardManifest::manifest_path(&base_path);
+        manifest.save(&manifest_path)?;
+
+        let sharded = ShardedInvertedIndex::open(&base_path)?;
+
+        let query1: &[u8] = seq1;
+        let query2: &[u8] = seq2;
+        let records: Vec<QueryRecord> = vec![(0, query1, None), (1, query2, None)];
+
+        let threshold = 0.1;
+
+        // Classify using merge-join
+        let results_merge_join =
+            classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None)?;
+
+        // Classify using parallel row group processing
+        let results_parallel_rg =
+            classify_batch_sharded_parallel_rg(&sharded, None, &records, threshold, None)?;
+
+        // Results should match
+        assert_eq!(
+            results_merge_join.len(),
+            results_parallel_rg.len(),
+            "Result counts should match: merge_join={}, parallel_rg={}",
+            results_merge_join.len(),
+            results_parallel_rg.len()
+        );
+
+        let mut sorted_merge_join = results_merge_join.clone();
+        sorted_merge_join.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
+
+        let mut sorted_parallel_rg = results_parallel_rg.clone();
+        sorted_parallel_rg
+            .sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
+
+        for (mj, prg) in sorted_merge_join.iter().zip(sorted_parallel_rg.iter()) {
+            assert_eq!(mj.query_id, prg.query_id, "Query IDs should match");
+            assert_eq!(mj.bucket_id, prg.bucket_id, "Bucket IDs should match");
+            assert!(
+                (mj.score - prg.score).abs() < 0.001,
+                "Scores should match: {} vs {}",
+                mj.score,
+                prg.score
             );
         }
 

@@ -250,6 +250,11 @@ INVERTED INDEX SHARDING:
         #[arg(long)]
         parquet: bool,
 
+        /// Parquet row group size (rows per group). Larger = better compression,
+        /// but less effective filtering. Only used with --parquet.
+        #[arg(long, default_value_t = 100_000)]
+        parquet_row_group_size: usize,
+
         /// Enable bloom filters in Parquet files for faster lookups.
         /// Only used with --parquet.
         #[arg(long)]
@@ -459,6 +464,13 @@ WHEN TO USE 'run' vs 'aggregate':
         #[arg(short = 'M', long)]
         merge_join: bool,
 
+        /// Use parallel row group processing (requires --use-inverted with Parquet index).
+        /// Processes each row group independently in parallel, maximizing CPU utilization.
+        /// Most effective when query minimizers span entire index range (row group
+        /// filtering is ineffective). Mutually exclusive with --merge-join.
+        #[arg(long, conflicts_with = "merge_join")]
+        parallel_rg: bool,
+
         /// Use bloom filters for row group filtering (requires --use-inverted with Parquet index).
         /// Reduces I/O by rejecting row groups that definitely don't contain query minimizers.
         /// Only effective if index was built with --parquet-bloom-filter.
@@ -493,6 +505,8 @@ WHEN TO USE 'run' vs 'aggregate':
         use_inverted: bool,
         #[arg(short = 'M', long)]
         merge_join: bool,
+        #[arg(long, conflicts_with = "merge_join")]
+        parallel_rg: bool,
         #[arg(long)]
         use_bloom_filter: bool,
         #[arg(long)]

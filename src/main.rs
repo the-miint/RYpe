@@ -13,9 +13,10 @@ use rype::memory::{
 use rype::parquet_index;
 use rype::{
     aggregate_batch, classify_batch, classify_batch_sharded_main,
-    classify_batch_sharded_merge_join, classify_batch_sharded_sequential, extract_into, log_timing,
-    Index, IndexMetadata, InvertedIndex, MainIndexManifest, MainIndexShard, MinimizerWorkspace,
-    QueryRecord, ShardFormat, ShardManifest, ShardedInvertedIndex, ShardedMainIndex, ENABLE_TIMING,
+    classify_batch_sharded_merge_join, classify_batch_sharded_parallel_rg,
+    classify_batch_sharded_sequential, extract_into, log_timing, Index, IndexMetadata,
+    InvertedIndex, MainIndexManifest, MainIndexShard, MinimizerWorkspace, QueryRecord, ShardFormat,
+    ShardManifest, ShardedInvertedIndex, ShardedMainIndex, ENABLE_TIMING,
 };
 
 mod commands;
@@ -424,6 +425,7 @@ fn main() -> Result<()> {
                 max_shard_size,
                 invert,
                 parquet,
+                parquet_row_group_size,
                 parquet_bloom_filter,
                 parquet_bloom_fpp,
                 timing,
@@ -436,6 +438,7 @@ fn main() -> Result<()> {
                 if parquet {
                     // Create parquet inverted index directly (bypasses main index)
                     let options = parquet_index::ParquetWriteOptions {
+                        row_group_size: parquet_row_group_size,
                         bloom_filter_enabled: parquet_bloom_filter,
                         bloom_filter_fpp: parquet_bloom_fpp,
                         ..Default::default()
@@ -984,6 +987,7 @@ fn main() -> Result<()> {
                 output,
                 use_inverted,
                 merge_join,
+                parallel_rg,
                 use_bloom_filter,
                 timing,
             }
@@ -998,11 +1002,16 @@ fn main() -> Result<()> {
                 output,
                 use_inverted,
                 merge_join,
+                parallel_rg,
                 use_bloom_filter,
                 timing,
             } => {
                 if merge_join && !use_inverted {
                     return Err(anyhow!("--merge-join requires --use-inverted"));
+                }
+
+                if parallel_rg && !use_inverted {
+                    return Err(anyhow!("--parallel-rg requires --use-inverted"));
                 }
 
                 if use_bloom_filter && !use_inverted {
@@ -1205,7 +1214,12 @@ fn main() -> Result<()> {
                         None
                     };
 
-                    if merge_join {
+                    if parallel_rg {
+                        log::info!(
+                            "Starting parallel row group classification (batch_size={})",
+                            effective_batch_size
+                        );
+                    } else if merge_join {
                         log::info!("Starting merge-join classification with sequential shard loading (batch_size={})", effective_batch_size);
                     } else {
                         log::info!(
@@ -1226,7 +1240,15 @@ fn main() -> Result<()> {
                             .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
                             .collect();
 
-                        let results = if merge_join {
+                        let results = if parallel_rg {
+                            classify_batch_sharded_parallel_rg(
+                                &sharded,
+                                neg_mins.as_ref(),
+                                &batch_refs,
+                                threshold,
+                                read_options.as_ref(),
+                            )?
+                        } else if merge_join {
                             classify_batch_sharded_merge_join(
                                 &sharded,
                                 neg_mins.as_ref(),

@@ -196,6 +196,139 @@ pub(super) fn accumulate_merge_join(
     }
 }
 
+/// A sparse hit: (read_idx, bucket_id, fwd_hits, rc_hits).
+///
+/// Used for memory-efficient parallel row group processing. Each entry represents
+/// hits from a single minimizer match: fwd_hits=1 for forward strand, rc_hits=1
+/// for reverse complement. Multiple entries may exist for the same (read, bucket)
+/// pair when multiple minimizers match; the merge step accumulates them.
+pub type SparseHit = (u32, u32, u32, u32);
+
+/// Merge-join query index against sorted pairs, returning sparse hits.
+///
+/// Optimized for parallel row group processing. Instead of writing to dense
+/// per-read accumulators (O(num_reads) HashMaps per RG), returns only actual
+/// hits as a compact vector.
+///
+/// # Range-Bounded Query Filtering
+///
+/// Since each row group covers only a small slice of the minimizer space, we
+/// narrow query minimizers to only those that could match:
+///
+/// 1. Determine min/max minimizer from ref_pairs (first and last elements)
+/// 2. Binary search query_idx.minimizers to find the overlapping range
+/// 3. Merge-join only within that bounded range
+///
+/// # Complexity
+/// O(Q_bounded + R) where Q_bounded = query minimizers in [rg_min, rg_max]
+///
+/// # Arguments
+/// * `query_idx` - Query inverted index (CSR format, built once per batch)
+/// * `ref_pairs` - Sorted (minimizer, bucket_id) pairs from a single row group
+///
+/// # Returns
+/// Sparse hits vector. May contain multiple entries for the same (read, bucket)
+/// pair; the merge step accumulates them.
+pub fn merge_join_pairs_sparse(
+    query_idx: &QueryInvertedIndex,
+    ref_pairs: &[(u64, u32)],
+) -> Vec<SparseHit> {
+    debug_assert!(
+        ref_pairs.windows(2).all(|w| w[0].0 <= w[1].0),
+        "ref_pairs must be sorted by minimizer"
+    );
+
+    if query_idx.num_minimizers() == 0 || ref_pairs.is_empty() {
+        return Vec::new();
+    }
+
+    // Get row group min/max from sorted pairs
+    let rg_min = ref_pairs[0].0;
+    let rg_max = ref_pairs[ref_pairs.len() - 1].0;
+
+    // Binary search to find bounded query range
+    let q_start = query_idx.minimizers.partition_point(|&m| m < rg_min);
+    let q_end = query_idx.minimizers.partition_point(|&m| m <= rg_max);
+
+    if q_start >= q_end {
+        return Vec::new();
+    }
+
+    // Estimate capacity based on bounded query count
+    let bounded_query_count = q_end - q_start;
+    let mut hits = Vec::with_capacity(bounded_query_count);
+
+    let mut qi = q_start;
+    let mut ri = 0usize;
+
+    while qi < q_end && ri < ref_pairs.len() {
+        let q_min = query_idx.minimizers[qi];
+        let (r_min, bucket_id) = ref_pairs[ri];
+
+        if q_min < r_min {
+            qi += 1;
+        } else if q_min > r_min {
+            ri += 1;
+        } else {
+            // Match! Emit hit for each read with this query minimizer
+            let q_off_start = query_idx.offsets[qi] as usize;
+            let q_off_end = query_idx.offsets[qi + 1] as usize;
+
+            for &packed in &query_idx.read_ids[q_off_start..q_off_end] {
+                let (read_idx, is_rc) = QueryInvertedIndex::unpack_read_id(packed);
+                if is_rc {
+                    hits.push((read_idx, bucket_id, 0, 1));
+                } else {
+                    hits.push((read_idx, bucket_id, 1, 0));
+                }
+            }
+
+            // Advance ref only - multiple ref pairs may have the same minimizer
+            ri += 1;
+        }
+    }
+
+    hits
+}
+
+/// Merge sparse hits from row groups into dense accumulators.
+///
+/// Takes sparse hit vectors from parallel RG processing and accumulates them
+/// into per-read HashMaps suitable for scoring.
+///
+/// # Arguments
+/// * `sparse_hits_list` - Vector of sparse hit vectors from each row group
+/// * `num_reads` - Number of reads in the batch
+///
+/// # Returns
+/// Dense accumulator: Vec<HashMap<bucket_id, (fwd_total, rc_total)>>
+pub fn merge_sparse_hits(
+    sparse_hits_list: Vec<Vec<SparseHit>>,
+    num_reads: usize,
+) -> Vec<HashMap<u32, (u32, u32)>> {
+    let mut accumulators: Vec<HashMap<u32, (u32, u32)>> = (0..num_reads)
+        .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
+        .collect();
+
+    for rg_hits in sparse_hits_list {
+        for (read_idx, bucket_id, fwd, rc) in rg_hits {
+            debug_assert!(
+                (read_idx as usize) < num_reads,
+                "read_idx {} >= num_reads {}",
+                read_idx,
+                num_reads
+            );
+            let entry = accumulators[read_idx as usize]
+                .entry(bucket_id)
+                .or_insert((0, 0));
+            entry.0 += fwd;
+            entry.1 += rc;
+        }
+    }
+
+    accumulators
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +491,159 @@ mod tests {
         assert_eq!(results[0].bucket_id, 1);
         // 1/100 fwd minimizers matched = 0.01
         assert!((results[0].score - 0.01).abs() < 0.001);
+    }
+
+    // Tests for merge_join_pairs_sparse
+
+    #[test]
+    fn test_merge_join_pairs_sparse_basic() {
+        // Query with fwd=[100, 200, 300], rc=[150, 250]
+        let queries = vec![(vec![100, 200, 300], vec![150, 250])];
+        let query_idx = QueryInvertedIndex::build(&queries);
+
+        // Sorted pairs from a "row group" - bucket 1 has 100, 200; bucket 2 has 150
+        let ref_pairs: Vec<(u64, u32)> = vec![
+            (100, 1), // minimizer 100 -> bucket 1
+            (150, 2), // minimizer 150 -> bucket 2
+            (200, 1), // minimizer 200 -> bucket 1
+        ];
+
+        let hits = merge_join_pairs_sparse(&query_idx, &ref_pairs);
+
+        // Merge sparse hits to verify
+        let accumulators = merge_sparse_hits(vec![hits], 1);
+
+        // Read 0 should have: bucket 1 -> (2 fwd, 0 rc), bucket 2 -> (0 fwd, 1 rc)
+        assert_eq!(accumulators[0].get(&1), Some(&(2, 0)));
+        assert_eq!(accumulators[0].get(&2), Some(&(0, 1)));
+    }
+
+    #[test]
+    fn test_merge_join_pairs_sparse_range_bounded() {
+        // Query spans wide range [100..900], but row group only covers [400..600]
+        let queries = vec![(vec![100, 200, 300, 400, 500, 600, 700, 800, 900], vec![])];
+        let query_idx = QueryInvertedIndex::build(&queries);
+
+        // Row group only has minimizers in [400..600]
+        let ref_pairs: Vec<(u64, u32)> = vec![(400, 1), (500, 1), (600, 1)];
+
+        let hits = merge_join_pairs_sparse(&query_idx, &ref_pairs);
+        let accumulators = merge_sparse_hits(vec![hits], 1);
+
+        // Should only count hits for 400, 500, 600 (3 hits)
+        assert_eq!(accumulators[0].get(&1), Some(&(3, 0)));
+    }
+
+    #[test]
+    fn test_merge_join_pairs_sparse_no_overlap() {
+        // Query minimizers don't overlap with row group range
+        let queries = vec![(vec![100, 200, 300], vec![])];
+        let query_idx = QueryInvertedIndex::build(&queries);
+
+        // Row group has minimizers outside query range
+        let ref_pairs: Vec<(u64, u32)> = vec![(500, 1), (600, 1)];
+
+        let hits = merge_join_pairs_sparse(&query_idx, &ref_pairs);
+
+        // No hits
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_merge_join_pairs_sparse_duplicate_minimizers() {
+        // Multiple pairs with same minimizer (different buckets)
+        let queries = vec![(vec![100, 200], vec![])];
+        let query_idx = QueryInvertedIndex::build(&queries);
+
+        // Minimizer 100 appears in buckets 1 and 2
+        let ref_pairs: Vec<(u64, u32)> = vec![(100, 1), (100, 2), (200, 1)];
+
+        let hits = merge_join_pairs_sparse(&query_idx, &ref_pairs);
+        let accumulators = merge_sparse_hits(vec![hits], 1);
+
+        // bucket 1: 2 hits (100, 200), bucket 2: 1 hit (100)
+        assert_eq!(accumulators[0].get(&1), Some(&(2, 0)));
+        assert_eq!(accumulators[0].get(&2), Some(&(1, 0)));
+    }
+
+    #[test]
+    fn test_merge_join_pairs_sparse_multiple_reads() {
+        // Two reads with overlapping minimizers
+        let queries = vec![
+            (vec![100, 200], vec![150]), // read 0
+            (vec![100, 300], vec![150]), // read 1
+        ];
+        let query_idx = QueryInvertedIndex::build(&queries);
+
+        let ref_pairs: Vec<(u64, u32)> = vec![(100, 1), (150, 2)];
+
+        let hits = merge_join_pairs_sparse(&query_idx, &ref_pairs);
+        let accumulators = merge_sparse_hits(vec![hits], 2);
+
+        // Read 0: bucket 1 -> (1, 0), bucket 2 -> (0, 1)
+        assert_eq!(accumulators[0].get(&1), Some(&(1, 0)));
+        assert_eq!(accumulators[0].get(&2), Some(&(0, 1)));
+
+        // Read 1: bucket 1 -> (1, 0), bucket 2 -> (0, 1)
+        assert_eq!(accumulators[1].get(&1), Some(&(1, 0)));
+        assert_eq!(accumulators[1].get(&2), Some(&(0, 1)));
+    }
+
+    #[test]
+    fn test_merge_join_pairs_sparse_empty_inputs() {
+        let queries: Vec<(Vec<u64>, Vec<u64>)> = vec![];
+        let query_idx = QueryInvertedIndex::build(&queries);
+        let ref_pairs: Vec<(u64, u32)> = vec![];
+
+        // Should not panic on empty inputs
+        let hits = merge_join_pairs_sparse(&query_idx, &ref_pairs);
+        assert!(hits.is_empty());
+    }
+
+    // Tests for merge_sparse_hits
+
+    #[test]
+    fn test_merge_sparse_hits_basic() {
+        // Two RGs with sparse hits for 2 reads
+        let rg1_hits = vec![
+            (0, 1, 2, 0), // read 0, bucket 1, 2 fwd
+            (0, 2, 1, 0), // read 0, bucket 2, 1 fwd
+            (1, 1, 1, 0), // read 1, bucket 1, 1 fwd
+        ];
+        let rg2_hits = vec![
+            (0, 1, 1, 0), // read 0, bucket 1, 1 more fwd
+            (0, 3, 0, 1), // read 0, bucket 3, 1 rc
+            (1, 2, 0, 2), // read 1, bucket 2, 2 rc
+        ];
+
+        let merged = merge_sparse_hits(vec![rg1_hits, rg2_hits], 2);
+
+        // Read 0: bucket 1 -> (3, 0), bucket 2 -> (1, 0), bucket 3 -> (0, 1)
+        assert_eq!(merged[0].get(&1), Some(&(3, 0)));
+        assert_eq!(merged[0].get(&2), Some(&(1, 0)));
+        assert_eq!(merged[0].get(&3), Some(&(0, 1)));
+
+        // Read 1: bucket 1 -> (1, 0), bucket 2 -> (0, 2)
+        assert_eq!(merged[1].get(&1), Some(&(1, 0)));
+        assert_eq!(merged[1].get(&2), Some(&(0, 2)));
+    }
+
+    #[test]
+    fn test_merge_sparse_hits_single_rg() {
+        let hits = vec![(0, 1, 2, 1)];
+
+        let merged = merge_sparse_hits(vec![hits], 1);
+
+        assert_eq!(merged[0].get(&1), Some(&(2, 1)));
+    }
+
+    #[test]
+    fn test_merge_sparse_hits_empty() {
+        let merged = merge_sparse_hits(vec![], 3);
+
+        assert_eq!(merged.len(), 3);
+        assert!(merged[0].is_empty());
+        assert!(merged[1].is_empty());
+        assert!(merged[2].is_empty());
     }
 }

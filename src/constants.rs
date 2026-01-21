@@ -119,6 +119,11 @@ pub(crate) const ESTIMATED_MINIMIZERS_PER_SEQUENCE: usize = 32;
 /// Above this many query minimizers, use HashSet instead of binary search.
 pub(crate) const QUERY_HASHSET_THRESHOLD: usize = 1000;
 
+/// Threshold for using HashSet vs binary search for bounded query filtering
+/// during row group loading. When the bounded query slice exceeds this size,
+/// build a local HashSet for O(1) lookups instead of O(log n) binary search.
+pub(crate) const BOUNDED_QUERY_HASHSET_THRESHOLD: usize = 100;
+
 /// Threshold for switching to galloping search in merge-join.
 /// When one index is more than GALLOP_THRESHOLD times larger, use galloping.
 pub(crate) const GALLOP_THRESHOLD: usize = 16;

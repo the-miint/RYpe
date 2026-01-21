@@ -266,7 +266,11 @@ impl InvertedIndex {
             //
             // Parquet min/max statistics are inclusive ranges [min, max], so we use
             // partition_point with <= for the max bound.
+            //
+            // TODO: This loop is sequential - could be parallelized if bloom filter
+            // access is thread-safe and the bottleneck is CPU-bound.
             if use_bloom_filter {
+                let _t_bloom = std::time::Instant::now();
                 let mut bloom_filtered = Vec::with_capacity(stats_filtered.len());
                 let mut bloom_rejected_count = 0usize;
                 let mut bloom_filters_found = 0usize;
@@ -470,6 +474,221 @@ impl InvertedIndex {
             bucket_ids: bucket_ids_out,
         })
     }
+}
+
+/// Load a single row group and return filtered (minimizer, bucket_id) pairs.
+///
+/// Pairs are sorted by minimizer within the row group (enforced at write time).
+///
+/// # Query Minimizer Filtering
+///
+/// Before filtering pairs, we narrow the query minimizers to only those
+/// that could possibly match this row group:
+///
+/// 1. Read the RG's min/max minimizer values from Parquet column statistics
+/// 2. Binary search the sorted `query_minimizers` to find the range:
+///    - `start = query_minimizers.partition_point(|m| m < rg_min)`
+///    - `end = query_minimizers.partition_point(|m| m <= rg_max)`
+/// 3. Use `query_minimizers[start..end]` for filtering pairs
+///
+/// This reduces merge-join work when query minimizers span a wider range
+/// than any individual row group.
+///
+/// # Arguments
+/// * `path` - Path to the Parquet file
+/// * `rg_idx` - Row group index within the file
+/// * `query_minimizers` - Sorted, deduplicated query minimizers
+///
+/// # Returns
+/// Sorted (minimizer, bucket_id) pairs where minimizer is in the bounded query range.
+///
+/// # Errors
+/// Returns an error if the row group lacks column statistics (required for range-bounded filtering).
+pub fn load_row_group_pairs(
+    path: &std::path::Path,
+    rg_idx: usize,
+    query_minimizers: &[u64],
+) -> Result<Vec<(u64, u32)>> {
+    use crate::constants::BOUNDED_QUERY_HASHSET_THRESHOLD;
+    use arrow::array::{Array, UInt32Array, UInt64Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+    use parquet::file::statistics::Statistics;
+    use std::fs::File;
+
+    if query_minimizers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Open file and get row group metadata
+    let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet file", e))?;
+    let parquet_reader = SerializedFileReader::new(file)?;
+    let metadata = parquet_reader.metadata();
+
+    if rg_idx >= metadata.num_row_groups() {
+        return Err(RypeError::validation(format!(
+            "Row group index {} out of range (file has {} row groups)",
+            rg_idx,
+            metadata.num_row_groups()
+        )));
+    }
+
+    // Get RG min/max from Parquet statistics
+    let rg_meta = metadata.row_group(rg_idx);
+    let col_meta = rg_meta.column(0); // minimizer column
+
+    let (rg_min, rg_max, rg_num_rows) = match col_meta.statistics() {
+        Some(Statistics::Int64(s)) => {
+            let min = s.min_opt().ok_or_else(|| {
+                RypeError::format(
+                    path,
+                    format!(
+                        "Row group {} has statistics but min value is missing",
+                        rg_idx
+                    ),
+                )
+            })?;
+            let max = s.max_opt().ok_or_else(|| {
+                RypeError::format(
+                    path,
+                    format!(
+                        "Row group {} has statistics but max value is missing",
+                        rg_idx
+                    ),
+                )
+            })?;
+            (*min as u64, *max as u64, rg_meta.num_rows() as usize)
+        }
+        _ => {
+            return Err(RypeError::format(
+                path,
+                format!(
+                    "Row group {} lacks column statistics; parallel RG processing requires \
+                     statistics for range-bounded filtering. Rebuild index with statistics enabled.",
+                    rg_idx
+                ),
+            ));
+        }
+    };
+
+    // Drop the parquet_reader before doing more work
+    drop(parquet_reader);
+
+    // Binary search to find bounded query minimizers
+    let q_start = query_minimizers.partition_point(|&m| m < rg_min);
+    let q_end = query_minimizers.partition_point(|&m| m <= rg_max);
+
+    // No overlap between query minimizers and this row group's range
+    if q_start >= q_end {
+        return Ok(Vec::new());
+    }
+
+    let bounded_queries = &query_minimizers[q_start..q_end];
+
+    // Build HashSet from bounded queries for O(1) filtering when set is large enough.
+    // Always build from bounded_queries (not the full query set) for efficiency.
+    let local_set: Option<std::collections::HashSet<u64>> =
+        if bounded_queries.len() > BOUNDED_QUERY_HASHSET_THRESHOLD {
+            Some(bounded_queries.iter().copied().collect())
+        } else {
+            None
+        };
+
+    // Load the row group using Arrow reader
+    let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet file", e))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.with_row_groups(vec![rg_idx]).build()?;
+
+    // Estimate capacity based on row group size
+    let estimated_pairs = rg_num_rows / 10; // Assume ~10% match rate
+    let mut pairs = Vec::with_capacity(estimated_pairs);
+
+    for batch in reader {
+        let batch = batch?;
+
+        let min_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| RypeError::format(path, "Expected UInt64Array for minimizer column"))?;
+
+        let bid_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| RypeError::format(path, "Expected UInt32Array for bucket_id column"))?;
+
+        for i in 0..batch.num_rows() {
+            let m = min_col.value(i);
+
+            // Filter: only include pairs where minimizer is in bounded query set
+            let matches = if let Some(ref hs) = local_set {
+                hs.contains(&m)
+            } else {
+                // Binary search for small query sets
+                bounded_queries.binary_search(&m).is_ok()
+            };
+
+            if matches {
+                pairs.push((m, bid_col.value(i)));
+            }
+        }
+    }
+
+    // Pairs should already be sorted by minimizer (enforced at write time)
+    // But verify in debug mode
+    debug_assert!(
+        pairs.windows(2).all(|w| w[0].0 <= w[1].0),
+        "Row group pairs should be sorted by minimizer"
+    );
+
+    Ok(pairs)
+}
+
+/// Get the min/max statistics for each row group in a Parquet file.
+///
+/// Returns a vector of (rg_index, min_minimizer, max_minimizer) tuples.
+/// Only row groups with valid statistics are included.
+///
+/// # Errors
+/// Returns an error if the file cannot be opened or lacks statistics.
+pub fn get_row_group_ranges(path: &std::path::Path) -> Result<Vec<(usize, u64, u64)>> {
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+    use parquet::file::statistics::Statistics;
+    use std::fs::File;
+
+    let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet file", e))?;
+    let parquet_reader = SerializedFileReader::new(file)?;
+    let metadata = parquet_reader.metadata();
+
+    let mut ranges = Vec::with_capacity(metadata.num_row_groups());
+
+    for rg_idx in 0..metadata.num_row_groups() {
+        let rg_meta = metadata.row_group(rg_idx);
+        let col_meta = rg_meta.column(0); // minimizer column
+
+        match col_meta.statistics() {
+            Some(Statistics::Int64(s)) => {
+                if let (Some(&min), Some(&max)) = (s.min_opt(), s.max_opt()) {
+                    ranges.push((rg_idx, min as u64, max as u64));
+                }
+            }
+            _ => {
+                return Err(RypeError::format(
+                    path,
+                    format!(
+                        "Row group {} lacks column statistics; parallel RG processing requires \
+                         statistics for range-bounded filtering.",
+                        rg_idx
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(ranges)
 }
 
 #[cfg(test)]
@@ -1044,6 +1263,208 @@ mod tests {
                 m
             );
         }
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Tests for load_row_group_pairs and get_row_group_info
+    // ========================================================================
+
+    #[test]
+    fn test_load_row_group_pairs_basic() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("rg_pairs.parquet");
+
+        // Create inverted index with multiple minimizers
+        let mut index = Index::new(64, 50, 0xABCD).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300, 400, 500]);
+        index.buckets.insert(2, vec![200, 300, 600]);
+        index.bucket_names.insert(1, "A".into());
+        index.bucket_names.insert(2, "B".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_shard_parquet(&path, 0, None)?;
+
+        // Load pairs from row group 0 with specific query
+        let query_minimizers = vec![200, 300, 500];
+        let pairs = load_row_group_pairs(&path, 0, &query_minimizers)?;
+
+        // Should find pairs for minimizers 200, 300, 500
+        let found_mins: std::collections::HashSet<u64> = pairs.iter().map(|(m, _)| *m).collect();
+        assert!(found_mins.contains(&200));
+        assert!(found_mins.contains(&300));
+        assert!(found_mins.contains(&500));
+
+        // Pairs should be sorted by minimizer
+        assert!(pairs.windows(2).all(|w| w[0].0 <= w[1].0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_row_group_pairs_range_bounded() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("rg_bounded.parquet");
+
+        // Create a small row group with limited range
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![500, 600, 700]); // range [500, 700]
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_shard_parquet(&path, 0, None)?;
+
+        // Query spans wider range than row group
+        let query_minimizers = vec![100, 200, 500, 600, 700, 800, 900];
+        let pairs = load_row_group_pairs(&path, 0, &query_minimizers)?;
+
+        // Should only find pairs within row group range
+        for (m, _) in &pairs {
+            assert!(
+                *m >= 500 && *m <= 700,
+                "Minimizer {} outside expected range",
+                m
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_row_group_pairs_no_overlap() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("rg_no_overlap.parquet");
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]); // range [100, 300]
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_shard_parquet(&path, 0, None)?;
+
+        // Query outside row group range
+        let query_minimizers = vec![500, 600, 700];
+        let pairs = load_row_group_pairs(&path, 0, &query_minimizers)?;
+
+        // No overlap - should return empty
+        assert!(pairs.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_row_group_pairs_empty_query() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("rg_empty.parquet");
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_shard_parquet(&path, 0, None)?;
+
+        // Empty query
+        let pairs = load_row_group_pairs(&path, 0, &[])?;
+        assert!(pairs.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_row_group_pairs_with_hashset() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("rg_hashset.parquet");
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200, 300, 400, 500]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_shard_parquet(&path, 0, None)?;
+
+        let query_minimizers = vec![200, 300];
+
+        let pairs = load_row_group_pairs(&path, 0, &query_minimizers)?;
+
+        // Should find pairs for 200 and 300
+        let found_mins: std::collections::HashSet<u64> = pairs.iter().map(|(m, _)| *m).collect();
+        assert!(found_mins.contains(&200));
+        assert!(found_mins.contains(&300));
+        assert!(!found_mins.contains(&100));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_row_group_count_basic() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("rg_count.parquet");
+
+        // Create large index to span multiple row groups
+        let mut index = Index::new(64, 50, 0x1234).unwrap();
+
+        // Create buckets with different ranges
+        for bucket_id in 0..5u32 {
+            let base = bucket_id as u64 * 100_000;
+            let minimizers: Vec<u64> = (0..30000).map(|i| base + i as u64).collect();
+            index.buckets.insert(bucket_id, minimizers);
+            index
+                .bucket_names
+                .insert(bucket_id, format!("bucket_{}", bucket_id));
+        }
+
+        let inverted = InvertedIndex::build_from_index(&index);
+
+        // Use small row group size to create multiple RGs
+        let write_opts = ParquetWriteOptions {
+            row_group_size: 50_000,
+            ..Default::default()
+        };
+        inverted.save_shard_parquet(&path, 0, Some(&write_opts))?;
+
+        let rg_ranges = get_row_group_ranges(&path)?;
+
+        // Should have multiple row groups
+        assert!(
+            rg_ranges.len() > 1,
+            "Expected multiple row groups, got {}",
+            rg_ranges.len()
+        );
+
+        // Each RG should have valid range
+        for (idx, min, max) in &rg_ranges {
+            assert!(
+                min <= max,
+                "RG {} has invalid range: min {} > max {}",
+                idx,
+                min,
+                max
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_row_group_pairs_invalid_rg_index() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("rg_invalid.parquet");
+
+        let mut index = Index::new(64, 50, 0).unwrap();
+        index.buckets.insert(1, vec![100, 200]);
+        index.bucket_names.insert(1, "A".into());
+
+        let inverted = InvertedIndex::build_from_index(&index);
+        inverted.save_shard_parquet(&path, 0, None)?;
+
+        // Try to load invalid row group index
+        let result = load_row_group_pairs(&path, 999, &[100, 200]);
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("out of range"), "Error: {}", err_msg);
 
         Ok(())
     }
