@@ -71,25 +71,25 @@ fn test_unified_load_single_main_index() -> Result<()> {
 
     // Load via unified API
     let path_cstr = CString::new(index_path.to_str().unwrap())?;
-    let loaded = unsafe { rype_index_load(path_cstr.as_ptr()) };
+    let loaded = rype_index_load(path_cstr.as_ptr());
 
     assert!(!loaded.is_null(), "Should load single-file main index");
 
     // Verify accessors
-    assert_eq!(unsafe { rype_index_k(loaded) }, 64);
-    assert_eq!(unsafe { rype_index_w(loaded) }, 50);
-    assert_eq!(unsafe { rype_index_salt(loaded) }, 0x12345);
-    assert_eq!(unsafe { rype_index_num_buckets(loaded) }, 2);
-    assert_eq!(unsafe { rype_index_is_sharded(loaded) }, 0); // Not sharded
-    assert_eq!(unsafe { rype_index_num_shards(loaded) }, 1);
+    assert_eq!(rype_index_k(loaded), 64);
+    assert_eq!(rype_index_w(loaded), 50);
+    assert_eq!(rype_index_salt(loaded), 0x12345);
+    assert_eq!(rype_index_num_buckets(loaded), 2);
+    assert_eq!(rype_index_is_sharded(loaded), 0); // Not sharded
+    assert_eq!(rype_index_num_shards(loaded), 1);
 
     // Verify bucket names
-    let name_ptr = unsafe { rype_bucket_name(loaded, 1) };
+    let name_ptr = rype_bucket_name(loaded, 1);
     assert!(!name_ptr.is_null());
     let name = unsafe { std::ffi::CStr::from_ptr(name_ptr) };
     assert_eq!(name.to_str().unwrap(), "BucketA");
 
-    unsafe { rype_index_free(loaded) };
+    rype_index_free(loaded);
     Ok(())
 }
 
@@ -102,24 +102,22 @@ fn test_unified_classify_single_main_index() -> Result<()> {
     index.save(&index_path)?;
 
     let path_cstr = CString::new(index_path.to_str().unwrap())?;
-    let loaded = unsafe { rype_index_load(path_cstr.as_ptr()) };
+    let loaded = rype_index_load(path_cstr.as_ptr());
     assert!(!loaded.is_null());
 
     // Create a query that matches bucket 1
     let query_seq = generate_sequence(200, 0);
     let (query, _seq_holder) = make_query(1, &query_seq);
 
-    let results = unsafe { rype_classify(loaded, &query, 1, 0.1) };
+    let results = rype_classify(loaded, &query, 1, 0.1);
 
     assert!(!results.is_null(), "Classification should succeed");
 
     let results_ref = unsafe { &*results };
     assert!(results_ref.len > 0, "Should have at least one hit");
 
-    unsafe {
-        rype_results_free(results);
-        rype_index_free(loaded);
-    }
+    rype_results_free(results);
+    rype_index_free(loaded);
     Ok(())
 }
 
@@ -159,19 +157,19 @@ fn test_unified_load_sharded_main_index() -> Result<()> {
 
     // Load via unified API
     let path_cstr = CString::new(index_path.to_str().unwrap())?;
-    let loaded = unsafe { rype_index_load(path_cstr.as_ptr()) };
+    let loaded = rype_index_load(path_cstr.as_ptr());
 
     assert!(!loaded.is_null(), "Should load sharded main index");
 
     // Verify accessors
-    assert_eq!(unsafe { rype_index_k(loaded) }, 64);
-    assert_eq!(unsafe { rype_index_w(loaded) }, 50);
-    assert_eq!(unsafe { rype_index_salt(loaded) }, 0xABCDE);
-    assert_eq!(unsafe { rype_index_num_buckets(loaded) }, 2);
-    assert_eq!(unsafe { rype_index_is_sharded(loaded) }, 1); // Is sharded
-    assert!(unsafe { rype_index_num_shards(loaded) } >= 1);
+    assert_eq!(rype_index_k(loaded), 64);
+    assert_eq!(rype_index_w(loaded), 50);
+    assert_eq!(rype_index_salt(loaded), 0xABCDE);
+    assert_eq!(rype_index_num_buckets(loaded), 2);
+    assert_eq!(rype_index_is_sharded(loaded), 1); // Is sharded
+    assert!(rype_index_num_shards(loaded) >= 1);
 
-    unsafe { rype_index_free(loaded) };
+    rype_index_free(loaded);
     Ok(())
 }
 
@@ -197,14 +195,14 @@ fn test_unified_classify_sharded_main_index() -> Result<()> {
     builder.finish()?;
 
     let path_cstr = CString::new(index_path.to_str().unwrap())?;
-    let loaded = unsafe { rype_index_load(path_cstr.as_ptr()) };
+    let loaded = rype_index_load(path_cstr.as_ptr());
     assert!(!loaded.is_null());
 
     // Query with matching sequence
     let query_seq = generate_sequence(200, 0);
     let (query, _seq_holder) = make_query(1, &query_seq);
 
-    let results = unsafe { rype_classify(loaded, &query, 1, 0.1) };
+    let results = rype_classify(loaded, &query, 1, 0.1);
 
     assert!(!results.is_null(), "Classification should succeed");
 
@@ -214,10 +212,8 @@ fn test_unified_classify_sharded_main_index() -> Result<()> {
         "Should have hits for matching sequence"
     );
 
-    unsafe {
-        rype_results_free(results);
-        rype_index_free(loaded);
-    }
+    rype_results_free(results);
+    rype_index_free(loaded);
     Ok(())
 }
 
@@ -338,20 +334,18 @@ fn test_unified_negative_set_creation() -> Result<()> {
     index.save(&index_path)?;
 
     let path_cstr = CString::new(index_path.to_str().unwrap())?;
-    let loaded = unsafe { rype_index_load(path_cstr.as_ptr()) };
+    let loaded = rype_index_load(path_cstr.as_ptr());
     assert!(!loaded.is_null());
 
     // Create negative set from unified index
-    let neg_set = unsafe { rype_negative_set_create(loaded) };
+    let neg_set = rype_negative_set_create(loaded);
     assert!(!neg_set.is_null(), "Should create negative set");
 
-    let size = unsafe { rype_negative_set_size(neg_set) };
+    let size = rype_negative_set_size(neg_set);
     assert!(size > 0, "Negative set should have minimizers");
 
-    unsafe {
-        rype_negative_set_free(neg_set);
-        rype_index_free(loaded);
-    }
+    rype_negative_set_free(neg_set);
+    rype_index_free(loaded);
     Ok(())
 }
 
@@ -381,27 +375,26 @@ fn test_unified_classify_with_negative_filtering() -> Result<()> {
     let pos_cstr = CString::new(pos_path.to_str().unwrap())?;
     let neg_cstr = CString::new(neg_path.to_str().unwrap())?;
 
-    let pos_loaded = unsafe { rype_index_load(pos_cstr.as_ptr()) };
-    let neg_loaded = unsafe { rype_index_load(neg_cstr.as_ptr()) };
+    let pos_loaded = rype_index_load(pos_cstr.as_ptr());
+    let neg_loaded = rype_index_load(neg_cstr.as_ptr());
 
     assert!(!pos_loaded.is_null());
     assert!(!neg_loaded.is_null());
 
     // Create negative set
-    let neg_set = unsafe { rype_negative_set_create(neg_loaded) };
+    let neg_set = rype_negative_set_create(neg_loaded);
     assert!(!neg_set.is_null());
 
     // Query with the sequence that's in both indices
     let (query, _seq_holder) = make_query(1, &seq1);
 
     // Classify without negative filtering - should have hits
-    let results_no_neg = unsafe { rype_classify(pos_loaded, &query, 1, 0.1) };
+    let results_no_neg = rype_classify(pos_loaded, &query, 1, 0.1);
     assert!(!results_no_neg.is_null());
     let no_neg_len = unsafe { (*results_no_neg).len };
 
     // Classify with negative filtering - should have fewer/no hits
-    let results_with_neg =
-        unsafe { rype_classify_with_negative(pos_loaded, neg_set, &query, 1, 0.5) };
+    let results_with_neg = rype_classify_with_negative(pos_loaded, neg_set, &query, 1, 0.5);
     assert!(!results_with_neg.is_null());
     let with_neg_len = unsafe { (*results_with_neg).len };
 
@@ -411,13 +404,11 @@ fn test_unified_classify_with_negative_filtering() -> Result<()> {
         "Negative filtering should reduce or eliminate hits"
     );
 
-    unsafe {
-        rype_results_free(results_no_neg);
-        rype_results_free(results_with_neg);
-        rype_negative_set_free(neg_set);
-        rype_index_free(pos_loaded);
-        rype_index_free(neg_loaded);
-    }
+    rype_results_free(results_no_neg);
+    rype_results_free(results_with_neg);
+    rype_negative_set_free(neg_set);
+    rype_index_free(pos_loaded);
+    rype_index_free(neg_loaded);
     Ok(())
 }
 
@@ -427,20 +418,20 @@ fn test_unified_classify_with_negative_filtering() -> Result<()> {
 
 #[test]
 fn test_unified_load_null_path() {
-    let result = unsafe { rype_index_load(ptr::null()) };
+    let result = rype_index_load(ptr::null());
     assert!(result.is_null(), "Should return NULL for null path");
 
-    let err = unsafe { rype_get_last_error() };
+    let err = rype_get_last_error();
     assert!(!err.is_null(), "Should set error message");
 }
 
 #[test]
 fn test_unified_load_nonexistent_path() {
     let path = CString::new("/nonexistent/path/index.ryidx").unwrap();
-    let result = unsafe { rype_index_load(path.as_ptr()) };
+    let result = rype_index_load(path.as_ptr());
     assert!(result.is_null(), "Should return NULL for nonexistent path");
 
-    let err = unsafe { rype_get_last_error() };
+    let err = rype_get_last_error();
     assert!(!err.is_null(), "Should set error message");
 }
 
@@ -455,7 +446,7 @@ fn test_unified_classify_null_index() {
         pair_len: 0,
     };
 
-    let result = unsafe { rype_classify(ptr::null(), &query, 1, 0.1) };
+    let result = rype_classify(ptr::null(), &query, 1, 0.1);
     assert!(result.is_null(), "Should return NULL for null index");
 }
 

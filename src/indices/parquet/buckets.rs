@@ -5,7 +5,8 @@
 
 use crate::error::{Result, RypeError};
 use arrow::array::{
-    Array, ArrayRef, ListArray, ListBuilder, StringArray, StringBuilder, UInt32Array,
+    Array, ArrayRef, LargeListArray, LargeListBuilder, LargeStringArray, LargeStringBuilder,
+    UInt32Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -32,10 +33,10 @@ pub fn write_buckets_parquet(
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("bucket_id", DataType::UInt32, false),
-        Field::new("bucket_name", DataType::Utf8, false),
+        Field::new("bucket_name", DataType::LargeUtf8, false),
         Field::new(
             "sources",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            DataType::LargeList(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
             false,
         ),
     ]));
@@ -65,10 +66,10 @@ pub fn write_buckets_parquet(
     let names: Vec<&str> = buckets.iter().map(|(_, name, _)| name.as_str()).collect();
 
     let bucket_id_array: ArrayRef = Arc::new(UInt32Array::from(bucket_ids));
-    let bucket_name_array: ArrayRef = Arc::new(StringArray::from(names));
+    let bucket_name_array: ArrayRef = Arc::new(LargeStringArray::from(names));
 
     // Build list array for sources
-    let mut list_builder = ListBuilder::new(StringBuilder::new());
+    let mut list_builder = LargeListBuilder::new(LargeStringBuilder::new());
     for (_, _, sources) in &buckets {
         let values_builder = list_builder.values();
         for source in *sources {
@@ -120,19 +121,22 @@ pub fn read_buckets_parquet(
         let names = batch
             .column(1)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .ok_or_else(|| {
                 RypeError::format(
                     path.clone(),
-                    "expected StringArray for bucket_name".to_string(),
+                    "expected LargeStringArray for bucket_name".to_string(),
                 )
             })?;
         let sources_list = batch
             .column(2)
             .as_any()
-            .downcast_ref::<ListArray>()
+            .downcast_ref::<LargeListArray>()
             .ok_or_else(|| {
-                RypeError::format(path.clone(), "expected ListArray for sources".to_string())
+                RypeError::format(
+                    path.clone(),
+                    "expected LargeListArray for sources".to_string(),
+                )
             })?;
 
         for i in 0..batch.num_rows() {
@@ -142,11 +146,11 @@ pub fn read_buckets_parquet(
             let sources_array = sources_list.value(i);
             let sources_str = sources_array
                 .as_any()
-                .downcast_ref::<StringArray>()
+                .downcast_ref::<LargeStringArray>()
                 .ok_or_else(|| {
                     RypeError::format(
                         path.clone(),
-                        "expected StringArray for sources items".to_string(),
+                        "expected LargeStringArray for sources items".to_string(),
                     )
                 })?;
             let sources: Vec<String> = (0..sources_str.len())
