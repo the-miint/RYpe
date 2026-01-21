@@ -1207,6 +1207,20 @@ fn main() -> Result<()> {
                         log::info!("Sharded index validated successfully");
                     }
 
+                    // Advise kernel to prefetch Parquet shard files
+                    // Uses mmap + madvise(MADV_WILLNEED) - non-blocking, kernel handles I/O
+                    if parallel_rg {
+                        let available = detect_available_memory();
+                        let prefetch_budget = available.bytes / 2;
+                        let advised = sharded.advise_prefetch(Some(prefetch_budget));
+                        if advised > 0 {
+                            log::info!(
+                                "Advised kernel to prefetch {} of index data",
+                                format_bytes(advised)
+                            );
+                        }
+                    }
+
                     // Build read options for Parquet indices
                     let read_options = if use_bloom_filter {
                         log::info!("Bloom filter row group filtering enabled");

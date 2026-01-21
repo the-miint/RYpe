@@ -646,14 +646,27 @@ pub fn load_row_group_pairs(
     Ok(pairs)
 }
 
-/// Get the min/max statistics for each row group in a Parquet file.
+/// Row group metadata for filtering and memory estimation.
+#[derive(Debug, Clone, Copy)]
+pub struct RowGroupRangeInfo {
+    /// Row group index within the file
+    pub rg_idx: usize,
+    /// Minimum minimizer value in this row group
+    pub min: u64,
+    /// Maximum minimizer value in this row group
+    pub max: u64,
+    /// Total uncompressed size in bytes (for memory estimation)
+    pub uncompressed_size: usize,
+}
+
+/// Get the min/max statistics and sizes for each row group in a Parquet file.
 ///
-/// Returns a vector of (rg_index, min_minimizer, max_minimizer) tuples.
+/// Returns a vector of `RowGroupRangeInfo` with ranges and uncompressed sizes.
 /// Only row groups with valid statistics are included.
 ///
 /// # Errors
 /// Returns an error if the file cannot be opened or lacks statistics.
-pub fn get_row_group_ranges(path: &std::path::Path) -> Result<Vec<(usize, u64, u64)>> {
+pub fn get_row_group_ranges(path: &std::path::Path) -> Result<Vec<RowGroupRangeInfo>> {
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
     use parquet::file::statistics::Statistics;
@@ -672,7 +685,12 @@ pub fn get_row_group_ranges(path: &std::path::Path) -> Result<Vec<(usize, u64, u
         match col_meta.statistics() {
             Some(Statistics::Int64(s)) => {
                 if let (Some(&min), Some(&max)) = (s.min_opt(), s.max_opt()) {
-                    ranges.push((rg_idx, min as u64, max as u64));
+                    ranges.push(RowGroupRangeInfo {
+                        rg_idx,
+                        min: min as u64,
+                        max: max as u64,
+                        uncompressed_size: rg_meta.total_byte_size() as usize,
+                    });
                 }
             }
             _ => {
@@ -1434,13 +1452,13 @@ mod tests {
         );
 
         // Each RG should have valid range
-        for (idx, min, max) in &rg_ranges {
+        for info in &rg_ranges {
             assert!(
-                min <= max,
+                info.min <= info.max,
                 "RG {} has invalid range: min {} > max {}",
-                idx,
-                min,
-                max
+                info.rg_idx,
+                info.min,
+                info.max
             );
         }
 

@@ -20,7 +20,7 @@ mod shard_parquet;
 
 // Re-export public types
 pub use query::QueryInvertedIndex;
-pub use query_loading::{get_row_group_ranges, load_row_group_pairs};
+pub use query_loading::{get_row_group_ranges, load_row_group_pairs, RowGroupRangeInfo};
 
 use crate::error::{Result, RypeError};
 use rayon::prelude::*;

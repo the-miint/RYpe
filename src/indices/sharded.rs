@@ -501,11 +501,18 @@ impl ShardManifest {
 ///
 /// This struct holds a manifest describing the shards. Shards are loaded
 /// on-demand during classification via `classify_batch_sharded_sequential`.
+///
+/// For Parquet format, row group metadata (min/max ranges) is preloaded during
+/// open() to avoid file I/O during classification hot path.
 #[derive(Debug)]
 pub struct ShardedInvertedIndex {
     manifest: ShardManifest,
     base_path: PathBuf,
     shard_format: ShardFormat,
+    /// Cached row group ranges for Parquet shards: Vec indexed by shard position in manifest.
+    /// Each inner Vec contains RowGroupRangeInfo with rg_idx, min, max, and uncompressed_size.
+    /// Empty for Legacy format.
+    rg_ranges_cache: Vec<Vec<super::inverted::RowGroupRangeInfo>>,
 }
 
 impl ShardedInvertedIndex {
@@ -549,10 +556,18 @@ impl ShardedInvertedIndex {
             ShardFormat::Legacy // Default for empty manifests
         };
 
+        // Preload row group ranges for Parquet format
+        let rg_ranges_cache = if shard_format == ShardFormat::Parquet {
+            Self::load_rg_ranges_for_shards(base_path, &manifest.shards)?
+        } else {
+            Vec::new()
+        };
+
         Ok(ShardedInvertedIndex {
             manifest,
             base_path: base_path.to_path_buf(),
             shard_format,
+            rg_ranges_cache,
         })
     }
 
@@ -561,10 +576,18 @@ impl ShardedInvertedIndex {
         let manifest_path = ShardManifest::manifest_path(base_path);
         let manifest = ShardManifest::load(&manifest_path)?;
 
+        // Preload row group ranges for Parquet format
+        let rg_ranges_cache = if format == ShardFormat::Parquet {
+            Self::load_rg_ranges_for_shards(base_path, &manifest.shards)?
+        } else {
+            Vec::new()
+        };
+
         Ok(ShardedInvertedIndex {
             manifest,
             base_path: base_path.to_path_buf(),
             shard_format: format,
+            rg_ranges_cache,
         })
     }
 
@@ -617,11 +640,35 @@ impl ShardedInvertedIndex {
             bucket_minimizer_counts: HashMap::new(), // Not stored in Parquet format
         };
 
+        // Preload row group ranges for Parquet shards
+        let rg_ranges_cache = Self::load_rg_ranges_for_shards(base_path, &manifest.shards)?;
+
         Ok(ShardedInvertedIndex {
             manifest,
             base_path: base_path.to_path_buf(),
             shard_format: ShardFormat::Parquet,
+            rg_ranges_cache,
         })
+    }
+
+    /// Load row group ranges for all shards.
+    ///
+    /// Returns a Vec indexed by shard position (not shard_id).
+    fn load_rg_ranges_for_shards(
+        base_path: &Path,
+        shards: &[ShardInfo],
+    ) -> Result<Vec<Vec<super::inverted::RowGroupRangeInfo>>> {
+        use super::inverted::get_row_group_ranges;
+
+        let mut cache = Vec::with_capacity(shards.len());
+
+        for shard_info in shards {
+            let shard_path = ShardManifest::shard_path_parquet(base_path, shard_info.shard_id);
+            let ranges = get_row_group_ranges(&shard_path)?;
+            cache.push(ranges);
+        }
+
+        Ok(cache)
     }
 
     /// Returns the K value (k-mer size).
@@ -677,6 +724,119 @@ impl ShardedInvertedIndex {
     /// Get the path for a specific shard, using the detected format.
     pub fn shard_path(&self, shard_id: u32) -> PathBuf {
         ShardManifest::shard_path_for_format(&self.base_path, shard_id, self.shard_format)
+    }
+
+    /// Get cached row group ranges for a shard by its position in the manifest.
+    ///
+    /// Returns None for Legacy format or if shard_pos is out of bounds.
+    /// For Parquet format, returns the preloaded RowGroupRangeInfo entries.
+    pub fn rg_ranges(&self, shard_pos: usize) -> Option<&[super::inverted::RowGroupRangeInfo]> {
+        self.rg_ranges_cache.get(shard_pos).map(|v| v.as_slice())
+    }
+
+    /// Check if row group ranges are cached (i.e., Parquet format with preloaded metadata).
+    pub fn has_rg_cache(&self) -> bool {
+        !self.rg_ranges_cache.is_empty()
+    }
+
+    /// Calculate total uncompressed size of all row groups across all shards.
+    ///
+    /// This is used for memory estimation to decide whether to preload data.
+    /// Returns 0 for Legacy format (no size info available).
+    pub fn total_uncompressed_size(&self) -> usize {
+        self.rg_ranges_cache
+            .iter()
+            .flat_map(|rgs| rgs.iter())
+            .map(|info| info.uncompressed_size)
+            .sum()
+    }
+
+    /// Advise the kernel to prefetch Parquet shard files into page cache.
+    ///
+    /// Uses mmap + madvise(MADV_WILLNEED) to tell the kernel to asynchronously
+    /// read the shard files into memory. This is non-blocking - the kernel
+    /// handles prefetching in the background while other work continues.
+    ///
+    /// # Arguments
+    /// * `max_bytes` - Maximum bytes to prefetch (prefetches largest shards first up to budget)
+    ///
+    /// # Returns
+    /// Number of bytes advised for prefetching, or 0 if prefetching is not available.
+    #[cfg(unix)]
+    pub fn advise_prefetch(&self, max_bytes: Option<usize>) -> usize {
+        use std::os::unix::io::AsRawFd;
+
+        if self.shard_format != ShardFormat::Parquet || self.rg_ranges_cache.is_empty() {
+            return 0;
+        }
+
+        let budget = max_bytes.unwrap_or(usize::MAX);
+        let mut total_advised = 0usize;
+
+        for shard_info in &self.manifest.shards {
+            let shard_path =
+                ShardManifest::shard_path_parquet(&self.base_path, shard_info.shard_id);
+
+            // Get file size
+            let file_size = match std::fs::metadata(&shard_path) {
+                Ok(meta) => meta.len() as usize,
+                Err(_) => continue,
+            };
+
+            // Check budget
+            if total_advised + file_size > budget {
+                log::debug!(
+                    "Prefetch budget reached at {} bytes, skipping remaining shards",
+                    total_advised
+                );
+                break;
+            }
+
+            // Open and mmap the file
+            let file = match std::fs::File::open(&shard_path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+
+            // Use madvise to advise the kernel to prefetch
+            // SAFETY: We're just advising the kernel, not dereferencing the memory
+            unsafe {
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    file_size,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                );
+
+                if ptr != libc::MAP_FAILED {
+                    // Tell kernel to prefetch this region
+                    libc::madvise(ptr, file_size, libc::MADV_WILLNEED);
+
+                    // Immediately unmap - the kernel will still do the prefetch
+                    libc::munmap(ptr, file_size);
+
+                    total_advised += file_size;
+                }
+            }
+        }
+
+        if total_advised > 0 {
+            log::debug!(
+                "Advised kernel to prefetch {} bytes across {} shards",
+                total_advised,
+                self.manifest.shards.len()
+            );
+        }
+
+        total_advised
+    }
+
+    /// Non-unix stub - prefetching not available.
+    #[cfg(not(unix))]
+    pub fn advise_prefetch(&self, _max_bytes: Option<usize>) -> usize {
+        0
     }
 
     /// Load a specific shard by ID.

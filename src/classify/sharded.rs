@@ -409,18 +409,29 @@ pub fn classify_batch_sharded_parallel_rg(
     let mut work_items: Vec<(std::path::PathBuf, usize)> = Vec::new();
 
     let t_filter = Instant::now();
-    for shard_info in &manifest.shards {
+
+    // Use cached row group ranges if available (Parquet format with preloaded metadata)
+    let use_cache = sharded.has_rg_cache();
+
+    for (shard_pos, shard_info) in manifest.shards.iter().enumerate() {
         let shard_path =
             ShardManifest::shard_path_parquet(sharded.base_path(), shard_info.shard_id);
 
-        // Get RG ranges and pre-filter by query range
-        let rg_ranges = get_row_group_ranges(&shard_path)?;
+        // Get RG ranges from cache or load from file
+        let rg_ranges = if use_cache {
+            sharded
+                .rg_ranges(shard_pos)
+                .map(|s| s.to_vec())
+                .unwrap_or_default()
+        } else {
+            get_row_group_ranges(&shard_path)?
+        };
         total_rg_count += rg_ranges.len();
 
-        for (rg_idx, rg_min, rg_max) in rg_ranges {
+        for info in rg_ranges {
             // Check if RG range overlaps with query range
-            if rg_max >= query_min && rg_min <= query_max {
-                work_items.push((shard_path.clone(), rg_idx));
+            if info.max >= query_min && info.min <= query_max {
+                work_items.push((shard_path.clone(), info.rg_idx));
             }
         }
     }
