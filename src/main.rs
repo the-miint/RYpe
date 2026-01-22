@@ -25,8 +25,9 @@ mod logging;
 use commands::{
     add_reference_file_to_index, bucket_add_from_config, build_index_from_config,
     build_parquet_index_from_config, create_parquet_index_from_refs, inspect_matches,
-    load_index_metadata, sanitize_bucket_name, ClassifyCommands, Cli, Commands, IndexCommands,
-    InspectCommands, PrefetchingIoHandler,
+    is_parquet_input, load_index_metadata, sanitize_bucket_name, ClassifyCommands, Cli, Commands,
+    IndexCommands, InspectCommands, OutputFormat, OutputWriter, ParquetInputReader,
+    PrefetchingIoHandler,
 };
 
 // CLI argument definitions moved to commands/args.rs
@@ -1138,6 +1139,15 @@ fn main() -> Result<()> {
                     }
                 };
 
+                // Check for Parquet input
+                let input_is_parquet = is_parquet_input(&r1);
+                if input_is_parquet && r2.is_some() {
+                    return Err(anyhow!(
+                        "Parquet input with separate R2 file is not supported. \
+                         Use a Parquet file with 'sequence2' column for paired-end data."
+                    ));
+                }
+
                 if use_inverted {
                     // Use inverted index path - detect format:
                     // 1. Parquet format: directory with manifest.toml
@@ -1169,9 +1179,29 @@ fn main() -> Result<()> {
 
                     log::info!("Metadata loaded: {} buckets", metadata.bucket_names.len());
 
-                    let mut io =
-                        PrefetchingIoHandler::new(&r1, r2.as_ref(), output, effective_batch_size)?;
-                    io.write(b"read_id\tbucket_name\tscore\n".to_vec())?;
+                    // Set up I/O based on input format
+                    let output_format = OutputFormat::detect(output.as_ref());
+                    let mut out_writer = OutputWriter::new(output_format, output.as_ref(), None)?;
+                    out_writer.write_header(b"read_id\tbucket_name\tscore\n")?;
+
+                    // Create input reader (Parquet or FASTX)
+                    let mut parquet_reader = if input_is_parquet {
+                        log::info!("Using Parquet input reader for {:?}", r1);
+                        Some(ParquetInputReader::new(&r1)?)
+                    } else {
+                        None
+                    };
+                    let mut fastx_io = if !input_is_parquet {
+                        // Use PrefetchingIoHandler for FASTX input (with dummy output)
+                        Some(PrefetchingIoHandler::new(
+                            &r1,
+                            r2.as_ref(),
+                            None,
+                            effective_batch_size,
+                        )?)
+                    } else {
+                        None
+                    };
 
                     let mut total_reads = 0;
                     let mut batch_num = 0;
@@ -1245,7 +1275,14 @@ fn main() -> Result<()> {
 
                     loop {
                         let t_io_read = std::time::Instant::now();
-                        let batch_opt = io.next_batch()?;
+                        // Get next batch from either Parquet or FASTX reader
+                        let batch_opt = if let Some(ref mut reader) = parquet_reader {
+                            reader.next_batch(effective_batch_size)?
+                        } else if let Some(ref mut io) = fastx_io {
+                            io.next_batch()?
+                        } else {
+                            None
+                        };
                         log_timing("batch: io_read", t_io_read.elapsed().as_millis());
 
                         let Some((owned_records, headers)) = batch_opt else {
@@ -1304,7 +1341,7 @@ fn main() -> Result<()> {
                         log_timing("batch: format_output", t_format.elapsed().as_millis());
 
                         let t_write = std::time::Instant::now();
-                        io.write(chunk_out)?;
+                        out_writer.write_chunk(chunk_out)?;
                         log_timing("batch: io_write", t_write.elapsed().as_millis());
 
                         log::info!(
@@ -1316,14 +1353,18 @@ fn main() -> Result<()> {
                     }
 
                     log::info!("Classification complete: {} reads processed", total_reads);
-                    io.finish()?;
+                    out_writer.finish()?;
+                    // Finish FASTX handler if used
+                    if let Some(ref mut io) = fastx_io {
+                        io.finish()?;
+                    }
                 } else {
                     // Standard path - detect sharded vs single-file main index
                     let main_manifest_path = MainIndexManifest::manifest_path(&index);
 
                     let mut io =
                         PrefetchingIoHandler::new(&r1, r2.as_ref(), output, effective_batch_size)?;
-                    io.write(b"read_id\tbucket_name\tscore\n".to_vec())?;
+                    io.write_header(b"read_id\tbucket_name\tscore\n")?;
 
                     let mut total_reads = 0;
                     let mut batch_num = 0;
@@ -1555,7 +1596,7 @@ fn main() -> Result<()> {
 
                 let mut io =
                     PrefetchingIoHandler::new(&r1, r2.as_ref(), output, effective_batch_size)?;
-                io.write(b"query_name\tbucket_name\tscore\n".to_vec())?;
+                io.write_header(b"query_name\tbucket_name\tscore\n")?;
 
                 let mut total_reads = 0;
                 let mut batch_num = 0;

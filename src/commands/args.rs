@@ -21,9 +21,16 @@ WORKFLOW:
 INPUT FORMATS:
   FASTA (.fa, .fasta, .fna) and FASTQ (.fq, .fastq) files are supported.
   Gzip-compressed files (.gz) are automatically detected and decompressed.
+  Parquet (.parquet) with columns: read_id, sequence1, sequence2 (optional)
 
 OUTPUT FORMAT (classify):
-  Tab-separated: read_id<TAB>bucket_name<TAB>score
+  Format auto-detected from extension:
+  - .tsv or no extension: Plain TSV
+  - .tsv.gz: Gzip-compressed TSV
+  - .parquet: Apache Parquet with zstd compression
+  - -: stdout (TSV)
+
+  Tab-separated columns: read_id<TAB>bucket_name<TAB>score
   - read_id: Sequence header (first whitespace-delimited token)
   - bucket_name: Human-readable name from index
   - score: Fraction of query minimizers matching (0.0-1.0)"
@@ -423,11 +430,13 @@ WHEN TO USE 'run' vs 'aggregate':
         #[arg(short = 'N', long)]
         negative_index: Option<PathBuf>,
 
-        /// Forward reads (FASTA/FASTQ, optionally gzipped)
+        /// Forward reads. Formats: FASTA/FASTQ (.fa/.fq, optionally .gz),
+        /// Parquet (.parquet) with columns: read_id, sequence1, sequence2 (optional)
         #[arg(short = '1', long)]
         r1: PathBuf,
 
-        /// Reverse reads for paired-end data (optional)
+        /// Reverse reads for paired-end data (optional).
+        /// Not supported with Parquet input - use sequence2 column instead.
         #[arg(short = '2', long)]
         r2: Option<PathBuf>,
 
@@ -448,7 +457,11 @@ WHEN TO USE 'run' vs 'aggregate':
         #[arg(short, long)]
         batch_size: Option<usize>,
 
-        /// Output file path (TSV format). Writes to stdout if not specified.
+        /// Output file path. Format auto-detected from extension:
+        /// - `.tsv` or no extension: Plain TSV
+        /// - `.tsv.gz`: Gzip-compressed TSV
+        /// - `.parquet`: Apache Parquet with zstd compression
+        /// - `-`: stdout (TSV)
         #[arg(short, long)]
         output: Option<PathBuf>,
 
@@ -541,11 +554,13 @@ THRESHOLD:
         #[arg(short = 'N', long)]
         negative_index: Option<PathBuf>,
 
-        /// Forward reads (FASTA/FASTQ, optionally gzipped)
+        /// Forward reads. Formats: FASTA/FASTQ (.fa/.fq, optionally .gz),
+        /// Parquet (.parquet) with columns: read_id, sequence1, sequence2 (optional)
         #[arg(short = '1', long)]
         r1: PathBuf,
 
-        /// Reverse reads for paired-end data (optional)
+        /// Reverse reads for paired-end data (optional).
+        /// Not supported with Parquet input - use sequence2 column instead.
         #[arg(short = '2', long)]
         r2: Option<PathBuf>,
 
@@ -562,7 +577,11 @@ THRESHOLD:
         #[arg(short, long)]
         batch_size: Option<usize>,
 
-        /// Output file path (TSV format)
+        /// Output file path. Format auto-detected from extension:
+        /// - `.tsv` or no extension: Plain TSV
+        /// - `.tsv.gz`: Gzip-compressed TSV
+        /// - `.parquet`: Apache Parquet with zstd compression
+        /// - `-`: stdout (TSV)
         #[arg(short, long)]
         output: Option<PathBuf>,
     },

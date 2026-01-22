@@ -63,7 +63,7 @@ pub mod arrow;
 // ============================================================================
 
 // Core types
-pub use error::{Result as RypeResult, RypeError};
+pub use error::{FirstErrorCapture, Result as RypeResult, RypeError};
 pub use types::{HitResult, IndexMetadata, QueryRecord};
 
 // Primary index types

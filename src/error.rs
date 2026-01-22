@@ -15,6 +15,8 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 /// Unified error type for the rype library.
 #[derive(Debug)]
@@ -190,6 +192,74 @@ impl RypeError {
 }
 
 // ============================================================================
+// Thread-safe error capture
+// ============================================================================
+
+/// Thread-safe error capture that stores only the first error.
+///
+/// This is useful for background threads that need to communicate errors
+/// back to the main thread when the channel may have been dropped.
+/// Uses atomic operations to ensure only the first error is stored.
+pub struct FirstErrorCapture {
+    has_error: AtomicBool,
+    error: Mutex<Option<RypeError>>,
+}
+
+impl FirstErrorCapture {
+    /// Create a new, empty error capture.
+    pub fn new() -> Self {
+        Self {
+            has_error: AtomicBool::new(false),
+            error: Mutex::new(None),
+        }
+    }
+
+    /// Store an error, but only if no error has been stored yet.
+    /// Returns true if this error was stored, false if an error already existed.
+    pub fn store(&self, err: RypeError) -> bool {
+        // Use compare_exchange to atomically check and set the flag
+        if self
+            .has_error
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            // We won the race - store the error
+            if let Ok(mut guard) = self.error.lock() {
+                *guard = Some(err);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Store a string error (convenience method that wraps in RypeError::Validation).
+    pub fn store_msg(&self, msg: impl Into<String>) -> bool {
+        self.store(RypeError::Validation(msg.into()))
+    }
+
+    /// Retrieve the stored error, if any.
+    pub fn get(&self) -> Option<RypeError> {
+        if self.has_error.load(Ordering::SeqCst) {
+            self.error.lock().ok().and_then(|mut g| g.take())
+        } else {
+            None
+        }
+    }
+
+    /// Check if an error has been stored.
+    pub fn has_error(&self) -> bool {
+        self.has_error.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for FirstErrorCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -251,5 +321,53 @@ mod tests {
             RypeError::Io { operation, .. } => assert_eq!(operation, "unknown"),
             _ => panic!("Expected Io variant"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // FirstErrorCapture tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_first_error_capture_stores_first() {
+        let capture = FirstErrorCapture::new();
+
+        assert!(capture.store(RypeError::validation("first error")));
+        assert!(!capture.store(RypeError::validation("second error"))); // Should return false
+
+        let err = capture.get().expect("Should have error");
+        assert!(err.to_string().contains("first error"));
+    }
+
+    #[test]
+    fn test_first_error_capture_store_msg() {
+        let capture = FirstErrorCapture::new();
+
+        assert!(capture.store_msg("first error"));
+        assert!(!capture.store_msg("second error"));
+
+        let err = capture.get().expect("Should have error");
+        assert!(err.to_string().contains("first error"));
+    }
+
+    #[test]
+    fn test_first_error_capture_empty() {
+        let capture = FirstErrorCapture::new();
+        assert!(capture.get().is_none());
+        assert!(!capture.has_error());
+    }
+
+    #[test]
+    fn test_first_error_capture_has_error() {
+        let capture = FirstErrorCapture::new();
+        assert!(!capture.has_error());
+
+        capture.store_msg("test error");
+        assert!(capture.has_error());
+    }
+
+    #[test]
+    fn test_first_error_capture_default() {
+        let capture = FirstErrorCapture::default();
+        assert!(!capture.has_error());
     }
 }
