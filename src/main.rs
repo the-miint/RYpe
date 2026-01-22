@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use arrow::record_batch::RecordBatch;
 use clap::Parser;
 use needletail::parse_fastx_file;
 use std::collections::{HashMap, HashSet};
@@ -25,9 +26,9 @@ mod logging;
 use commands::{
     add_reference_file_to_index, bucket_add_from_config, build_index_from_config,
     build_parquet_index_from_config, create_parquet_index_from_refs, inspect_matches,
-    is_parquet_input, load_index_metadata, sanitize_bucket_name, ClassifyCommands, Cli, Commands,
-    IndexCommands, InspectCommands, OutputFormat, OutputWriter, ParquetInputReader,
-    PrefetchingIoHandler,
+    is_parquet_input, load_index_metadata, sanitize_bucket_name, stacked_batches_to_records,
+    ClassifyCommands, Cli, Commands, IndexCommands, InspectCommands, OutputFormat, OutputWriter,
+    PrefetchingIoHandler, PrefetchingParquetReader,
 };
 
 // CLI argument definitions moved to commands/args.rs
@@ -990,6 +991,7 @@ fn main() -> Result<()> {
                 merge_join,
                 parallel_rg,
                 use_bloom_filter,
+                parallel_input_rg,
                 timing,
             }
             | ClassifyCommands::Batch {
@@ -1005,6 +1007,7 @@ fn main() -> Result<()> {
                 merge_join,
                 parallel_rg,
                 use_bloom_filter,
+                parallel_input_rg,
                 timing,
             } => {
                 if merge_join && !use_inverted {
@@ -1185,9 +1188,29 @@ fn main() -> Result<()> {
                     out_writer.write_header(b"read_id\tbucket_name\tscore\n")?;
 
                     // Create input reader (Parquet or FASTX)
+                    // Use PrefetchingParquetReader for zero-copy Parquet access
                     let mut parquet_reader = if input_is_parquet {
-                        log::info!("Using Parquet input reader for {:?}", r1);
-                        Some(ParquetInputReader::new(&r1)?)
+                        // Convert parallel_input_rg flag: 0 = disabled, N > 0 = N parallel row groups
+                        // When enabled, row groups are decompressed in parallel for better throughput.
+                        // Note: Actual batch size is limited by row group size in both modes.
+                        // For very large batch sizes (>200K) with long sequences, users may hit
+                        // "index overflow" errors - reduce batch size if this occurs.
+                        let parallel_rg_opt = if parallel_input_rg > 0 {
+                            Some(parallel_input_rg)
+                        } else {
+                            None
+                        };
+                        log::info!(
+                            "Using prefetching Parquet input reader (zero-copy, batch_size={}, parallel_rg={:?}) for {:?}",
+                            effective_batch_size,
+                            parallel_rg_opt,
+                            r1
+                        );
+                        Some(PrefetchingParquetReader::with_parallel_row_groups(
+                            &r1,
+                            effective_batch_size,
+                            parallel_rg_opt,
+                        )?)
                     } else {
                         None
                     };
@@ -1273,60 +1296,54 @@ fn main() -> Result<()> {
                         );
                     }
 
-                    loop {
-                        let t_io_read = std::time::Instant::now();
-                        // Get next batch from either Parquet or FASTX reader
-                        let batch_opt = if let Some(ref mut reader) = parquet_reader {
-                            reader.next_batch(effective_batch_size)?
-                        } else if let Some(ref mut io) = fastx_io {
-                            io.next_batch()?
-                        } else {
-                            None
-                        };
-                        log_timing("batch: io_read", t_io_read.elapsed().as_millis());
-
-                        let Some((owned_records, headers)) = batch_opt else {
-                            break;
-                        };
-
-                        batch_num += 1;
-                        let batch_read_count = owned_records.len();
-                        total_reads += batch_read_count;
-
-                        let t_convert = std::time::Instant::now();
-                        let batch_refs: Vec<QueryRecord> = owned_records
-                            .iter()
-                            .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
-                            .collect();
-                        log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
-
-                        let results = if parallel_rg {
-                            classify_batch_sharded_parallel_rg(
-                                &sharded,
-                                neg_mins.as_ref(),
-                                &batch_refs,
-                                threshold,
-                                read_options.as_ref(),
-                            )?
-                        } else if merge_join {
-                            classify_batch_sharded_merge_join(
-                                &sharded,
-                                neg_mins.as_ref(),
-                                &batch_refs,
-                                threshold,
-                                read_options.as_ref(),
-                            )?
-                        } else {
-                            classify_batch_sharded_sequential(
-                                &sharded,
-                                neg_mins.as_ref(),
-                                &batch_refs,
-                                threshold,
-                                read_options.as_ref(),
-                            )?
+                    // Helper closure for classification
+                    let classify_records =
+                        |batch_refs: &[QueryRecord]| -> Result<Vec<rype::HitResult>> {
+                            if parallel_rg {
+                                classify_batch_sharded_parallel_rg(
+                                    &sharded,
+                                    neg_mins.as_ref(),
+                                    batch_refs,
+                                    threshold,
+                                    read_options.as_ref(),
+                                )
+                            } else if merge_join {
+                                classify_batch_sharded_merge_join(
+                                    &sharded,
+                                    neg_mins.as_ref(),
+                                    batch_refs,
+                                    threshold,
+                                    read_options.as_ref(),
+                                )
+                            } else {
+                                classify_batch_sharded_sequential(
+                                    &sharded,
+                                    neg_mins.as_ref(),
+                                    batch_refs,
+                                    threshold,
+                                    read_options.as_ref(),
+                                )
+                            }
                         };
 
-                        let t_format = std::time::Instant::now();
+                    // Helper closure for output formatting - works with &str headers
+                    let format_results_ref = |results: &[rype::HitResult], headers: &[&str]| {
+                        let mut chunk_out = Vec::with_capacity(1024);
+                        for res in results {
+                            let header = headers[res.query_id as usize];
+                            let bucket_name = metadata
+                                .bucket_names
+                                .get(&res.bucket_id)
+                                .map(|s| s.as_str())
+                                .unwrap_or("unknown");
+                            writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score)
+                                .unwrap();
+                        }
+                        chunk_out
+                    };
+
+                    // Helper closure for output formatting - works with String headers
+                    let format_results = |results: &[rype::HitResult], headers: &[String]| {
                         let mut chunk_out = Vec::with_capacity(1024);
                         for res in results {
                             let header = &headers[res.query_id as usize];
@@ -1338,23 +1355,135 @@ fn main() -> Result<()> {
                             writeln!(chunk_out, "{}\t{}\t{:.4}", header, bucket_name, res.score)
                                 .unwrap();
                         }
-                        log_timing("batch: format_output", t_format.elapsed().as_millis());
+                        chunk_out
+                    };
 
-                        let t_write = std::time::Instant::now();
-                        out_writer.write_chunk(chunk_out)?;
-                        log_timing("batch: io_write", t_write.elapsed().as_millis());
+                    loop {
+                        let t_io_read = std::time::Instant::now();
 
-                        log::info!(
-                            "Processed batch {}: {} reads ({} total)",
-                            batch_num,
-                            batch_read_count,
-                            total_reads
-                        );
+                        // Handle Parquet and FASTX differently for zero-copy optimization
+                        if let Some(ref mut reader) = parquet_reader {
+                            // Zero-copy Parquet path with batch stacking
+                            // Accumulate row groups until we reach effective_batch_size
+                            let mut stacked_batches: Vec<(RecordBatch, Vec<String>)> = Vec::new();
+                            let mut stacked_rows = 0usize;
+                            let mut reached_end = false;
+
+                            // Accumulate batches until we have enough rows or run out of data
+                            loop {
+                                let batch_opt = reader.next_batch()?;
+                                let Some((record_batch, headers)) = batch_opt else {
+                                    reached_end = true;
+                                    break; // No more data
+                                };
+
+                                let batch_rows = record_batch.num_rows();
+                                stacked_rows += batch_rows;
+                                stacked_batches.push((record_batch, headers));
+
+                                // Stop accumulating when we've reached target batch size
+                                if stacked_rows >= effective_batch_size {
+                                    break;
+                                }
+                            }
+
+                            log_timing("batch: io_read", t_io_read.elapsed().as_millis());
+
+                            // If no batches were accumulated, we're done
+                            if stacked_batches.is_empty() {
+                                break;
+                            }
+
+                            // Track if this is the final batch (for clean exit after processing)
+                            let is_final_batch = reached_end;
+
+                            batch_num += 1;
+                            total_reads += stacked_rows;
+
+                            // Zero-copy conversion of all stacked batches
+                            // All batches stay alive while we process the combined records
+                            let t_convert = std::time::Instant::now();
+                            let (batch_refs, headers) =
+                                stacked_batches_to_records(&stacked_batches)?;
+                            log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
+
+                            log::debug!(
+                                "Stacked {} row groups into {} records",
+                                stacked_batches.len(),
+                                batch_refs.len()
+                            );
+
+                            let results = classify_records(&batch_refs)?;
+                            // stacked_batches stays alive until here ^^^
+
+                            let t_format = std::time::Instant::now();
+                            let chunk_out = format_results_ref(&results, &headers);
+                            log_timing("batch: format_output", t_format.elapsed().as_millis());
+
+                            let t_write = std::time::Instant::now();
+                            out_writer.write_chunk(chunk_out)?;
+                            log_timing("batch: io_write", t_write.elapsed().as_millis());
+
+                            log::info!(
+                                "Processed batch {} ({} row groups stacked): {} reads ({} total)",
+                                batch_num,
+                                stacked_batches.len(),
+                                stacked_rows,
+                                total_reads
+                            );
+
+                            // If we reached end-of-stream while accumulating, exit cleanly
+                            // (don't try to read again - the reader is done)
+                            if is_final_batch {
+                                break;
+                            }
+                        } else if let Some(ref mut io) = fastx_io {
+                            // FASTX path (copies sequences)
+                            let batch_opt = io.next_batch()?;
+                            log_timing("batch: io_read", t_io_read.elapsed().as_millis());
+
+                            let Some((owned_records, headers)) = batch_opt else {
+                                break;
+                            };
+
+                            batch_num += 1;
+                            let batch_read_count = owned_records.len();
+                            total_reads += batch_read_count;
+
+                            let t_convert = std::time::Instant::now();
+                            let batch_refs: Vec<QueryRecord> = owned_records
+                                .iter()
+                                .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                                .collect();
+                            log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
+
+                            let results = classify_records(&batch_refs)?;
+
+                            let t_format = std::time::Instant::now();
+                            let chunk_out = format_results(&results, &headers);
+                            log_timing("batch: format_output", t_format.elapsed().as_millis());
+
+                            let t_write = std::time::Instant::now();
+                            out_writer.write_chunk(chunk_out)?;
+                            log_timing("batch: io_write", t_write.elapsed().as_millis());
+
+                            log::info!(
+                                "Processed batch {}: {} reads ({} total)",
+                                batch_num,
+                                batch_read_count,
+                                total_reads
+                            );
+                        } else {
+                            break;
+                        }
                     }
 
                     log::info!("Classification complete: {} reads processed", total_reads);
                     out_writer.finish()?;
-                    // Finish FASTX handler if used
+                    // Finish handlers
+                    if let Some(ref mut reader) = parquet_reader {
+                        reader.finish()?;
+                    }
                     if let Some(ref mut io) = fastx_io {
                         io.finish()?;
                     }

@@ -81,7 +81,7 @@ mod stream;
 
 // Re-export public API
 pub use error::ArrowClassifyError;
-pub use input::batch_to_records;
+pub use input::{batch_to_records, batch_to_records_with_columns};
 pub use output::{empty_result_batch, hits_to_record_batch};
 pub use schema::{
     result_schema, validate_input_schema, COL_BUCKET_ID, COL_ID, COL_PAIR_SEQUENCE, COL_QUERY_ID,

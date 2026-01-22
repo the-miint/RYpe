@@ -490,6 +490,13 @@ WHEN TO USE 'run' vs 'aggregate':
         #[arg(long)]
         use_bloom_filter: bool,
 
+        /// Enable parallel row group reading for Parquet input files.
+        /// Processes N row groups in parallel for faster decompression.
+        /// Default: 4 when enabled, 0 = disabled (sequential reading).
+        /// Most effective with SSDs when decompression is CPU-bound.
+        #[arg(long, default_value_t = 0)]
+        parallel_input_rg: usize,
+
         /// Print timing diagnostics to stderr for performance analysis.
         #[arg(long)]
         timing: bool,
@@ -522,6 +529,8 @@ WHEN TO USE 'run' vs 'aggregate':
         parallel_rg: bool,
         #[arg(long)]
         use_bloom_filter: bool,
+        #[arg(long, default_value_t = 0)]
+        parallel_input_rg: usize,
         #[arg(long)]
         timing: bool,
     },

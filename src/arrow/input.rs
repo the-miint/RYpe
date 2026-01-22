@@ -21,7 +21,9 @@
 //! // batch must remain alive until classification is complete
 //! ```
 
-use arrow::array::{Array, BinaryArray, Int64Array, LargeBinaryArray};
+use arrow::array::{
+    Array, BinaryArray, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+};
 use arrow::record_batch::RecordBatch;
 
 use super::error::{ArrowClassifyError, MAX_SEQUENCE_LENGTH};
@@ -64,13 +66,39 @@ impl<'a> BinaryArrayAccess<'a> for &'a LargeBinaryArray {
     }
 }
 
-/// Abstraction over Binary and LargeBinary arrays for uniform access.
+impl<'a> BinaryArrayAccess<'a> for &'a StringArray {
+    #[inline]
+    fn value_at(&self, i: usize) -> &'a [u8] {
+        self.value(i).as_bytes()
+    }
+
+    #[inline]
+    fn is_null_at(&self, i: usize) -> bool {
+        self.is_null(i)
+    }
+}
+
+impl<'a> BinaryArrayAccess<'a> for &'a LargeStringArray {
+    #[inline]
+    fn value_at(&self, i: usize) -> &'a [u8] {
+        self.value(i).as_bytes()
+    }
+
+    #[inline]
+    fn is_null_at(&self, i: usize) -> bool {
+        self.is_null(i)
+    }
+}
+
+/// Abstraction over Binary, LargeBinary, String, and LargeString arrays for uniform access.
 ///
 /// Uses an enum internally but with `#[inline]` hints to allow the compiler
 /// to optimize away the match when processing uniform batches.
 enum BinaryColumnRef<'a> {
     Binary(&'a BinaryArray),
     LargeBinary(&'a LargeBinaryArray),
+    String(&'a StringArray),
+    LargeString(&'a LargeStringArray),
 }
 
 impl<'a> BinaryColumnRef<'a> {
@@ -80,6 +108,8 @@ impl<'a> BinaryColumnRef<'a> {
         match self {
             BinaryColumnRef::Binary(arr) => arr.value_at(i),
             BinaryColumnRef::LargeBinary(arr) => arr.value_at(i),
+            BinaryColumnRef::String(arr) => arr.value_at(i),
+            BinaryColumnRef::LargeString(arr) => arr.value_at(i),
         }
     }
 
@@ -89,11 +119,16 @@ impl<'a> BinaryColumnRef<'a> {
         match self {
             BinaryColumnRef::Binary(arr) => arr.is_null_at(i),
             BinaryColumnRef::LargeBinary(arr) => arr.is_null_at(i),
+            BinaryColumnRef::String(arr) => arr.is_null_at(i),
+            BinaryColumnRef::LargeString(arr) => arr.is_null_at(i),
         }
     }
 }
 
-/// Extract a binary column from a RecordBatch by index.
+/// Extract a binary or string column from a RecordBatch by index.
+///
+/// Supports Binary, LargeBinary, Utf8 (String), and LargeUtf8 (LargeString) arrays.
+/// String arrays are converted to byte slices via `.as_bytes()` (valid for ASCII DNA sequences).
 fn get_binary_column(
     batch: &RecordBatch,
     col_idx: usize,
@@ -108,11 +143,19 @@ fn get_binary_column(
         return Ok(BinaryColumnRef::LargeBinary(arr));
     }
 
+    if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
+        return Ok(BinaryColumnRef::String(arr));
+    }
+
+    if let Some(arr) = column.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(BinaryColumnRef::LargeString(arr));
+    }
+
     let schema = batch.schema();
     let field = schema.field(col_idx);
     Err(ArrowClassifyError::TypeError {
         column: field.name().clone(),
-        expected: "Binary or LargeBinary".into(),
+        expected: "Binary, LargeBinary, Utf8, or LargeUtf8".into(),
         actual: format!("{:?}", column.data_type()),
     })
 }
@@ -142,7 +185,44 @@ fn get_binary_column(
 pub fn batch_to_records(batch: &RecordBatch) -> Result<Vec<QueryRecord<'_>>, ArrowClassifyError> {
     // Validate schema first
     validate_input_schema(batch.schema().as_ref())?;
+    // Delegate to the parameterized version with standard column names
+    batch_to_records_with_columns(batch, COL_ID, COL_SEQUENCE, Some(COL_PAIR_SEQUENCE))
+}
 
+/// Convert an Arrow RecordBatch to a vector of QueryRecords with custom column names.
+///
+/// This is the parameterized version that allows custom column names for different
+/// input schemas (e.g., Parquet files with different column naming conventions).
+///
+/// # Zero-Copy Guarantee
+///
+/// The returned `QueryRecord` references point directly into the Arrow buffers.
+/// No sequence data is copied. The lifetime of the returned records is tied to
+/// the input `RecordBatch`.
+///
+/// # Arguments
+///
+/// * `batch` - A RecordBatch containing the required columns
+/// * `id_col` - Name of the ID column (must be Int64)
+/// * `seq_col` - Name of the primary sequence column (must be Binary or LargeBinary)
+/// * `pair_col` - Optional name of the paired sequence column (must be Binary or LargeBinary if present)
+///
+/// # Returns
+///
+/// A vector of `QueryRecord` tuples: `(id, sequence, optional_pair)`
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - A required column is not found
+/// - A column has an unexpected type
+/// - A required column has an unexpected null value
+pub fn batch_to_records_with_columns<'a>(
+    batch: &'a RecordBatch,
+    id_col: &str,
+    seq_col: &str,
+    pair_col: Option<&str>,
+) -> Result<Vec<QueryRecord<'a>>, ArrowClassifyError> {
     let num_rows = batch.num_rows();
     if num_rows == 0 {
         return Ok(Vec::new());
@@ -151,13 +231,13 @@ pub fn batch_to_records(batch: &RecordBatch) -> Result<Vec<QueryRecord<'_>>, Arr
     // Get column indices
     let id_idx = batch
         .schema()
-        .index_of(COL_ID)
-        .map_err(|_| ArrowClassifyError::ColumnNotFound(COL_ID.into()))?;
+        .index_of(id_col)
+        .map_err(|_| ArrowClassifyError::ColumnNotFound(id_col.into()))?;
     let seq_idx = batch
         .schema()
-        .index_of(COL_SEQUENCE)
-        .map_err(|_| ArrowClassifyError::ColumnNotFound(COL_SEQUENCE.into()))?;
-    let pair_idx = batch.schema().index_of(COL_PAIR_SEQUENCE).ok();
+        .index_of(seq_col)
+        .map_err(|_| ArrowClassifyError::ColumnNotFound(seq_col.into()))?;
+    let pair_idx = pair_col.and_then(|col| batch.schema().index_of(col).ok());
 
     // Get typed column references
     let ids = batch
@@ -165,14 +245,35 @@ pub fn batch_to_records(batch: &RecordBatch) -> Result<Vec<QueryRecord<'_>>, Arr
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| ArrowClassifyError::TypeError {
-            column: COL_ID.into(),
+            column: id_col.into(),
             expected: "Int64".into(),
             actual: format!("{:?}", batch.column(id_idx).data_type()),
         })?;
 
-    let seqs = get_binary_column(batch, seq_idx)?;
+    let seqs = get_binary_column(batch, seq_idx).map_err(|e| match e {
+        ArrowClassifyError::TypeError {
+            expected, actual, ..
+        } => ArrowClassifyError::TypeError {
+            column: seq_col.into(),
+            expected,
+            actual,
+        },
+        other => other,
+    })?;
+
     let pairs = pair_idx
-        .map(|idx| get_binary_column(batch, idx))
+        .map(|idx| {
+            get_binary_column(batch, idx).map_err(|e| match e {
+                ArrowClassifyError::TypeError {
+                    expected, actual, ..
+                } => ArrowClassifyError::TypeError {
+                    column: pair_col.unwrap_or("pair").into(),
+                    expected,
+                    actual,
+                },
+                other => other,
+            })
+        })
         .transpose()?;
 
     // Build records with zero-copy references
@@ -182,7 +283,7 @@ pub fn batch_to_records(batch: &RecordBatch) -> Result<Vec<QueryRecord<'_>>, Arr
         // Check for null ID
         if ids.is_null(i) {
             return Err(ArrowClassifyError::NullError {
-                column: COL_ID.into(),
+                column: id_col.into(),
                 row: i,
             });
         }
@@ -191,7 +292,7 @@ pub fn batch_to_records(batch: &RecordBatch) -> Result<Vec<QueryRecord<'_>>, Arr
         // Check for null sequence
         if seqs.is_null(i) {
             return Err(ArrowClassifyError::NullError {
-                column: COL_SEQUENCE.into(),
+                column: seq_col.into(),
                 row: i,
             });
         }
@@ -433,6 +534,296 @@ mod tests {
             result.unwrap_err(),
             ArrowClassifyError::NullError { column, row } if column == COL_SEQUENCE && row == 2
         ));
+    }
+
+    // -------------------------------------------------------------------------
+    // Tests for batch_to_records_with_columns
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_batch_to_records_with_columns_custom_names() {
+        // Create batch with Parquet-style column names (read_id, sequence1, sequence2)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("read_id", DataType::Int64, false),
+            Field::new("sequence1", DataType::Binary, false),
+            Field::new("sequence2", DataType::Binary, true),
+        ]));
+
+        let id_array = Int64Array::from(vec![1, 2]);
+        let seq_array = BinaryArray::from_iter_values([b"ACGT" as &[u8], b"TGCA"]);
+        let pair_array = BinaryArray::from_iter([Some(b"AAAA" as &[u8]), Some(b"TTTT")]);
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(id_array),
+                Arc::new(seq_array),
+                Arc::new(pair_array),
+            ],
+        )
+        .unwrap();
+
+        // Test custom column mapping
+        let records =
+            batch_to_records_with_columns(&batch, "read_id", "sequence1", Some("sequence2"))
+                .unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0, 1);
+        assert_eq!(records[0].1, b"ACGT");
+        assert_eq!(records[0].2, Some(b"AAAA" as &[u8]));
+
+        assert_eq!(records[1].0, 2);
+        assert_eq!(records[1].1, b"TGCA");
+        assert_eq!(records[1].2, Some(b"TTTT" as &[u8]));
+    }
+
+    #[test]
+    fn test_batch_to_records_with_columns_single_end() {
+        // Test without pair column
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("my_id", DataType::Int64, false),
+            Field::new("my_seq", DataType::Binary, false),
+        ]));
+
+        let id_array = Int64Array::from(vec![1, 2, 3]);
+        let seq_array = BinaryArray::from_iter_values([b"ACGT" as &[u8], b"TGCA", b"GGCC"]);
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap();
+
+        let records = batch_to_records_with_columns(&batch, "my_id", "my_seq", None).unwrap();
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].0, 1);
+        assert_eq!(records[0].1, b"ACGT");
+        assert!(records[0].2.is_none());
+
+        assert_eq!(records[2].0, 3);
+        assert_eq!(records[2].1, b"GGCC");
+    }
+
+    #[test]
+    fn test_batch_to_records_with_columns_zero_copy() {
+        // Verify zero-copy: pointers should point into Arrow buffer
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id_col", DataType::Int64, false),
+            Field::new("seq_col", DataType::Binary, false),
+        ]));
+
+        let id_array = Int64Array::from(vec![1, 2]);
+        let seq_array = BinaryArray::from_iter_values([b"ACGTACGTACGT" as &[u8], b"TGCATGCATGCA"]);
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap();
+
+        let records = batch_to_records_with_columns(&batch, "id_col", "seq_col", None).unwrap();
+
+        // Get pointer to the sequence data in records
+        let record_ptr = records[0].1.as_ptr();
+
+        // Get pointer to the underlying Arrow buffer
+        let seq_col = batch.column(1);
+        let binary_arr = seq_col.as_any().downcast_ref::<BinaryArray>().unwrap();
+        let arrow_ptr = binary_arr.value(0).as_ptr();
+
+        // Verify zero-copy: pointers should be identical
+        assert_eq!(
+            record_ptr, arrow_ptr,
+            "Record should point directly into Arrow buffer"
+        );
+    }
+
+    #[test]
+    fn test_batch_to_records_with_columns_missing_id() {
+        // Use a non-empty batch so we don't early-return before column lookup
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("wrong_id", DataType::Int64, false),
+            Field::new("sequence", DataType::Binary, false),
+        ]));
+
+        let id_array = Int64Array::from(vec![1]);
+        let seq_array = BinaryArray::from_iter_values([b"ACGT" as &[u8]]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap();
+
+        let result = batch_to_records_with_columns(&batch, "id", "sequence", None);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ArrowClassifyError::ColumnNotFound(col) if col == "id"
+        ));
+    }
+
+    #[test]
+    fn test_batch_to_records_with_columns_missing_sequence() {
+        // Use a non-empty batch so we don't early-return before column lookup
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("wrong_seq", DataType::Binary, false),
+        ]));
+
+        let id_array = Int64Array::from(vec![1]);
+        let seq_array = BinaryArray::from_iter_values([b"ACGT" as &[u8]]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap();
+
+        let result = batch_to_records_with_columns(&batch, "id", "sequence", None);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ArrowClassifyError::ColumnNotFound(col) if col == "sequence"
+        ));
+    }
+
+    #[test]
+    fn test_batch_to_records_with_columns_wrong_id_type() {
+        // Use a non-empty batch so we don't early-return before type check
+        use arrow::array::StringArray;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false), // Wrong type
+            Field::new("sequence", DataType::Binary, false),
+        ]));
+
+        let id_array = StringArray::from(vec!["1"]);
+        let seq_array = BinaryArray::from_iter_values([b"ACGT" as &[u8]]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap();
+
+        let result = batch_to_records_with_columns(&batch, "id", "sequence", None);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ArrowClassifyError::TypeError { column, .. } if column == "id"
+        ));
+    }
+
+    #[test]
+    fn test_batch_to_records_with_columns_large_binary() {
+        // Test with LargeBinary arrays
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("seq", DataType::LargeBinary, false),
+            Field::new("pair", DataType::LargeBinary, true),
+        ]));
+
+        let id_array = Int64Array::from(vec![1, 2]);
+        let seq_array = LargeBinaryArray::from_iter_values([b"ACGT" as &[u8], b"TGCA"]);
+        let pair_array = LargeBinaryArray::from_iter([Some(b"AAAA" as &[u8]), None]); // Second is null
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(id_array),
+                Arc::new(seq_array),
+                Arc::new(pair_array),
+            ],
+        )
+        .unwrap();
+
+        let records = batch_to_records_with_columns(&batch, "id", "seq", Some("pair")).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].1, b"ACGT");
+        assert_eq!(records[0].2, Some(b"AAAA" as &[u8]));
+        assert_eq!(records[1].1, b"TGCA");
+        assert!(records[1].2.is_none()); // Null pair is None
+    }
+
+    #[test]
+    fn test_batch_to_records_with_columns_string_arrays() {
+        // Test with Utf8 (String) arrays - used by Parquet input
+        use arrow::array::StringArray;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("seq", DataType::Utf8, false),
+            Field::new("pair", DataType::Utf8, true),
+        ]));
+
+        let id_array = Int64Array::from(vec![1, 2]);
+        let seq_array = StringArray::from(vec!["ACGT", "TGCA"]);
+        let pair_array = StringArray::from(vec![Some("AAAA"), None]);
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(id_array),
+                Arc::new(seq_array),
+                Arc::new(pair_array),
+            ],
+        )
+        .unwrap();
+
+        let records = batch_to_records_with_columns(&batch, "id", "seq", Some("pair")).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0, 1);
+        assert_eq!(records[0].1, b"ACGT");
+        assert_eq!(records[0].2, Some(b"AAAA" as &[u8]));
+        assert_eq!(records[1].0, 2);
+        assert_eq!(records[1].1, b"TGCA");
+        assert!(records[1].2.is_none()); // Null pair is None
+    }
+
+    #[test]
+    fn test_batch_to_records_with_columns_string_zero_copy() {
+        // Verify zero-copy for String arrays
+        use arrow::array::StringArray;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("seq", DataType::Utf8, false),
+        ]));
+
+        let id_array = Int64Array::from(vec![1]);
+        let seq_array = StringArray::from(vec!["ACGTACGTACGT"]);
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap();
+
+        let records = batch_to_records_with_columns(&batch, "id", "seq", None).unwrap();
+
+        // Get pointer to the sequence data in records
+        let record_ptr = records[0].1.as_ptr();
+
+        // Get pointer to the underlying Arrow buffer
+        let seq_col = batch.column(1);
+        let string_arr = seq_col.as_any().downcast_ref::<StringArray>().unwrap();
+        let arrow_ptr = string_arr.value(0).as_bytes().as_ptr();
+
+        // Verify zero-copy: pointers should be identical
+        assert_eq!(
+            record_ptr, arrow_ptr,
+            "Record should point directly into Arrow buffer"
+        );
+    }
+
+    #[test]
+    fn test_batch_to_records_with_columns_large_string_arrays() {
+        // Test with LargeUtf8 (LargeString) arrays
+        use arrow::array::LargeStringArray;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("seq", DataType::LargeUtf8, false),
+        ]));
+
+        let id_array = Int64Array::from(vec![1, 2]);
+        let seq_array = LargeStringArray::from(vec!["ACGT", "TGCA"]);
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap();
+
+        let records = batch_to_records_with_columns(&batch, "id", "seq", None).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].1, b"ACGT");
+        assert_eq!(records[1].1, b"TGCA");
     }
 
     #[test]
