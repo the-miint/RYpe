@@ -7,11 +7,8 @@ pub mod inspect;
 
 pub use args::{ClassifyCommands, Cli, Commands, IndexCommands, InspectCommands};
 pub use helpers::{
-    is_parquet_input, load_index_metadata, sanitize_bucket_name, stacked_batches_to_records,
-    OutputFormat, OutputWriter, PrefetchingIoHandler, PrefetchingParquetReader,
+    is_parquet_input, load_index_metadata, stacked_batches_to_records, OutputFormat, OutputWriter,
+    PrefetchingIoHandler, PrefetchingParquetReader,
 };
-pub use index::{
-    add_reference_file_to_index, bucket_add_from_config, build_index_from_config,
-    build_parquet_index_from_config, create_parquet_index_from_refs,
-};
+pub use index::{build_parquet_index_from_config, create_parquet_index_from_refs};
 pub use inspect::inspect_matches;

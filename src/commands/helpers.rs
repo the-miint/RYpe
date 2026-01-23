@@ -20,7 +20,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use rype::memory::parse_byte_suffix;
-use rype::{FirstErrorCapture, Index, IndexMetadata, MainIndexManifest};
+use rype::{FirstErrorCapture, IndexMetadata};
 
 /// Owned record type: (query_id, seq1, optional_seq2)
 pub type OwnedRecord = (i64, Vec<u8>, Option<Vec<u8>>);
@@ -56,18 +56,6 @@ pub fn parse_bloom_fpp(s: &str) -> Result<f64, String> {
     Ok(fpp)
 }
 
-/// Parse shard format argument ("legacy" or "parquet")
-pub fn parse_shard_format(s: &str) -> Result<String, String> {
-    match s.to_lowercase().as_str() {
-        "legacy" | "ryxs" => Ok("legacy".to_string()),
-        "parquet" | "pq" => Ok("parquet".to_string()),
-        _ => Err(format!(
-            "Unknown format '{}'. Valid options: legacy, parquet",
-            s
-        )),
-    }
-}
-
 /// Sanitize bucket names by replacing nonprintable characters with "_"
 pub fn sanitize_bucket_name(name: &str) -> String {
     name.chars()
@@ -81,14 +69,11 @@ pub fn sanitize_bucket_name(name: &str) -> String {
         .collect()
 }
 
-/// Load metadata from Parquet, sharded, or single-file indices.
+/// Load metadata from a Parquet inverted index.
 ///
-/// This helper handles:
-/// - Parquet inverted index directories (with manifest.toml)
-/// - Sharded main indices (with .manifest and .shard.* files)
-/// - Single-file indices (.ryidx)
+/// This helper handles Parquet inverted index directories (with manifest.toml).
 pub fn load_index_metadata(path: &Path) -> Result<IndexMetadata> {
-    // Check for Parquet format first (directory with manifest.toml)
+    // Parquet format (directory with manifest.toml)
     if rype::is_parquet_index(path) {
         let manifest = rype::ParquetManifest::load(path)?;
         let (bucket_names, bucket_sources) = rype::parquet_index::read_buckets_parquet(path)?;
@@ -102,14 +87,10 @@ pub fn load_index_metadata(path: &Path) -> Result<IndexMetadata> {
         });
     }
 
-    // Check for sharded main index
-    if MainIndexManifest::is_sharded(path) {
-        let manifest = MainIndexManifest::load(&MainIndexManifest::manifest_path(path))?;
-        Ok(manifest.to_metadata())
-    } else {
-        // Single-file index
-        Ok(Index::load_metadata(path)?)
-    }
+    Err(anyhow!(
+        "Invalid index format: expected Parquet index directory (.ryxdi/) at {:?}",
+        path
+    ))
 }
 
 /// Type alias for batch data sent through the prefetch channel.
@@ -378,16 +359,6 @@ impl PrefetchingIoHandler {
                 }
             }
         }
-    }
-
-    /// Write TSV header to output.
-    pub fn write_header(&mut self, header: &[u8]) -> Result<()> {
-        self.writer.write_header(header)
-    }
-
-    /// Write data chunk to the output.
-    pub fn write(&mut self, data: Vec<u8>) -> Result<()> {
-        self.writer.write_chunk(data)
     }
 
     /// Flush the output and wait for the prefetch thread to complete.

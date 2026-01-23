@@ -41,7 +41,7 @@
 //! All public types in this module are `Send + Sync`:
 //!
 //! - `ArrowClassifyError`: Safe to send across threads
-//! - `IndexStreamClassifier<'a>`: Safe to send if the referenced `Index` is `Sync`
+//! - `ShardedStreamClassifier<'a>`: Safe to send if the referenced index is `Sync`
 //!
 //! Classification functions use internal rayon parallelism. The streaming classifiers
 //! are designed for single-threaded use per stream instance, but multiple streams can
@@ -57,17 +57,17 @@
 //! ## Example
 //!
 //! ```ignore
-//! use rype::arrow::{classify_arrow_batch, result_schema};
-//! use rype::Index;
+//! use rype::arrow::{classify_arrow_batch_sharded, result_schema};
+//! use rype::ShardedInvertedIndex;
 //!
 //! // Load index
-//! let index = Index::load("reference.ryidx")?;
+//! let index = ShardedInvertedIndex::open("reference.ryxdi")?;
 //!
 //! // Create or receive Arrow batch from DuckDB, Parquet, etc.
 //! let sequences: RecordBatch = /* ... */;
 //!
-//! // Classify
-//! let results = classify_arrow_batch(&index, None, &sequences, 0.1)?;
+//! // Classify (use_merge_join=true for better performance with overlapping minimizers)
+//! let results = classify_arrow_batch_sharded(&index, None, &sequences, 0.1, true)?;
 //!
 //! // Results can be passed to DuckDB, written to Parquet, etc.
 //! assert_eq!(results.schema(), result_schema());
@@ -87,56 +87,15 @@ pub use schema::{
     result_schema, validate_input_schema, COL_BUCKET_ID, COL_ID, COL_PAIR_SEQUENCE, COL_QUERY_ID,
     COL_SCORE, COL_SEQUENCE,
 };
-pub use stream::IndexStreamClassifier;
+pub use stream::ShardedStreamClassifier;
 
 use std::collections::HashSet;
 
 use arrow::record_batch::RecordBatch;
 
 use crate::{
-    classify_batch, classify_batch_sharded_main, classify_batch_sharded_merge_join,
-    classify_batch_sharded_sequential, Index, ShardedInvertedIndex, ShardedMainIndex,
+    classify_batch_sharded_merge_join, classify_batch_sharded_sequential, ShardedInvertedIndex,
 };
-
-/// Classify sequences from an Arrow RecordBatch using an Index.
-///
-/// This is a convenience function that combines input conversion, classification,
-/// and output conversion in a single call.
-///
-/// # Arguments
-///
-/// * `index` - The index to classify against
-/// * `negative_mins` - Optional set of minimizers to exclude from queries
-/// * `batch` - Input RecordBatch with sequences (see module docs for schema)
-/// * `threshold` - Minimum score threshold for reporting hits (0.0-1.0)
-///
-/// # Returns
-///
-/// A RecordBatch containing classification results (query_id, bucket_id, score).
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Schema validation fails
-/// - Required columns contain null values
-/// - Type conversion fails
-///
-/// # Example
-///
-/// ```ignore
-/// let results = classify_arrow_batch(&index, None, &sequences, 0.1)?;
-/// println!("Found {} hits", results.num_rows());
-/// ```
-pub fn classify_arrow_batch(
-    index: &Index,
-    negative_mins: Option<&HashSet<u64>>,
-    batch: &RecordBatch,
-    threshold: f64,
-) -> Result<RecordBatch, ArrowClassifyError> {
-    let records = batch_to_records(batch)?;
-    let hits = classify_batch(index, negative_mins, &records, threshold);
-    hits_to_record_batch(hits)
-}
 
 /// Classify sequences from an Arrow RecordBatch using a ShardedInvertedIndex.
 ///
@@ -168,7 +127,7 @@ pub fn classify_arrow_batch(
 /// # Example
 ///
 /// ```ignore
-/// let sharded = ShardedInvertedIndex::load("index.ryxdi.manifest")?;
+/// let sharded = ShardedInvertedIndex::open("index.ryxdi")?;
 /// let results = classify_arrow_batch_sharded(&sharded, None, &sequences, 0.1, true)?;
 /// ```
 pub fn classify_arrow_batch_sharded(
@@ -188,49 +147,17 @@ pub fn classify_arrow_batch_sharded(
     hits_to_record_batch(hits)
 }
 
-/// Classify sequences from an Arrow RecordBatch using a ShardedMainIndex.
-///
-/// For very large main indices that don't fit in memory, loads index shards
-/// sequentially during classification.
-///
-/// # Memory Complexity
-///
-/// O(batch_size × minimizers_per_read) + O(single_shard_buckets)
-///
-/// # Arguments
-///
-/// * `sharded` - The sharded main index
-/// * `negative_mins` - Optional set of minimizers to exclude from queries
-/// * `batch` - Input RecordBatch with sequences (see module docs for schema)
-/// * `threshold` - Minimum score threshold for reporting hits (0.0-1.0)
-///
-/// # Returns
-///
-/// A RecordBatch containing classification results (query_id, bucket_id, score).
-///
-/// # Errors
-///
-/// Returns an error if schema validation fails, shards cannot be loaded, or
-/// type conversion fails.
-pub fn classify_arrow_batch_sharded_main(
-    sharded: &ShardedMainIndex,
-    negative_mins: Option<&HashSet<u64>>,
-    batch: &RecordBatch,
-    threshold: f64,
-) -> Result<RecordBatch, ArrowClassifyError> {
-    let records = batch_to_records(batch)?;
-    let hits = classify_batch_sharded_main(sharded, negative_mins, &records, threshold)
-        .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
-    hits_to_record_batch(hits)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MinimizerWorkspace;
+    use crate::{
+        create_parquet_inverted_index, extract_into, BucketData, MinimizerWorkspace,
+        ParquetWriteOptions,
+    };
     use arrow::array::{BinaryArray, Float64Array, Int64Array, UInt32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+    use tempfile::tempdir;
 
     /// Helper to generate a DNA sequence.
     fn generate_sequence(len: usize, seed: u8) -> Vec<u8> {
@@ -251,28 +178,42 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap()
     }
 
-    /// Create a simple test index.
-    fn create_test_index() -> Index {
-        let mut index = Index::new(16, 5, 0x12345).unwrap();
+    /// Create a test Parquet index
+    fn create_test_parquet_index() -> (tempfile::TempDir, ShardedInvertedIndex) {
+        let dir = tempdir().unwrap();
+        let index_path = dir.path().join("test.ryxdi");
+
         let mut ws = MinimizerWorkspace::new();
-
         let ref_seq = generate_sequence(100, 0);
-        index.add_record(1, "ref1", &ref_seq, &mut ws);
-        index.finalize_bucket(1);
-        index.bucket_names.insert(1, "test_bucket".into());
+        extract_into(&ref_seq, 16, 5, 0x12345, &mut ws);
+        let mut mins: Vec<u64> = ws.buffer.drain(..).collect();
+        mins.sort();
+        mins.dedup();
 
-        index
+        let buckets = vec![BucketData {
+            bucket_id: 1,
+            bucket_name: "test_bucket".to_string(),
+            sources: vec!["ref1".to_string()],
+            minimizers: mins,
+        }];
+
+        let options = ParquetWriteOptions::default();
+        create_parquet_inverted_index(&index_path, buckets, 16, 5, 0x12345, None, Some(&options))
+            .unwrap();
+
+        let index = ShardedInvertedIndex::open(&index_path).unwrap();
+        (dir, index)
     }
 
     #[test]
-    fn test_classify_arrow_batch_basic() {
-        let index = create_test_index();
+    fn test_classify_arrow_batch_sharded_basic() {
+        let (_dir, index) = create_test_parquet_index();
 
         // Query that matches reference
         let query_seq = generate_sequence(100, 0);
         let batch = make_test_batch(&[101], &[&query_seq]);
 
-        let result = classify_arrow_batch(&index, None, &batch, 0.0).unwrap();
+        let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true).unwrap();
 
         assert!(result.num_rows() > 0, "Should have classification results");
         assert_eq!(result.num_columns(), 3);
@@ -284,28 +225,28 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_arrow_batch_no_matches() {
-        let index = create_test_index();
+    fn test_classify_arrow_batch_sharded_no_matches() {
+        let (_dir, index) = create_test_parquet_index();
 
         // Query with completely different sequence
         let query_seq = vec![b'N'; 100]; // All N's produce no minimizers
         let batch = make_test_batch(&[101], &[&query_seq]);
 
-        let result = classify_arrow_batch(&index, None, &batch, 0.5).unwrap();
+        let result = classify_arrow_batch_sharded(&index, None, &batch, 0.5, true).unwrap();
 
         // May have 0 rows if nothing matches threshold
         assert_eq!(result.num_columns(), 3);
     }
 
     #[test]
-    fn test_classify_arrow_batch_multiple_queries() {
-        let index = create_test_index();
+    fn test_classify_arrow_batch_sharded_multiple_queries() {
+        let (_dir, index) = create_test_parquet_index();
 
         let query1 = generate_sequence(100, 0); // Matches ref
         let query2 = generate_sequence(100, 1); // Different pattern
         let batch = make_test_batch(&[1, 2], &[&query1, &query2]);
 
-        let result = classify_arrow_batch(&index, None, &batch, 0.0).unwrap();
+        let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true).unwrap();
 
         // Should have results
         assert!(result.num_rows() >= 1);
@@ -335,8 +276,8 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_arrow_batch_empty() {
-        let index = create_test_index();
+    fn test_classify_arrow_batch_sharded_empty() {
+        let (_dir, index) = create_test_parquet_index();
 
         let schema = Arc::new(Schema::new(vec![
             Field::new(COL_ID, DataType::Int64, false),
@@ -344,13 +285,13 @@ mod tests {
         ]));
         let empty_batch = RecordBatch::new_empty(schema);
 
-        let result = classify_arrow_batch(&index, None, &empty_batch, 0.1).unwrap();
+        let result = classify_arrow_batch_sharded(&index, None, &empty_batch, 0.1, true).unwrap();
         assert_eq!(result.num_rows(), 0);
     }
 
     #[test]
-    fn test_classify_arrow_batch_invalid_schema() {
-        let index = create_test_index();
+    fn test_classify_arrow_batch_sharded_invalid_schema() {
+        let (_dir, index) = create_test_parquet_index();
 
         // Wrong ID type
         let schema = Arc::new(Schema::new(vec![
@@ -359,64 +300,25 @@ mod tests {
         ]));
         let batch = RecordBatch::new_empty(schema);
 
-        let result = classify_arrow_batch(&index, None, &batch, 0.1);
+        let result = classify_arrow_batch_sharded(&index, None, &batch, 0.1, true);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_classify_arrow_matches_regular_api() {
-        let index = create_test_index();
+    fn test_classify_arrow_batch_sharded_merge_join_vs_sequential() {
+        let (_dir, index) = create_test_parquet_index();
 
-        // Create test data
-        let query1 = generate_sequence(100, 0);
-        let query2 = generate_sequence(100, 2);
-        let threshold = 0.1;
+        let query_seq = generate_sequence(100, 0);
+        let batch = make_test_batch(&[1], &[&query_seq]);
 
-        // Regular API
-        let records: Vec<crate::QueryRecord> =
-            vec![(1, query1.as_slice(), None), (2, query2.as_slice(), None)];
-        let regular_hits = classify_batch(&index, None, &records, threshold);
+        // Both strategies should produce the same results
+        let result_merge = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true).unwrap();
+        let result_seq = classify_arrow_batch_sharded(&index, None, &batch, 0.0, false).unwrap();
 
-        // Arrow API
-        let batch = make_test_batch(&[1, 2], &[&query1, &query2]);
-        let arrow_result = classify_arrow_batch(&index, None, &batch, threshold).unwrap();
-
-        // Results should be consistent
         assert_eq!(
-            regular_hits.len(),
-            arrow_result.num_rows(),
-            "Arrow and regular API should produce same number of hits"
+            result_merge.num_rows(),
+            result_seq.num_rows(),
+            "Merge-join and sequential should produce same number of results"
         );
-
-        // Verify hit content matches (may be in different order)
-        let arrow_query_ids = arrow_result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let arrow_bucket_ids = arrow_result
-            .column(1)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-        let arrow_scores = arrow_result
-            .column(2)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-
-        for regular_hit in &regular_hits {
-            // Find matching hit in arrow results
-            let found = (0..arrow_result.num_rows()).any(|i| {
-                arrow_query_ids.value(i) == regular_hit.query_id
-                    && arrow_bucket_ids.value(i) == regular_hit.bucket_id
-                    && (arrow_scores.value(i) - regular_hit.score).abs() < 1e-10
-            });
-            assert!(
-                found,
-                "Regular hit {:?} not found in Arrow results",
-                regular_hit
-            );
-        }
     }
 }

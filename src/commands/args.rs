@@ -3,9 +3,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use super::helpers::{
-    parse_bloom_fpp, parse_max_memory_arg, parse_shard_format, parse_shard_size_arg,
-};
+use super::helpers::{parse_bloom_fpp, parse_max_memory_arg, parse_shard_size_arg};
 
 #[derive(Parser)]
 #[command(name = "rype")]
@@ -14,9 +12,8 @@ use super::helpers::{
     long_about = "Rype: High-performance genomic sequence classification using minimizer-based k-mer sketching in RY (purine/pyrimidine) space.
 
 WORKFLOW:
-  1. Create an index:     rype index create -o index.ryidx -r refs.fasta
-  2. (Optional) Invert:   rype index invert -i index.ryidx
-  3. Classify reads:      rype classify run -i index.ryidx -1 reads.fq
+  1. Create an index:     rype index create -o index.ryxdi -r refs.fasta
+  2. Classify reads:      rype classify run -i index.ryxdi -1 reads.fq
 
 INPUT FORMATS:
   FASTA (.fa, .fasta, .fna) and FASTQ (.fq, .fastq) files are supported.
@@ -37,25 +34,19 @@ OUTPUT FORMAT (classify):
 )]
 #[command(after_help = "EXAMPLES:
   # Create index from reference genomes
-  rype index create -o bacteria.ryidx -r genome1.fna -r genome2.fna -k 64 -w 50
+  rype index create -o bacteria.ryxdi -r genome1.fna -r genome2.fna -k 64 -w 50
 
   # Create index with one bucket per sequence
-  rype index create -o genes.ryidx -r genes.fasta --separate-buckets
-
-  # Build inverted index for faster classification
-  rype index invert -i bacteria.ryidx
+  rype index create -o genes.ryxdi -r genes.fasta --separate-buckets
 
   # Classify single-end reads
-  rype classify run -i bacteria.ryidx -1 reads.fq -t 0.1 -o results.tsv
+  rype classify run -i bacteria.ryxdi -1 reads.fq -t 0.1 -o results.tsv
 
   # Classify paired-end reads with negative filtering
-  rype classify run -i bacteria.ryidx -N host.ryidx -1 R1.fq -2 R2.fq -t 0.1
-
-  # Use inverted index for faster classification
-  rype classify run -i bacteria.ryidx -I -1 reads.fq
+  rype classify run -i bacteria.ryxdi -N host.ryxdi -1 R1.fq -2 R2.fq -t 0.1
 
   # Aggregate mode for higher sensitivity
-  rype classify aggregate -i bacteria.ryidx -1 R1.fq -2 R2.fq -t 0.05")]
+  rype classify aggregate -i bacteria.ryxdi -1 R1.fq -2 R2.fq -t 0.05")]
 pub struct Cli {
     /// Enable verbose progress output with timestamps
     #[arg(short, long, global = true)]
@@ -85,18 +76,18 @@ pub enum IndexCommands {
     /// Create a new index from reference sequences
     #[command(after_help = "EXAMPLES:
   # Basic index creation
-  rype index create -o index.ryidx -r genome.fasta
+  rype index create -o index.ryxdi -r genome.fasta
 
   # Multiple references, all in one bucket
-  rype index create -o index.ryidx -r chr1.fa -r chr2.fa
+  rype index create -o index.ryxdi -r chr1.fa -r chr2.fa
 
   # One bucket per sequence (e.g., for gene-level classification)
-  rype index create -o genes.ryidx -r genes.fasta --separate-buckets
+  rype index create -o genes.ryxdi -r genes.fasta --separate-buckets
 
   # Large index with sharding (for memory-constrained systems)
-  rype index create -o large.ryidx -r refs.fa --max-shard-size 1073741824")]
+  rype index create -o large.ryxdi -r refs.fa --max-shard-size 1073741824")]
     Create {
-        /// Output index file path (.ryidx extension recommended)
+        /// Output index path (.ryxdi directory will be created)
         #[arg(short, long)]
         output: PathBuf,
 
@@ -132,31 +123,24 @@ pub enum IndexCommands {
         #[arg(long, value_parser = parse_shard_size_arg)]
         max_shard_size: Option<usize>,
 
-        /// Create Parquet inverted index directly (bypasses main index).
-        /// Output will be a directory (e.g., index.ryxdi/) containing Parquet files.
-        /// This is the recommended format for large indices.
-        #[arg(long)]
-        parquet: bool,
-
-        /// Parquet row group size (rows per group). Larger = better compression.
-        /// Only used when --parquet is specified.
+        /// Row group size (rows per group). Larger = better compression.
         #[arg(long, default_value_t = 100_000)]
-        parquet_row_group_size: usize,
+        row_group_size: usize,
 
         /// Use Zstd compression instead of Snappy for Parquet files.
-        /// Better compression ratio but slower. Only used with --parquet.
+        /// Better compression ratio but slower.
         #[arg(long)]
-        parquet_zstd: bool,
+        zstd: bool,
 
-        /// Enable bloom filters in Parquet files for faster lookups.
-        /// Increases file size slightly. Only used with --parquet.
+        /// Enable bloom filters for faster lookups.
+        /// Increases file size slightly.
         #[arg(long)]
-        parquet_bloom_filter: bool,
+        bloom_filter: bool,
 
         /// Bloom filter false positive probability (0.0-1.0).
-        /// Lower = more accurate but larger files. Only used with --parquet-bloom-filter.
+        /// Lower = more accurate but larger files. Only used with --bloom-filter.
         #[arg(long, default_value = "0.05", value_parser = parse_bloom_fpp)]
-        parquet_bloom_fpp: f64,
+        bloom_fpp: f64,
 
         /// Print timing diagnostics to stderr for performance analysis.
         #[arg(long)]
@@ -165,18 +149,14 @@ pub enum IndexCommands {
 
     /// Show index statistics and bucket information
     Stats {
-        /// Path to index file (.ryidx)
+        /// Path to index directory (.ryxdi)
         #[arg(short, long)]
         index: PathBuf,
-
-        /// Show inverted index stats instead of primary index
-        #[arg(short = 'I', long)]
-        inverted: bool,
     },
 
     /// Show source file paths or sequence IDs for a bucket
     BucketSourceDetail {
-        /// Path to index file (.ryidx)
+        /// Path to index directory (.ryxdi)
         #[arg(short, long)]
         index: PathBuf,
 
@@ -193,9 +173,9 @@ pub enum IndexCommands {
         ids: bool,
     },
 
-    /// Add a new reference file as a new bucket to an existing index
+    /// Add a new reference file as a new bucket to an existing index (development pending)
     BucketAdd {
-        /// Path to existing index file
+        /// Path to existing index directory
         #[arg(short, long)]
         index: PathBuf,
 
@@ -204,26 +184,14 @@ pub enum IndexCommands {
         reference: PathBuf,
     },
 
-    /// Merge multiple indices into one (buckets renumbered to avoid conflicts)
-    Merge {
-        /// Output path for merged index
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// Input indices to merge (must have same k, w, salt)
-        #[arg(short, long, required = true)]
-        inputs: Vec<PathBuf>,
-    },
-
     /// Build index from a TOML configuration file (see CONFIG FORMAT below)
     #[command(after_help = "CONFIG FORMAT (from-config):
   [index]
   k = 64                           # K-mer size (16, 32, or 64)
   window = 50                      # Minimizer window size
   salt = 0x5555555555555555        # Hash salt (hex)
-  output = \"index.ryidx\"           # Output path
-  max_shard_size = 1073741824      # Optional: shard main index (bytes)
-  invert = true                    # Optional: create inverted index
+  output = \"index.ryxdi\"           # Output path (directory will be created)
+  max_shard_size = 1073741824      # Optional: shard size (bytes)
 
   [buckets.BucketName]             # Define a bucket
   files = [\"ref1.fa\", \"ref2.fa\"]   # Files for this bucket
@@ -232,55 +200,38 @@ pub enum IndexCommands {
   files = [\"other.fasta\"]
 
 CLI OPTIONS OVERRIDE CONFIG FILE:
-  --max-shard-size overrides [index].max_shard_size
-  --invert (-I) enables inverted index creation (even without invert = true)
-
-INVERTED INDEX SHARDING:
-  Inverted shards are automatically created with 1:1 correspondence to main shards.
-  - Sharded main index (--max-shard-size): creates N inverted shards (1:1)
-  - Single-file main index: creates 1 inverted shard")]
+  --max-shard-size overrides [index].max_shard_size")]
     FromConfig {
         /// Path to TOML config file
         #[arg(short, long)]
         config: PathBuf,
 
-        /// Maximum shard size for main index (e.g., "1G", overrides config)
+        /// Maximum shard size (e.g., "1G", overrides config)
         #[arg(long, value_parser = parse_shard_size_arg)]
         max_shard_size: Option<usize>,
 
-        /// Create inverted index after building (overrides config)
-        #[arg(short = 'I', long)]
-        invert: bool,
-
-        /// Create Parquet inverted index directly (bypasses main index).
-        /// Output will be a directory (e.g., index.ryxdi/) containing Parquet files.
-        #[arg(long)]
-        parquet: bool,
-
-        /// Parquet row group size (rows per group). Larger = better compression,
-        /// but less effective filtering. Only used with --parquet.
+        /// Row group size (rows per group). Larger = better compression.
         #[arg(long, default_value_t = 100_000)]
-        parquet_row_group_size: usize,
+        row_group_size: usize,
 
-        /// Enable bloom filters in Parquet files for faster lookups.
-        /// Only used with --parquet.
+        /// Enable bloom filters for faster lookups.
         #[arg(long)]
-        parquet_bloom_filter: bool,
+        bloom_filter: bool,
 
         /// Bloom filter false positive probability (0.0-1.0).
-        /// Only used with --parquet-bloom-filter.
+        /// Only used with --bloom-filter.
         #[arg(long, default_value = "0.05", value_parser = parse_bloom_fpp)]
-        parquet_bloom_fpp: f64,
+        bloom_fpp: f64,
 
         /// Print timing diagnostics to stderr for performance analysis.
         #[arg(long)]
         timing: bool,
     },
 
-    /// Add files to existing index using TOML config (see CONFIG FORMAT below)
+    /// Add files to existing index using TOML config (development pending)
     #[command(after_help = "CONFIG FORMAT (bucket-add-config):
   [target]
-  index = \"existing.ryidx\"         # Index to modify
+  index = \"existing.ryxdi\"         # Index to modify
 
   [assignment]
   mode = \"new_bucket\"              # or \"existing_bucket\" or \"best_bin\"
@@ -297,95 +248,11 @@ INVERTED INDEX SHARDING:
         config: PathBuf,
     },
 
-    /// Create inverted index for faster classification (2-10x speedup)
-    #[command(
-        after_help = "The inverted index maps minimizers to buckets instead of buckets to
-minimizers, enabling O(Q log U) lookups instead of O(B × Q × log M).
-
-Creates bucket-partitioned shards:
-- Sharded main index: creates 1:1 inverted shard correspondence
-- Single-file main index: creates a 1-shard inverted index
-
-FORMATS:
-  legacy   - Custom RYXS binary format (default, smaller files)
-  parquet  - Apache Parquet format (faster parallel I/O, requires --features parquet)
-
-USAGE:
-  rype index invert -i index.ryidx                    # Legacy format
-  rype index invert -i index.ryidx --format parquet   # Parquet format
-  rype classify run -i index.ryidx -I                 # Auto-detects format"
-    )]
-    Invert {
-        /// Path to primary index file (.ryidx)
-        #[arg(short, long)]
-        index: PathBuf,
-
-        /// Output format for inverted index shards
-        #[arg(long, default_value = "legacy", value_parser = parse_shard_format)]
-        format: String,
-
-        /// Parquet row group size (rows per group). Larger = better compression.
-        /// Only used when --format=parquet is specified.
-        #[arg(long, default_value_t = 100_000)]
-        parquet_row_group_size: usize,
-
-        /// Use Zstd compression instead of Snappy for Parquet files.
-        /// Better compression ratio but slower. Only used with --format=parquet.
-        #[arg(long)]
-        parquet_zstd: bool,
-
-        /// Enable bloom filters in Parquet files for faster lookups.
-        /// Increases file size slightly. Only used with --format=parquet.
-        #[arg(long)]
-        parquet_bloom_filter: bool,
-
-        /// Bloom filter false positive probability (0.0-1.0).
-        /// Lower = more accurate but larger files. Only used with --parquet-bloom-filter.
-        #[arg(long, default_value = "0.05", value_parser = parse_bloom_fpp)]
-        parquet_bloom_fpp: f64,
-
-        /// Print timing diagnostics to stderr for performance analysis.
-        #[arg(long)]
-        timing: bool,
-    },
-
     /// Show detailed minimizer statistics for compression analysis
     Summarize {
-        /// Path to index file (.ryidx)
+        /// Path to index directory (.ryxdi)
         #[arg(short, long)]
         index: PathBuf,
-    },
-
-    /// Convert single-file index to sharded format
-    #[command(
-        after_help = "Converts an existing single-file index (.ryidx) to sharded format.
-
-This is useful for:
-- Memory-constrained classification of large indices
-- Enabling parallel I/O during classification
-- Converting legacy indices to the more efficient sharded format
-
-USAGE:
-  rype index shard -i large.ryidx -o sharded.ryidx --max-shard-size 1G
-
-The output will be:
-  sharded.ryidx.manifest     (metadata)
-  sharded.ryidx.shard.0      (first shard)
-  sharded.ryidx.shard.1      (second shard)
-  ..."
-    )]
-    Shard {
-        /// Path to input single-file index (.ryidx)
-        #[arg(short, long)]
-        input: PathBuf,
-
-        /// Path to output sharded index (base path for .manifest and .shard.* files)
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// Maximum shard size (e.g., "1G", "512M", "100M")
-        #[arg(long, value_parser = parse_shard_size_arg)]
-        max_shard_size: usize,
     },
 }
 
@@ -419,7 +286,7 @@ WHEN TO USE 'run' vs 'aggregate':
   - Higher sensitivity (pools evidence across reads)
   - Abundance estimation")]
     Run {
-        /// Path to target index (references to classify against)
+        /// Path to target index directory (.ryxdi)
         #[arg(short, long, visible_alias = "positive-index")]
         index: PathBuf,
 
@@ -465,28 +332,22 @@ WHEN TO USE 'run' vs 'aggregate':
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Use inverted index (.ryxdi) for faster classification.
-        /// Creates index.ryxdi with: rype index invert -i index.ryidx
-        /// Recommended for large indices or repeated classifications.
-        #[arg(short = 'I', long)]
-        use_inverted: bool,
-
-        /// Use merge-join algorithm (requires --use-inverted).
+        /// Use merge-join algorithm.
         /// Faster when query and index have high overlap.
         /// May be slower for queries with many unique minimizers.
         #[arg(short = 'M', long)]
         merge_join: bool,
 
-        /// Use parallel row group processing (requires --use-inverted with Parquet index).
+        /// Use parallel row group processing.
         /// Processes each row group independently in parallel, maximizing CPU utilization.
         /// Most effective when query minimizers span entire index range (row group
         /// filtering is ineffective). Mutually exclusive with --merge-join.
         #[arg(long, conflicts_with = "merge_join")]
         parallel_rg: bool,
 
-        /// Use bloom filters for row group filtering (requires --use-inverted with Parquet index).
+        /// Use bloom filters for row group filtering.
         /// Reduces I/O by rejecting row groups that definitely don't contain query minimizers.
-        /// Only effective if index was built with --parquet-bloom-filter.
+        /// Only effective if index was built with --bloom-filter.
         #[arg(long)]
         use_bloom_filter: bool,
 
@@ -498,39 +359,6 @@ WHEN TO USE 'run' vs 'aggregate':
         parallel_input_rg: usize,
 
         /// Print timing diagnostics to stderr for performance analysis.
-        #[arg(long)]
-        timing: bool,
-    },
-
-    /// Batch classify reads (identical to 'run', kept for backwards compatibility)
-    #[command(hide = true)]
-    Batch {
-        #[arg(short, long, visible_alias = "positive-index")]
-        index: PathBuf,
-        #[arg(short = 'N', long)]
-        negative_index: Option<PathBuf>,
-        #[arg(short = '1', long)]
-        r1: PathBuf,
-        #[arg(short = '2', long)]
-        r2: Option<PathBuf>,
-        #[arg(short, long, default_value_t = 0.1)]
-        threshold: f64,
-        #[arg(long, default_value = "auto", value_parser = parse_max_memory_arg)]
-        max_memory: usize,
-        #[arg(short, long)]
-        batch_size: Option<usize>,
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-        #[arg(short = 'I', long)]
-        use_inverted: bool,
-        #[arg(short = 'M', long)]
-        merge_join: bool,
-        #[arg(long, conflicts_with = "merge_join")]
-        parallel_rg: bool,
-        #[arg(long)]
-        use_bloom_filter: bool,
-        #[arg(long, default_value_t = 0)]
-        parallel_input_rg: usize,
         #[arg(long)]
         timing: bool,
     },
@@ -555,7 +383,7 @@ THRESHOLD:
   Default 0.05 (lower than 'run') since aggregation reduces noise.
   Score represents fraction of total unique minimizers matching bucket.")]
     Aggregate {
-        /// Path to target index
+        /// Path to target index directory (.ryxdi)
         #[arg(short, long, visible_alias = "positive-index")]
         index: PathBuf,
 

@@ -369,9 +369,39 @@ impl InvertedIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indices::main::Index;
+    use crate::types::IndexMetadata;
     use anyhow::Result;
+    use std::collections::HashMap;
     use tempfile::TempDir;
+
+    /// Helper to build an InvertedIndex for testing from bucket minimizers.
+    fn build_test_inverted_index(
+        k: usize,
+        w: usize,
+        salt: u64,
+        buckets: Vec<(u32, &str, Vec<u64>)>,
+    ) -> InvertedIndex {
+        let mut bucket_map: HashMap<u32, Vec<u64>> = HashMap::new();
+        let mut bucket_names: HashMap<u32, String> = HashMap::new();
+        let mut bucket_minimizer_counts: HashMap<u32, usize> = HashMap::new();
+
+        for (id, name, mins) in buckets {
+            bucket_minimizer_counts.insert(id, mins.len());
+            bucket_map.insert(id, mins);
+            bucket_names.insert(id, name.to_string());
+        }
+
+        let metadata = IndexMetadata {
+            k,
+            w,
+            salt,
+            bucket_names,
+            bucket_sources: HashMap::new(),
+            bucket_minimizer_counts,
+        };
+
+        InvertedIndex::build_from_bucket_map(k, w, salt, &bucket_map, &metadata)
+    }
 
     #[test]
     fn test_inverted_parquet_roundtrip() -> Result<()> {
@@ -379,15 +409,16 @@ mod tests {
         let path = tmp.path().join("shard.0.parquet");
 
         // Create an inverted index
-        let mut index = Index::new(64, 50, 0xABCD).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300]);
-        index.buckets.insert(2, vec![200, 300, 400]);
-        index.buckets.insert(3, vec![500, 600]);
-        index.bucket_names.insert(1, "A".into());
-        index.bucket_names.insert(2, "B".into());
-        index.bucket_names.insert(3, "C".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(
+            64,
+            50,
+            0xABCD,
+            vec![
+                (1, "A", vec![100, 200, 300]),
+                (2, "B", vec![200, 300, 400]),
+                (3, "C", vec![500, 600]),
+            ],
+        );
         let original_minimizers = inverted.minimizers().to_vec();
         let original_bucket_ids = inverted.bucket_ids().to_vec();
 
@@ -435,8 +466,7 @@ mod tests {
         let path = tmp.path().join("empty.parquet");
 
         // Create an empty inverted index
-        let index = Index::new(64, 50, 0).unwrap();
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(64, 50, 0, vec![]);
 
         // Save as Parquet
         let shard_info = inverted.save_shard_parquet(&path, 0, None)?;
@@ -465,11 +495,8 @@ mod tests {
             u64::MAX - 1,
         ];
 
-        let mut index = Index::new(64, 50, 0x12345678).unwrap();
-        index.buckets.insert(1, minimizers.clone());
-        index.bucket_names.insert(1, "test".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted =
+            build_test_inverted_index(64, 50, 0x12345678, vec![(1, "test", minimizers.clone())]);
 
         // Save and load
         inverted.save_shard_parquet(&path, 0, None)?;
@@ -491,26 +518,14 @@ mod tests {
     }
 
     #[test]
-    fn test_inverted_parquet_load_shard_requires_params() -> Result<()> {
+    fn test_inverted_parquet_direct_load() -> Result<()> {
         let tmp = TempDir::new()?;
         let parquet_path = tmp.path().join("shard.parquet");
 
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300]);
-        index.bucket_names.insert(1, "A".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(64, 50, 0, vec![(1, "A", vec![100, 200, 300])]);
 
         // Save as Parquet
         inverted.save_shard_parquet(&parquet_path, 0, None)?;
-
-        // load_shard should error for Parquet files (they need manifest parameters)
-        let result = InvertedIndex::load_shard(&parquet_path);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Parquet shards must be loaded via ShardedInvertedIndex"));
 
         // Direct loading with params should work
         let loaded = InvertedIndex::load_shard_parquet_with_params(
@@ -531,17 +546,18 @@ mod tests {
         let path = tmp.path().join("many_buckets.parquet");
 
         // Create index with many buckets sharing some minimizers
-        let mut index = Index::new(64, 50, 0xBEEF).unwrap();
         let shared = vec![100, 200, 300, 400, 500];
-        for i in 0..50 {
-            let mut mins = shared.clone();
-            mins.push(1000 + i as u64); // Each bucket has one unique minimizer
-            mins.sort();
-            index.buckets.insert(i, mins);
-            index.bucket_names.insert(i, format!("bucket_{}", i));
-        }
+        let buckets: Vec<(u32, &str, Vec<u64>)> = (0..50u32)
+            .map(|i| {
+                let mut mins = shared.clone();
+                mins.push(1000 + i as u64); // Each bucket has one unique minimizer
+                mins.sort();
+                let name: &str = Box::leak(format!("bucket_{}", i).into_boxed_str());
+                (i, name, mins)
+            })
+            .collect();
 
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(64, 50, 0xBEEF, buckets);
 
         // Save and load
         inverted.save_shard_parquet(&path, 0, None)?;

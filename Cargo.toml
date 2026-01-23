@@ -39,24 +39,6 @@ tempfile = "3.24.0"
 name = "debug_inverted"
 path = "src/bin/debug_inverted.rs"
 
-[[example]]
-name = "parquet_poc"
-
-[[example]]
-name = "parquet_main_poc"
-
-[[example]]
-name = "bench_fixed_impl"
-
-[[example]]
-name = "explore_row_group_stats"
-
-[[example]]
-name = "bench_filtered_load"
-
-[[example]]
-name = "bench_e2e_classification"
-
 [features]
 default = []
 # The arrow-ffi feature enables the FFI module for exporting Arrow RecordBatches

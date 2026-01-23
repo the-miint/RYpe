@@ -1,95 +1,17 @@
-//! Constants used throughout the rype library for safety limits, performance tuning,
-//! and binary format definitions.
+//! Constants used throughout the rype library for safety limits and performance tuning.
 //!
 //! Centralizing these constants ensures consistency across the codebase and makes
 //! it easy to adjust values when needed.
 
 // ============================================================================
-// I/O Buffer Sizes
+// Safety Limits for Parquet Inverted Index
 // ============================================================================
-
-/// Buffer size for writing binary index files (8MB).
-pub(crate) const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024;
-
-/// Buffer size for reading binary index files (8MB).
-pub(crate) const READ_BUF_SIZE: usize = 8 * 1024 * 1024;
-
-// ============================================================================
-// Binary Format Magic Bytes
-// ============================================================================
-
-/// Magic bytes for single-file main index files (.ryidx).
-pub(crate) const SINGLE_FILE_INDEX_MAGIC: &[u8; 4] = b"RYP5";
-
-/// Magic bytes for inverted index shard files (.ryxdi.shard.*).
-pub(crate) const SHARD_MAGIC: &[u8; 4] = b"RYXS";
-
-/// Magic bytes for inverted index manifest files (.ryxdi.manifest).
-pub(crate) const MANIFEST_MAGIC: &[u8; 4] = b"RYXM";
-
-/// Magic bytes for sharded main index manifest files (.ryidx.manifest).
-pub(crate) const MAIN_MANIFEST_MAGIC: &[u8; 4] = b"RYPM";
-
-/// Magic bytes for sharded main index shard files (.ryidx.shard.*).
-pub(crate) const MAIN_SHARD_MAGIC: &[u8; 4] = b"RYPS";
-
-// ============================================================================
-// Binary Format Versions
-// ============================================================================
-
-/// Current version for single-file main index files.
-pub(crate) const SINGLE_FILE_INDEX_VERSION: u32 = 5;
-
-/// Current version for inverted index shard files.
-pub(crate) const SHARD_VERSION: u32 = 1;
-
-/// Current version for inverted index manifest files.
-/// Supports versions 3-5 for backwards compatibility.
-pub(crate) const MANIFEST_VERSION: u32 = 5;
-
-/// Current version for sharded main index manifest files.
-pub(crate) const MAIN_MANIFEST_VERSION: u32 = 2;
-
-/// Current version for sharded main index shard files.
-pub(crate) const MAIN_SHARD_VERSION: u32 = 2;
-
-// ============================================================================
-// Safety Limits for Loading Files
-// ============================================================================
-
-/// Maximum minimizers per bucket (~8GB at 8 bytes each).
-pub(crate) const MAX_BUCKET_SIZE: usize = 1_000_000_000;
-
-/// Maximum length for name/source strings (10KB).
-pub(crate) const MAX_STRING_LENGTH: usize = 10_000;
-
-/// Maximum number of buckets per index.
-pub(crate) const MAX_NUM_BUCKETS: u32 = 100_000;
 
 /// Maximum minimizers in inverted index (1 trillion).
 pub(crate) const MAX_INVERTED_MINIMIZERS: usize = 1_000_000_000_000;
 
 /// Maximum total bucket ID entries in inverted index (4 billion).
 pub(crate) const MAX_INVERTED_BUCKET_IDS: usize = 4_000_000_000;
-
-// ============================================================================
-// Sharded Index Limits
-// ============================================================================
-
-/// Maximum number of shards for inverted index.
-pub(crate) const MAX_SHARDS: u32 = 10_000;
-
-/// Maximum number of shards for main index.
-pub(crate) const MAX_MAIN_SHARDS: u32 = 10_000;
-
-/// Maximum total bytes for string table in sharded main index (100MB).
-pub(crate) const MAX_STRING_TABLE_BYTES: usize = 100_000_000;
-
-/// Maximum entries in string table for sharded main index (10 million).
-pub(crate) const MAX_STRING_TABLE_ENTRIES: u32 = 10_000_000;
-
-/// Maximum sources per bucket in sharded main index (100 million).
-pub(crate) const MAX_SOURCES_PER_BUCKET: usize = 100_000_000;
 
 // ============================================================================
 // Batch Processing
@@ -139,8 +61,8 @@ pub(crate) const ESTIMATED_BUCKETS_PER_READ: usize = 4;
 // ============================================================================
 
 /// Delimiter between filename and sequence name in bucket sources.
-/// Re-exported publicly via `Index::BUCKET_SOURCE_DELIM`.
-pub(crate) const BUCKET_SOURCE_DELIM: &str = "::";
+/// Format: `path/to/file.fa::sequence_name`
+pub const BUCKET_SOURCE_DELIM: &str = "::";
 
 // ============================================================================
 // C API Limits
@@ -163,16 +85,6 @@ pub(crate) const RC_FLAG_BIT: u32 = 0x80000000;
 pub(crate) const MAX_READS: usize = 0x7FFFFFFF;
 
 // ============================================================================
-// Memory Estimation
-// ============================================================================
-
-/// Bytes per minimizer for compressed output estimation (delta+varint+zstd).
-pub(crate) const BYTES_PER_MINIMIZER_COMPRESSED: usize = 4;
-
-/// Bytes per minimizer for in-memory estimation (u64 = 8 bytes).
-pub(crate) const BYTES_PER_MINIMIZER_MEMORY: usize = 8;
-
-// ============================================================================
 // Parallel Processing
 // ============================================================================
 
@@ -193,41 +105,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_max_bucket_size_no_overflow() {
-        // 8 bytes per minimizer, should not overflow usize
-        assert!(
-            MAX_BUCKET_SIZE <= usize::MAX / BYTES_PER_MINIMIZER_MEMORY,
-            "MAX_BUCKET_SIZE would overflow when multiplied by 8"
-        );
-    }
-
-    #[test]
     fn test_gallop_threshold_sane() {
         assert!(
             GALLOP_THRESHOLD > 1,
             "GALLOP_THRESHOLD must be > 1 for the algorithm to work"
         );
-    }
-
-    #[test]
-    fn test_buffer_sizes_are_power_of_two() {
-        assert!(
-            WRITE_BUF_SIZE.is_power_of_two(),
-            "WRITE_BUF_SIZE should be power of 2"
-        );
-        assert!(
-            READ_BUF_SIZE.is_power_of_two(),
-            "READ_BUF_SIZE should be power of 2"
-        );
-    }
-
-    #[test]
-    fn test_magic_bytes_are_4_bytes() {
-        assert_eq!(SINGLE_FILE_INDEX_MAGIC.len(), 4);
-        assert_eq!(SHARD_MAGIC.len(), 4);
-        assert_eq!(MANIFEST_MAGIC.len(), 4);
-        assert_eq!(MAIN_MANIFEST_MAGIC.len(), 4);
-        assert_eq!(MAIN_SHARD_MAGIC.len(), 4);
     }
 
     #[test]

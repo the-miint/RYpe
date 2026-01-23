@@ -597,21 +597,17 @@ mod tests {
     use crate::indices::parquet::manifest::is_parquet_index;
     use tempfile::TempDir;
 
-    /// Test that streaming Parquet creation produces identical classification results
-    /// as the traditional Index → InvertedIndex → save_shard_parquet path.
+    /// Test that streaming Parquet creation produces correct classification results.
     #[test]
-    fn test_streaming_parquet_matches_traditional() {
+    fn test_streaming_parquet_classification() {
         use crate::classify::classify_batch_sharded_sequential;
         use crate::core::extraction::extract_into;
         use crate::core::workspace::MinimizerWorkspace;
-        use crate::indices::inverted::InvertedIndex;
-        use crate::indices::main::Index;
-        use crate::indices::sharded::{ShardFormat, ShardManifest, ShardedInvertedIndex};
+        use crate::indices::sharded::ShardedInvertedIndex;
         use crate::types::QueryRecord;
 
         let tmp = TempDir::new().unwrap();
         let streaming_dir = tmp.path().join("streaming.ryxdi");
-        let traditional_dir = tmp.path().join("traditional.ryxdi");
 
         // Test sequences - long enough for K=32, W=10
         let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
@@ -665,57 +661,10 @@ mod tests {
         let _streaming_manifest =
             create_parquet_inverted_index(&streaming_dir, buckets, k, w, salt, None, None).unwrap();
 
-        // === Create traditional Parquet index ===
-        // Build Index the traditional way
-        let mut index = Index::new(k, w, salt).unwrap();
-        index.add_record(1, "ref1.fa", seq1, &mut ws);
-        index.add_record(2, "ref2.fa", seq2, &mut ws);
-        index.add_record(3, "ref3.fa", seq3, &mut ws);
-        index.bucket_names.insert(1, "bucket1".to_string());
-        index.bucket_names.insert(2, "bucket2".to_string());
-        index.bucket_names.insert(3, "bucket3".to_string());
-        index.finalize_bucket(1);
-        index.finalize_bucket(2);
-        index.finalize_bucket(3);
+        // Open the created index
+        let streaming_sharded = ShardedInvertedIndex::open(&streaming_dir).unwrap();
 
-        // Build InvertedIndex
-        let inverted = InvertedIndex::build_from_index(&index);
-
-        // Save as traditional Parquet shard
-        create_index_directory(&traditional_dir).unwrap();
-        let trad_shard_path = traditional_dir.join("inverted").join("shard.0.parquet");
-        let trad_shard_info = inverted
-            .save_shard_parquet(&trad_shard_path, 0, None)
-            .unwrap();
-
-        // Create manifest for traditional
-        let trad_manifest = ShardManifest {
-            k: inverted.k,
-            w: inverted.w,
-            salt: inverted.salt,
-            source_hash: 0,
-            total_minimizers: inverted.num_minimizers(),
-            total_bucket_ids: inverted.num_bucket_entries(),
-            has_overlapping_shards: true,
-            shard_format: ShardFormat::Parquet,
-            shards: vec![trad_shard_info],
-            bucket_names: index.bucket_names.clone(),
-            bucket_sources: index.bucket_sources.clone(),
-            bucket_minimizer_counts: index.buckets.iter().map(|(&id, v)| (id, v.len())).collect(),
-        };
-        trad_manifest
-            .save(&ShardManifest::manifest_path(&traditional_dir))
-            .unwrap();
-
-        // Also write buckets.parquet for traditional
-        write_buckets_parquet(&traditional_dir, &index.bucket_names, &index.bucket_sources)
-            .unwrap();
-
-        // === Compare classification results ===
-        let streaming_sharded = ShardedInvertedIndex::open_parquet(&streaming_dir).unwrap();
-        let traditional_sharded = ShardedInvertedIndex::open(&traditional_dir).unwrap();
-
-        // Query sequences
+        // Query sequences (using the same sequences we indexed)
         let query1: &[u8] = seq1;
         let query2: &[u8] = seq2;
         let query3: &[u8] = seq3;
@@ -724,71 +673,29 @@ mod tests {
 
         let threshold = 0.1;
 
-        let results_streaming =
+        let results =
             classify_batch_sharded_sequential(&streaming_sharded, None, &records, threshold, None)
                 .unwrap();
-        let results_traditional = classify_batch_sharded_sequential(
-            &traditional_sharded,
-            None,
-            &records,
-            threshold,
-            None,
-        )
-        .unwrap();
-
-        // Sort results for comparison (order may differ)
-        let mut sorted_streaming = results_streaming.clone();
-        sorted_streaming.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
-
-        let mut sorted_traditional = results_traditional.clone();
-        sorted_traditional
-            .sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
-
-        assert_eq!(
-            sorted_streaming.len(),
-            sorted_traditional.len(),
-            "Result count mismatch: streaming={}, traditional={}",
-            sorted_streaming.len(),
-            sorted_traditional.len()
-        );
-
-        for (s, t) in sorted_streaming.iter().zip(sorted_traditional.iter()) {
-            assert_eq!(
-                s.query_id, t.query_id,
-                "Query ID mismatch: streaming={}, traditional={}",
-                s.query_id, t.query_id
-            );
-            assert_eq!(
-                s.bucket_id, t.bucket_id,
-                "Bucket ID mismatch: streaming={}, traditional={}",
-                s.bucket_id, t.bucket_id
-            );
-            assert!(
-                (s.score - t.score).abs() < 0.001,
-                "Score mismatch: streaming={}, traditional={}",
-                s.score,
-                t.score
-            );
-        }
 
         // Verify we got expected matches (each query should match its own bucket perfectly)
         assert!(
-            sorted_streaming
-                .iter()
-                .any(|r| r.query_id == 0 && r.bucket_id == 1),
+            results.iter().any(|r| r.query_id == 0 && r.bucket_id == 1),
             "Query 0 should match bucket 1"
         );
         assert!(
-            sorted_streaming
-                .iter()
-                .any(|r| r.query_id == 1 && r.bucket_id == 2),
+            results.iter().any(|r| r.query_id == 1 && r.bucket_id == 2),
             "Query 1 should match bucket 2"
         );
         assert!(
-            sorted_streaming
-                .iter()
-                .any(|r| r.query_id == 2 && r.bucket_id == 3),
+            results.iter().any(|r| r.query_id == 2 && r.bucket_id == 3),
             "Query 2 should match bucket 3"
+        );
+
+        // Verify perfect matches have high scores (self-match should be ~1.0)
+        let bucket1_match = results.iter().find(|r| r.query_id == 0 && r.bucket_id == 1);
+        assert!(
+            bucket1_match.is_some() && bucket1_match.unwrap().score > 0.9,
+            "Query 0 should have high score for bucket 1"
         );
     }
 

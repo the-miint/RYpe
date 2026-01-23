@@ -23,37 +23,42 @@ use super::error::ArrowClassifyError;
 use super::input::batch_to_records;
 use super::output::hits_to_record_batch;
 use super::schema::result_schema;
-use crate::{classify_batch, Index};
+use crate::{classify_batch_sharded_merge_join, ShardedInvertedIndex};
 
-/// Streaming classifier for Index-based classification.
+/// Streaming classifier for ShardedInvertedIndex-based classification.
 ///
 /// Processes input batches one at a time and yields result batches.
 ///
 /// # Example
 ///
 /// ```ignore
-/// let classifier = IndexStreamClassifier::new(&index, None, 0.1);
+/// let index = ShardedInvertedIndex::open("index.ryxdi")?;
+/// let classifier = ShardedStreamClassifier::new(&index, None, 0.1);
 /// for result_batch in classifier.classify_iter(input_batches) {
 ///     let batch = result_batch?;
 ///     // Process results...
 /// }
 /// ```
-pub struct IndexStreamClassifier<'a> {
-    index: &'a Index,
+pub struct ShardedStreamClassifier<'a> {
+    index: &'a ShardedInvertedIndex,
     negative_mins: Option<&'a HashSet<u64>>,
     threshold: f64,
     output_schema: SchemaRef,
 }
 
-impl<'a> IndexStreamClassifier<'a> {
+impl<'a> ShardedStreamClassifier<'a> {
     /// Create a new streaming classifier.
     ///
     /// # Arguments
     ///
-    /// * `index` - The index to classify against
+    /// * `index` - The sharded inverted index to classify against
     /// * `negative_mins` - Optional set of minimizers to exclude
     /// * `threshold` - Minimum score threshold for reporting hits
-    pub fn new(index: &'a Index, negative_mins: Option<&'a HashSet<u64>>, threshold: f64) -> Self {
+    pub fn new(
+        index: &'a ShardedInvertedIndex,
+        negative_mins: Option<&'a HashSet<u64>>,
+        threshold: f64,
+    ) -> Self {
         Self {
             index,
             negative_mins,
@@ -70,7 +75,14 @@ impl<'a> IndexStreamClassifier<'a> {
     /// Classify a single batch and return results.
     pub fn classify_batch(&self, batch: &RecordBatch) -> Result<RecordBatch, ArrowClassifyError> {
         let records = batch_to_records(batch)?;
-        let hits = classify_batch(self.index, self.negative_mins, &records, self.threshold);
+        let hits = classify_batch_sharded_merge_join(
+            self.index,
+            self.negative_mins,
+            &records,
+            self.threshold,
+            None,
+        )
+        .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
         hits_to_record_batch(hits)
     }
 
@@ -100,10 +112,14 @@ impl<'a> IndexStreamClassifier<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MinimizerWorkspace;
+    use crate::{
+        create_parquet_inverted_index, extract_into, BucketData, MinimizerWorkspace,
+        ParquetWriteOptions,
+    };
     use arrow::array::{BinaryArray, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+    use tempfile::tempdir;
 
     use super::super::schema::{COL_ID, COL_SEQUENCE};
 
@@ -126,24 +142,37 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap()
     }
 
-    /// Create a simple test index with one bucket.
-    fn create_test_index() -> Index {
-        let mut index = Index::new(16, 5, 0x12345).unwrap();
+    /// Create a test Parquet index with one bucket.
+    fn create_test_parquet_index() -> (tempfile::TempDir, ShardedInvertedIndex) {
+        let dir = tempdir().unwrap();
+        let index_path = dir.path().join("test.ryxdi");
+
         let mut ws = MinimizerWorkspace::new();
-
-        // Add a reference sequence
         let ref_seq = generate_sequence(100, 0);
-        index.add_record(1, "ref1", &ref_seq, &mut ws);
-        index.finalize_bucket(1);
-        index.bucket_names.insert(1, "test_bucket".into());
+        extract_into(&ref_seq, 16, 5, 0x12345, &mut ws);
+        let mut mins: Vec<u64> = ws.buffer.drain(..).collect();
+        mins.sort();
+        mins.dedup();
 
-        index
+        let buckets = vec![BucketData {
+            bucket_id: 1,
+            bucket_name: "test_bucket".to_string(),
+            sources: vec!["ref1".to_string()],
+            minimizers: mins,
+        }];
+
+        let options = ParquetWriteOptions::default();
+        create_parquet_inverted_index(&index_path, buckets, 16, 5, 0x12345, None, Some(&options))
+            .unwrap();
+
+        let index = ShardedInvertedIndex::open(&index_path).unwrap();
+        (dir, index)
     }
 
     #[test]
     fn test_stream_classifier_single_batch() {
-        let index = create_test_index();
-        let classifier = IndexStreamClassifier::new(&index, None, 0.0);
+        let (_dir, index) = create_test_parquet_index();
+        let classifier = ShardedStreamClassifier::new(&index, None, 0.0);
 
         // Create a query that matches the reference
         let query_seq = generate_sequence(100, 0);
@@ -157,8 +186,8 @@ mod tests {
 
     #[test]
     fn test_stream_classifier_multiple_batches() {
-        let index = create_test_index();
-        let classifier = IndexStreamClassifier::new(&index, None, 0.0);
+        let (_dir, index) = create_test_parquet_index();
+        let classifier = ShardedStreamClassifier::new(&index, None, 0.0);
 
         // Create multiple batches
         let query_seq1 = generate_sequence(100, 0);
@@ -180,8 +209,8 @@ mod tests {
 
     #[test]
     fn test_stream_classifier_empty_input() {
-        let index = create_test_index();
-        let classifier = IndexStreamClassifier::new(&index, None, 0.1);
+        let (_dir, index) = create_test_parquet_index();
+        let classifier = ShardedStreamClassifier::new(&index, None, 0.1);
 
         let input_batches: Vec<Result<RecordBatch, arrow::error::ArrowError>> = vec![];
 
@@ -194,8 +223,8 @@ mod tests {
 
     #[test]
     fn test_stream_classifier_empty_batch() {
-        let index = create_test_index();
-        let classifier = IndexStreamClassifier::new(&index, None, 0.1);
+        let (_dir, index) = create_test_parquet_index();
+        let classifier = ShardedStreamClassifier::new(&index, None, 0.1);
 
         let schema = Arc::new(Schema::new(vec![
             Field::new(COL_ID, DataType::Int64, false),
@@ -209,8 +238,8 @@ mod tests {
 
     #[test]
     fn test_stream_classifier_output_schema() {
-        let index = create_test_index();
-        let classifier = IndexStreamClassifier::new(&index, None, 0.1);
+        let (_dir, index) = create_test_parquet_index();
+        let classifier = ShardedStreamClassifier::new(&index, None, 0.1);
 
         let schema = classifier.output_schema();
 
@@ -222,10 +251,10 @@ mod tests {
 
     #[test]
     fn test_stream_classifier_threshold_filtering() {
-        let index = create_test_index();
+        let (_dir, index) = create_test_parquet_index();
 
         // With very high threshold, should get no results
-        let classifier_high = IndexStreamClassifier::new(&index, None, 1.1);
+        let classifier_high = ShardedStreamClassifier::new(&index, None, 1.1);
         let query_seq = generate_sequence(100, 0);
         let batch = make_test_batch(&[1], &[&query_seq]);
 
@@ -237,15 +266,15 @@ mod tests {
         );
 
         // With zero threshold, should get results
-        let classifier_low = IndexStreamClassifier::new(&index, None, 0.0);
+        let classifier_low = ShardedStreamClassifier::new(&index, None, 0.0);
         let result_low = classifier_low.classify_batch(&batch).unwrap();
         assert!(result_low.num_rows() > 0, "Zero threshold should pass some");
     }
 
     #[test]
     fn test_stream_classifier_error_propagation() {
-        let index = create_test_index();
-        let classifier = IndexStreamClassifier::new(&index, None, 0.1);
+        let (_dir, index) = create_test_parquet_index();
+        let classifier = ShardedStreamClassifier::new(&index, None, 0.1);
 
         // Create an error in the input stream
         let error = arrow::error::ArrowError::InvalidArgumentError("test error".into());

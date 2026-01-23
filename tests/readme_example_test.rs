@@ -108,18 +108,28 @@ fn test_readme_c_example_compiles_and_runs() {
 
     // Create test index for the C example to use
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let index_path = temp_dir.path().join("test.ryidx");
+    let index_path = temp_dir.path().join("test.ryxdi");
 
     {
-        use rype::{Index, MinimizerWorkspace};
-        let mut index = Index::new(32, 10, 0).expect("Failed to create index");
+        use rype::{extract_into, BucketData, MinimizerWorkspace, ParquetWriteOptions};
         let mut ws = MinimizerWorkspace::new();
         // Use the same sequence that the README C example queries
         let seq = b"GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT";
-        index.add_record(1, "phiX174_fragment", seq, &mut ws);
-        index.finalize_bucket(1);
-        index.bucket_names.insert(1, "phiX174".to_string());
-        index.save(&index_path).expect("Failed to save index");
+        extract_into(seq, 32, 10, 0, &mut ws);
+        let mut mins: Vec<u64> = ws.buffer.drain(..).collect();
+        mins.sort();
+        mins.dedup();
+
+        let buckets = vec![BucketData {
+            bucket_id: 1,
+            bucket_name: "phiX174".to_string(),
+            sources: vec!["phiX174_fragment".to_string()],
+            minimizers: mins,
+        }];
+
+        let options = ParquetWriteOptions::default();
+        rype::create_parquet_inverted_index(&index_path, buckets, 32, 10, 0, None, Some(&options))
+            .expect("Failed to create index");
     }
 
     for (i, c_code) in c_blocks.iter().enumerate() {

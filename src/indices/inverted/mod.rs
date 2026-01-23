@@ -6,7 +6,6 @@
 //!
 //! This module is organized into submodules:
 //! - `query`: Query-side inverted index for merge-join classification
-//! - `shard_legacy`: RYXS binary format serialization
 //! - `shard_parquet`: Parquet format serialization
 //! - `query_loading`: Query-aware Parquet loading with bloom filters
 
@@ -15,7 +14,6 @@
 
 mod query;
 mod query_loading;
-mod shard_legacy;
 mod shard_parquet;
 
 // Re-export public types
@@ -23,12 +21,9 @@ pub use query::QueryInvertedIndex;
 pub use query_loading::{get_row_group_ranges, load_row_group_pairs, RowGroupRangeInfo};
 
 use crate::error::{Result, RypeError};
-use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
-use super::main::Index;
-use super::sharded_main::MainIndexShard;
 use crate::types::IndexMetadata;
 
 /// CSR-format inverted index for fast minimizer → bucket lookups.
@@ -76,61 +71,8 @@ impl InvertedIndex {
         hasher.finish()
     }
 
-    /// Build an inverted index from a primary Index using k-way merge.
-    ///
-    /// This implementation uses O(num_buckets) heap memory instead of O(total_entries)
-    /// by leveraging the fact that each bucket is already sorted.
-    ///
-    /// # Requirements
-    /// All buckets in the index must be finalized (sorted and deduplicated).
-    ///
-    /// # Panics
-    /// Panics if any bucket is not sorted.
-    pub fn build_from_index(index: &Index) -> Self {
-        Self::verify_buckets_sorted(&index.buckets);
-
-        let metadata = IndexMetadata {
-            k: index.k,
-            w: index.w,
-            salt: index.salt,
-            bucket_names: index.bucket_names.clone(),
-            bucket_sources: index.bucket_sources.clone(),
-            bucket_minimizer_counts: index.buckets.iter().map(|(&id, v)| (id, v.len())).collect(),
-        };
-
-        Self::build_from_bucket_map(index.k, index.w, index.salt, &index.buckets, &metadata)
-    }
-
-    /// Build an inverted index from a single main index shard.
-    ///
-    /// This is used for 1:1 correspondence between main index shards and
-    /// inverted index shards when the main index is sharded.
-    pub fn build_from_shard(shard: &MainIndexShard) -> Self {
-        Self::verify_buckets_sorted(&shard.buckets);
-
-        let metadata = IndexMetadata {
-            k: shard.k,
-            w: shard.w,
-            salt: shard.salt,
-            bucket_names: HashMap::new(),
-            bucket_sources: HashMap::new(),
-            bucket_minimizer_counts: shard.buckets.iter().map(|(&id, v)| (id, v.len())).collect(),
-        };
-
-        Self::build_from_bucket_map(shard.k, shard.w, shard.salt, &shard.buckets, &metadata)
-    }
-
-    /// Verify all buckets are sorted. Panics if any bucket is unsorted.
-    fn verify_buckets_sorted(buckets: &HashMap<u32, Vec<u64>>) {
-        buckets.par_iter().for_each(|(&id, minimizers)| {
-            if !minimizers.windows(2).all(|w| w[0] <= w[1]) {
-                panic!("Bucket {} is not sorted. Call finalize_bucket() before building inverted index.", id);
-            }
-        });
-    }
-
     /// Core k-way merge algorithm to build inverted index from bucket data.
-    fn build_from_bucket_map(
+    pub fn build_from_bucket_map(
         k: usize,
         w: usize,
         salt: u64,
@@ -250,7 +192,7 @@ impl InvertedIndex {
         if self.source_hash != expected_hash {
             return Err(RypeError::validation(format!(
                 "Inverted index is stale (hash 0x{:016x} != expected 0x{:016x}). \
-                 The source index has been modified. Regenerate with 'rype index invert -i <index.ryidx>'",
+                 The source index has been modified. Regenerate the index.",
                 self.source_hash, expected_hash
             )));
         }
@@ -327,21 +269,28 @@ impl InvertedIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indices::main::Index;
-    use anyhow::Result;
-    use tempfile::NamedTempFile;
+
+    fn build_test_inverted_index() -> InvertedIndex {
+        let mut buckets: HashMap<u32, Vec<u64>> = HashMap::new();
+        buckets.insert(1, vec![100, 200, 300]);
+        buckets.insert(2, vec![200, 300, 400]);
+        buckets.insert(3, vec![500, 600]);
+
+        let metadata = IndexMetadata {
+            k: 64,
+            w: 50,
+            salt: 0x1234,
+            bucket_names: HashMap::new(),
+            bucket_sources: HashMap::new(),
+            bucket_minimizer_counts: buckets.iter().map(|(&id, v)| (id, v.len())).collect(),
+        };
+
+        InvertedIndex::build_from_bucket_map(64, 50, 0x1234, &buckets, &metadata)
+    }
 
     #[test]
     fn test_inverted_index_build() {
-        let mut index = Index::new(64, 50, 0x1234).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300]);
-        index.buckets.insert(2, vec![200, 300, 400]);
-        index.buckets.insert(3, vec![500, 600]);
-        index.bucket_names.insert(1, "A".into());
-        index.bucket_names.insert(2, "B".into());
-        index.bucket_names.insert(3, "C".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index();
 
         assert_eq!(inverted.k, 64);
         assert_eq!(inverted.w, 50);
@@ -352,15 +301,7 @@ mod tests {
 
     #[test]
     fn test_inverted_index_get_bucket_hits() {
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300]);
-        index.buckets.insert(2, vec![200, 300, 400]);
-        index.buckets.insert(3, vec![500, 600]);
-        index.bucket_names.insert(1, "A".into());
-        index.bucket_names.insert(2, "B".into());
-        index.bucket_names.insert(3, "C".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index();
 
         let query = vec![200, 300, 500];
         let hits = inverted.get_bucket_hits(&query);
@@ -372,11 +313,7 @@ mod tests {
 
     #[test]
     fn test_inverted_index_get_bucket_hits_no_matches() {
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300]);
-        index.bucket_names.insert(1, "A".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index();
 
         let query = vec![999, 1000, 1001];
         let hits = inverted.get_bucket_hits(&query);
@@ -385,54 +322,18 @@ mod tests {
     }
 
     #[test]
-    fn test_inverted_index_validate_success() -> Result<()> {
-        let file = NamedTempFile::new()?;
-        let path = file.path().to_path_buf();
-
-        let mut index = Index::new(64, 50, 0x1234).unwrap();
-        index.buckets.insert(1, vec![100, 200]);
-        index.bucket_names.insert(1, "A".into());
-        index.bucket_sources.insert(1, vec!["src".into()]);
-        index.save(&path)?;
-
-        let inverted = InvertedIndex::build_from_index(&index);
-        let metadata = Index::load_metadata(&path)?;
-
-        inverted.validate_against_metadata(&metadata)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_inverted_index_validate_stale() -> Result<()> {
-        let file = NamedTempFile::new()?;
-        let path = file.path().to_path_buf();
-
-        let mut index = Index::new(64, 50, 0x1234).unwrap();
-        index.buckets.insert(1, vec![100, 200]);
-        index.bucket_names.insert(1, "A".into());
-        index.bucket_sources.insert(1, vec!["src".into()]);
-        index.save(&path)?;
-
-        let inverted = InvertedIndex::build_from_index(&index);
-
-        index.buckets.insert(2, vec![300, 400]);
-        index.bucket_names.insert(2, "B".into());
-        index.bucket_sources.insert(2, vec!["src2".into()]);
-        index.save(&path)?;
-
-        let metadata = Index::load_metadata(&path)?;
-
-        let result = inverted.validate_against_metadata(&metadata);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("stale"));
-
-        Ok(())
-    }
-
-    #[test]
     fn test_inverted_index_empty() {
-        let index = Index::new(64, 50, 0).unwrap();
-        let inverted = InvertedIndex::build_from_index(&index);
+        let buckets: HashMap<u32, Vec<u64>> = HashMap::new();
+        let metadata = IndexMetadata {
+            k: 64,
+            w: 50,
+            salt: 0,
+            bucket_names: HashMap::new(),
+            bucket_sources: HashMap::new(),
+            bucket_minimizer_counts: HashMap::new(),
+        };
+
+        let inverted = InvertedIndex::build_from_bucket_map(64, 50, 0, &buckets, &metadata);
 
         assert_eq!(inverted.num_minimizers(), 0);
         assert_eq!(inverted.num_bucket_entries(), 0);
@@ -443,11 +344,19 @@ mod tests {
 
     #[test]
     fn test_inverted_index_hybrid_search_correctness() {
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, (0..1000).map(|i| i * 10).collect());
-        index.bucket_names.insert(1, "A".into());
+        let mut buckets: HashMap<u32, Vec<u64>> = HashMap::new();
+        buckets.insert(1, (0..1000).map(|i| i * 10).collect());
 
-        let inverted = InvertedIndex::build_from_index(&index);
+        let metadata = IndexMetadata {
+            k: 64,
+            w: 50,
+            salt: 0,
+            bucket_names: HashMap::new(),
+            bucket_sources: HashMap::new(),
+            bucket_minimizer_counts: buckets.iter().map(|(&id, v)| (id, v.len())).collect(),
+        };
+
+        let inverted = InvertedIndex::build_from_bucket_map(64, 50, 0, &buckets, &metadata);
 
         let query: Vec<u64> = vec![50, 500, 5000, 9990];
         let hits = inverted.get_bucket_hits(&query);
@@ -456,105 +365,25 @@ mod tests {
     }
 
     #[test]
-    fn test_build_from_shard() {
-        use crate::indices::sharded_main::MainIndexShard;
-
-        // Create a main index shard with some buckets
-        let mut shard = MainIndexShard {
-            k: 64,
-            w: 50,
-            salt: 0x1234,
-            shard_id: 0,
-            buckets: HashMap::new(),
-            bucket_sources: HashMap::new(),
-        };
-        shard.buckets.insert(1, vec![100, 200, 300]);
-        shard.buckets.insert(2, vec![200, 300, 400]);
-        shard.buckets.insert(3, vec![500, 600]);
-
-        let inverted = InvertedIndex::build_from_shard(&shard);
-
-        assert_eq!(inverted.k, 64);
-        assert_eq!(inverted.w, 50);
-        assert_eq!(inverted.salt, 0x1234);
-        // Unique minimizers: 100, 200, 300, 400, 500, 600
-        assert_eq!(inverted.num_minimizers(), 6);
-        // Bucket entries: 100->1, 200->1,2, 300->1,2, 400->2, 500->3, 600->3 = 8
-        assert_eq!(inverted.num_bucket_entries(), 8);
-
-        // Verify we can query it
-        let hits = inverted.get_bucket_hits(&[200, 300, 500]);
-        assert_eq!(hits.get(&1), Some(&2)); // 200, 300
-        assert_eq!(hits.get(&2), Some(&2)); // 200, 300
-        assert_eq!(hits.get(&3), Some(&1)); // 500
-    }
-
-    #[test]
-    fn test_build_from_shard_empty() {
-        use crate::indices::sharded_main::MainIndexShard;
-
-        let shard = MainIndexShard {
-            k: 64,
-            w: 50,
-            salt: 0xABCD,
-            shard_id: 5,
-            buckets: HashMap::new(),
-            bucket_sources: HashMap::new(),
-        };
-
-        let inverted = InvertedIndex::build_from_shard(&shard);
-
-        assert_eq!(inverted.k, 64);
-        assert_eq!(inverted.w, 50);
-        assert_eq!(inverted.salt, 0xABCD);
-        assert_eq!(inverted.num_minimizers(), 0);
-        assert_eq!(inverted.num_bucket_entries(), 0);
-    }
-
-    #[test]
-    fn test_build_from_shard_single_bucket() {
-        use crate::indices::sharded_main::MainIndexShard;
-
-        let mut shard = MainIndexShard {
-            k: 32,
-            w: 20,
-            salt: 0x5678,
-            shard_id: 0,
-            buckets: HashMap::new(),
-            bucket_sources: HashMap::new(),
-        };
-        shard.buckets.insert(42, vec![10, 20, 30, 40, 50]);
-
-        let inverted = InvertedIndex::build_from_shard(&shard);
-
-        assert_eq!(inverted.num_minimizers(), 5);
-        assert_eq!(inverted.num_bucket_entries(), 5);
-
-        // Each minimizer maps to only bucket 42
-        let hits = inverted.get_bucket_hits(&[10, 20, 30, 40, 50]);
-        assert_eq!(hits.get(&42), Some(&5));
-    }
-
-    #[test]
-    fn test_build_from_shard_high_overlap() {
-        use crate::indices::sharded_main::MainIndexShard;
-
+    fn test_build_high_overlap() {
         // All buckets share all minimizers (maximum overlap)
-        let mut shard = MainIndexShard {
+        let mut buckets: HashMap<u32, Vec<u64>> = HashMap::new();
+        let shared_mins = vec![100, 200, 300, 400, 500];
+        buckets.insert(1, shared_mins.clone());
+        buckets.insert(2, shared_mins.clone());
+        buckets.insert(3, shared_mins.clone());
+        buckets.insert(4, shared_mins.clone());
+
+        let metadata = IndexMetadata {
             k: 64,
             w: 50,
             salt: 0,
-            shard_id: 0,
-            buckets: HashMap::new(),
+            bucket_names: HashMap::new(),
             bucket_sources: HashMap::new(),
+            bucket_minimizer_counts: buckets.iter().map(|(&id, v)| (id, v.len())).collect(),
         };
-        let shared_mins = vec![100, 200, 300, 400, 500];
-        shard.buckets.insert(1, shared_mins.clone());
-        shard.buckets.insert(2, shared_mins.clone());
-        shard.buckets.insert(3, shared_mins.clone());
-        shard.buckets.insert(4, shared_mins.clone());
 
-        let inverted = InvertedIndex::build_from_shard(&shard);
+        let inverted = InvertedIndex::build_from_bucket_map(64, 50, 0, &buckets, &metadata);
 
         // Only 5 unique minimizers despite 20 total entries
         assert_eq!(inverted.num_minimizers(), 5);
@@ -566,61 +395,5 @@ mod tests {
         assert_eq!(hits.get(&2), Some(&3));
         assert_eq!(hits.get(&3), Some(&3));
         assert_eq!(hits.get(&4), Some(&3));
-    }
-
-    #[test]
-    fn test_build_from_shard_matches_build_from_index() {
-        use crate::indices::sharded_main::MainIndexShard;
-
-        // Create identical data as both Index and MainIndexShard
-        let mut index = Index::new(64, 50, 0x1234).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300]);
-        index.buckets.insert(2, vec![200, 300, 400]);
-        index.buckets.insert(3, vec![500, 600]);
-        index.bucket_names.insert(1, "A".into());
-        index.bucket_names.insert(2, "B".into());
-        index.bucket_names.insert(3, "C".into());
-
-        let mut shard = MainIndexShard {
-            k: 64,
-            w: 50,
-            salt: 0x1234,
-            shard_id: 0,
-            buckets: HashMap::new(),
-            bucket_sources: HashMap::new(),
-        };
-        shard.buckets.insert(1, vec![100, 200, 300]);
-        shard.buckets.insert(2, vec![200, 300, 400]);
-        shard.buckets.insert(3, vec![500, 600]);
-
-        let inv_from_index = InvertedIndex::build_from_index(&index);
-        let inv_from_shard = InvertedIndex::build_from_shard(&shard);
-
-        // Core structure should be identical
-        assert_eq!(inv_from_index.k, inv_from_shard.k);
-        assert_eq!(inv_from_index.w, inv_from_shard.w);
-        assert_eq!(inv_from_index.salt, inv_from_shard.salt);
-        assert_eq!(
-            inv_from_index.num_minimizers(),
-            inv_from_shard.num_minimizers()
-        );
-        assert_eq!(
-            inv_from_index.num_bucket_entries(),
-            inv_from_shard.num_bucket_entries()
-        );
-
-        // Minimizer arrays should be identical
-        assert_eq!(inv_from_index.minimizers, inv_from_shard.minimizers);
-
-        // Offsets should be identical
-        assert_eq!(inv_from_index.offsets, inv_from_shard.offsets);
-
-        // Bucket IDs should be identical
-        assert_eq!(inv_from_index.bucket_ids, inv_from_shard.bucket_ids);
-
-        // Query results should match
-        let hits_index = inv_from_index.get_bucket_hits(&[200, 300, 500]);
-        let hits_shard = inv_from_shard.get_bucket_hits(&[200, 300, 500]);
-        assert_eq!(hits_index, hits_shard);
     }
 }

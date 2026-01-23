@@ -13,13 +13,12 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 use rype::arrow::{
-    batch_to_records, classify_arrow_batch, classify_arrow_batch_sharded, hits_to_record_batch,
-    result_schema, validate_input_schema, IndexStreamClassifier, COL_ID, COL_PAIR_SEQUENCE,
-    COL_SEQUENCE,
+    batch_to_records, classify_arrow_batch_sharded, hits_to_record_batch, result_schema,
+    validate_input_schema, ShardedStreamClassifier, COL_ID, COL_PAIR_SEQUENCE, COL_SEQUENCE,
 };
 use rype::{
-    classify_batch, Index, InvertedIndex, MinimizerWorkspace, ShardFormat, ShardManifest,
-    ShardedInvertedIndex,
+    classify_batch_sharded_merge_join, create_parquet_inverted_index, extract_into, BucketData,
+    MinimizerWorkspace, ParquetWriteOptions, ShardedInvertedIndex,
 };
 
 /// Generate a DNA sequence of given length with a deterministic pattern.
@@ -64,35 +63,59 @@ fn make_test_batch_paired(ids: &[i64], seqs: &[&[u8]], pairs: &[Option<&[u8]>]) 
     .unwrap()
 }
 
-/// Create a test index with multiple buckets.
-fn create_test_index() -> Index {
-    let mut index = Index::new(16, 5, 0x12345).unwrap();
+/// Create a test Parquet index with multiple buckets.
+fn create_test_parquet_index() -> (tempfile::TempDir, ShardedInvertedIndex) {
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("test.ryxdi");
+
     let mut ws = MinimizerWorkspace::new();
 
     // Bucket 1: Pattern starting with seed 0
     let ref_seq1 = generate_sequence(100, 0);
-    index.add_record(1, "ref1", &ref_seq1, &mut ws);
-    index.finalize_bucket(1);
-    index.bucket_names.insert(1, "bucket1".into());
+    extract_into(&ref_seq1, 16, 5, 0x12345, &mut ws);
+    let mut mins1: Vec<u64> = ws.buffer.drain(..).collect();
+    mins1.sort();
+    mins1.dedup();
 
     // Bucket 2: Pattern starting with seed 2
     let ref_seq2 = generate_sequence(100, 2);
-    index.add_record(2, "ref2", &ref_seq2, &mut ws);
-    index.finalize_bucket(2);
-    index.bucket_names.insert(2, "bucket2".into());
+    extract_into(&ref_seq2, 16, 5, 0x12345, &mut ws);
+    let mut mins2: Vec<u64> = ws.buffer.drain(..).collect();
+    mins2.sort();
+    mins2.dedup();
 
-    index
+    let buckets = vec![
+        BucketData {
+            bucket_id: 1,
+            bucket_name: "bucket1".to_string(),
+            sources: vec!["ref1".to_string()],
+            minimizers: mins1,
+        },
+        BucketData {
+            bucket_id: 2,
+            bucket_name: "bucket2".to_string(),
+            sources: vec!["ref2".to_string()],
+            minimizers: mins2,
+        },
+    ];
+
+    let options = ParquetWriteOptions::default();
+    create_parquet_inverted_index(&index_path, buckets, 16, 5, 0x12345, None, Some(&options))
+        .unwrap();
+
+    let index = ShardedInvertedIndex::open(&index_path).unwrap();
+    (dir, index)
 }
 
 #[test]
 fn test_arrow_roundtrip_classification() -> Result<()> {
-    let index = create_test_index();
+    let (_dir, index) = create_test_parquet_index();
 
     // Query that matches bucket 1
     let query_seq = generate_sequence(100, 0);
     let batch = make_test_batch(&[101], &[&query_seq]);
 
-    let result = classify_arrow_batch(&index, None, &batch, 0.0)?;
+    let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true)?;
 
     assert!(result.num_rows() > 0, "Should have classification results");
 
@@ -112,7 +135,7 @@ fn test_arrow_roundtrip_classification() -> Result<()> {
 
 #[test]
 fn test_arrow_vs_regular_api_consistency() -> Result<()> {
-    let index = create_test_index();
+    let (_dir, index) = create_test_parquet_index();
     let threshold = 0.1;
 
     // Create test queries
@@ -126,11 +149,11 @@ fn test_arrow_vs_regular_api_consistency() -> Result<()> {
         (2, query2.as_slice(), None),
         (3, query3.as_slice(), None),
     ];
-    let regular_hits = classify_batch(&index, None, &records, threshold);
+    let regular_hits = classify_batch_sharded_merge_join(&index, None, &records, threshold, None)?;
 
     // Arrow API
     let batch = make_test_batch(&[1, 2, 3], &[&query1, &query2, &query3]);
-    let arrow_result = classify_arrow_batch(&index, None, &batch, threshold)?;
+    let arrow_result = classify_arrow_batch_sharded(&index, None, &batch, threshold, true)?;
 
     // Results should be consistent
     assert_eq!(
@@ -174,7 +197,7 @@ fn test_arrow_vs_regular_api_consistency() -> Result<()> {
 
 #[test]
 fn test_arrow_with_paired_end() -> Result<()> {
-    let index = create_test_index();
+    let (_dir, index) = create_test_parquet_index();
 
     let seq1 = generate_sequence(80, 0);
     let pair1 = generate_sequence(80, 0);
@@ -182,7 +205,7 @@ fn test_arrow_with_paired_end() -> Result<()> {
 
     let batch = make_test_batch_paired(&[1, 2], &[&seq1, &seq2], &[Some(pair1.as_slice()), None]);
 
-    let result = classify_arrow_batch(&index, None, &batch, 0.0)?;
+    let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true)?;
 
     // Should have results for both queries
     assert!(result.num_rows() >= 2);
@@ -192,7 +215,7 @@ fn test_arrow_with_paired_end() -> Result<()> {
 
 #[test]
 fn test_arrow_large_batch() -> Result<()> {
-    let index = create_test_index();
+    let (_dir, index) = create_test_parquet_index();
 
     // Create a large batch
     let num_queries = 1000;
@@ -204,7 +227,7 @@ fn test_arrow_large_batch() -> Result<()> {
 
     let batch = make_test_batch(&ids, &seq_refs);
 
-    let result = classify_arrow_batch(&index, None, &batch, 0.0)?;
+    let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true)?;
 
     // Should handle large batches without error
     assert!(result.num_rows() > 0);
@@ -214,8 +237,8 @@ fn test_arrow_large_batch() -> Result<()> {
 
 #[test]
 fn test_arrow_streaming_multiple_batches() -> Result<()> {
-    let index = create_test_index();
-    let classifier = IndexStreamClassifier::new(&index, None, 0.0);
+    let (_dir, index) = create_test_parquet_index();
+    let classifier = ShardedStreamClassifier::new(&index, None, 0.0);
 
     // Create multiple batches
     let batch1 = make_test_batch(
@@ -245,16 +268,16 @@ fn test_arrow_streaming_multiple_batches() -> Result<()> {
 
 #[test]
 fn test_arrow_threshold_filtering() -> Result<()> {
-    let index = create_test_index();
+    let (_dir, index) = create_test_parquet_index();
 
     let query_seq = generate_sequence(100, 0);
     let batch = make_test_batch(&[1], &[&query_seq]);
 
     // With very high threshold
-    let high_result = classify_arrow_batch(&index, None, &batch, 1.0)?;
+    let high_result = classify_arrow_batch_sharded(&index, None, &batch, 1.0, true)?;
 
     // With zero threshold
-    let low_result = classify_arrow_batch(&index, None, &batch, 0.0)?;
+    let low_result = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true)?;
 
     // High threshold should filter more results
     assert!(
@@ -267,7 +290,7 @@ fn test_arrow_threshold_filtering() -> Result<()> {
 
 #[test]
 fn test_arrow_empty_batch() -> Result<()> {
-    let index = create_test_index();
+    let (_dir, index) = create_test_parquet_index();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(COL_ID, DataType::Int64, false),
@@ -275,7 +298,7 @@ fn test_arrow_empty_batch() -> Result<()> {
     ]));
     let empty_batch = RecordBatch::new_empty(schema);
 
-    let result = classify_arrow_batch(&index, None, &empty_batch, 0.1)?;
+    let result = classify_arrow_batch_sharded(&index, None, &empty_batch, 0.1, true)?;
 
     assert_eq!(result.num_rows(), 0);
     assert_eq!(result.schema(), result_schema());
@@ -284,50 +307,21 @@ fn test_arrow_empty_batch() -> Result<()> {
 }
 
 #[test]
-fn test_arrow_with_inverted_index() -> Result<()> {
-    let dir = tempdir()?;
-    let index = create_test_index();
+fn test_arrow_merge_join_vs_sequential() -> Result<()> {
+    let (_dir, index) = create_test_parquet_index();
 
-    // Save main index
-    let index_path = dir.path().join("test.ryidx");
-    index.save(&index_path)?;
-
-    // Build and save inverted index as sharded format
-    let inverted_path = dir.path().join("test.ryxdi");
-    let inverted = InvertedIndex::build_from_index(&index);
-
-    // Save as single shard
-    let shard_path = ShardManifest::shard_path(&inverted_path, 0);
-    let shard_info = inverted.save_shard(&shard_path, 0, 0, inverted.num_minimizers(), true)?;
-
-    // Create and save manifest
-    let manifest = ShardManifest {
-        k: inverted.k,
-        w: inverted.w,
-        salt: inverted.salt,
-        source_hash: 0,
-        total_minimizers: inverted.num_minimizers(),
-        total_bucket_ids: inverted.num_bucket_entries(),
-        has_overlapping_shards: true,
-        shard_format: ShardFormat::Legacy,
-        shards: vec![shard_info],
-        bucket_names: std::collections::HashMap::new(),
-        bucket_sources: std::collections::HashMap::new(),
-        bucket_minimizer_counts: std::collections::HashMap::new(),
-    };
-    let manifest_path = ShardManifest::manifest_path(&inverted_path);
-    manifest.save(&manifest_path)?;
-
-    // Open sharded inverted index
-    let sharded = ShardedInvertedIndex::open(&inverted_path)?;
-
-    // Test classification
     let query_seq = generate_sequence(100, 0);
     let batch = make_test_batch(&[1], &[&query_seq]);
 
-    let result = classify_arrow_batch_sharded(&sharded, None, &batch, 0.0, false)?;
+    // Both strategies should produce the same results
+    let result_merge = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true)?;
+    let result_seq = classify_arrow_batch_sharded(&index, None, &batch, 0.0, false)?;
 
-    assert!(result.num_rows() > 0);
+    assert_eq!(
+        result_merge.num_rows(),
+        result_seq.num_rows(),
+        "Merge-join and sequential should produce same number of results"
+    );
 
     Ok(())
 }

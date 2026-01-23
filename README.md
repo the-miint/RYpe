@@ -39,7 +39,7 @@ cargo build
 
 ```bash
 # Create index from reference sequences
-rype index create -o index.ryidx -r ref1.fasta -r ref2.fasta -k 64 -w 50
+rype index create -o index.ryxdi -r ref1.fasta -r ref2.fasta -k 64 -w 50
 
 # Or build from a TOML configuration file
 rype index from-config -c config.toml
@@ -49,35 +49,17 @@ rype index from-config -c config.toml
 
 ```bash
 # Single-end reads
-rype classify run -i index.ryidx -1 reads.fastq -t 0.1
+rype classify run -i index.ryxdi -1 reads.fastq -t 0.1
 
 # Paired-end reads
-rype classify run -i index.ryidx -1 reads_R1.fastq -2 reads_R2.fastq -t 0.1
-
-# Aggregated classification (higher sensitivity)
-rype classify aggregate -i index.ryidx -1 reads.fastq -t 0.05
+rype classify run -i index.ryxdi -1 reads_R1.fastq -2 reads_R2.fastq -t 0.1
 ```
 
 ### Index management
 
 ```bash
 # Show index statistics
-rype index stats -i index.ryidx
-
-# Add sequences as a new bucket
-rype index bucket-add -i index.ryidx -r new_ref.fasta
-
-# Merge buckets within an index
-rype index bucket-merge -i index.ryidx --src 2 --dest 1
-
-# Merge multiple indices
-rype index merge -o merged.ryidx -i idx1.ryidx -i idx2.ryidx
-
-# Create sharded index for large datasets
-rype index shard -i large.ryidx -o sharded.ryidx --max-shard-size 1G
-
-# Create inverted index for memory-efficient classification
-rype index invert -i index.ryidx
+rype index stats -i index.ryxdi
 ```
 
 ## CLI Reference
@@ -89,12 +71,7 @@ rype index invert -i index.ryidx
 | `create` | Build index from FASTA/FASTQ files |
 | `stats` | Show index statistics |
 | `bucket-source-detail` | Show source details for a specific bucket |
-| `bucket-add` | Add sequences to existing index as new bucket |
-| `bucket-merge` | Merge two buckets within an index |
-| `merge` | Merge multiple indices into one |
 | `from-config` | Build index from TOML configuration file |
-| `shard` | Convert single-file index to sharded format |
-| `invert` | Create inverted index for memory-efficient classification |
 
 ### `rype classify`
 
@@ -102,7 +79,6 @@ rype index invert -i index.ryidx
 |------------|-------------|
 | `run` | Per-read classification |
 | `batch` | Batch classify (alias for run) |
-| `aggregate` | Aggregated classification for paired-end reads |
 
 ## Configuration File
 
@@ -110,7 +86,7 @@ Build complex indices using a TOML configuration file:
 
 ```toml
 [index]
-output = "output.ryidx"
+output = "output.ryxdi"
 k = 64
 w = 50
 
@@ -127,46 +103,71 @@ sources = ["ref_b.fasta"]
 
 ```rust
 use needletail::parse_fastx_file;
-use rype::{classify_batch, Index, MinimizerWorkspace};
+use rype::{
+    classify_batch_sharded_merge_join, extract_into, BucketData, MinimizerWorkspace,
+    ParquetWriteOptions, ShardedInvertedIndex,
+};
 
 fn main() -> anyhow::Result<()> {
-    // Create an index with k=32, window=10, salt=0
-    let mut index = Index::new(32, 10, 0)?;
     let mut workspace = MinimizerWorkspace::new();
+    let k = 32;
+    let w = 10;
+    let salt = 0u64;
 
-    // Add phiX174 genome (bucket 1) from examples/phiX174.fasta
+    // Read phiX174 genome and extract minimizers
+    let mut phix_mins = Vec::new();
     let mut reader = parse_fastx_file("examples/phiX174.fasta")?;
     while let Some(record) = reader.next() {
         let record = record?;
-        index.add_record(1, std::str::from_utf8(record.id())?, &record.seq(), &mut workspace);
+        extract_into(&record.seq(), k, w, salt, &mut workspace);
+        phix_mins.extend(workspace.buffer.drain(..));
     }
-    index.finalize_bucket(1);
-    index.bucket_names.insert(1, "phiX174".to_string());
+    phix_mins.sort();
+    phix_mins.dedup();
 
-    // Add pUC19 plasmid (bucket 2) from examples/pUC19.fasta
+    // Read pUC19 plasmid and extract minimizers
+    let mut puc19_mins = Vec::new();
     let mut reader = parse_fastx_file("examples/pUC19.fasta")?;
     while let Some(record) = reader.next() {
         let record = record?;
-        index.add_record(2, std::str::from_utf8(record.id())?, &record.seq(), &mut workspace);
+        extract_into(&record.seq(), k, w, salt, &mut workspace);
+        puc19_mins.extend(workspace.buffer.drain(..));
     }
-    index.finalize_bucket(2);
-    index.bucket_names.insert(2, "pUC19".to_string());
+    puc19_mins.sort();
+    puc19_mins.dedup();
 
-    // Save index (using tempfile to avoid side effects in doc tests)
+    // Build bucket data
+    let buckets = vec![
+        BucketData {
+            bucket_id: 1,
+            bucket_name: "phiX174".to_string(),
+            sources: vec!["phiX174.fasta".to_string()],
+            minimizers: phix_mins,
+        },
+        BucketData {
+            bucket_id: 2,
+            bucket_name: "pUC19".to_string(),
+            sources: vec!["pUC19.fasta".to_string()],
+            minimizers: puc19_mins,
+        },
+    ];
+
+    // Create index in temporary directory
     let temp_dir = tempfile::tempdir()?;
-    let index_path = temp_dir.path().join("example.ryidx");
-    index.save(&index_path)?;
+    let index_path = temp_dir.path().join("example.ryxdi");
+    let options = ParquetWriteOptions::default();
+    rype::create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))?;
 
     // Load and classify
-    let loaded = Index::load(&index_path)?;
+    let index = ShardedInvertedIndex::open(&index_path)?;
 
     // Create query from first 100bp of phiX174 - should match bucket 1
     let query_seq = b"GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTTGATAAAGCAGGAATTACTACTGCTTGTTT";
     let queries = vec![(1_i64, query_seq.as_slice(), None)];
 
-    let results = classify_batch(&loaded, None, &queries, 0.1);
+    let results = classify_batch_sharded_merge_join(&index, None, &queries, 0.1, None)?;
     for hit in &results {
-        let name = loaded.bucket_names.get(&hit.bucket_id).unwrap();
+        let name = index.manifest().bucket_names.get(&hit.bucket_id).unwrap();
         println!("Query {} -> {} (score: {:.2})", hit.query_id, name, hit.score);
     }
 
@@ -186,7 +187,7 @@ Rype provides a C API for FFI integration:
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <index.ryidx>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <index.ryxdi>\n", argv[0]);
         return 1;
     }
 
@@ -234,7 +235,7 @@ int main(int argc, char** argv) {
 Build and run:
 ```bash
 gcc example.c -L target/release -lrype -o example
-LD_LIBRARY_PATH=target/release ./example index.ryidx
+LD_LIBRARY_PATH=target/release ./example index.ryxdi
 ```
 
 ### Thread Safety
@@ -267,37 +268,29 @@ The implementation uses a monotonic deque for O(n) time complexity.
 
 - K = 16, 32, or 64 (stored as `u64`)
 
-## Index Formats
+## Index Format
 
-### Main Index (`.ryidx`)
+Rype uses a Parquet-based inverted index format stored as a directory:
 
-Binary format with zstd-compressed, delta-encoded minimizers. Achieves ~65% compression vs raw storage.
-
-### Sharded Index
-
-For large datasets that exceed available RAM:
 ```text
-index.ryidx.manifest     # Manifest file
-index.ryidx.shard.0      # Shard 0
-index.ryidx.shard.1      # Shard 1
-...
+index.ryxdi/
+├── manifest.toml         # Index metadata (k, w, salt, bucket info)
+├── buckets.parquet       # Bucket metadata (id, name, sources)
+└── inverted/
+    ├── shard.0.parquet   # Inverted index shard (minimizer -> bucket_id pairs)
+    └── ...               # Additional shards for large indices
 ```
 
-### Inverted Index (`.ryxdi`)
-
-Memory-efficient format for classification:
-```text
-index.ryxdi.manifest     # Manifest file
-index.ryxdi.shard.0      # Shard 0 (1:1 with main shards)
-...
-```
+This format provides:
+- Efficient columnar storage with compression
+- Memory-efficient streaming classification
+- Support for indices larger than available RAM
 
 ## Performance Tips
 
 - Use `--release` builds for production
 - Batch processing amortizes thread pool overhead
-- Sharded indices enable classification when total index exceeds RAM
-- Inverted indices reduce per-bucket search from O(queries × minimizers) to O(unique_minimizers)
+- Parquet format enables memory-efficient classification for large indices
 
 ## Testing
 

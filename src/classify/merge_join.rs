@@ -332,7 +332,32 @@ pub fn merge_sparse_hits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indices::main::Index;
+    use crate::types::IndexMetadata;
+    use std::collections::HashMap;
+
+    /// Helper to build an InvertedIndex for testing from bucket minimizers.
+    fn build_test_inverted_index(buckets: Vec<(u32, &str, Vec<u64>)>) -> InvertedIndex {
+        let mut bucket_map: HashMap<u32, Vec<u64>> = HashMap::new();
+        let mut bucket_names: HashMap<u32, String> = HashMap::new();
+        let mut bucket_minimizer_counts: HashMap<u32, usize> = HashMap::new();
+
+        for (id, name, mins) in buckets {
+            bucket_minimizer_counts.insert(id, mins.len());
+            bucket_map.insert(id, mins);
+            bucket_names.insert(id, name.to_string());
+        }
+
+        let metadata = IndexMetadata {
+            k: 64,
+            w: 50,
+            salt: 0,
+            bucket_names,
+            bucket_sources: HashMap::new(),
+            bucket_minimizer_counts,
+        };
+
+        InvertedIndex::build_from_bucket_map(64, 50, 0, &bucket_map, &metadata)
+    }
 
     #[test]
     fn test_merge_join_basic() {
@@ -343,13 +368,10 @@ mod tests {
         let query_idx = QueryInvertedIndex::build(&queries);
 
         // Build reference with overlapping minimizers
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 400]); // shares 100, 200
-        index.buckets.insert(2, vec![150, 250, 500]); // shares 150, 250
-        index.bucket_names.insert(1, "A".into());
-        index.bucket_names.insert(2, "B".into());
-
-        let ref_idx = InvertedIndex::build_from_index(&index);
+        let ref_idx = build_test_inverted_index(vec![
+            (1, "A", vec![100, 200, 400]), // shares 100, 200
+            (2, "B", vec![150, 250, 500]), // shares 150, 250
+        ]);
         let query_ids = vec![101i64];
 
         let results = classify_batch_merge_join(&query_idx, &ref_idx, &query_ids, 0.0);
@@ -371,11 +393,9 @@ mod tests {
         let queries = vec![(vec![100, 200], vec![150])];
         let query_idx = QueryInvertedIndex::build(&queries);
 
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![500, 600, 700]); // no overlap
-        index.bucket_names.insert(1, "A".into());
-
-        let ref_idx = InvertedIndex::build_from_index(&index);
+        let ref_idx = build_test_inverted_index(vec![
+            (1, "A", vec![500, 600, 700]), // no overlap
+        ]);
         let query_ids = vec![101i64];
 
         let results = classify_batch_merge_join(&query_idx, &ref_idx, &query_ids, 0.0);
@@ -391,11 +411,7 @@ mod tests {
         let queries: Vec<(Vec<u64>, Vec<u64>)> = vec![];
         let query_idx = QueryInvertedIndex::build(&queries);
 
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200]);
-        index.bucket_names.insert(1, "A".into());
-
-        let ref_idx = InvertedIndex::build_from_index(&index);
+        let ref_idx = build_test_inverted_index(vec![(1, "A", vec![100, 200])]);
         let query_ids: Vec<i64> = vec![];
 
         let results = classify_batch_merge_join(&query_idx, &ref_idx, &query_ids, 0.0);
@@ -412,12 +428,8 @@ mod tests {
         let query_idx = QueryInvertedIndex::build(&queries);
 
         // Large reference (need at least 17 minimizers to trigger gallop with 1 query)
-        let mut index = Index::new(64, 50, 0).unwrap();
         let minimizers: Vec<u64> = (0..100).map(|i| i * 10).collect();
-        index.buckets.insert(1, minimizers);
-        index.bucket_names.insert(1, "A".into());
-
-        let ref_idx = InvertedIndex::build_from_index(&index);
+        let ref_idx = build_test_inverted_index(vec![(1, "A", minimizers)]);
         let query_ids = vec![101i64];
 
         // 500 is in the reference (50 * 10 = 500)
@@ -445,12 +457,8 @@ mod tests {
         let query_idx = QueryInvertedIndex::build(&queries);
 
         // Large reference to trigger galloping (need q_len * 16 < r_len)
-        let mut index = Index::new(64, 50, 0).unwrap();
         let minimizers: Vec<u64> = (0..100).map(|i| i * 10).collect(); // [0, 10, 20, ...]
-        index.buckets.insert(1, minimizers);
-        index.bucket_names.insert(1, "A".into());
-
-        let ref_idx = InvertedIndex::build_from_index(&index);
+        let ref_idx = build_test_inverted_index(vec![(1, "A", minimizers)]);
         let query_ids = vec![101i64];
 
         // 10 is at position 1 in the reference (1 * 10 = 10)
@@ -478,11 +486,9 @@ mod tests {
         let query_idx = QueryInvertedIndex::build(&queries);
 
         // Small reference (< 100/16 = 6 minimizers)
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![500]); // Single minimizer at position 50
-        index.bucket_names.insert(1, "A".into());
-
-        let ref_idx = InvertedIndex::build_from_index(&index);
+        let ref_idx = build_test_inverted_index(vec![
+            (1, "A", vec![500]), // Single minimizer at position 50
+        ]);
         let query_ids = vec![101i64];
 
         let results = classify_batch_merge_join(&query_idx, &ref_idx, &query_ids, 0.0);

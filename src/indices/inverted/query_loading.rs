@@ -712,10 +712,40 @@ pub fn get_row_group_ranges(path: &std::path::Path) -> Result<Vec<RowGroupRangeI
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indices::main::Index;
     use crate::indices::parquet::{ParquetReadOptions, ParquetWriteOptions};
+    use crate::types::IndexMetadata;
     use anyhow::Result;
+    use std::collections::HashMap;
     use tempfile::TempDir;
+
+    /// Helper to build an InvertedIndex for testing from bucket minimizers.
+    fn build_test_inverted_index(
+        k: usize,
+        w: usize,
+        salt: u64,
+        buckets: Vec<(u32, &str, Vec<u64>)>,
+    ) -> InvertedIndex {
+        let mut bucket_map: HashMap<u32, Vec<u64>> = HashMap::new();
+        let mut bucket_names: HashMap<u32, String> = HashMap::new();
+        let mut bucket_minimizer_counts: HashMap<u32, usize> = HashMap::new();
+
+        for (id, name, mins) in buckets {
+            bucket_minimizer_counts.insert(id, mins.len());
+            bucket_map.insert(id, mins);
+            bucket_names.insert(id, name.to_string());
+        }
+
+        let metadata = IndexMetadata {
+            k,
+            w,
+            salt,
+            bucket_names,
+            bucket_sources: HashMap::new(),
+            bucket_minimizer_counts,
+        };
+
+        InvertedIndex::build_from_bucket_map(k, w, salt, &bucket_map, &metadata)
+    }
 
     #[test]
     fn test_load_parquet_for_query_basic() -> Result<()> {
@@ -723,15 +753,16 @@ mod tests {
         let path = tmp.path().join("shard.parquet");
 
         // Create an inverted index with multiple minimizers across buckets
-        let mut index = Index::new(64, 50, 0xABCD).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300, 400, 500]);
-        index.buckets.insert(2, vec![200, 300, 600, 700]);
-        index.buckets.insert(3, vec![500, 800, 900]);
-        index.bucket_names.insert(1, "A".into());
-        index.bucket_names.insert(2, "B".into());
-        index.bucket_names.insert(3, "C".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(
+            64,
+            50,
+            0xABCD,
+            vec![
+                (1, "A", vec![100, 200, 300, 400, 500]),
+                (2, "B", vec![200, 300, 600, 700]),
+                (3, "C", vec![500, 800, 900]),
+            ],
+        );
 
         // Save as Parquet
         inverted.save_shard_parquet(&path, 0, None)?;
@@ -769,11 +800,7 @@ mod tests {
         let path = tmp.path().join("shard.parquet");
 
         // Create an inverted index
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300]);
-        index.bucket_names.insert(1, "A".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(64, 50, 0, vec![(1, "A", vec![100, 200, 300])]);
         inverted.save_shard_parquet(&path, 0, None)?;
 
         // Empty query should return empty result without reading row groups
@@ -799,11 +826,7 @@ mod tests {
         let path = tmp.path().join("shard.parquet");
 
         // Create an inverted index with minimizers in a specific range
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300]);
-        index.bucket_names.insert(1, "A".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(64, 50, 0, vec![(1, "A", vec![100, 200, 300])]);
         inverted.save_shard_parquet(&path, 0, None)?;
 
         // Query for minimizers not in the file - should return empty
@@ -831,19 +854,28 @@ mod tests {
 
         // Create a large inverted index that will span multiple row groups (>100k pairs)
         // Each bucket has many minimizers to create enough pairs
-        let mut index = Index::new(64, 50, 0x1234).unwrap();
-
         // Create 10 buckets, each with 15000 minimizers (150k pairs total = 2+ row groups)
-        for bucket_id in 0..10u32 {
-            let base = bucket_id as u64 * 100_000;
-            let minimizers: Vec<u64> = (0..15000).map(|i| base + i as u64).collect();
-            index.buckets.insert(bucket_id, minimizers);
-            index
-                .bucket_names
-                .insert(bucket_id, format!("bucket_{}", bucket_id));
-        }
+        let buckets: Vec<(u32, &str, Vec<u64>)> = (0..10u32)
+            .map(|bucket_id| {
+                let base = bucket_id as u64 * 100_000;
+                let minimizers: Vec<u64> = (0..15000).map(|i| base + i as u64).collect();
+                let name: &str = match bucket_id {
+                    0 => "bucket_0",
+                    1 => "bucket_1",
+                    2 => "bucket_2",
+                    3 => "bucket_3",
+                    4 => "bucket_4",
+                    5 => "bucket_5",
+                    6 => "bucket_6",
+                    7 => "bucket_7",
+                    8 => "bucket_8",
+                    _ => "bucket_9",
+                };
+                (bucket_id, name, minimizers)
+            })
+            .collect();
 
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(64, 50, 0x1234, buckets);
         inverted.save_shard_parquet(&path, 0, None)?;
 
         // Query for minimizers from different row groups
@@ -881,11 +913,7 @@ mod tests {
         let path = tmp.path().join("shard.parquet");
 
         // Create a simple Parquet file
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300]);
-        index.bucket_names.insert(1, "A".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(64, 50, 0, vec![(1, "A", vec![100, 200, 300])]);
         inverted.save_shard_parquet(&path, 0, None)?;
 
         // Unsorted query should fail with clear error
@@ -917,12 +945,8 @@ mod tests {
         let path = tmp.path().join("shard.parquet");
 
         // Create Parquet file with many minimizers
-        let mut index = Index::new(64, 50, 0xBEEF).unwrap();
         let minimizers: Vec<u64> = (0..5000).map(|i| i as u64 * 10).collect();
-        index.buckets.insert(1, minimizers);
-        index.bucket_names.insert(1, "big".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(64, 50, 0xBEEF, vec![(1, "big", minimizers)]);
         inverted.save_shard_parquet(&path, 0, None)?;
 
         // Query with >1000 minimizers to exercise HashSet code path
@@ -953,11 +977,14 @@ mod tests {
         let path = tmp.path().join("shard.parquet");
 
         // Create Parquet file with specific minimizers
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 500, 1000]); // min=100, max=1000
-        index.bucket_names.insert(1, "A".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(
+            64,
+            50,
+            0,
+            vec![
+                (1, "A", vec![100, 500, 1000]), // min=100, max=1000
+            ],
+        );
         inverted.save_shard_parquet(&path, 0, None)?;
 
         // Test query at exact boundaries
@@ -1020,11 +1047,12 @@ mod tests {
             0xFFFF_FFFF_FFFF_FFFF, // u64::MAX (becomes -1 as i64)
         ];
 
-        let mut index = Index::new(64, 50, 0xDEADBEEF).unwrap();
-        index.buckets.insert(1, high_value_minimizers.clone());
-        index.bucket_names.insert(1, "high_values".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(
+            64,
+            50,
+            0xDEADBEEF,
+            vec![(1, "high_values", high_value_minimizers.clone())],
+        );
 
         // Save with bloom filter enabled
         let write_opts = ParquetWriteOptions {
@@ -1071,11 +1099,8 @@ mod tests {
         // Create file with specific minimizers in a tight range
         let present_minimizers: Vec<u64> = vec![1000, 1001, 1002, 1003, 1004];
 
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, present_minimizers.clone());
-        index.bucket_names.insert(1, "test".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted =
+            build_test_inverted_index(64, 50, 0, vec![(1, "test", present_minimizers.clone())]);
 
         // Save with bloom filter enabled and low FPP for accurate rejection
         let write_opts = ParquetWriteOptions {
@@ -1141,11 +1166,7 @@ mod tests {
 
         let minimizers: Vec<u64> = vec![100, 200, 300, 400, 500];
 
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, minimizers.clone());
-        index.bucket_names.insert(1, "test".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(64, 50, 0, vec![(1, "test", minimizers.clone())]);
 
         // Save WITHOUT bloom filter
         let write_opts = ParquetWriteOptions {
@@ -1188,11 +1209,7 @@ mod tests {
 
         let minimizers: Vec<u64> = vec![100, 200, 300];
 
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, minimizers);
-        index.bucket_names.insert(1, "test".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(64, 50, 0, vec![(1, "test", minimizers)]);
 
         let write_opts = ParquetWriteOptions {
             bloom_filter_enabled: true,
@@ -1243,11 +1260,8 @@ mod tests {
         // Create a larger set of minimizers to test bloom filter behavior
         let minimizers: Vec<u64> = (0..1000).map(|i| i * 1000).collect();
 
-        let mut index = Index::new(64, 50, 0x5555).unwrap();
-        index.buckets.insert(1, minimizers.clone());
-        index.bucket_names.insert(1, "test".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted =
+            build_test_inverted_index(64, 50, 0x5555, vec![(1, "test", minimizers.clone())]);
 
         let write_opts = ParquetWriteOptions {
             bloom_filter_enabled: true,
@@ -1295,13 +1309,15 @@ mod tests {
         let path = tmp.path().join("rg_pairs.parquet");
 
         // Create inverted index with multiple minimizers
-        let mut index = Index::new(64, 50, 0xABCD).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300, 400, 500]);
-        index.buckets.insert(2, vec![200, 300, 600]);
-        index.bucket_names.insert(1, "A".into());
-        index.bucket_names.insert(2, "B".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(
+            64,
+            50,
+            0xABCD,
+            vec![
+                (1, "A", vec![100, 200, 300, 400, 500]),
+                (2, "B", vec![200, 300, 600]),
+            ],
+        );
         inverted.save_shard_parquet(&path, 0, None)?;
 
         // Load pairs from row group 0 with specific query
@@ -1326,11 +1342,14 @@ mod tests {
         let path = tmp.path().join("rg_bounded.parquet");
 
         // Create a small row group with limited range
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![500, 600, 700]); // range [500, 700]
-        index.bucket_names.insert(1, "A".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(
+            64,
+            50,
+            0,
+            vec![
+                (1, "A", vec![500, 600, 700]), // range [500, 700]
+            ],
+        );
         inverted.save_shard_parquet(&path, 0, None)?;
 
         // Query spans wider range than row group
@@ -1354,11 +1373,14 @@ mod tests {
         let tmp = TempDir::new()?;
         let path = tmp.path().join("rg_no_overlap.parquet");
 
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300]); // range [100, 300]
-        index.bucket_names.insert(1, "A".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(
+            64,
+            50,
+            0,
+            vec![
+                (1, "A", vec![100, 200, 300]), // range [100, 300]
+            ],
+        );
         inverted.save_shard_parquet(&path, 0, None)?;
 
         // Query outside row group range
@@ -1376,11 +1398,7 @@ mod tests {
         let tmp = TempDir::new()?;
         let path = tmp.path().join("rg_empty.parquet");
 
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300]);
-        index.bucket_names.insert(1, "A".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(64, 50, 0, vec![(1, "A", vec![100, 200, 300])]);
         inverted.save_shard_parquet(&path, 0, None)?;
 
         // Empty query
@@ -1395,11 +1413,8 @@ mod tests {
         let tmp = TempDir::new()?;
         let path = tmp.path().join("rg_hashset.parquet");
 
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200, 300, 400, 500]);
-        index.bucket_names.insert(1, "A".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted =
+            build_test_inverted_index(64, 50, 0, vec![(1, "A", vec![100, 200, 300, 400, 500])]);
         inverted.save_shard_parquet(&path, 0, None)?;
 
         let query_minimizers = vec![200, 300];
@@ -1421,19 +1436,23 @@ mod tests {
         let path = tmp.path().join("rg_count.parquet");
 
         // Create large index to span multiple row groups
-        let mut index = Index::new(64, 50, 0x1234).unwrap();
-
         // Create buckets with different ranges
-        for bucket_id in 0..5u32 {
-            let base = bucket_id as u64 * 100_000;
-            let minimizers: Vec<u64> = (0..30000).map(|i| base + i as u64).collect();
-            index.buckets.insert(bucket_id, minimizers);
-            index
-                .bucket_names
-                .insert(bucket_id, format!("bucket_{}", bucket_id));
-        }
+        let buckets: Vec<(u32, &str, Vec<u64>)> = (0..5u32)
+            .map(|bucket_id| {
+                let base = bucket_id as u64 * 100_000;
+                let minimizers: Vec<u64> = (0..30000).map(|i| base + i as u64).collect();
+                let name: &str = match bucket_id {
+                    0 => "bucket_0",
+                    1 => "bucket_1",
+                    2 => "bucket_2",
+                    3 => "bucket_3",
+                    _ => "bucket_4",
+                };
+                (bucket_id, name, minimizers)
+            })
+            .collect();
 
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(64, 50, 0x1234, buckets);
 
         // Use small row group size to create multiple RGs
         let write_opts = ParquetWriteOptions {
@@ -1470,11 +1489,7 @@ mod tests {
         let tmp = TempDir::new()?;
         let path = tmp.path().join("rg_invalid.parquet");
 
-        let mut index = Index::new(64, 50, 0).unwrap();
-        index.buckets.insert(1, vec![100, 200]);
-        index.bucket_names.insert(1, "A".into());
-
-        let inverted = InvertedIndex::build_from_index(&index);
+        let inverted = build_test_inverted_index(64, 50, 0, vec![(1, "A", vec![100, 200])]);
         inverted.save_shard_parquet(&path, 0, None)?;
 
         // Try to load invalid row group index

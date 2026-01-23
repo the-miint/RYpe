@@ -11,17 +11,15 @@
 //!
 //! # Main Types
 //!
-//! - [`Index`]: Primary index structure with per-bucket minimizer sets
 //! - [`InvertedIndex`]: Minimizer → bucket mappings for fast classification
 //! - [`ShardedInvertedIndex`]: Memory-efficient sharded inverted index
 //! - [`MinimizerWorkspace`]: Reusable workspace for minimizer extraction
 //!
 //! # Classification Functions
 //!
-//! - [`classify_batch`]: Classify against an Index (per-bucket binary search)
 //! - [`classify_batch_sharded_sequential`]: Classify with sharded inverted index (low memory)
 //! - [`classify_batch_sharded_merge_join`]: Classify with merge-join algorithm (high overlap)
-//! - [`aggregate_batch`]: Aggregated paired-end classification
+//! - [`classify_batch_sharded_parallel_rg`]: Classify with parallel row group processing
 
 // Internal modules
 mod classify;
@@ -67,16 +65,15 @@ pub use error::{FirstErrorCapture, Result as RypeResult, RypeError};
 pub use types::{HitResult, IndexMetadata, QueryRecord};
 
 // Primary index types
-pub use indices::{Index, InvertedIndex, ShardedInvertedIndex, ShardedMainIndex};
+pub use indices::{InvertedIndex, ShardedInvertedIndex};
 
 // Minimizer extraction
 pub use core::{extract_into, get_paired_minimizers_into, MinimizerWorkspace, Strand};
 
 // Classification functions
 pub use classify::{
-    aggregate_batch, classify_batch, classify_batch_merge_join, classify_batch_sharded_main,
-    classify_batch_sharded_merge_join, classify_batch_sharded_parallel_rg,
-    classify_batch_sharded_sequential,
+    classify_batch_merge_join, classify_batch_sharded_merge_join,
+    classify_batch_sharded_parallel_rg, classify_batch_sharded_sequential,
 };
 
 // ============================================================================
@@ -90,20 +87,15 @@ pub use core::{
     MinimizerWithPosition,
 };
 
+// Constants
+pub use constants::BUCKET_SOURCE_DELIM;
+
 // Sharded index internals
 pub use indices::{
-    // Main index internals
-    estimate_bucket_bytes,
-    plan_shards,
-    MainIndexManifest,
-    MainIndexShard,
-    MainIndexShardInfo,
     // Inverted index internals
     QueryInvertedIndex,
-    ShardFormat,
     ShardInfo,
     ShardManifest,
-    ShardedMainIndexBuilder,
 };
 
 // Parquet index types (also available via `rype::parquet_index::*`)
