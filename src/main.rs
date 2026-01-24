@@ -10,8 +10,8 @@ mod logging;
 
 use commands::{
     build_parquet_index_from_config, create_parquet_index_from_refs, inspect_matches,
-    load_index_metadata, run_aggregate, run_classify, ClassifyAggregateArgs, ClassifyCommands,
-    ClassifyRunArgs, Cli, Commands, IndexCommands, InspectCommands,
+    load_index_metadata, resolve_bucket_id, run_aggregate, run_classify, ClassifyAggregateArgs,
+    ClassifyCommands, ClassifyRunArgs, Cli, Commands, IndexCommands, InspectCommands,
 };
 
 // CLI argument definitions moved to commands/args.rs
@@ -138,7 +138,11 @@ fn main() -> Result<()> {
                 ids,
             } => {
                 let metadata = load_index_metadata(&index)?;
-                let sources = metadata.bucket_sources.get(&bucket).unwrap();
+                let bucket_id = resolve_bucket_id(&bucket, &metadata.bucket_names)?;
+                let sources = metadata
+                    .bucket_sources
+                    .get(&bucket_id)
+                    .ok_or_else(|| anyhow!("Bucket {} not found in index", bucket_id))?;
 
                 if paths && ids {
                     return Err(anyhow!("Cannot have --paths and --ids"));

@@ -160,9 +160,10 @@ pub enum IndexCommands {
         #[arg(short, long)]
         index: PathBuf,
 
-        /// Bucket ID to inspect (from 'rype index stats' output)
+        /// Bucket identifier: numeric ID (e.g., '1') or exact bucket name (case-sensitive).
+        /// Numeric IDs take precedence - if a bucket is named '42', use its numeric ID instead.
         #[arg(short, long, required = true)]
-        bucket: u32,
+        bucket: String,
 
         /// Show only unique file paths (one per line)
         #[arg(long)]

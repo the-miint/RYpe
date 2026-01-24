@@ -420,3 +420,142 @@ fn test_cli_index_stats() -> Result<()> {
 
     Ok(())
 }
+
+/// Test bucket-source-detail command with both numeric ID and bucket name
+#[test]
+fn test_cli_bucket_source_detail_by_name() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index with two separate buckets (one per file)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // First, get the bucket names from stats to know what to look for
+    let output = Command::new(&binary)
+        .args(["index", "stats", "-i", index_path.to_str().unwrap()])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Stats failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stats_stdout = String::from_utf8_lossy(&output.stdout);
+    println!("Stats output:\n{}", stats_stdout);
+
+    // Test bucket-source-detail by numeric ID (bucket 1)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "bucket-source-detail",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-b",
+            "1",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "bucket-source-detail by ID failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout_by_id = String::from_utf8_lossy(&output.stdout);
+    println!("Output by ID '1':\n{}", stdout_by_id);
+
+    // Test bucket-source-detail by bucket name
+    // The bucket name is the full FASTA header: "NC_001422.1 Escherichia phage phiX174, complete genome"
+    let bucket_name = "NC_001422.1 Escherichia phage phiX174, complete genome";
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "bucket-source-detail",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-b",
+            bucket_name,
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "bucket-source-detail by name failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout_by_name = String::from_utf8_lossy(&output.stdout);
+    println!("Output by name '{}':\n{}", bucket_name, stdout_by_name);
+
+    // Both should return the same results
+    assert_eq!(
+        stdout_by_id, stdout_by_name,
+        "Output should be identical whether accessed by ID or name"
+    );
+
+    // Test with invalid bucket name (should error)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "bucket-source-detail",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-b",
+            "NonExistentBucket",
+        ])
+        .output()?;
+
+    assert!(
+        !output.status.success(),
+        "bucket-source-detail with invalid name should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not found"),
+        "Error should mention 'not found': {}",
+        stderr
+    );
+
+    Ok(())
+}
