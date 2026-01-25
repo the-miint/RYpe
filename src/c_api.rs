@@ -1,6 +1,23 @@
 //! C API for rype - FFI bindings for external language integration.
 //!
+//! This module provides C-compatible bindings for the rype library, enabling
+//! integration with C, Python (via ctypes/cffi), and other languages.
+//!
+//! # Index Format
+//!
+//! All indices are Parquet-based sharded inverted indices stored as directories:
+//!
+//! ```text
+//! index.ryxdi/
+//! ├── manifest.toml           # TOML metadata (k, w, salt, bucket info)
+//! ├── buckets.parquet         # Bucket metadata (id, name, sources)
+//! └── inverted/
+//!     ├── shard.0.parquet     # (minimizer, bucket_id) pairs
+//!     └── ...                 # Additional shards for large indices
+//! ```
+//!
 //! # Safety
+//!
 //! All functions that take raw pointers perform null checks and validation internally.
 //! These `extern "C"` functions cannot be marked `unsafe` in Rust since they are
 //! designed to be called from C code.
@@ -70,9 +87,13 @@ impl RypeIndex {
 
     /// Estimate the memory footprint of all shards when loaded.
     ///
-    /// Parquet shards are loaded as Arrow arrays:
+    /// Returns a **lower bound estimate** based on raw data size:
     /// - minimizer column: num_entries × 8 bytes (u64)
     /// - bucket_id column: num_entries × 4 bytes (u32)
+    ///
+    /// Actual memory usage will be higher due to Arrow array overhead,
+    /// Parquet decompression buffers, and temporary allocations during
+    /// classification. Plan for 1.5-2x this estimate in practice.
     pub fn estimate_memory_bytes(&self) -> usize {
         let manifest = self.0.manifest();
         manifest
@@ -120,6 +141,12 @@ fn clear_last_error() {
 
 /// Validates that a pointer is non-null and properly aligned for type T.
 /// Returns true if valid, false otherwise.
+///
+/// # Limitations
+///
+/// This does NOT verify the pointer points to valid memory or a live object.
+/// Dereferencing an aligned pointer to freed memory causes undefined behavior.
+/// This is an inherent limitation of C FFI - we cannot fully validate C pointers.
 #[inline]
 fn is_valid_ptr<T>(ptr: *const T) -> bool {
     !ptr.is_null() && (ptr as usize) % std::mem::align_of::<T>() == 0
@@ -226,6 +253,14 @@ pub extern "C" fn rype_index_load(path: *const c_char) -> *mut RypeIndex {
 #[no_mangle]
 pub extern "C" fn rype_index_free(ptr: *mut RypeIndex) {
     if !ptr.is_null() {
+        // Clear bucket name cache entries for this index to prevent memory leak
+        let index_addr = ptr as usize;
+        BUCKET_NAME_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .retain(|(addr, _), _| *addr != index_addr);
+        });
+
         unsafe {
             let _ = Box::from_raw(ptr);
         }
@@ -439,10 +474,10 @@ pub struct RypeNegativeSet {
 /// Creates a negative minimizer set from an index.
 ///
 /// Returns NULL because negative set creation requires loading all minimizers
-/// which is not supported for the sharded Parquet format.
+/// from all shards into memory, which is not currently supported.
 ///
-/// For negative filtering, use a separate non-sharded index or create the
-/// minimizer set from the original FASTA reference.
+/// For negative filtering, create the minimizer set directly from the original
+/// FASTA reference sequences using the CLI or Rust API.
 #[no_mangle]
 pub extern "C" fn rype_negative_set_create(
     _negative_index_ptr: *const RypeIndex,

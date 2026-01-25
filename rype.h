@@ -18,7 +18,7 @@ extern "C" {
  *
  * ## Quick Start
  *
- *     RypeIndex* idx = rype_index_load("index.ryidx");
+ *     RypeIndex* idx = rype_index_load("index.ryxdi");
  *     if (!idx) {
  *         fprintf(stderr, "Error: %s\n", rype_get_last_error());
  *         return 1;
@@ -46,17 +46,20 @@ extern "C" {
  *
  *     rype_index_free(idx);
  *
- * ## Unified Index API
+ * ## Index Format
  *
- * This library uses a unified index type that automatically handles:
- * - Single-file main indices (.ryidx)
- * - Sharded main indices (.ryidx.manifest + .ryidx.shard.*)
- * - Single-file inverted indices (.ryxdi)
- * - Sharded inverted indices (.ryxdi.manifest + .ryxdi.shard.*)
+ * This library uses Parquet-based sharded inverted indices stored as directories:
  *
- * The format is auto-detected by rype_index_load() based on file extension
- * and presence of manifest files. Classification functions automatically
- * dispatch to the appropriate algorithm.
+ *     index.ryxdi/
+ *     ├── manifest.toml           # TOML metadata (k, w, salt, bucket info)
+ *     ├── buckets.parquet         # Bucket metadata (id, name, sources)
+ *     └── inverted/
+ *         ├── shard.0.parquet     # (minimizer, bucket_id) pairs
+ *         ├── shard.1.parquet     # Additional shards for large indices
+ *         └── ...
+ *
+ * All indices are sharded inverted indices. The format is auto-detected by
+ * rype_index_load() when opening a .ryxdi directory.
  *
  * ## Thread Safety
  *
@@ -93,16 +96,14 @@ extern "C" {
 // ============================================================================
 
 /**
- * Opaque pointer to a unified index
+ * Opaque pointer to a Parquet inverted index
  *
- * RypeIndex abstracts over all supported index formats:
- * - Single-file main indices (.ryidx)
- * - Sharded main indices (.ryidx.manifest + .ryidx.shard.*)
- * - Single-file inverted indices (.ryxdi)
- * - Sharded inverted indices (.ryxdi.manifest + .ryxdi.shard.*)
+ * RypeIndex represents a sharded Parquet inverted index stored as a directory:
  *
- * The format is auto-detected when loading. Use rype_index_is_inverted()
- * and rype_index_is_sharded() to query the format if needed.
+ *     index.ryxdi/
+ *     ├── manifest.toml       # Index metadata
+ *     ├── buckets.parquet     # Bucket names and sources
+ *     └── inverted/           # Parquet shards with (minimizer, bucket_id) pairs
  *
  * Create with rype_index_load(), free with rype_index_free().
  */
@@ -114,16 +115,8 @@ typedef struct RypeIndex RypeIndex;
  * Contains a set of minimizers to exclude from query scoring.
  * Used to filter out contaminating sequences (e.g., host DNA, adapters).
  *
- * Workflow:
- * 1. Load a negative index from contaminating sequences (same k/w/salt)
- * 2. Create a negative set: rype_negative_set_create(neg_index)
- * 3. Pass to classification: rype_classify_with_negative(..., neg_set, ...)
- * 4. Free when done: rype_negative_set_free(neg_set)
- *
- * The negative index can be freed after creating the set.
- *
- * Note: Creating negative sets from sharded indices is not supported
- * (would require loading all shards into memory). Use single-file indices.
+ * Note: Creating negative sets from Parquet indices is not currently supported.
+ * Create the minimizer set directly from FASTA reference sequences instead.
  */
 typedef struct RypeNegativeSet RypeNegativeSet;
 
@@ -239,25 +232,21 @@ typedef struct {
 // ============================================================================
 
 /**
- * Load an index from disk, automatically detecting the format
+ * Load an index from disk
  *
- * Supported formats (auto-detected by extension and manifest presence):
- * - Single-file main index (.ryidx)
- * - Sharded main index (.ryidx with .manifest + .shard.* files)
- * - Single-file inverted index (.ryxdi)
- * - Sharded inverted index (.ryxdi with .manifest + .shard.* files)
+ * Supported format:
+ * - Parquet inverted index directory (.ryxdi with manifest.toml)
  *
- * @param path  Null-terminated UTF-8 file path to index file
+ * @param path  Null-terminated UTF-8 path to index directory
  * @return      Non-NULL RypeIndex pointer on success, NULL on failure
  *
  * ## Errors (returns NULL)
  *
  * - path is NULL
- * - File not found or cannot be opened
- * - File is corrupted or has wrong format/magic
- * - Unsupported index version
+ * - Directory not found or cannot be opened
+ * - Missing or corrupted manifest.toml
+ * - Unsupported format version
  * - Out of memory
- * - File contains invalid data (triggers DoS protection limits)
  *
  * ## Thread Safety
  *
@@ -273,10 +262,11 @@ typedef struct {
  *
  * ## Example
  *
- *     // Load any index type - format is auto-detected
- *     RypeIndex* idx = rype_index_load("myindex.ryidx");      // main index
- *     RypeIndex* inv = rype_index_load("myindex.ryxdi");      // inverted index
- *     RypeIndex* shd = rype_index_load("myindex.ryidx");      // sharded (if .manifest exists)
+ *     RypeIndex* idx = rype_index_load("bacteria.ryxdi");
+ *     if (!idx) {
+ *         fprintf(stderr, "Error: %s\n", rype_get_last_error());
+ *         return 1;
+ *     }
  */
 RypeIndex* rype_index_load(const char* path);
 
@@ -336,13 +326,7 @@ uint64_t rype_index_salt(const RypeIndex* index);
  * Get the number of buckets in an index
  *
  * @param index  Non-NULL RypeIndex pointer
- * @return       Number of buckets for main indices, -1 for inverted indices
- *               (which don't store bucket metadata), 0 if index is NULL
- *
- * ## Note
- *
- * Inverted indices don't store bucket names/counts. Use the original main
- * index to get bucket information, or check with rype_index_is_inverted().
+ * @return       Number of buckets, or 0 if index is NULL
  *
  * ## Thread Safety
  *
@@ -351,22 +335,14 @@ uint64_t rype_index_salt(const RypeIndex* index);
 int32_t rype_index_num_buckets(const RypeIndex* index);
 
 /**
- * Check if an index is an inverted index
- *
- * @param index  Non-NULL RypeIndex pointer
- * @return       1 if inverted index, 0 if main index or NULL
- *
- * ## Thread Safety
- *
- * Thread-safe (read-only access).
- */
-int rype_index_is_inverted(const RypeIndex* index);
-
-/**
  * Check if an index is sharded
  *
  * @param index  Non-NULL RypeIndex pointer
- * @return       1 if sharded, 0 if single-file or NULL
+ * @return       Always 1 (all Parquet indices are sharded), or 0 if NULL
+ *
+ * ## Note
+ *
+ * All Parquet indices are sharded, even if they contain only one shard.
  *
  * ## Thread Safety
  *
@@ -378,7 +354,7 @@ int rype_index_is_sharded(const RypeIndex* index);
  * Get the number of shards in an index
  *
  * @param index  Non-NULL RypeIndex pointer
- * @return       Number of shards (1 for single-file indices), 0 if NULL
+ * @return       Number of shards (>= 1), or 0 if NULL
  *
  * ## Thread Safety
  *
@@ -393,11 +369,12 @@ uint32_t rype_index_num_shards(const RypeIndex* index);
 /**
  * Get the estimated memory footprint of the loaded index in bytes
  *
- * For single-file indices, returns total memory used by the loaded data.
- * For sharded indices, returns only the manifest memory (shards load on-demand).
+ * Returns a **lower bound estimate** of memory needed to load all shards.
+ * Actual usage will be 1.5-2x higher due to Arrow array overhead and
+ * temporary allocations. Shards are loaded on-demand during classification.
  *
  * @param index  Non-NULL RypeIndex pointer
- * @return       Estimated memory in bytes, 0 if NULL
+ * @return       Estimated memory in bytes (lower bound), 0 if NULL
  *
  * ## Thread Safety
  *
@@ -408,13 +385,11 @@ size_t rype_index_memory_bytes(const RypeIndex* index);
 /**
  * Get the estimated size of the largest shard in bytes
  *
- * For single-file indices, returns 0 (no shards).
- * For sharded indices, returns the size needed to load the largest shard.
- *
+ * Returns the estimated memory needed to load the largest single shard.
  * Use this for memory planning when classifying against sharded indices.
  *
  * @param index  Non-NULL RypeIndex pointer
- * @return       Largest shard size in bytes, 0 if NULL or not sharded
+ * @return       Largest shard size in bytes, or 0 if NULL
  *
  * ## Thread Safety
  *
@@ -463,32 +438,18 @@ size_t rype_parse_byte_suffix(const char* str);
  *
  * @param index      Non-NULL RypeIndex pointer
  * @param bucket_id  Bucket ID from RypeHit.bucket_id
- * @return           Bucket name string, or NULL (see below)
+ * @return           Bucket name string, or NULL if not found
  *
  * ## NULL Return Cases
  *
- * This function returns NULL in the following situations:
+ * - index is NULL
+ * - bucket_id doesn't exist in the index
  *
- * 1. **index is NULL**: Caller error - always check index pointer validity
- * 2. **Inverted index**: Inverted indices (.ryxdi) don't store bucket names.
- *    Use the original main index (.ryidx) to look up bucket names.
- *    Check with rype_index_is_inverted() if uncertain.
- * 3. **Invalid bucket_id**: The bucket_id doesn't exist in the index.
- *    This is unexpected if bucket_id came from a valid RypeHit result.
- *    May indicate index corruption or version mismatch.
- *
- * ## Recommended Usage Pattern
+ * **WARNING**: ALWAYS check return value before use. Passing NULL to
+ * printf("%s") causes undefined behavior. Use pattern:
  *
  *     const char* name = rype_bucket_name(idx, hit->bucket_id);
- *     if (name) {
- *         printf("Matched: %s\n", name);
- *     } else if (rype_index_is_inverted(idx)) {
- *         // Expected for inverted indices - use main index for names
- *         printf("Matched bucket ID: %u\n", hit->bucket_id);
- *     } else {
- *         // Unexpected - bucket_id should exist in main index
- *         fprintf(stderr, "Warning: unknown bucket ID %u\n", hit->bucket_id);
- *     }
+ *     printf("%s\n", name ? name : "unknown");
  *
  * ## Memory
  *
@@ -509,44 +470,15 @@ const char* rype_bucket_name(const RypeIndex* index, uint32_t bucket_id);
  * Create a negative minimizer set from an index
  *
  * @param negative_index  RypeIndex containing sequences to filter out
- * @return                Non-NULL RypeNegativeSet on success, NULL on failure
+ * @return                Always returns NULL (not currently supported)
  *
- * ## Use Case
+ * ## Current Limitations
  *
- * Negative filtering improves specificity by removing minimizers that match
- * contaminating sequences before scoring. Common uses:
+ * Creating negative sets from Parquet indices is not currently supported
+ * because it would require loading all shard data into memory.
  *
- * - Filter host DNA when classifying metagenomic samples
- * - Remove adapter/primer sequences
- * - Exclude known false-positive sources
- *
- * ## Requirements
- *
- * - The negative index MUST have the same k, w, and salt as the positive index
- *   used for classification. Mismatched parameters will produce incorrect results.
- * - Sharded indices are NOT supported (would require loading all shards).
- *   Use single-file indices for negative set creation.
- *
- * ## Memory
- *
- * - The negative index can be freed after creating the set
- * - The returned set must be freed with rype_negative_set_free()
- *
- * ## Thread Safety
- *
- * NOT thread-safe for creation. Safe to share for concurrent classification.
- *
- * ## Example
- *
- *     RypeIndex* host_idx = rype_index_load("human_genome.ryidx");
- *     RypeNegativeSet* host_filter = rype_negative_set_create(host_idx);
- *     rype_index_free(host_idx);  // Safe - set owns its own copy
- *
- *     // Use host_filter for all subsequent classifications
- *     RypeResultArray* results = rype_classify_with_negative(
- *         target_idx, host_filter, queries, num_queries, 0.1);
- *
- *     rype_negative_set_free(host_filter);
+ * For negative filtering, create the minimizer set directly from the
+ * original FASTA reference sequences using the CLI or Rust API.
  */
 RypeNegativeSet* rype_negative_set_create(const RypeIndex* negative_index);
 
@@ -566,8 +498,6 @@ void rype_negative_set_free(RypeNegativeSet* neg_set);
  *
  * @param neg_set  RypeNegativeSet pointer
  * @return         Number of minimizers, or 0 if neg_set is NULL
- *
- * Useful for logging/debugging to verify the negative set was built correctly.
  */
 size_t rype_negative_set_size(const RypeNegativeSet* neg_set);
 
@@ -579,11 +509,6 @@ size_t rype_negative_set_size(const RypeNegativeSet* neg_set);
  * Classify a batch of sequences against an index
  *
  * Equivalent to rype_classify_with_negative(index, NULL, queries, num_queries, threshold).
- * Use rype_classify_with_negative() for negative filtering support.
- *
- * This function automatically dispatches to the correct classification
- * algorithm based on the index type (single main, sharded main, single
- * inverted, or sharded inverted).
  *
  * @param index        Non-NULL RypeIndex pointer from rype_index_load()
  * @param queries      Array of RypeQuery structs
@@ -603,12 +528,8 @@ RypeResultArray* rype_classify(
 /**
  * Classify a batch of sequences with optional negative filtering
  *
- * This function automatically dispatches to the correct classification
- * algorithm based on the index type:
- * - Single main index: bucket-by-bucket scoring
- * - Sharded main index: loads shards on-demand
- * - Single inverted index: minimizer-to-bucket lookup
- * - Sharded inverted index: sequential shard processing
+ * Processes queries against a Parquet sharded inverted index, loading
+ * shards sequentially to minimize memory usage.
  *
  * @param index        Non-NULL RypeIndex pointer from rype_index_load()
  * @param negative_set Optional RypeNegativeSet for filtering (NULL to disable)
@@ -632,9 +553,6 @@ RypeResultArray* rype_classify(
  * excluded from the query before scoring. This improves specificity when
  * contaminating sequences (e.g., host DNA) share minimizers with targets.
  *
- * The score is still computed as:
- *     score = matching_minimizers / (total_query_minimizers - negative_matches)
- *
  * ## Errors (returns NULL)
  *
  * - index is NULL
@@ -645,8 +563,7 @@ RypeResultArray* rype_classify(
  *
  * ## Thread Safety
  *
- * Thread-safe. Multiple threads can classify concurrently with same RypeIndex
- * and negative_set.
+ * Thread-safe. Multiple threads can classify concurrently with same RypeIndex.
  *
  * ## Memory
  *
@@ -656,27 +573,6 @@ RypeResultArray* rype_classify(
  *
  * Uses parallel processing internally. For best throughput, batch many
  * queries together rather than calling one at a time.
- *
- * ## Example
- *
- *     // Without negative filtering
- *     RypeResultArray* results = rype_classify_with_negative(
- *         idx, NULL, queries, 1000, 0.1);
- *
- *     // With negative filtering
- *     RypeNegativeSet* host = rype_negative_set_create(host_idx);
- *     RypeResultArray* filtered = rype_classify_with_negative(
- *         idx, host, queries, 1000, 0.1);
- *
- *     for (size_t i = 0; i < filtered->len; i++) {
- *         RypeHit* hit = &filtered->data[i];
- *         const char* name = rype_bucket_name(idx, hit->bucket_id);
- *         printf("Query %ld -> %s (score: %.3f)\n",
- *                hit->query_id, name ? name : "unknown", hit->score);
- *     }
- *
- *     rype_results_free(filtered);
- *     rype_negative_set_free(host);
  */
 RypeResultArray* rype_classify_with_negative(
     const RypeIndex* index,
@@ -709,11 +605,10 @@ RypeResultArray* rype_classify_best_hit(
 );
 
 /**
- * Classify a batch of sequences with negative filtering, returning only the best hit per query
+ * Classify with negative filtering, returning only the best hit per query
  *
  * Same as rype_classify_with_negative() but filters results to keep only the
- * highest-scoring bucket for each query. If multiple buckets tie for the best
- * score, one is chosen arbitrarily.
+ * highest-scoring bucket for each query.
  *
  * @param index         Non-NULL RypeIndex pointer from rype_index_load()
  * @param negative_set  Optional RypeNegativeSet (NULL to disable filtering)
@@ -767,15 +662,6 @@ void rype_results_free(RypeResultArray* results);
  * ## Thread Safety
  *
  * Thread-safe (returns thread-local error).
- *
- * ## Example
- *
- *     RypeIndex* idx = rype_index_load("missing.ryidx");
- *     if (!idx) {
- *         const char* err = rype_get_last_error();
- *         fprintf(stderr, "Error: %s\n", err ? err : "unknown error");
- *         return 1;
- *     }
  */
 const char* rype_get_last_error(void);
 
@@ -783,7 +669,7 @@ const char* rype_get_last_error(void);
 // ARROW C DATA INTERFACE API (Optional Feature)
 // ============================================================================
 //
-// These functions are only available when rype is built with --features arrow.
+// These functions are only available when rype is built with --features arrow-ffi.
 // They use the Arrow C Data Interface for zero-copy data exchange with
 // Arrow-compatible systems (Python/PyArrow, R/arrow, DuckDB, Polars, etc.).
 //
@@ -791,7 +677,7 @@ const char* rype_get_last_error(void);
 //
 // ## Building with Arrow support
 //
-//     cargo build --release --features arrow
+//     cargo build --release --features arrow-ffi
 //
 // ## Linking
 //
@@ -817,12 +703,6 @@ const char* rype_get_last_error(void);
 #define ARROW_FLAG_NULLABLE 2
 #define ARROW_FLAG_MAP_KEYS_SORTED 4
 
-/**
- * Arrow C Data Interface schema structure
- *
- * Describes the type and metadata of an Arrow array.
- * Part of the Arrow C Data Interface standard.
- */
 struct ArrowSchema {
     const char* format;
     const char* name;
@@ -835,12 +715,6 @@ struct ArrowSchema {
     void* private_data;
 };
 
-/**
- * Arrow C Data Interface array structure
- *
- * Contains the actual data buffers for an Arrow array.
- * Part of the Arrow C Data Interface standard.
- */
 struct ArrowArray {
     int64_t length;
     int64_t null_count;
@@ -854,13 +728,6 @@ struct ArrowArray {
     void* private_data;
 };
 
-/**
- * Arrow C Stream Interface structure
- *
- * A streaming interface for Arrow record batches.
- * Part of the Arrow C Stream Interface standard.
- * See: https://arrow.apache.org/docs/format/CStreamInterface.html
- */
 struct ArrowArrayStream {
     int (*get_schema)(struct ArrowArrayStream*, struct ArrowSchema* out);
     int (*get_next)(struct ArrowArrayStream*, struct ArrowArray* out);
@@ -876,11 +743,7 @@ struct ArrowArrayStream {
 // ----------------------------------------------------------------------------
 
 /**
- * Classify sequences from an Arrow stream using any index type
- *
- * This function automatically dispatches to the correct classification
- * algorithm based on the index type (single main, sharded main, single
- * inverted, or sharded inverted).
+ * Classify sequences from an Arrow stream
  *
  * TRUE STREAMING: Processes one batch at a time. Memory usage is O(batch_size),
  * not O(total_data). Results are available as soon as each batch is processed.
@@ -889,14 +752,11 @@ struct ArrowArrayStream {
  * @param negative_set   Optional RypeNegativeSet for filtering (NULL to disable)
  * @param input_stream   Input ArrowArrayStream containing sequence batches
  * @param threshold      Classification threshold (0.0-1.0)
- * @param use_merge_join For sharded inverted indices: non-zero for merge-join
- *                       strategy, 0 for sequential. Ignored for other index types.
+ * @param use_merge_join Non-zero for merge-join strategy, 0 for sequential
  * @param out_stream     Output ArrowArrayStream for results (caller-allocated)
  * @return               0 on success, -1 on error
  *
  * ## Input Schema
- *
- * The input stream must produce RecordBatches with these columns:
  *
  * | Column         | Type                    | Nullable | Description              |
  * |----------------|-------------------------|----------|--------------------------|
@@ -906,56 +766,21 @@ struct ArrowArrayStream {
  *
  * ## Output Schema
  *
- * The output stream produces RecordBatches with these columns:
- *
  * | Column    | Type    | Description                         |
  * |-----------|---------|-------------------------------------|
  * | query_id  | Int64   | Matching query ID from input        |
  * | bucket_id | UInt32  | Matched bucket/reference ID         |
  * | score     | Float64 | Classification score (0.0-1.0)      |
  *
- * ## Memory Management and Ownership
+ * ## Memory Management
  *
- * **Input Stream Ownership (CRITICAL):**
- * - This function TAKES OWNERSHIP of input_stream via the Arrow C Data Interface
- *   release callback mechanism
- * - After this function returns, input_stream->release has been called internally
- * - The caller MUST NOT call input_stream->release() again (causes double-free)
- * - The caller MUST NOT wrap input_stream in another structure that also manages
- *   its lifetime (e.g., a C++ RAII wrapper that calls release in destructor)
- * - If using PyArrow or similar: the stream is consumed; do not reuse it
- *
- * **Output Stream Ownership:**
- * - out_stream is initialized by this function with a new stream
- * - Caller owns out_stream and MUST call out_stream->release(out_stream) when done
- * - Do NOT release out_stream if this function returns -1 (error case)
- *
- * **Schema Lifetime (Arrow C Data Interface requirement):**
- * - When consuming out_stream, the schema obtained via get_schema() must be
- *   kept alive (not released) while iterating batches via get_next()
- * - Release order: finish all get_next() calls, then release schema, then release stream
+ * - This function TAKES OWNERSHIP of input_stream
+ * - Caller owns out_stream and MUST call out_stream->release() when done
+ * - Do NOT release out_stream if this function returns -1
  *
  * ## Thread Safety
  *
  * Thread-safe for concurrent classification with the same RypeIndex.
- * Each thread must use its own input/output streams.
- *
- * ## Example
- *
- *     struct ArrowArrayStream input_stream;
- *     struct ArrowArrayStream output_stream;
- *
- *     // ... initialize input_stream from PyArrow, DuckDB, etc. ...
- *
- *     int result = rype_classify_arrow(
- *         idx, NULL, &input_stream, 0.1, 0, &output_stream);
- *
- *     if (result == 0) {
- *         // ... consume output_stream ...
- *         output_stream.release(&output_stream);
- *     } else {
- *         fprintf(stderr, "Error: %s\n", rype_get_last_error());
- *     }
  */
 int rype_classify_arrow(
     const RypeIndex* index,
@@ -967,31 +792,27 @@ int rype_classify_arrow(
 );
 
 /**
- * Get the output schema for Arrow classification results
+ * Classify from Arrow stream, returning only the best hit per query
  *
- * Returns the schema that rype_classify_arrow() produces.
- * Useful for pre-allocating memory or validating expected output format.
+ * Same as rype_classify_arrow() but filters results to keep only the
+ * highest-scoring bucket for each query.
+ */
+int rype_classify_arrow_best_hit(
+    const RypeIndex* index,
+    const RypeNegativeSet* negative_set,
+    struct ArrowArrayStream* input_stream,
+    double threshold,
+    int use_merge_join,
+    struct ArrowArrayStream* out_stream
+);
+
+/**
+ * Get the output schema for Arrow classification results
  *
  * @param out_schema  Pointer to caller-allocated ArrowSchema to initialize
  * @return            0 on success, -1 on error
  *
- * ## Output Schema
- *
- * - query_id: Int64 (non-nullable)
- * - bucket_id: UInt32 (non-nullable)
- * - score: Float64 (non-nullable)
- *
- * ## Memory
- *
  * Caller must call out_schema->release(out_schema) when done.
- *
- * ## Example
- *
- *     struct ArrowSchema schema;
- *     if (rype_arrow_result_schema(&schema) == 0) {
- *         // Use schema...
- *         schema.release(&schema);
- *     }
  */
 int rype_arrow_result_schema(struct ArrowSchema* out_schema);
 

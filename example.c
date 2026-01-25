@@ -33,7 +33,7 @@ extern void rype_results_free(RypeResultArray* results);
 int main() {
     // 1. Load the Index
     printf("Loading index...\n");
-    void* index = rype_index_load("my_index.ryp");
+    void* index = rype_index_load("my_index.ryxdi");
     if (!index) {
         fprintf(stderr, "Failed to load index. Did you run 'rype index'?\n");
         return 1;
