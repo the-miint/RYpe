@@ -15,7 +15,8 @@ use rype::memory::{
 use rype::parquet_index;
 use rype::{
     classify_batch_sharded_merge_join, classify_batch_sharded_parallel_rg,
-    classify_batch_sharded_sequential, log_timing, IndexMetadata, ShardedInvertedIndex,
+    classify_batch_sharded_sequential, filter_best_hits, log_timing, IndexMetadata,
+    ShardedInvertedIndex,
 };
 
 use super::helpers::{
@@ -37,6 +38,7 @@ pub struct ClassifyRunArgs {
     pub parallel_rg: bool,
     pub use_bloom_filter: bool,
     pub parallel_input_rg: usize,
+    pub best_hit: bool,
 }
 
 /// Run the classify command with the given arguments.
@@ -352,6 +354,11 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
             );
 
             let results = classify_records(&batch_refs)?;
+            let results = if args.best_hit {
+                filter_best_hits(results)
+            } else {
+                results
+            };
 
             let t_format = std::time::Instant::now();
             let chunk_out = format_results_ref(&results, &headers);
@@ -393,6 +400,11 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
             log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
 
             let results = classify_records(&batch_refs)?;
+            let results = if args.best_hit {
+                filter_best_hits(results)
+            } else {
+                results
+            };
 
             let t_format = std::time::Instant::now();
             let chunk_out = format_results(&results, &headers);

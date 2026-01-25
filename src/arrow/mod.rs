@@ -137,6 +137,59 @@ pub fn classify_arrow_batch_sharded(
     threshold: f64,
     use_merge_join: bool,
 ) -> Result<RecordBatch, ArrowClassifyError> {
+    classify_arrow_batch_sharded_internal(
+        sharded,
+        negative_mins,
+        batch,
+        threshold,
+        use_merge_join,
+        false,
+    )
+}
+
+/// Classify sequences in an Arrow RecordBatch and return only the best hit per query.
+///
+/// Same as `classify_arrow_batch_sharded` but filters results to keep only the
+/// highest-scoring bucket for each query. If multiple buckets tie for the best
+/// score, one is chosen arbitrarily.
+///
+/// # Arguments
+///
+/// * `sharded` - The sharded inverted index to classify against
+/// * `negative_mins` - Optional set of minimizers to exclude (for contamination filtering)
+/// * `batch` - Arrow RecordBatch with columns: `read_id` (Int64), `sequence` (Binary/LargeBinary)
+/// * `threshold` - Minimum score threshold (0.0-1.0) for reporting matches
+/// * `use_merge_join` - If true, uses merge-join algorithm; otherwise sequential
+///
+/// # Returns
+///
+/// RecordBatch with at most one row per query_id, containing the highest-scoring hit.
+pub fn classify_arrow_batch_sharded_best_hit(
+    sharded: &ShardedInvertedIndex,
+    negative_mins: Option<&HashSet<u64>>,
+    batch: &RecordBatch,
+    threshold: f64,
+    use_merge_join: bool,
+) -> Result<RecordBatch, ArrowClassifyError> {
+    classify_arrow_batch_sharded_internal(
+        sharded,
+        negative_mins,
+        batch,
+        threshold,
+        use_merge_join,
+        true,
+    )
+}
+
+/// Internal implementation that supports both regular and best-hit modes.
+fn classify_arrow_batch_sharded_internal(
+    sharded: &ShardedInvertedIndex,
+    negative_mins: Option<&HashSet<u64>>,
+    batch: &RecordBatch,
+    threshold: f64,
+    use_merge_join: bool,
+    best_hit_only: bool,
+) -> Result<RecordBatch, ArrowClassifyError> {
     let records = batch_to_records(batch)?;
     let hits = if use_merge_join {
         classify_batch_sharded_merge_join(sharded, negative_mins, &records, threshold, None)
@@ -144,6 +197,13 @@ pub fn classify_arrow_batch_sharded(
         classify_batch_sharded_sequential(sharded, negative_mins, &records, threshold, None)
     }
     .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
+
+    let hits = if best_hit_only {
+        crate::classify::filter_best_hits(hits)
+    } else {
+        hits
+    };
+
     hits_to_record_batch(hits)
 }
 

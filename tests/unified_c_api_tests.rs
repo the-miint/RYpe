@@ -4,10 +4,10 @@
 
 use anyhow::Result;
 use rype::c_api::{
-    rype_bucket_name, rype_classify, rype_classify_with_negative, rype_get_last_error,
-    rype_index_free, rype_index_is_sharded, rype_index_k, rype_index_load, rype_index_num_buckets,
-    rype_index_num_shards, rype_index_salt, rype_index_w, rype_negative_set_create,
-    rype_negative_set_free, rype_results_free, RypeQuery,
+    rype_bucket_name, rype_classify, rype_classify_best_hit, rype_classify_with_negative,
+    rype_get_last_error, rype_index_free, rype_index_is_sharded, rype_index_k, rype_index_load,
+    rype_index_num_buckets, rype_index_num_shards, rype_index_salt, rype_index_w,
+    rype_negative_set_create, rype_negative_set_free, rype_results_free, RypeQuery,
 };
 use rype::{
     extract_into, BucketData, IndexMetadata, InvertedIndex, MinimizerWorkspace, ParquetWriteOptions,
@@ -704,6 +704,128 @@ fn test_unified_classify_paired_vs_single_end() -> Result<()> {
 
     rype_results_free(single_results);
     rype_results_free(paired_results);
+    rype_index_free(loaded);
+    Ok(())
+}
+
+// =============================================================================
+// Best Hit Filtering Tests
+// =============================================================================
+
+/// Helper to create a Parquet index where buckets share some minimizers.
+/// This ensures a query can match both buckets.
+fn create_overlapping_bucket_index(
+    dir: &std::path::Path,
+    k: usize,
+    w: usize,
+    salt: u64,
+) -> Result<std::path::PathBuf> {
+    let index_path = dir.join("overlap.ryxdi");
+
+    let mut ws = MinimizerWorkspace::new();
+
+    // Generate a base sequence and two variants
+    let base_seq = generate_sequence(300, 0);
+
+    // Bucket 1: minimizers from first 200 bases
+    extract_into(&base_seq[..200], k, w, salt, &mut ws);
+    let mut mins1: Vec<u64> = ws.buffer.drain(..).collect();
+    mins1.sort();
+    mins1.dedup();
+
+    // Bucket 2: minimizers from last 200 bases (overlaps with bucket 1 in middle)
+    extract_into(&base_seq[100..], k, w, salt, &mut ws);
+    let mut mins2: Vec<u64> = ws.buffer.drain(..).collect();
+    mins2.sort();
+    mins2.dedup();
+
+    // Build bucket data
+    let buckets = vec![
+        BucketData {
+            bucket_id: 1,
+            bucket_name: "Bucket1".to_string(),
+            sources: vec!["src1".to_string()],
+            minimizers: mins1,
+        },
+        BucketData {
+            bucket_id: 2,
+            bucket_name: "Bucket2".to_string(),
+            sources: vec!["src2".to_string()],
+            minimizers: mins2,
+        },
+    ];
+
+    let options = ParquetWriteOptions::default();
+    rype::create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))?;
+
+    Ok(index_path)
+}
+
+#[test]
+fn test_rype_classify_best_hit_filters_results() -> Result<()> {
+    let dir = tempdir()?;
+    let index_path = create_overlapping_bucket_index(dir.path(), 32, 10, 0x12345)?;
+
+    let path_cstr = CString::new(index_path.to_str().unwrap())?;
+    let loaded = rype_index_load(path_cstr.as_ptr());
+    assert!(!loaded.is_null());
+
+    // Create a query that overlaps with the middle portion (should match both buckets)
+    let query_seq = generate_sequence(300, 0);
+    let (query, _seq_holder) = make_query(1, &query_seq[100..200]); // Middle 100 bases
+
+    // Test rype_classify (should return hits for both buckets)
+    let results_all = rype_classify(loaded, &query, 1, 0.0); // threshold 0 to get all matches
+    assert!(!results_all.is_null(), "Classification should succeed");
+
+    let results_all_ref = unsafe { &*results_all };
+    let hits_all = unsafe { std::slice::from_raw_parts(results_all_ref.data, results_all_ref.len) };
+
+    // Count unique bucket IDs in regular results
+    let mut bucket_ids_all: Vec<u32> = hits_all.iter().map(|h| h.bucket_id).collect();
+    bucket_ids_all.sort();
+    bucket_ids_all.dedup();
+
+    // Test rype_classify_best_hit (should return at most one hit per query)
+    let results_best = rype_classify_best_hit(loaded, &query, 1, 0.0);
+    assert!(
+        !results_best.is_null(),
+        "Best-hit classification should succeed"
+    );
+
+    let results_best_ref = unsafe { &*results_best };
+
+    // With best_hit, we should have at most one result per query
+    assert!(
+        results_best_ref.len <= 1,
+        "Best-hit should return at most one result per query. Got {} results.",
+        results_best_ref.len
+    );
+
+    // If we have a result, it should be the one with the highest score
+    if results_best_ref.len == 1 && results_all_ref.len > 1 {
+        let best_hit = unsafe { &*results_best_ref.data };
+
+        // Find the max score from all results
+        let max_score = hits_all.iter().map(|h| h.score).fold(0.0_f64, f64::max);
+
+        assert!(
+            (best_hit.score - max_score).abs() < 1e-10,
+            "Best hit score {} should equal max score {}",
+            best_hit.score,
+            max_score
+        );
+    }
+
+    println!(
+        "Results: all={} hits ({} unique buckets), best_hit={} hits",
+        results_all_ref.len,
+        bucket_ids_all.len(),
+        results_best_ref.len
+    );
+
+    rype_results_free(results_all);
+    rype_results_free(results_best);
     rype_index_free(loaded);
     Ok(())
 }

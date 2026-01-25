@@ -362,6 +362,11 @@ WHEN TO USE 'run' vs 'aggregate':
         /// Print timing diagnostics to stderr for performance analysis.
         #[arg(long)]
         timing: bool,
+
+        /// Report only the single best hit per query.
+        /// If multiple buckets tie for best score, one is chosen arbitrarily.
+        #[arg(long)]
+        best_hit: bool,
     },
 
     /// Pool all reads for sample-level classification (higher sensitivity)

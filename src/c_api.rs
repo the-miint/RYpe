@@ -18,7 +18,7 @@ use std::path::Path;
 use std::slice;
 
 #[cfg(feature = "arrow-ffi")]
-use crate::arrow::classify_arrow_batch_sharded;
+use crate::arrow::{classify_arrow_batch_sharded, classify_arrow_batch_sharded_best_hit};
 #[cfg(feature = "arrow-ffi")]
 use arrow::ffi::FFI_ArrowSchema;
 #[cfg(feature = "arrow-ffi")]
@@ -517,6 +517,28 @@ pub extern "C" fn rype_classify_with_negative(
     num_queries: size_t,
     threshold: c_double,
 ) -> *mut RypeResultArray {
+    classify_internal(
+        index_ptr,
+        negative_set_ptr,
+        queries_ptr,
+        num_queries,
+        threshold,
+        false,
+    )
+}
+
+/// Internal classification helper shared by all classify functions.
+///
+/// # Arguments
+/// * `best_hit_only` - If true, filter results to keep only the best hit per query
+fn classify_internal(
+    index_ptr: *const RypeIndex,
+    negative_set_ptr: *const RypeNegativeSet,
+    queries_ptr: *const RypeQuery,
+    num_queries: size_t,
+    threshold: c_double,
+    best_hit_only: bool,
+) -> *mut RypeResultArray {
     // Validate pointers with alignment checks
     if !is_valid_ptr(index_ptr) {
         set_last_error("index is NULL or misaligned".to_string());
@@ -591,8 +613,18 @@ pub extern "C" fn rype_classify_with_negative(
             .collect();
 
         // Classify using sharded inverted index
-        classify_batch_sharded_sequential(&index.0, neg_mins, &rust_queries, threshold, None)
-            .map_err(|e| format!("Classification failed: {}", e))
+        let hits =
+            classify_batch_sharded_sequential(&index.0, neg_mins, &rust_queries, threshold, None)
+                .map_err(|e| format!("Classification failed: {}", e))?;
+
+        // Apply best-hit filter if requested
+        let hits = if best_hit_only {
+            crate::classify::filter_best_hits(hits)
+        } else {
+            hits
+        };
+
+        Ok(hits)
     });
 
     // Handle the result
@@ -644,6 +676,61 @@ pub extern "C" fn rype_classify_with_negative(
             std::ptr::null_mut()
         }
     }
+}
+
+/// Classifies queries and returns only the best hit per query.
+///
+/// Same as rype_classify() but filters results to keep only the highest-scoring
+/// bucket for each query. If multiple buckets tie for the best score, one is
+/// chosen arbitrarily.
+///
+/// # Safety
+/// - index_ptr must be a valid pointer obtained from rype_index_load()
+/// - queries_ptr must point to a valid array of num_queries RypeQuery structs
+/// - All sequence pointers in queries must remain valid for the duration of this call
+#[no_mangle]
+pub extern "C" fn rype_classify_best_hit(
+    index_ptr: *const RypeIndex,
+    queries_ptr: *const RypeQuery,
+    num_queries: size_t,
+    threshold: c_double,
+) -> *mut RypeResultArray {
+    rype_classify_best_hit_with_negative(
+        index_ptr,
+        std::ptr::null(),
+        queries_ptr,
+        num_queries,
+        threshold,
+    )
+}
+
+/// Classifies queries with negative filtering and returns only the best hit per query.
+///
+/// Same as rype_classify_with_negative() but filters results to keep only the
+/// highest-scoring bucket for each query. If multiple buckets tie for the best
+/// score, one is chosen arbitrarily.
+///
+/// # Safety
+/// - index_ptr must be a valid pointer obtained from rype_index_load()
+/// - queries_ptr must point to a valid array of num_queries RypeQuery structs
+/// - All sequence pointers in queries must remain valid for the duration of this call
+/// - negative_set_ptr (if non-null) must be obtained from rype_negative_set_create()
+#[no_mangle]
+pub extern "C" fn rype_classify_best_hit_with_negative(
+    index_ptr: *const RypeIndex,
+    negative_set_ptr: *const RypeNegativeSet,
+    queries_ptr: *const RypeQuery,
+    num_queries: size_t,
+    threshold: c_double,
+) -> *mut RypeResultArray {
+    classify_internal(
+        index_ptr,
+        negative_set_ptr,
+        queries_ptr,
+        num_queries,
+        threshold,
+        true,
+    )
 }
 
 #[no_mangle]
@@ -995,6 +1082,93 @@ mod arrow_ffi {
         }
     }
 
+    /// Classify sequences from an Arrow stream and return only the best hit per query.
+    ///
+    /// Same as `rype_classify_arrow` but filters results to keep only the highest-scoring
+    /// bucket for each query. If multiple buckets tie for the best score, one is chosen
+    /// arbitrarily.
+    ///
+    /// ## Input Schema
+    ///
+    /// Same requirements as `rype_classify_arrow`:
+    /// - `read_id`: Int64 - Query identifier
+    /// - `sequence`: Binary or LargeBinary - DNA sequence
+    /// - Optional `sequence2`: Binary or LargeBinary - Paired-end read
+    ///
+    /// ## Output Schema
+    ///
+    /// Same as `rype_classify_arrow` but with at most one row per query_id:
+    /// - `query_id`: Int64 - Query ID from input
+    /// - `bucket_id`: UInt32 - Matched bucket/reference ID (highest scoring)
+    /// - `score`: Float64 - Classification score (0.0-1.0)
+    ///
+    /// # Safety
+    /// - index_ptr must remain valid until the output stream is fully consumed
+    /// - negative_set_ptr (if non-null) must remain valid until output is consumed
+    ///
+    /// # Returns
+    /// 0 on success, -1 on error. Call rype_get_last_error() for details.
+    #[no_mangle]
+    pub unsafe extern "C" fn rype_classify_arrow_best_hit(
+        index_ptr: *const RypeIndex,
+        negative_set_ptr: *const RypeNegativeSet,
+        input_stream: *mut FFI_ArrowArrayStream,
+        threshold: c_double,
+        use_merge_join: i32,
+        out_stream: *mut FFI_ArrowArrayStream,
+    ) -> i32 {
+        // Validate parameters
+        if index_ptr.is_null() {
+            set_last_error("index is NULL".to_string());
+            return -1;
+        }
+        if input_stream.is_null() {
+            set_last_error("input_stream is NULL".to_string());
+            return -1;
+        }
+        if out_stream.is_null() {
+            set_last_error("out_stream is NULL".to_string());
+            return -1;
+        }
+        if let Err(e) = validate_threshold(threshold) {
+            set_last_error(e);
+            return -1;
+        }
+
+        let merge_join = use_merge_join != 0;
+
+        // Wrap pointers in Send-safe wrappers
+        let index_send = SendRypeIndexPtr::new(index_ptr);
+        let neg_set_send = if negative_set_ptr.is_null() {
+            None
+        } else {
+            Some(SendRypeNegativeSetPtr::new(negative_set_ptr))
+        };
+
+        let classify_fn = move |batch: &RecordBatch| {
+            let index = unsafe { index_send.get() };
+            let neg_mins: Option<&HashSet<u64>> = neg_set_send
+                .as_ref()
+                .map(|p| unsafe { &p.get().minimizers });
+
+            let result = classify_arrow_batch_sharded_best_hit(
+                &index.0, neg_mins, batch, threshold, merge_join,
+            );
+            result.map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
+        };
+
+        match create_streaming_output(input_stream, out_stream, classify_fn) {
+            Ok(()) => {
+                clear_last_error();
+                0
+            }
+            Err(e) => {
+                set_last_error(e);
+                -1
+            }
+        }
+    }
+
     /// Returns the schema for classification result batches as an FFI_ArrowSchema.
     ///
     /// This allows callers to pre-allocate memory or validate expected output format.
@@ -1115,5 +1289,84 @@ mod c_api_tests {
             CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
         };
         assert!(err.contains("NULL"));
+    }
+
+    #[test]
+    fn test_rype_classify_best_hit_null_index() {
+        let seq = CString::new("ACGTACGTACGT").unwrap();
+        let query = RypeQuery {
+            id: 1,
+            seq: seq.as_ptr(),
+            seq_len: 12,
+            pair_seq: std::ptr::null(),
+            pair_len: 0,
+        };
+
+        let result = rype_classify_best_hit(std::ptr::null(), &query, 1, 0.1);
+        assert!(result.is_null());
+
+        let err = unsafe {
+            let err_ptr = rype_get_last_error();
+            assert!(!err_ptr.is_null());
+            CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+        };
+        assert!(err.contains("NULL") || err.contains("misaligned"));
+    }
+
+    #[test]
+    fn test_rype_classify_best_hit_with_negative_null_index() {
+        let seq = CString::new("ACGTACGTACGT").unwrap();
+        let query = RypeQuery {
+            id: 1,
+            seq: seq.as_ptr(),
+            seq_len: 12,
+            pair_seq: std::ptr::null(),
+            pair_len: 0,
+        };
+
+        let result = rype_classify_best_hit_with_negative(
+            std::ptr::null(),
+            std::ptr::null(),
+            &query,
+            1,
+            0.1,
+        );
+        assert!(result.is_null());
+
+        let err = unsafe {
+            let err_ptr = rype_get_last_error();
+            assert!(!err_ptr.is_null());
+            CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+        };
+        assert!(err.contains("NULL") || err.contains("misaligned"));
+    }
+
+    #[test]
+    fn test_rype_classify_best_hit_invalid_threshold() {
+        let seq = CString::new("ACGTACGTACGT").unwrap();
+        let query = RypeQuery {
+            id: 1,
+            seq: seq.as_ptr(),
+            seq_len: 12,
+            pair_seq: std::ptr::null(),
+            pair_len: 0,
+        };
+
+        // Create a fake "index" pointer - we'll catch the error before dereferencing
+        let fake_index: usize = 0x1000; // Non-null aligned pointer
+        let result = rype_classify_best_hit(
+            fake_index as *const RypeIndex,
+            &query,
+            1,
+            1.5, // Invalid threshold > 1.0
+        );
+        assert!(result.is_null());
+
+        let err = unsafe {
+            let err_ptr = rype_get_last_error();
+            assert!(!err_ptr.is_null());
+            CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+        };
+        assert!(err.contains("threshold") || err.contains("Invalid"));
     }
 }

@@ -236,6 +236,7 @@ fn main() -> Result<()> {
                 use_bloom_filter,
                 parallel_input_rg,
                 timing,
+                best_hit,
             } => {
                 // Enable timing diagnostics if requested
                 if timing {
@@ -255,6 +256,7 @@ fn main() -> Result<()> {
                     parallel_rg,
                     use_bloom_filter,
                     parallel_input_rg,
+                    best_hit,
                 })?;
             }
 

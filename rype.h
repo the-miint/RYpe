@@ -687,6 +687,52 @@ RypeResultArray* rype_classify_with_negative(
 );
 
 /**
+ * Classify a batch of sequences and return only the best hit per query
+ *
+ * Same as rype_classify() but filters results to keep only the highest-scoring
+ * bucket for each query. If multiple buckets tie for the best score, one is
+ * chosen arbitrarily.
+ *
+ * @param index        Non-NULL RypeIndex pointer from rype_index_load()
+ * @param queries      Array of RypeQuery structs
+ * @param num_queries  Number of queries (must be > 0 and < INTPTR_MAX)
+ * @param threshold    Classification threshold (0.0-1.0, must be finite)
+ * @return             Non-NULL RypeResultArray on success, NULL on failure
+ *
+ * The result array contains at most one hit per query_id.
+ */
+RypeResultArray* rype_classify_best_hit(
+    const RypeIndex* index,
+    const RypeQuery* queries,
+    size_t num_queries,
+    double threshold
+);
+
+/**
+ * Classify a batch of sequences with negative filtering, returning only the best hit per query
+ *
+ * Same as rype_classify_with_negative() but filters results to keep only the
+ * highest-scoring bucket for each query. If multiple buckets tie for the best
+ * score, one is chosen arbitrarily.
+ *
+ * @param index         Non-NULL RypeIndex pointer from rype_index_load()
+ * @param negative_set  Optional RypeNegativeSet (NULL to disable filtering)
+ * @param queries       Array of RypeQuery structs
+ * @param num_queries   Number of queries (must be > 0 and < INTPTR_MAX)
+ * @param threshold     Classification threshold (0.0-1.0, must be finite)
+ * @return              Non-NULL RypeResultArray on success, NULL on failure
+ *
+ * The result array contains at most one hit per query_id.
+ */
+RypeResultArray* rype_classify_best_hit_with_negative(
+    const RypeIndex* index,
+    const RypeNegativeSet* negative_set,
+    const RypeQuery* queries,
+    size_t num_queries,
+    double threshold
+);
+
+/**
  * Free a result array
  *
  * @param results  RypeResultArray pointer from rype_classify(), or NULL (no-op)

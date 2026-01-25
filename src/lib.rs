@@ -73,7 +73,7 @@ pub use core::{extract_into, get_paired_minimizers_into, MinimizerWorkspace, Str
 // Classification functions
 pub use classify::{
     classify_batch_merge_join, classify_batch_sharded_merge_join,
-    classify_batch_sharded_parallel_rg, classify_batch_sharded_sequential,
+    classify_batch_sharded_parallel_rg, classify_batch_sharded_sequential, filter_best_hits,
 };
 
 // ============================================================================

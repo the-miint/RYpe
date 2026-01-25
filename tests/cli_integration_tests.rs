@@ -421,6 +421,143 @@ fn test_cli_index_stats() -> Result<()> {
     Ok(())
 }
 
+/// Test that --best-hit flag returns at most one result per query
+#[test]
+fn test_cli_best_hit_flag() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index with two separate buckets (one per file)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query file with two reads (50 bases each)
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+         @query2\nTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    // Test classification WITHOUT --best-hit (may get multiple results per query)
+    let output_no_best = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0", // Very low threshold to ensure matches
+        ])
+        .output()?;
+
+    assert!(
+        output_no_best.status.success(),
+        "Classification without --best-hit failed: {}",
+        String::from_utf8_lossy(&output_no_best.stderr)
+    );
+
+    let stdout_no_best = String::from_utf8_lossy(&output_no_best.stdout);
+    let lines_no_best: Vec<&str> = stdout_no_best
+        .lines()
+        .filter(|l| !l.starts_with("read_id")) // Skip header
+        .collect();
+
+    // Test classification WITH --best-hit
+    let output_best = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+            "--best-hit",
+        ])
+        .output()?;
+
+    assert!(
+        output_best.status.success(),
+        "Classification with --best-hit failed: {}",
+        String::from_utf8_lossy(&output_best.stderr)
+    );
+
+    let stdout_best = String::from_utf8_lossy(&output_best.stdout);
+    let lines_best: Vec<&str> = stdout_best
+        .lines()
+        .filter(|l| !l.starts_with("read_id"))
+        .collect();
+
+    // With --best-hit, we should have at most one result per query
+    // Count unique query IDs in best-hit output
+    let mut query_ids_best: Vec<&str> = lines_best
+        .iter()
+        .filter_map(|l| l.split('\t').next())
+        .collect();
+    query_ids_best.sort();
+    query_ids_best.dedup();
+
+    // Each query ID should appear exactly once in best-hit output
+    assert_eq!(
+        lines_best.len(),
+        query_ids_best.len(),
+        "With --best-hit, each query should have at most one result.\n\
+         Found {} lines but {} unique query IDs.\n\
+         Lines: {:?}",
+        lines_best.len(),
+        query_ids_best.len(),
+        lines_best
+    );
+
+    println!("Without --best-hit: {} result lines", lines_no_best.len());
+    println!("With --best-hit: {} result lines", lines_best.len());
+    println!("Unique queries in best-hit: {}", query_ids_best.len());
+
+    Ok(())
+}
+
 /// Test bucket-source-detail command with both numeric ID and bucket name
 #[test]
 fn test_cli_bucket_source_detail_by_name() -> Result<()> {
