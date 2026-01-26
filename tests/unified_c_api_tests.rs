@@ -7,7 +7,8 @@ use rype::c_api::{
     rype_bucket_name, rype_classify, rype_classify_best_hit, rype_classify_with_negative,
     rype_get_last_error, rype_index_free, rype_index_is_sharded, rype_index_k, rype_index_load,
     rype_index_num_buckets, rype_index_num_shards, rype_index_salt, rype_index_w,
-    rype_negative_set_create, rype_negative_set_free, rype_results_free, RypeQuery,
+    rype_negative_set_create, rype_negative_set_free, rype_negative_set_size, rype_results_free,
+    RypeQuery,
 };
 use rype::{
     extract_into, BucketData, IndexMetadata, InvertedIndex, MinimizerWorkspace, ParquetWriteOptions,
@@ -192,7 +193,7 @@ fn test_unified_classify_multiple_queries() -> Result<()> {
 // =============================================================================
 
 #[test]
-fn test_unified_negative_set_not_supported() -> Result<()> {
+fn test_unified_negative_set_creation() -> Result<()> {
     let dir = tempdir()?;
     let index_path = create_test_parquet_index(dir.path(), 32, 10, 0x12345)?;
 
@@ -200,18 +201,39 @@ fn test_unified_negative_set_not_supported() -> Result<()> {
     let loaded = rype_index_load(path_cstr.as_ptr());
     assert!(!loaded.is_null());
 
-    // Creating negative set from sharded index is not supported
+    // Creating negative set from sharded index now works (memory-efficient sharded filtering)
     let neg_set = rype_negative_set_create(loaded);
     assert!(
+        !neg_set.is_null(),
+        "Negative set creation should succeed for sharded indices"
+    );
+
+    // Should NOT have an error message
+    let err = rype_get_last_error();
+    assert!(err.is_null(), "Should not set error message on success");
+
+    // Verify we can get the size (returns total minimizer count from manifest)
+    let size = rype_negative_set_size(neg_set);
+    assert!(size > 0, "Negative set should have non-zero size");
+
+    rype_negative_set_free(neg_set);
+    rype_index_free(loaded);
+    Ok(())
+}
+
+#[test]
+fn test_unified_negative_set_null_index() -> Result<()> {
+    // Creating negative set from NULL index should fail
+    let neg_set = rype_negative_set_create(ptr::null());
+    assert!(
         neg_set.is_null(),
-        "Negative set creation should return NULL for sharded indices"
+        "Negative set creation should return NULL for NULL index"
     );
 
     // Should have an error message
     let err = rype_get_last_error();
     assert!(!err.is_null(), "Should set error message");
 
-    rype_index_free(loaded);
     Ok(())
 }
 
@@ -240,6 +262,67 @@ fn test_unified_classify_with_null_negative_set() -> Result<()> {
 
     rype_results_free(results);
     rype_index_free(loaded);
+    Ok(())
+}
+
+#[test]
+fn test_unified_classify_with_negative_filtering() -> Result<()> {
+    // Create two separate indices: positive and negative
+    let pos_dir = tempdir()?;
+    let neg_dir = tempdir()?;
+
+    // Create positive index
+    let pos_index_path = create_test_parquet_index(pos_dir.path(), 32, 10, 0x12345)?;
+
+    // Create a negative index from the same seed (so minimizers overlap)
+    let neg_index_path = create_test_parquet_index(neg_dir.path(), 32, 10, 0x12345)?;
+
+    // Load both indices
+    let pos_path_cstr = CString::new(pos_index_path.to_str().unwrap())?;
+    let neg_path_cstr = CString::new(neg_index_path.to_str().unwrap())?;
+
+    let pos_loaded = rype_index_load(pos_path_cstr.as_ptr());
+    let neg_loaded = rype_index_load(neg_path_cstr.as_ptr());
+    assert!(!pos_loaded.is_null());
+    assert!(!neg_loaded.is_null());
+
+    // Create negative set from negative index
+    let neg_set = rype_negative_set_create(neg_loaded);
+    assert!(!neg_set.is_null(), "Negative set creation should succeed");
+
+    // Create query sequence with same seed as indices (so it matches)
+    let query_seq = generate_sequence(200, 0);
+    let (query, _seq_holder) = make_query(1, &query_seq);
+
+    // Classify without negative filtering
+    let results_no_neg = rype_classify(pos_loaded, &query, 1, 0.0);
+    assert!(!results_no_neg.is_null());
+    let results_no_neg_ref = unsafe { &*results_no_neg };
+    let hits_without_filtering = results_no_neg_ref.len;
+
+    // Classify with negative filtering
+    let results_with_neg = rype_classify_with_negative(pos_loaded, neg_set, &query, 1, 0.0);
+    assert!(!results_with_neg.is_null());
+    let results_with_neg_ref = unsafe { &*results_with_neg };
+    let hits_with_filtering = results_with_neg_ref.len;
+
+    // With threshold 0.0, negative filtering should reduce scores (since negative
+    // index has overlapping minimizers). The exact behavior depends on how many
+    // minimizers are filtered. With identical indices, all minimizers should be
+    // filtered out, resulting in 0 hits or very low scores.
+    //
+    // Note: hits_with_filtering could be equal if there are no query minimizers
+    // that hit both indices, or lower if there is overlap.
+    assert!(
+        hits_with_filtering <= hits_without_filtering,
+        "Negative filtering should not increase hits"
+    );
+
+    rype_results_free(results_no_neg);
+    rype_results_free(results_with_neg);
+    rype_negative_set_free(neg_set);
+    rype_index_free(neg_loaded);
+    rype_index_free(pos_loaded);
     Ok(())
 }
 

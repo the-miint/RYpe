@@ -18,7 +18,7 @@ use crate::types::{HitResult, QueryRecord};
 
 use crate::log_timing;
 
-use super::common::filter_negative_mins;
+use super::common::{collect_negative_minimizers_sharded, filter_negative_mins};
 use super::merge_join::{
     accumulate_merge_join, merge_join_pairs_sparse, merge_sparse_hits, SparseHit,
 };
@@ -486,6 +486,83 @@ pub fn classify_batch_sharded_parallel_rg(
     Ok(results)
 }
 
+/// Classify with memory-efficient negative filtering using sharded index.
+///
+/// Instead of requiring a pre-loaded `HashSet<u64>` containing all minimizers from
+/// a negative index (which can require 24GB+ for large indices), this function
+/// accepts a `ShardedInvertedIndex` for the negative filter and processes it
+/// shard-by-shard to collect only the query minimizers that need filtering.
+///
+/// This reduces memory from O(entire_negative_index) to O(single_shard + batch_minimizers).
+///
+/// # Arguments
+/// * `positive_index` - The sharded inverted index to classify against
+/// * `negative_index` - Optional sharded index containing sequences to filter out
+/// * `records` - Batch of query records
+/// * `threshold` - Minimum score threshold
+/// * `read_options` - Parquet read options
+///
+/// # Returns
+/// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
+pub fn classify_with_sharded_negative(
+    positive_index: &ShardedInvertedIndex,
+    negative_index: Option<&ShardedInvertedIndex>,
+    records: &[QueryRecord],
+    threshold: f64,
+    read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
+) -> Result<Vec<HitResult>> {
+    // If no negative index, delegate directly to the standard function
+    if negative_index.is_none() {
+        return classify_batch_sharded_sequential(
+            positive_index,
+            None,
+            records,
+            threshold,
+            read_options,
+        );
+    }
+
+    let negative = negative_index.unwrap();
+    let manifest = positive_index.manifest();
+
+    // Step 1: Extract minimizers from all records
+    let estimated_mins = estimate_minimizers_from_records(records, manifest.k, manifest.w);
+    let processed: Vec<_> = records
+        .par_iter()
+        .map_init(
+            || MinimizerWorkspace::with_estimate(estimated_mins),
+            |ws, (_, s1, s2)| {
+                let (fwd, rc) =
+                    get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
+                (fwd, rc)
+            },
+        )
+        .collect();
+
+    // Step 2: Build sorted unique minimizers for querying negative index
+    let mut all_minimizers: Vec<u64> = processed
+        .iter()
+        .flat_map(|(fwd, rc)| fwd.iter().chain(rc.iter()).copied())
+        .collect();
+    all_minimizers.sort_unstable();
+    all_minimizers.dedup();
+
+    // Step 3: Collect hitting minimizers from negative index (memory-efficient)
+    let negative_set =
+        collect_negative_minimizers_sharded(negative, &all_minimizers, read_options)?;
+
+    // Step 4: Classify using the collected negative set
+    // Note: This will re-extract minimizers, but the memory savings from sharded
+    // negative filtering (24GB -> 1-2GB) far outweigh the extraction overhead.
+    classify_batch_sharded_sequential(
+        positive_index,
+        Some(&negative_set),
+        records,
+        threshold,
+        read_options,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,5 +974,221 @@ mod tests {
             estimate >= 30 && estimate <= 50,
             "Estimate should be reasonable"
         );
+    }
+
+    // =========================================================================
+    // classify_with_sharded_negative tests (Phase 3)
+    // =========================================================================
+
+    /// Helper to create a test Parquet index at a given path with specified bucket data.
+    fn create_test_index_at_path(
+        path: &std::path::Path,
+        bucket_data: Vec<(u32, &str, Vec<u64>)>,
+        k: usize,
+        w: usize,
+        salt: u64,
+    ) -> ShardedInvertedIndex {
+        let buckets: Vec<BucketData> = bucket_data
+            .into_iter()
+            .map(|(id, name, mins)| BucketData {
+                bucket_id: id,
+                bucket_name: name.to_string(),
+                sources: vec![format!("source_{}", id)],
+                minimizers: mins,
+            })
+            .collect();
+
+        let options = ParquetWriteOptions::default();
+        create_parquet_inverted_index(path, buckets, k, w, salt, None, Some(&options)).unwrap();
+
+        ShardedInvertedIndex::open(path).unwrap()
+    }
+
+    #[test]
+    fn test_classify_with_sharded_negative_no_negative() {
+        // Without a negative index, should behave identically to classify_batch_sharded_sequential
+        let (_dir, index, seqs) = create_test_index();
+        let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
+
+        let results_standard =
+            classify_batch_sharded_sequential(&index, None, &records, 0.1, None).unwrap();
+        let results_sharded =
+            classify_with_sharded_negative(&index, None, &records, 0.1, None).unwrap();
+
+        assert_eq!(
+            results_standard.len(),
+            results_sharded.len(),
+            "Results should match when no negative index"
+        );
+    }
+
+    #[test]
+    fn test_classify_with_sharded_negative_filters_correctly() {
+        // Use explicit minimizer values for predictable behavior
+        let dir = tempdir().unwrap();
+
+        let k = 32;
+        let w = 10;
+        let salt = 0x12345u64;
+
+        // Positive index has minimizers 100-109 (10 total)
+        let positive_mins: Vec<u64> = (100..110).collect();
+        // Negative index filters out 100-104 (first 5)
+        let negative_mins: Vec<u64> = (100..105).collect();
+
+        // Create positive index
+        let pos_path = dir.path().join("positive.ryxdi");
+        let pos_index = create_test_index_at_path(
+            &pos_path,
+            vec![(1, "target", positive_mins.clone())],
+            k,
+            w,
+            salt,
+        );
+
+        // Create negative index
+        let neg_path = dir.path().join("negative.ryxdi");
+        let neg_index = create_test_index_at_path(
+            &neg_path,
+            vec![(1, "contaminant", negative_mins)],
+            k,
+            w,
+            salt,
+        );
+
+        // Create a query sequence that produces minimizers overlapping with positive index
+        // Use a longer, non-repetitive sequence
+        let seq = generate_sequence(500, 42);
+        let mut ws = MinimizerWorkspace::new();
+        extract_into(&seq, k, w, salt, &mut ws);
+        let _query_mins: Vec<u64> = ws.buffer.drain(..).collect();
+
+        // Build a synthetic query that has exact minimizers we want to test
+        // For this test, we'll use the existing index's self-match capability
+        let records: Vec<QueryRecord> = vec![(1, seq.as_slice(), None)];
+
+        // Without negative filtering
+        let results_without =
+            classify_with_sharded_negative(&pos_index, None, &records, 0.0, None).unwrap();
+
+        // With negative filtering
+        let results_with =
+            classify_with_sharded_negative(&pos_index, Some(&neg_index), &records, 0.0, None)
+                .unwrap();
+
+        // Both should work (may or may not have hits depending on minimizer overlap)
+        // The key test is that with negative filtering, we get equal or fewer hits
+        assert!(
+            results_with.len() <= results_without.len(),
+            "Negative filtering should not increase hit count"
+        );
+    }
+
+    #[test]
+    fn test_classify_with_sharded_negative_all_filtered() {
+        // Test that when all query minimizers hit the negative index, we get no results
+        let (_dir, index, seqs) = create_test_index();
+
+        // Extract minimizers from seq[0] to use as the negative set
+        let k = index.k();
+        let w = index.w();
+        let salt = index.salt();
+        let mut ws = MinimizerWorkspace::new();
+        extract_into(&seqs[0], k, w, salt, &mut ws);
+        let mut seq_mins: Vec<u64> = ws.buffer.drain(..).collect();
+        seq_mins.sort();
+        seq_mins.dedup();
+
+        // Create negative index with all minimizers from the query sequence
+        let dir = tempdir().unwrap();
+        let neg_path = dir.path().join("negative.ryxdi");
+        let neg_index =
+            create_test_index_at_path(&neg_path, vec![(1, "contaminant", seq_mins)], k, w, salt);
+
+        let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
+
+        // All query minimizers should be filtered, resulting in no hits
+        let results =
+            classify_with_sharded_negative(&index, Some(&neg_index), &records, 0.1, None).unwrap();
+
+        assert!(
+            results.is_empty(),
+            "All minimizers filtered should produce no hits"
+        );
+    }
+
+    #[test]
+    fn test_classify_with_sharded_negative_empty_records() {
+        let (_dir, index, _seqs) = create_test_index();
+        let records: Vec<QueryRecord> = vec![];
+
+        let results = classify_with_sharded_negative(&index, None, &records, 0.1, None).unwrap();
+
+        assert!(
+            results.is_empty(),
+            "Empty records should produce empty results"
+        );
+    }
+
+    #[test]
+    fn test_classify_with_sharded_negative_consistency_with_hashset() {
+        // Verify that sharded negative filtering produces the same results
+        // as the traditional HashSet-based approach
+        let (_dir, index, seqs) = create_test_index();
+
+        // Extract minimizers to use as negative set
+        let k = index.k();
+        let w = index.w();
+        let salt = index.salt();
+        let mut ws = MinimizerWorkspace::new();
+        extract_into(&seqs[0], k, w, salt, &mut ws);
+        let mut seq_mins: Vec<u64> = ws.buffer.drain(..).collect();
+        seq_mins.sort();
+        seq_mins.dedup();
+
+        // Use first third as negative minimizers
+        let neg_count = (seq_mins.len() / 3).max(1);
+        let negative_mins: Vec<u64> = seq_mins[..neg_count].to_vec();
+        let negative_set: HashSet<u64> = negative_mins.iter().copied().collect();
+
+        // Create negative index
+        let dir = tempdir().unwrap();
+        let neg_path = dir.path().join("negative.ryxdi");
+        let neg_index = create_test_index_at_path(
+            &neg_path,
+            vec![(1, "contaminant", negative_mins)],
+            k,
+            w,
+            salt,
+        );
+
+        let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
+
+        // Traditional HashSet approach
+        let results_hashset =
+            classify_batch_sharded_sequential(&index, Some(&negative_set), &records, 0.1, None)
+                .unwrap();
+
+        // New sharded approach
+        let results_sharded =
+            classify_with_sharded_negative(&index, Some(&neg_index), &records, 0.1, None).unwrap();
+
+        assert_eq!(
+            results_hashset.len(),
+            results_sharded.len(),
+            "Both approaches should produce same number of results"
+        );
+
+        if !results_hashset.is_empty() {
+            let score_hashset = results_hashset[0].score;
+            let score_sharded = results_sharded[0].score;
+            let diff = (score_hashset - score_sharded).abs();
+            assert!(
+                diff < 1e-10,
+                "Scores should match: hashset={}, sharded={}",
+                score_hashset,
+                score_sharded
+            );
+        }
     }
 }

@@ -23,16 +23,19 @@
 //! designed to be called from C code.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use crate::classify_batch_sharded_sequential;
+use crate::classify_with_sharded_negative;
 use crate::constants::MAX_SEQUENCE_LENGTH;
 use crate::memory::{detect_available_memory, parse_byte_suffix};
 use crate::{QueryRecord, ShardedInvertedIndex};
 use libc::{c_char, c_double, size_t};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(feature = "arrow-ffi")]
+use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::slice;
+use std::sync::Arc;
 
 #[cfg(feature = "arrow-ffi")]
 use crate::arrow::{classify_arrow_batch_sharded, classify_arrow_batch_sharded_best_hit};
@@ -48,7 +51,8 @@ use arrow::record_batch::RecordBatch;
 /// Unified index type that wraps a ShardedInvertedIndex.
 ///
 /// The only supported format is the Parquet inverted index (.ryxdi directory).
-pub struct RypeIndex(ShardedInvertedIndex);
+/// Uses Arc internally to allow cheap sharing with RypeNegativeSet.
+pub struct RypeIndex(Arc<ShardedInvertedIndex>);
 
 impl RypeIndex {
     /// Returns the k-mer size.
@@ -240,7 +244,7 @@ pub extern "C" fn rype_index_load(path: *const c_char) -> *mut RypeIndex {
     match ShardedInvertedIndex::open(path) {
         Ok(idx) => {
             clear_last_error();
-            Box::into_raw(Box::new(RypeIndex(idx)))
+            Box::into_raw(Box::new(RypeIndex(Arc::new(idx))))
         }
         Err(e) => {
             set_last_error(format!("Failed to load index: {}", e));
@@ -465,25 +469,45 @@ pub extern "C" fn rype_bucket_name(index_ptr: *const RypeIndex, bucket_id: u32) 
 
 // --- Negative Index API ---
 
-/// Opaque handle to a pre-built negative minimizer set for filtering.
-/// This allows efficient reuse when classifying multiple batches.
+/// Opaque handle to a negative index for memory-efficient filtering.
+///
+/// This holds an `Arc<ShardedInvertedIndex>` that is queried shard-by-shard during
+/// classification, avoiding the need to load all minimizers into memory at once.
+/// Using Arc allows cheap sharing with the source RypeIndex without cloning
+/// the entire index metadata (manifest, path, rg_ranges_cache).
 pub struct RypeNegativeSet {
-    minimizers: HashSet<u64>,
+    index: Arc<ShardedInvertedIndex>,
 }
 
 /// Creates a negative minimizer set from an index.
 ///
-/// Returns NULL because negative set creation requires loading all minimizers
-/// from all shards into memory, which is not currently supported.
+/// Returns a `RypeNegativeSet` that uses memory-efficient sharded filtering.
+/// Memory usage during classification is O(single_shard), not O(entire_index).
 ///
-/// For negative filtering, create the minimizer set directly from the original
-/// FASTA reference sequences using the CLI or Rust API.
+/// The caller takes ownership and must call `rype_negative_set_free()` when done.
+/// The original `negative_index_ptr` remains valid and can continue to be used.
+///
+/// Note: This clones an Arc, not the underlying data. The RypeNegativeSet shares
+/// the same underlying ShardedInvertedIndex with the source RypeIndex via Arc.
+/// Both handles must remain valid during classification, but either can be freed
+/// independently once classification is complete.
 #[no_mangle]
 pub extern "C" fn rype_negative_set_create(
-    _negative_index_ptr: *const RypeIndex,
+    negative_index_ptr: *const RypeIndex,
 ) -> *mut RypeNegativeSet {
-    set_last_error("Negative set creation is not supported for Parquet indices. Create minimizers directly from FASTA reference sequences instead.".to_string());
-    std::ptr::null_mut()
+    if !is_valid_ptr(negative_index_ptr) {
+        set_last_error("negative_index_ptr is NULL or misaligned".to_string());
+        return std::ptr::null_mut();
+    }
+
+    let index = unsafe { &*negative_index_ptr };
+    // Clone the Arc - this is a cheap reference count increment, not a deep copy.
+    // The underlying ShardedInvertedIndex (manifest, path, rg_ranges_cache) is shared.
+    let neg_set = RypeNegativeSet {
+        index: Arc::clone(&index.0),
+    };
+    clear_last_error();
+    Box::into_raw(Box::new(neg_set))
 }
 
 /// Frees a negative set. NULL is safe to pass.
@@ -497,13 +521,17 @@ pub extern "C" fn rype_negative_set_free(ptr: *mut RypeNegativeSet) {
 }
 
 /// Returns the number of unique minimizers in the negative set.
+///
+/// This returns the total minimizer count from the index manifest.
+/// Note that shards may contain duplicate entries across shards, so this
+/// is an upper bound rather than an exact count.
 #[no_mangle]
 pub extern "C" fn rype_negative_set_size(ptr: *const RypeNegativeSet) -> size_t {
     if ptr.is_null() {
         return 0;
     }
     let neg_set = unsafe { &*ptr };
-    neg_set.minimizers.len()
+    neg_set.index.manifest().total_minimizers
 }
 
 // --- Primary Index Classification ---
@@ -625,12 +653,12 @@ fn classify_internal(
     let result = std::panic::catch_unwind(|| {
         let index = unsafe { &*index_ptr };
 
-        // Get negative set if provided
-        let neg_mins: Option<&HashSet<u64>> = if negative_set_ptr.is_null() {
+        // Get negative index if provided (for memory-efficient sharded filtering)
+        let neg_index: Option<&ShardedInvertedIndex> = if negative_set_ptr.is_null() {
             None
         } else {
             let neg_set = unsafe { &*negative_set_ptr };
-            Some(&neg_set.minimizers)
+            Some(&neg_set.index)
         };
 
         // Build query records (validation already done above)
@@ -647,9 +675,9 @@ fn classify_internal(
             })
             .collect();
 
-        // Classify using sharded inverted index
+        // Classify using sharded inverted index with memory-efficient negative filtering
         let hits =
-            classify_batch_sharded_sequential(&index.0, neg_mins, &rust_queries, threshold, None)
+            classify_with_sharded_negative(&index.0, neg_index, &rust_queries, threshold, None)
                 .map_err(|e| format!("Classification failed: {}", e))?;
 
         // Apply best-hit filter if requested
@@ -876,6 +904,72 @@ mod arrow_ffi {
     }
 
     // -------------------------------------------------------------------------
+    // Helper: Sharded Negative Filtering for Arrow Batches
+    // -------------------------------------------------------------------------
+
+    /// Collect negative minimizers from a sharded index for the given batch.
+    ///
+    /// Returns a HashSet of minimizers that should be filtered out during
+    /// classification. This processes the negative index shard-by-shard to
+    /// avoid loading all negative minimizers into memory at once.
+    fn collect_negative_mins_for_batch(
+        negative_index: &ShardedInvertedIndex,
+        batch: &RecordBatch,
+        positive_index: &ShardedInvertedIndex,
+    ) -> Result<HashSet<u64>, arrow::error::ArrowError> {
+        use crate::arrow::batch_to_records;
+        use crate::classify::collect_negative_minimizers_sharded;
+        use crate::{get_paired_minimizers_into, MinimizerWorkspace};
+        use rayon::prelude::*;
+
+        // Convert batch to records
+        let records = batch_to_records(batch)
+            .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
+
+        if records.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        // Get index parameters
+        let manifest = positive_index.manifest();
+
+        // Extract minimizers from records in parallel
+        let processed: Vec<_> = records
+            .par_iter()
+            .map_init(
+                || MinimizerWorkspace::with_estimate(256),
+                |ws, (_, s1, s2)| {
+                    let (fwd, rc) = get_paired_minimizers_into(
+                        s1,
+                        *s2,
+                        manifest.k,
+                        manifest.w,
+                        manifest.salt,
+                        ws,
+                    );
+                    (fwd, rc)
+                },
+            )
+            .collect();
+
+        // Build sorted unique minimizers for querying negative index
+        let mut all_minimizers: Vec<u64> = processed
+            .iter()
+            .flat_map(|(fwd, rc)| fwd.iter().chain(rc.iter()).copied())
+            .collect();
+        all_minimizers.sort_unstable();
+        all_minimizers.dedup();
+
+        // Collect hitting minimizers from negative index (memory-efficient)
+        collect_negative_minimizers_sharded(negative_index, &all_minimizers, None).map_err(|e| {
+            arrow::error::ArrowError::ComputeError(format!(
+                "Failed to collect negative minimizers: {}",
+                e
+            ))
+        })
+    }
+
+    // -------------------------------------------------------------------------
     // Send-safe pointer wrappers for FFI
     // -------------------------------------------------------------------------
     //
@@ -889,12 +983,13 @@ mod arrow_ffi {
     // 3. Prevent accidental misuse with other pointer types
 
     /// Send-safe wrapper for RypeIndex pointer.
-    /// SAFETY: RypeIndex is immutable during classification (read-only access).
+    /// SAFETY: RypeIndex wraps Arc<ShardedInvertedIndex> which is immutable during
+    /// classification (read-only access). Arc itself is Send+Sync.
     /// Caller must guarantee the pointer remains valid until the stream is consumed.
     struct SendRypeIndexPtr(*const RypeIndex);
 
-    // SAFETY: RypeIndex is read-only during classification. The ShardedInvertedIndex
-    // is safe for concurrent reads.
+    // SAFETY: RypeIndex contains Arc<ShardedInvertedIndex>. Arc is Send+Sync when T is,
+    // and ShardedInvertedIndex is safe for concurrent reads (no interior mutability).
     unsafe impl Send for SendRypeIndexPtr {}
     unsafe impl Sync for SendRypeIndexPtr {}
 
@@ -913,12 +1008,13 @@ mod arrow_ffi {
     }
 
     /// Send-safe wrapper for RypeNegativeSet pointer.
-    /// SAFETY: RypeNegativeSet contains a HashSet<u64> which is read-only during classification.
+    /// SAFETY: RypeNegativeSet contains Arc<ShardedInvertedIndex> which is read-only
+    /// during classification. Arc itself is Send+Sync.
     /// Caller must guarantee the pointer remains valid until the stream is consumed.
     struct SendRypeNegativeSetPtr(*const RypeNegativeSet);
 
-    // SAFETY: RypeNegativeSet.minimizers is a HashSet<u64> that is only read during classification.
-    // HashSet is safe for concurrent reads.
+    // SAFETY: RypeNegativeSet.index is Arc<ShardedInvertedIndex>. Arc is Send+Sync when T is,
+    // and ShardedInvertedIndex is safe for concurrent reads (no interior mutability).
     unsafe impl Send for SendRypeNegativeSetPtr {}
     unsafe impl Sync for SendRypeNegativeSetPtr {}
 
@@ -1096,12 +1192,22 @@ mod arrow_ffi {
 
         let classify_fn = move |batch: &RecordBatch| {
             let index = unsafe { index_send.get() };
-            let neg_mins: Option<&HashSet<u64>> = neg_set_send
-                .as_ref()
-                .map(|p| unsafe { &p.get().minimizers });
 
-            let result =
-                classify_arrow_batch_sharded(&index.0, neg_mins, batch, threshold, merge_join);
+            // Handle sharded negative filtering: collect hitting minimizers per batch
+            let neg_mins_owned: Option<HashSet<u64>> = if let Some(ref neg_send) = neg_set_send {
+                let neg_index = unsafe { &neg_send.get().index };
+                Some(collect_negative_mins_for_batch(neg_index, batch, &index.0)?)
+            } else {
+                None
+            };
+
+            let result = classify_arrow_batch_sharded(
+                &index.0,
+                neg_mins_owned.as_ref(),
+                batch,
+                threshold,
+                merge_join,
+            );
             result.map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
         };
 
@@ -1182,12 +1288,21 @@ mod arrow_ffi {
 
         let classify_fn = move |batch: &RecordBatch| {
             let index = unsafe { index_send.get() };
-            let neg_mins: Option<&HashSet<u64>> = neg_set_send
-                .as_ref()
-                .map(|p| unsafe { &p.get().minimizers });
+
+            // Handle sharded negative filtering: collect hitting minimizers per batch
+            let neg_mins_owned: Option<HashSet<u64>> = if let Some(ref neg_send) = neg_set_send {
+                let neg_index = unsafe { &neg_send.get().index };
+                Some(collect_negative_mins_for_batch(neg_index, batch, &index.0)?)
+            } else {
+                None
+            };
 
             let result = classify_arrow_batch_sharded_best_hit(
-                &index.0, neg_mins, batch, threshold, merge_join,
+                &index.0,
+                neg_mins_owned.as_ref(),
+                batch,
+                threshold,
+                merge_join,
             );
             result.map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
         };

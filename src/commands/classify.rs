@@ -4,7 +4,7 @@
 
 use anyhow::{anyhow, Result};
 use arrow::record_batch::RecordBatch;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -15,8 +15,8 @@ use rype::memory::{
 use rype::parquet_index;
 use rype::{
     classify_batch_sharded_merge_join, classify_batch_sharded_parallel_rg,
-    classify_batch_sharded_sequential, filter_best_hits, log_timing, IndexMetadata,
-    ShardedInvertedIndex,
+    classify_batch_sharded_sequential, classify_with_sharded_negative, filter_best_hits,
+    log_timing, IndexMetadata, ShardedInvertedIndex,
 };
 
 use super::helpers::{
@@ -43,14 +43,28 @@ pub struct ClassifyRunArgs {
 
 /// Run the classify command with the given arguments.
 pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
-    // Negative index not yet supported with Parquet format
-    if args.negative_index.is_some() {
-        return Err(anyhow!(
-            "Negative index filtering is not yet supported with Parquet indices.\n\
-             This feature is pending development."
-        ));
-    }
-    let neg_mins: Option<HashSet<u64>> = None;
+    // Load negative index if provided (memory-efficient sharded filtering)
+    let negative_sharded: Option<ShardedInvertedIndex> = if let Some(ref neg_path) =
+        args.negative_index
+    {
+        if !rype::is_parquet_index(neg_path) {
+            return Err(anyhow!(
+                "Negative index not found or not in Parquet format: {}\n\
+                 Create a negative index with: rype index create -o negative.ryxdi -r contaminants.fasta",
+                neg_path.display()
+            ));
+        }
+        log::info!("Loading negative index from {:?}", neg_path);
+        let neg = ShardedInvertedIndex::open(neg_path)?;
+        log::info!(
+            "Negative index: {} shards, {} total minimizers (memory-efficient filtering enabled)",
+            neg.num_shards(),
+            neg.total_minimizers()
+        );
+        Some(neg)
+    } else {
+        None
+    };
 
     // Determine effective batch size: user override or adaptive
     let effective_batch_size = if let Some(bs) = args.batch_size {
@@ -249,10 +263,26 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
 
     // Helper closure for classification
     let classify_records = |batch_refs: &[rype::QueryRecord]| -> Result<Vec<rype::HitResult>> {
-        if args.parallel_rg {
+        // If negative index is provided, use memory-efficient sharded filtering
+        if let Some(ref neg) = negative_sharded {
+            // Negative filtering currently only supported with sequential mode
+            if args.parallel_rg || args.merge_join {
+                return Err(anyhow!(
+                    "Negative index filtering is only supported with sequential mode.\n\
+                     Remove --parallel-rg or --merge-join flags when using --negative-index."
+                ));
+            }
+            classify_with_sharded_negative(
+                &sharded,
+                Some(neg),
+                batch_refs,
+                args.threshold,
+                read_options.as_ref(),
+            )
+        } else if args.parallel_rg {
             classify_batch_sharded_parallel_rg(
                 &sharded,
-                neg_mins.as_ref(),
+                None,
                 batch_refs,
                 args.threshold,
                 read_options.as_ref(),
@@ -260,7 +290,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         } else if args.merge_join {
             classify_batch_sharded_merge_join(
                 &sharded,
-                neg_mins.as_ref(),
+                None,
                 batch_refs,
                 args.threshold,
                 read_options.as_ref(),
@@ -268,7 +298,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         } else {
             classify_batch_sharded_sequential(
                 &sharded,
-                neg_mins.as_ref(),
+                None,
                 batch_refs,
                 args.threshold,
                 read_options.as_ref(),

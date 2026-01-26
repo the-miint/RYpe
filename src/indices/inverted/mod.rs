@@ -264,6 +264,45 @@ impl InvertedIndex {
     pub fn bucket_ids(&self) -> &[u32] {
         &self.bucket_ids
     }
+
+    /// Get query minimizers that exist in this index.
+    ///
+    /// Returns a Vec of minimizers (preserving query order) that hit anything
+    /// in the index. This is useful for negative filtering where we need to
+    /// know which query minimizers should be excluded.
+    ///
+    /// # Arguments
+    /// * `query` - A sorted, deduplicated slice of minimizer values
+    ///
+    /// # Returns
+    /// Vec of minimizers from query that exist in this index.
+    pub fn get_hitting_minimizers(&self, query: &[u64]) -> Vec<u64> {
+        let mut hits = Vec::new();
+
+        if query.is_empty() || self.minimizers.is_empty() {
+            return hits;
+        }
+
+        let mut search_start = 0;
+
+        for &q in query {
+            if search_start >= self.minimizers.len() {
+                break;
+            }
+
+            match self.minimizers[search_start..].binary_search(&q) {
+                Ok(relative_idx) => {
+                    hits.push(q);
+                    search_start += relative_idx + 1;
+                }
+                Err(relative_idx) => {
+                    search_start += relative_idx;
+                }
+            }
+        }
+
+        hits
+    }
 }
 
 #[cfg(test)]
@@ -395,5 +434,48 @@ mod tests {
         assert_eq!(hits.get(&2), Some(&3));
         assert_eq!(hits.get(&3), Some(&3));
         assert_eq!(hits.get(&4), Some(&3));
+    }
+
+    // Tests for get_hitting_minimizers
+    #[test]
+    fn test_get_hitting_minimizers_basic() {
+        // Index has minimizers: 100, 200, 300, 400, 500, 600
+        let inverted = build_test_inverted_index();
+        let query = vec![50, 100, 150, 200, 250];
+        let hits = inverted.get_hitting_minimizers(&query);
+        // Only 100, 200 exist in index
+        assert_eq!(hits, vec![100, 200]);
+    }
+
+    #[test]
+    fn test_get_hitting_minimizers_empty_query() {
+        let inverted = build_test_inverted_index();
+        let hits = inverted.get_hitting_minimizers(&[]);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_get_hitting_minimizers_no_matches() {
+        let inverted = build_test_inverted_index();
+        let hits = inverted.get_hitting_minimizers(&[50, 150, 250, 700]);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_get_hitting_minimizers_all_hit() {
+        let inverted = build_test_inverted_index();
+        // Query exactly the minimizers in the index
+        let query = vec![100, 200, 300, 400, 500, 600];
+        let hits = inverted.get_hitting_minimizers(&query);
+        assert_eq!(hits, vec![100, 200, 300, 400, 500, 600]);
+    }
+
+    #[test]
+    fn test_get_hitting_minimizers_partial_overlap() {
+        let inverted = build_test_inverted_index();
+        // Mix of hits and misses
+        let query = vec![100, 150, 300, 450, 600, 700];
+        let hits = inverted.get_hitting_minimizers(&query);
+        assert_eq!(hits, vec![100, 300, 600]);
     }
 }

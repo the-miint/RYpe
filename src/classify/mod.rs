@@ -11,10 +11,12 @@ mod scoring;
 mod sharded;
 
 // Re-export public API
+#[cfg(feature = "arrow-ffi")]
+pub use common::collect_negative_minimizers_sharded;
 pub use merge_join::classify_batch_merge_join;
 pub use sharded::{
     classify_batch_sharded_merge_join, classify_batch_sharded_parallel_rg,
-    classify_batch_sharded_sequential,
+    classify_batch_sharded_sequential, classify_with_sharded_negative,
 };
 
 // Re-export best-hit filtering

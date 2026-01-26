@@ -112,11 +112,14 @@ typedef struct RypeIndex RypeIndex;
 /**
  * Opaque pointer to a negative minimizer set
  *
- * Contains a set of minimizers to exclude from query scoring.
- * Used to filter out contaminating sequences (e.g., host DNA, adapters).
+ * Contains a shared reference (via Arc) to an index used to filter query
+ * minimizers during classification. Used to filter out contaminating sequences
+ * (e.g., host DNA, adapters).
  *
- * Note: Creating negative sets from Parquet indices is not currently supported.
- * Create the minimizer set directly from FASTA reference sequences instead.
+ * Memory-efficient: Uses sharded filtering that loads one shard at a time,
+ * rather than loading all minimizers into memory at once. Creating a negative
+ * set from an index is a cheap operation (increments a reference count) rather
+ * than copying data.
  */
 typedef struct RypeNegativeSet RypeNegativeSet;
 
@@ -470,15 +473,38 @@ const char* rype_bucket_name(const RypeIndex* index, uint32_t bucket_id);
  * Create a negative minimizer set from an index
  *
  * @param negative_index  RypeIndex containing sequences to filter out
- * @return                Always returns NULL (not currently supported)
+ * @return                RypeNegativeSet pointer on success, NULL on failure
  *
- * ## Current Limitations
+ * The negative set uses memory-efficient sharded filtering. During
+ * classification, negative shards are processed one at a time, so memory
+ * usage is O(single_shard) rather than O(entire_index).
  *
- * Creating negative sets from Parquet indices is not currently supported
- * because it would require loading all shard data into memory.
+ * ## Example
  *
- * For negative filtering, create the minimizer set directly from the
- * original FASTA reference sequences using the CLI or Rust API.
+ *     RypeIndex* neg_idx = rype_index_load("contaminants.ryxdi");
+ *     RypeNegativeSet* neg_set = rype_negative_set_create(neg_idx);
+ *     // neg_idx can be freed after creating neg_set if desired
+ *     rype_index_free(neg_idx);
+ *
+ *     // Use neg_set for classification
+ *     RypeResultArray* results = rype_classify_with_negative(
+ *         main_idx, neg_set, queries, num_queries, threshold
+ *     );
+ *
+ *     rype_negative_set_free(neg_set);
+ *
+ * ## Thread Safety
+ *
+ * NOT thread-safe. Use external synchronization when creating from multiple threads.
+ *
+ * ## Memory
+ *
+ * The returned RypeNegativeSet must be freed with rype_negative_set_free().
+ * The RypeNegativeSet shares the underlying index data with the source RypeIndex
+ * via reference counting (Arc). This means:
+ * - Creating a negative set is cheap (no data copying)
+ * - The original negative_index can be freed after creating the negative set
+ * - The negative set remains valid and usable after freeing the source index
  */
 RypeNegativeSet* rype_negative_set_create(const RypeIndex* negative_index);
 
@@ -494,10 +520,14 @@ RypeNegativeSet* rype_negative_set_create(const RypeIndex* negative_index);
 void rype_negative_set_free(RypeNegativeSet* neg_set);
 
 /**
- * Get the number of unique minimizers in a negative set
+ * Get the total minimizer count in a negative set
  *
  * @param neg_set  RypeNegativeSet pointer
- * @return         Number of minimizers, or 0 if neg_set is NULL
+ * @return         Total minimizer count from the index manifest, or 0 if NULL
+ *
+ * Note: This returns the total entry count from the index manifest.
+ * Since shards may contain duplicate entries, this is an upper bound
+ * rather than an exact count of unique minimizers.
  */
 size_t rype_negative_set_size(const RypeNegativeSet* neg_set);
 

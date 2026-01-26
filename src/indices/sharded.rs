@@ -101,7 +101,7 @@ impl ShardManifest {
 ///
 /// Row group metadata (min/max ranges) is preloaded during open() to avoid
 /// file I/O during classification hot path.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ShardedInvertedIndex {
     manifest: ShardManifest,
     base_path: PathBuf,
