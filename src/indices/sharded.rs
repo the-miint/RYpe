@@ -97,7 +97,7 @@ impl ShardManifest {
 /// Handle for a sharded inverted index.
 ///
 /// This struct holds a manifest describing the shards. Shards are loaded
-/// on-demand during classification via `classify_batch_sharded_sequential`.
+/// on-demand during classification via `classify_batch_sharded_merge_join`.
 ///
 /// Row group metadata (min/max ranges) is preloaded during open() to avoid
 /// file I/O during classification hot path.

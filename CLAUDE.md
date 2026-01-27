@@ -345,7 +345,7 @@ cargo run --release --features parquet -- classify run -i index.ryxdi -1 reads.f
 
 **Memory Benefits**:
 - Manifest loads instantly (no minimizer data)
-- Classification loads one shard at a time via `classify_batch_sharded_sequential`
+- Classification loads one shard at a time via `classify_batch_sharded_merge_join`
 - Memory usage: O(batch_size × minimizers_per_read) + O(single_shard_size)
 - Enables classification when total index exceeds available RAM
 

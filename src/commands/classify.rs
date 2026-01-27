@@ -15,8 +15,8 @@ use rype::memory::{
 use rype::parquet_index;
 use rype::{
     classify_batch_sharded_merge_join, classify_batch_sharded_parallel_rg,
-    classify_batch_sharded_sequential, classify_with_sharded_negative, filter_best_hits,
-    log_timing, IndexMetadata, ShardedInvertedIndex,
+    classify_with_sharded_negative, filter_best_hits, log_timing, IndexMetadata,
+    ShardedInvertedIndex,
 };
 
 use super::helpers::{
@@ -34,7 +34,6 @@ pub struct ClassifyRunArgs {
     pub max_memory: usize,
     pub batch_size: Option<usize>,
     pub output: Option<PathBuf>,
-    pub merge_join: bool,
     pub parallel_rg: bool,
     pub use_bloom_filter: bool,
     pub parallel_input_rg: usize,
@@ -249,14 +248,9 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
             "Starting parallel row group classification (batch_size={})",
             effective_batch_size
         );
-    } else if args.merge_join {
-        log::info!(
-            "Starting merge-join classification with sequential shard loading (batch_size={})",
-            effective_batch_size
-        );
     } else {
         log::info!(
-            "Starting classification with sequential shard loading (batch_size={})",
+            "Starting merge-join classification with sequential shard loading (batch_size={})",
             effective_batch_size
         );
     }
@@ -265,11 +259,10 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     let classify_records = |batch_refs: &[rype::QueryRecord]| -> Result<Vec<rype::HitResult>> {
         // If negative index is provided, use memory-efficient sharded filtering
         if let Some(ref neg) = negative_sharded {
-            // Negative filtering currently only supported with sequential mode
-            if args.parallel_rg || args.merge_join {
+            // Negative filtering not supported with parallel-rg
+            if args.parallel_rg {
                 return Err(anyhow!(
-                    "Negative index filtering is only supported with sequential mode.\n\
-                     Remove --parallel-rg or --merge-join flags when using --negative-index."
+                    "Negative index filtering is not supported with --parallel-rg."
                 ));
             }
             classify_with_sharded_negative(
@@ -287,16 +280,8 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                 args.threshold,
                 read_options.as_ref(),
             )
-        } else if args.merge_join {
-            classify_batch_sharded_merge_join(
-                &sharded,
-                None,
-                batch_refs,
-                args.threshold,
-                read_options.as_ref(),
-            )
         } else {
-            classify_batch_sharded_sequential(
+            classify_batch_sharded_merge_join(
                 &sharded,
                 None,
                 batch_refs,

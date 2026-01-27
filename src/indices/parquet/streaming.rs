@@ -600,7 +600,7 @@ mod tests {
     /// Test that streaming Parquet creation produces correct classification results.
     #[test]
     fn test_streaming_parquet_classification() {
-        use crate::classify::classify_batch_sharded_sequential;
+        use crate::classify::classify_batch_sharded_merge_join;
         use crate::core::extraction::extract_into;
         use crate::core::workspace::MinimizerWorkspace;
         use crate::indices::sharded::ShardedInvertedIndex;
@@ -674,7 +674,7 @@ mod tests {
         let threshold = 0.1;
 
         let results =
-            classify_batch_sharded_sequential(&streaming_sharded, None, &records, threshold, None)
+            classify_batch_sharded_merge_join(&streaming_sharded, None, &records, threshold, None)
                 .unwrap();
 
         // Verify we got expected matches (each query should match its own bucket perfectly)

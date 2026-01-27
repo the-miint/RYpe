@@ -1131,8 +1131,6 @@ mod arrow_ffi {
     /// - `negative_set_ptr`: Optional pointer to RypeNegativeSet (can be NULL)
     /// - `input_stream`: Arrow input stream with sequences
     /// - `threshold`: Minimum score threshold (0.0-1.0)
-    /// - `use_merge_join`: 1 = use merge-join strategy (more efficient when minimizers
-    ///   overlap across queries), 0 = use sequential strategy.
     /// - `out_stream`: Output stream pointer to receive results
     ///
     /// # Input Schema
@@ -1157,7 +1155,6 @@ mod arrow_ffi {
         negative_set_ptr: *const RypeNegativeSet,
         input_stream: *mut FFI_ArrowArrayStream,
         threshold: c_double,
-        use_merge_join: i32,
         out_stream: *mut FFI_ArrowArrayStream,
     ) -> i32 {
         // Validate parameters
@@ -1177,9 +1174,6 @@ mod arrow_ffi {
             set_last_error(e);
             return -1;
         }
-
-        // Convert use_merge_join to bool (C convention: 0 = false, non-zero = true)
-        let merge_join = use_merge_join != 0;
 
         // Wrap pointers in type-specific Send-safe wrappers
         // SAFETY: Caller guarantees pointers remain valid until stream is consumed
@@ -1201,13 +1195,8 @@ mod arrow_ffi {
                 None
             };
 
-            let result = classify_arrow_batch_sharded(
-                &index.0,
-                neg_mins_owned.as_ref(),
-                batch,
-                threshold,
-                merge_join,
-            );
+            let result =
+                classify_arrow_batch_sharded(&index.0, neg_mins_owned.as_ref(), batch, threshold);
             result.map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
         };
 
@@ -1255,7 +1244,6 @@ mod arrow_ffi {
         negative_set_ptr: *const RypeNegativeSet,
         input_stream: *mut FFI_ArrowArrayStream,
         threshold: c_double,
-        use_merge_join: i32,
         out_stream: *mut FFI_ArrowArrayStream,
     ) -> i32 {
         // Validate parameters
@@ -1275,8 +1263,6 @@ mod arrow_ffi {
             set_last_error(e);
             return -1;
         }
-
-        let merge_join = use_merge_join != 0;
 
         // Wrap pointers in Send-safe wrappers
         let index_send = SendRypeIndexPtr::new(index_ptr);
@@ -1302,7 +1288,6 @@ mod arrow_ffi {
                 neg_mins_owned.as_ref(),
                 batch,
                 threshold,
-                merge_join,
             );
             result.map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
         };

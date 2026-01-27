@@ -9,9 +9,8 @@ use anyhow::Result;
 use tempfile::tempdir;
 
 use rype::{
-    classify_batch_sharded_merge_join, classify_batch_sharded_sequential, extract_into, BucketData,
-    HitResult, IndexMetadata, InvertedIndex, MinimizerWorkspace, ParquetWriteOptions, QueryRecord,
-    ShardedInvertedIndex,
+    classify_batch_sharded_merge_join, extract_into, BucketData, HitResult, IndexMetadata,
+    InvertedIndex, MinimizerWorkspace, ParquetWriteOptions, QueryRecord, ShardedInvertedIndex,
 };
 
 /// Test helper to sort results for comparison
@@ -232,26 +231,19 @@ fn test_parquet_index_classification() -> Result<()> {
 
     let threshold = 0.1;
 
-    let results_sequential =
-        classify_batch_sharded_sequential(&sharded, None, &records, threshold, None)?;
-    let results_merge =
-        classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None)?;
+    let results = classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None)?;
 
     eprintln!("\n=== Results ===");
-    eprintln!("Sequential: {} results", results_sequential.len());
-    eprintln!("Merge-join: {} results", results_merge.len());
+    eprintln!("Merge-join: {} results", results.len());
 
     // Verify results - each query should strongly match its corresponding bucket (self-match)
     // Query i comes from sequence i, which was used to build bucket (i+1)
-    assert!(
-        !results_sequential.is_empty(),
-        "Should have classification results"
-    );
+    assert!(!results.is_empty(), "Should have classification results");
 
     // Verify self-matches exist with high scores
     for i in 0..seqs.len() {
         let bucket_id = (i + 1) as u32;
-        let self_match = results_sequential
+        let self_match = results
             .iter()
             .find(|r| r.query_id == i as i64 && r.bucket_id == bucket_id);
         assert!(
@@ -269,17 +261,9 @@ fn test_parquet_index_classification() -> Result<()> {
         );
     }
 
-    // Sequential and merge-join should produce identical results
-    compare_results(
-        "Sequential",
-        &results_sequential,
-        "Merge-join",
-        &results_merge,
-    );
-
     // Print detailed results
     eprintln!("\nDetailed results:");
-    for r in &results_sequential {
+    for r in &results {
         eprintln!(
             "  Query {} -> Bucket {}: {:.4}",
             r.query_id, r.bucket_id, r.score
@@ -419,34 +403,19 @@ fn test_parquet_index_with_multiple_shards() -> Result<()> {
 
     let threshold = 0.1;
 
-    let results_sequential =
-        classify_batch_sharded_sequential(&sharded, None, &records, threshold, None)?;
-    let results_merge =
-        classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None)?;
+    let results = classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None)?;
 
     eprintln!("\n=== Classification Results ===");
-    eprintln!("Sequential: {} results", results_sequential.len());
-    eprintln!("Merge-join: {} results", results_merge.len());
-
-    // Verify consistency
-    compare_results(
-        "Sequential",
-        &results_sequential,
-        "Merge-join",
-        &results_merge,
-    );
+    eprintln!("Merge-join: {} results", results.len());
 
     // Verify we have results - each query should match its corresponding bucket
-    assert!(
-        !results_sequential.is_empty(),
-        "Should have classification results"
-    );
+    assert!(!results.is_empty(), "Should have classification results");
 
     // Verify self-matches exist for at least the first few queries
     // (Different sequences may have some minimizer overlap, but self-match should be strong)
     for i in 0..5 {
         let bucket_id = (i + 1) as u32;
-        let self_match = results_sequential
+        let self_match = results
             .iter()
             .find(|r| r.query_id == i as i64 && r.bucket_id == bucket_id);
         assert!(

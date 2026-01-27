@@ -66,8 +66,8 @@
 //! // Create or receive Arrow batch from DuckDB, Parquet, etc.
 //! let sequences: RecordBatch = /* ... */;
 //!
-//! // Classify (use_merge_join=true for better performance with overlapping minimizers)
-//! let results = classify_arrow_batch_sharded(&index, None, &sequences, 0.1, true)?;
+//! // Classify sequences
+//! let results = classify_arrow_batch_sharded(&index, None, &sequences, 0.1)?;
 //!
 //! // Results can be passed to DuckDB, written to Parquet, etc.
 //! assert_eq!(results.schema(), result_schema());
@@ -93,14 +93,13 @@ use std::collections::HashSet;
 
 use arrow::record_batch::RecordBatch;
 
-use crate::{
-    classify_batch_sharded_merge_join, classify_batch_sharded_sequential, ShardedInvertedIndex,
-};
+use crate::{classify_batch_sharded_merge_join, ShardedInvertedIndex};
 
 /// Classify sequences from an Arrow RecordBatch using a ShardedInvertedIndex.
 ///
 /// Loads shards sequentially from disk, enabling classification when the full
-/// inverted index exceeds available memory.
+/// inverted index exceeds available memory. Uses merge-join algorithm for
+/// efficient classification.
 ///
 /// # Memory Complexity
 ///
@@ -112,8 +111,6 @@ use crate::{
 /// * `negative_mins` - Optional set of minimizers to exclude from queries
 /// * `batch` - Input RecordBatch with sequences (see module docs for schema)
 /// * `threshold` - Minimum score threshold for reporting hits (0.0-1.0)
-/// * `use_merge_join` - If true, uses merge-join strategy (more efficient with high
-///   minimizer overlap); if false, uses sequential lookup strategy
 ///
 /// # Returns
 ///
@@ -128,23 +125,15 @@ use crate::{
 ///
 /// ```ignore
 /// let sharded = ShardedInvertedIndex::open("index.ryxdi")?;
-/// let results = classify_arrow_batch_sharded(&sharded, None, &sequences, 0.1, true)?;
+/// let results = classify_arrow_batch_sharded(&sharded, None, &sequences, 0.1)?;
 /// ```
 pub fn classify_arrow_batch_sharded(
     sharded: &ShardedInvertedIndex,
     negative_mins: Option<&HashSet<u64>>,
     batch: &RecordBatch,
     threshold: f64,
-    use_merge_join: bool,
 ) -> Result<RecordBatch, ArrowClassifyError> {
-    classify_arrow_batch_sharded_internal(
-        sharded,
-        negative_mins,
-        batch,
-        threshold,
-        use_merge_join,
-        false,
-    )
+    classify_arrow_batch_sharded_internal(sharded, negative_mins, batch, threshold, false)
 }
 
 /// Classify sequences in an Arrow RecordBatch and return only the best hit per query.
@@ -159,7 +148,6 @@ pub fn classify_arrow_batch_sharded(
 /// * `negative_mins` - Optional set of minimizers to exclude (for contamination filtering)
 /// * `batch` - Arrow RecordBatch with columns: `read_id` (Int64), `sequence` (Binary/LargeBinary)
 /// * `threshold` - Minimum score threshold (0.0-1.0) for reporting matches
-/// * `use_merge_join` - If true, uses merge-join algorithm; otherwise sequential
 ///
 /// # Returns
 ///
@@ -169,16 +157,8 @@ pub fn classify_arrow_batch_sharded_best_hit(
     negative_mins: Option<&HashSet<u64>>,
     batch: &RecordBatch,
     threshold: f64,
-    use_merge_join: bool,
 ) -> Result<RecordBatch, ArrowClassifyError> {
-    classify_arrow_batch_sharded_internal(
-        sharded,
-        negative_mins,
-        batch,
-        threshold,
-        use_merge_join,
-        true,
-    )
+    classify_arrow_batch_sharded_internal(sharded, negative_mins, batch, threshold, true)
 }
 
 /// Internal implementation that supports both regular and best-hit modes.
@@ -187,16 +167,11 @@ fn classify_arrow_batch_sharded_internal(
     negative_mins: Option<&HashSet<u64>>,
     batch: &RecordBatch,
     threshold: f64,
-    use_merge_join: bool,
     best_hit_only: bool,
 ) -> Result<RecordBatch, ArrowClassifyError> {
     let records = batch_to_records(batch)?;
-    let hits = if use_merge_join {
-        classify_batch_sharded_merge_join(sharded, negative_mins, &records, threshold, None)
-    } else {
-        classify_batch_sharded_sequential(sharded, negative_mins, &records, threshold, None)
-    }
-    .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
+    let hits = classify_batch_sharded_merge_join(sharded, negative_mins, &records, threshold, None)
+        .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
 
     let hits = if best_hit_only {
         crate::classify::filter_best_hits(hits)
@@ -273,7 +248,7 @@ mod tests {
         let query_seq = generate_sequence(100, 0);
         let batch = make_test_batch(&[101], &[&query_seq]);
 
-        let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true).unwrap();
+        let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0).unwrap();
 
         assert!(result.num_rows() > 0, "Should have classification results");
         assert_eq!(result.num_columns(), 3);
@@ -292,7 +267,7 @@ mod tests {
         let query_seq = vec![b'N'; 100]; // All N's produce no minimizers
         let batch = make_test_batch(&[101], &[&query_seq]);
 
-        let result = classify_arrow_batch_sharded(&index, None, &batch, 0.5, true).unwrap();
+        let result = classify_arrow_batch_sharded(&index, None, &batch, 0.5).unwrap();
 
         // May have 0 rows if nothing matches threshold
         assert_eq!(result.num_columns(), 3);
@@ -306,7 +281,7 @@ mod tests {
         let query2 = generate_sequence(100, 1); // Different pattern
         let batch = make_test_batch(&[1, 2], &[&query1, &query2]);
 
-        let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true).unwrap();
+        let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0).unwrap();
 
         // Should have results
         assert!(result.num_rows() >= 1);
@@ -345,7 +320,7 @@ mod tests {
         ]));
         let empty_batch = RecordBatch::new_empty(schema);
 
-        let result = classify_arrow_batch_sharded(&index, None, &empty_batch, 0.1, true).unwrap();
+        let result = classify_arrow_batch_sharded(&index, None, &empty_batch, 0.1).unwrap();
         assert_eq!(result.num_rows(), 0);
     }
 
@@ -360,25 +335,7 @@ mod tests {
         ]));
         let batch = RecordBatch::new_empty(schema);
 
-        let result = classify_arrow_batch_sharded(&index, None, &batch, 0.1, true);
+        let result = classify_arrow_batch_sharded(&index, None, &batch, 0.1);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_classify_arrow_batch_sharded_merge_join_vs_sequential() {
-        let (_dir, index) = create_test_parquet_index();
-
-        let query_seq = generate_sequence(100, 0);
-        let batch = make_test_batch(&[1], &[&query_seq]);
-
-        // Both strategies should produce the same results
-        let result_merge = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true).unwrap();
-        let result_seq = classify_arrow_batch_sharded(&index, None, &batch, 0.0, false).unwrap();
-
-        assert_eq!(
-            result_merge.num_rows(),
-            result_seq.num_rows(),
-            "Merge-join and sequential should produce same number of results"
-        );
     }
 }

@@ -6,7 +6,6 @@
 use anyhow::Result;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::constants::{ESTIMATED_BUCKETS_PER_READ, ESTIMATED_MINIMIZERS_PER_SEQUENCE};
@@ -46,126 +45,11 @@ fn estimate_minimizers_from_records(records: &[QueryRecord], k: usize, w: usize)
     estimate.max(ESTIMATED_MINIMIZERS_PER_SEQUENCE)
 }
 
-/// Classify a batch of records against a sharded inverted index.
-///
-/// Loads one shard at a time to minimize memory usage. Memory complexity
-/// is O(batch_size * minimizers_per_read) + O(single_shard_size).
-///
-/// # Arguments
-/// * `sharded` - The sharded inverted index
-/// * `negative_mins` - Optional set of minimizers to exclude from queries before scoring
-/// * `records` - Batch of query records
-/// * `threshold` - Minimum score threshold
-/// * `read_options` - Parquet read options (None = default behavior without bloom filters)
-///
-/// # Returns
-/// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
-pub fn classify_batch_sharded_sequential(
-    sharded: &ShardedInvertedIndex,
-    negative_mins: Option<&HashSet<u64>>,
-    records: &[QueryRecord],
-    threshold: f64,
-    read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
-) -> Result<Vec<HitResult>> {
-    let t_start = Instant::now();
-    let manifest = sharded.manifest();
-
-    let t_extract = Instant::now();
-    let estimated_mins = estimate_minimizers_from_records(records, manifest.k, manifest.w);
-    let processed: Vec<_> = records
-        .par_iter()
-        .map_init(
-            || MinimizerWorkspace::with_estimate(estimated_mins),
-            |ws, (id, s1, s2)| {
-                let (ha, hb) =
-                    get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
-                let (fa, fb) = filter_negative_mins(ha, hb, negative_mins);
-                (*id, fa, fb)
-            },
-        )
-        .collect();
-    log_timing("sequential: extraction", t_extract.elapsed().as_millis());
-
-    let all_hits: Vec<Mutex<HashMap<u32, (usize, usize)>>> = (0..processed.len())
-        .map(|_| Mutex::new(HashMap::new()))
-        .collect();
-
-    // Build sorted unique minimizers for filtered loading (Parquet only)
-    let mut all_minimizers: Vec<u64> = processed
-        .iter()
-        .flat_map(|(_, fwd, rc)| fwd.iter().chain(rc.iter()).copied())
-        .collect();
-    all_minimizers.sort_unstable();
-    all_minimizers.dedup();
-
-    let mut total_shard_load_ms = 0u128;
-    let mut total_shard_query_ms = 0u128;
-
-    for shard_info in &manifest.shards {
-        let t_load = Instant::now();
-        // Use filtered loading for Parquet shards (with optional bloom filter support)
-        let shard =
-            sharded.load_shard_for_query(shard_info.shard_id, &all_minimizers, read_options)?;
-        total_shard_load_ms += t_load.elapsed().as_millis();
-
-        let t_query = Instant::now();
-        processed
-            .par_iter()
-            .enumerate()
-            .for_each(|(idx, (_, fwd_mins, rc_mins))| {
-                let fwd_hits = shard.get_bucket_hits(fwd_mins);
-                let rc_hits = shard.get_bucket_hits(rc_mins);
-
-                let mut hits = all_hits[idx].lock().unwrap();
-                for (bucket_id, count) in fwd_hits {
-                    hits.entry(bucket_id).or_insert((0, 0)).0 += count;
-                }
-                for (bucket_id, count) in rc_hits {
-                    hits.entry(bucket_id).or_insert((0, 0)).1 += count;
-                }
-            });
-        total_shard_query_ms += t_query.elapsed().as_millis();
-        // shard dropped here, freeing memory before loading next
-    }
-    log_timing("sequential: shard_load_total", total_shard_load_ms);
-    log_timing("sequential: shard_query_total", total_shard_query_ms);
-
-    let t_score = Instant::now();
-    let results: Vec<HitResult> = processed
-        .iter()
-        .enumerate()
-        .flat_map(|(idx, (query_id, fwd_mins, rc_mins))| {
-            let fwd_total = fwd_mins.len();
-            let rc_total = rc_mins.len();
-            let hits = all_hits[idx].lock().unwrap();
-
-            hits.iter()
-                .filter_map(|(&bucket_id, &(fwd_count, rc_count))| {
-                    let score = compute_score(fwd_count, fwd_total, rc_count, rc_total);
-                    if score >= threshold {
-                        Some(HitResult {
-                            query_id: *query_id,
-                            bucket_id,
-                            score,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    log_timing("sequential: scoring", t_score.elapsed().as_millis());
-    log_timing("sequential: total", t_start.elapsed().as_millis());
-
-    Ok(results)
-}
-
 /// Classify a batch of records against a sharded inverted index using merge-join.
 ///
 /// Builds a QueryInvertedIndex once, then processes each shard sequentially
-/// using merge-join. This is more efficient than `classify_batch_sharded_sequential`
-/// when there is high minimizer overlap across reads.
+/// using merge-join. This is efficient when there is high minimizer overlap
+/// across reads.
 ///
 /// Memory complexity: O(batch_size * minimizers_per_read) + O(single_shard_size)
 ///
@@ -511,9 +395,9 @@ pub fn classify_with_sharded_negative(
     threshold: f64,
     read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
 ) -> Result<Vec<HitResult>> {
-    // If no negative index, delegate directly to the standard function
+    // If no negative index, delegate directly to the merge-join function
     if negative_index.is_none() {
-        return classify_batch_sharded_sequential(
+        return classify_batch_sharded_merge_join(
             positive_index,
             None,
             records,
@@ -554,7 +438,7 @@ pub fn classify_with_sharded_negative(
     // Step 4: Classify using the collected negative set
     // Note: This will re-extract minimizers, but the memory savings from sharded
     // negative filtering (24GB -> 1-2GB) far outweigh the extraction overhead.
-    classify_batch_sharded_sequential(
+    classify_batch_sharded_merge_join(
         positive_index,
         Some(&negative_set),
         records,
@@ -784,168 +668,6 @@ mod tests {
     }
 
     // =========================================================================
-    // classify_batch_sharded_sequential tests
-    // =========================================================================
-
-    #[test]
-    fn test_sequential_empty_records() {
-        let (_dir, index, _seqs) = create_test_index();
-        let records: Vec<QueryRecord> = vec![];
-
-        let results = classify_batch_sharded_sequential(&index, None, &records, 0.1, None).unwrap();
-
-        assert!(
-            results.is_empty(),
-            "Empty records should produce empty results"
-        );
-    }
-
-    #[test]
-    fn test_sequential_self_match() {
-        let (_dir, index, seqs) = create_test_index();
-
-        let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
-
-        let results = classify_batch_sharded_sequential(&index, None, &records, 0.1, None).unwrap();
-
-        let bucket1_hit = results.iter().find(|r| r.query_id == 1 && r.bucket_id == 1);
-        assert!(bucket1_hit.is_some(), "Should have self-match for bucket 1");
-        assert!(
-            bucket1_hit.unwrap().score > 0.9,
-            "Self-match score should be >0.9, got {}",
-            bucket1_hit.unwrap().score
-        );
-    }
-
-    #[test]
-    fn test_sequential_multiple_queries() {
-        let (_dir, index, seqs) = create_test_index();
-
-        let records: Vec<QueryRecord> =
-            vec![(1, seqs[0].as_slice(), None), (2, seqs[1].as_slice(), None)];
-
-        let results = classify_batch_sharded_sequential(&index, None, &records, 0.1, None).unwrap();
-
-        let q1_b1 = results.iter().find(|r| r.query_id == 1 && r.bucket_id == 1);
-        let q2_b2 = results.iter().find(|r| r.query_id == 2 && r.bucket_id == 2);
-
-        assert!(q1_b1.is_some(), "Query 1 should match bucket 1");
-        assert!(q2_b2.is_some(), "Query 2 should match bucket 2");
-    }
-
-    #[test]
-    fn test_sequential_threshold_filtering() {
-        let (_dir, index, seqs) = create_test_index();
-
-        let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
-
-        let low_results =
-            classify_batch_sharded_sequential(&index, None, &records, 0.1, None).unwrap();
-        let mid_results =
-            classify_batch_sharded_sequential(&index, None, &records, 0.5, None).unwrap();
-        // Threshold > 1.0 - should filter everything (scores are max 1.0)
-        let high_results =
-            classify_batch_sharded_sequential(&index, None, &records, 1.01, None).unwrap();
-
-        assert!(!low_results.is_empty(), "Low threshold should have results");
-        assert!(
-            mid_results.len() <= low_results.len(),
-            "Higher threshold should have fewer or equal results"
-        );
-        assert!(
-            high_results.is_empty(),
-            "Threshold > 1.0 should filter all results"
-        );
-    }
-
-    #[test]
-    fn test_sequential_with_negative_mins() {
-        let (_dir, index, seqs) = create_test_index();
-
-        let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
-
-        let results_without =
-            classify_batch_sharded_sequential(&index, None, &records, 0.1, None).unwrap();
-        assert!(!results_without.is_empty());
-
-        // Extract minimizers as negative set
-        let k = index.k();
-        let w = index.w();
-        let salt = index.salt();
-        let mut ws = MinimizerWorkspace::new();
-        extract_into(&seqs[0], k, w, salt, &mut ws);
-        let negative_mins: HashSet<u64> = ws.buffer.drain(..).collect();
-
-        let results_with =
-            classify_batch_sharded_sequential(&index, Some(&negative_mins), &records, 0.1, None)
-                .unwrap();
-
-        assert!(
-            results_with.is_empty(),
-            "Filtering all minimizers should produce no hits"
-        );
-    }
-
-    #[test]
-    fn test_sequential_paired_end() {
-        let (_dir, index, seqs) = create_test_index();
-
-        let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), Some(seqs[1].as_slice()))];
-
-        let results = classify_batch_sharded_sequential(&index, None, &records, 0.1, None).unwrap();
-
-        let b1_hit = results.iter().find(|r| r.bucket_id == 1);
-        let b2_hit = results.iter().find(|r| r.bucket_id == 2);
-
-        assert!(b1_hit.is_some(), "Should have hit for bucket 1");
-        assert!(b2_hit.is_some(), "Should have hit for bucket 2");
-    }
-
-    // =========================================================================
-    // Consistency tests - sequential vs merge-join should produce same results
-    // =========================================================================
-
-    #[test]
-    fn test_sequential_vs_merge_join_consistency() {
-        let (_dir, index, seqs) = create_test_index();
-
-        let records: Vec<QueryRecord> = vec![
-            (1, seqs[0].as_slice(), None),
-            (2, seqs[1].as_slice(), None),
-            (3, seqs[0].as_slice(), Some(seqs[1].as_slice())),
-        ];
-
-        let sequential_results =
-            classify_batch_sharded_sequential(&index, None, &records, 0.1, None).unwrap();
-        let merge_join_results =
-            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None).unwrap();
-
-        assert_eq!(
-            sequential_results.len(),
-            merge_join_results.len(),
-            "Sequential and merge-join should produce same number of results"
-        );
-
-        // Sort both result sets for comparison
-        let mut seq_sorted = sequential_results.clone();
-        let mut mj_sorted = merge_join_results.clone();
-        seq_sorted.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
-        mj_sorted.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
-
-        for (seq, mj) in seq_sorted.iter().zip(mj_sorted.iter()) {
-            assert_eq!(seq.query_id, mj.query_id, "Query IDs should match");
-            assert_eq!(seq.bucket_id, mj.bucket_id, "Bucket IDs should match");
-            let score_diff = (seq.score - mj.score).abs();
-            assert!(
-                score_diff < 1e-10,
-                "Scores should match: {} vs {}",
-                seq.score,
-                mj.score
-            );
-        }
-    }
-
-    // =========================================================================
     // Helper function tests
     // =========================================================================
 
@@ -1006,12 +728,12 @@ mod tests {
 
     #[test]
     fn test_classify_with_sharded_negative_no_negative() {
-        // Without a negative index, should behave identically to classify_batch_sharded_sequential
+        // Without a negative index, should behave identically to classify_batch_sharded_merge_join
         let (_dir, index, seqs) = create_test_index();
         let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
 
         let results_standard =
-            classify_batch_sharded_sequential(&index, None, &records, 0.1, None).unwrap();
+            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None).unwrap();
         let results_sharded =
             classify_with_sharded_negative(&index, None, &records, 0.1, None).unwrap();
 
@@ -1166,7 +888,7 @@ mod tests {
 
         // Traditional HashSet approach
         let results_hashset =
-            classify_batch_sharded_sequential(&index, Some(&negative_set), &records, 0.1, None)
+            classify_batch_sharded_merge_join(&index, Some(&negative_set), &records, 0.1, None)
                 .unwrap();
 
         // New sharded approach

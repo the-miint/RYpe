@@ -115,7 +115,7 @@ fn test_arrow_roundtrip_classification() -> Result<()> {
     let query_seq = generate_sequence(100, 0);
     let batch = make_test_batch(&[101], &[&query_seq]);
 
-    let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true)?;
+    let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0)?;
 
     assert!(result.num_rows() > 0, "Should have classification results");
 
@@ -153,7 +153,7 @@ fn test_arrow_vs_regular_api_consistency() -> Result<()> {
 
     // Arrow API
     let batch = make_test_batch(&[1, 2, 3], &[&query1, &query2, &query3]);
-    let arrow_result = classify_arrow_batch_sharded(&index, None, &batch, threshold, true)?;
+    let arrow_result = classify_arrow_batch_sharded(&index, None, &batch, threshold)?;
 
     // Results should be consistent
     assert_eq!(
@@ -205,7 +205,7 @@ fn test_arrow_with_paired_end() -> Result<()> {
 
     let batch = make_test_batch_paired(&[1, 2], &[&seq1, &seq2], &[Some(pair1.as_slice()), None]);
 
-    let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true)?;
+    let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0)?;
 
     // Should have results for both queries
     assert!(result.num_rows() >= 2);
@@ -227,7 +227,7 @@ fn test_arrow_large_batch() -> Result<()> {
 
     let batch = make_test_batch(&ids, &seq_refs);
 
-    let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true)?;
+    let result = classify_arrow_batch_sharded(&index, None, &batch, 0.0)?;
 
     // Should handle large batches without error
     assert!(result.num_rows() > 0);
@@ -274,10 +274,10 @@ fn test_arrow_threshold_filtering() -> Result<()> {
     let batch = make_test_batch(&[1], &[&query_seq]);
 
     // With very high threshold
-    let high_result = classify_arrow_batch_sharded(&index, None, &batch, 1.0, true)?;
+    let high_result = classify_arrow_batch_sharded(&index, None, &batch, 1.0)?;
 
     // With zero threshold
-    let low_result = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true)?;
+    let low_result = classify_arrow_batch_sharded(&index, None, &batch, 0.0)?;
 
     // High threshold should filter more results
     assert!(
@@ -298,30 +298,10 @@ fn test_arrow_empty_batch() -> Result<()> {
     ]));
     let empty_batch = RecordBatch::new_empty(schema);
 
-    let result = classify_arrow_batch_sharded(&index, None, &empty_batch, 0.1, true)?;
+    let result = classify_arrow_batch_sharded(&index, None, &empty_batch, 0.1)?;
 
     assert_eq!(result.num_rows(), 0);
     assert_eq!(result.schema(), result_schema());
-
-    Ok(())
-}
-
-#[test]
-fn test_arrow_merge_join_vs_sequential() -> Result<()> {
-    let (_dir, index) = create_test_parquet_index();
-
-    let query_seq = generate_sequence(100, 0);
-    let batch = make_test_batch(&[1], &[&query_seq]);
-
-    // Both strategies should produce the same results
-    let result_merge = classify_arrow_batch_sharded(&index, None, &batch, 0.0, true)?;
-    let result_seq = classify_arrow_batch_sharded(&index, None, &batch, 0.0, false)?;
-
-    assert_eq!(
-        result_merge.num_rows(),
-        result_seq.num_rows(),
-        "Merge-join and sequential should produce same number of results"
-    );
 
     Ok(())
 }

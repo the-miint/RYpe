@@ -333,17 +333,11 @@ WHEN TO USE 'run' vs 'aggregate':
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Use merge-join algorithm.
-        /// Faster when query and index have high overlap.
-        /// May be slower for queries with many unique minimizers.
-        #[arg(short = 'M', long)]
-        merge_join: bool,
-
         /// Use parallel row group processing.
         /// Processes each row group independently in parallel, maximizing CPU utilization.
         /// Most effective when query minimizers span entire index range (row group
-        /// filtering is ineffective). Mutually exclusive with --merge-join.
-        #[arg(long, conflicts_with = "merge_join")]
+        /// filtering is ineffective).
+        #[arg(long)]
         parallel_rg: bool,
 
         /// Use bloom filters for row group filtering.
