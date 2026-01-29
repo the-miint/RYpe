@@ -193,6 +193,7 @@ pub enum IndexCommands {
   salt = 0x5555555555555555        # Hash salt (hex)
   output = \"index.ryxdi\"           # Output path (directory will be created)
   max_shard_size = 1073741824      # Optional: shard size (bytes)
+  orient_sequences = true          # Optional: orient sequences for better overlap
 
   [buckets.BucketName]             # Define a bucket
   files = [\"ref1.fa\", \"ref2.fa\"]   # Files for this bucket
@@ -201,7 +202,8 @@ pub enum IndexCommands {
   files = [\"other.fasta\"]
 
 CLI OPTIONS OVERRIDE CONFIG FILE:
-  --max-shard-size overrides [index].max_shard_size")]
+  --max-shard-size overrides [index].max_shard_size
+  --orient overrides [index].orient_sequences")]
     FromConfig {
         /// Path to TOML config file
         #[arg(short, long)]
@@ -223,6 +225,12 @@ CLI OPTIONS OVERRIDE CONFIG FILE:
         /// Only used with --bloom-filter.
         #[arg(long, default_value = "0.05", value_parser = parse_bloom_fpp)]
         bloom_fpp: f64,
+
+        /// Orient sequences within buckets to maximize minimizer overlap.
+        /// First sequence establishes baseline; subsequent sequences use
+        /// forward or reverse-complement based on which has higher overlap.
+        #[arg(long)]
+        orient: bool,
 
         /// Print timing diagnostics to stderr for performance analysis.
         #[arg(long)]

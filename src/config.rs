@@ -22,6 +22,11 @@ pub struct IndexSettings {
     /// Whether to create an inverted index after building (optional, default: false)
     #[serde(default)]
     pub invert: Option<bool>,
+    /// Orient sequences within buckets to maximize minimizer overlap.
+    /// First sequence establishes baseline; subsequent sequences use
+    /// forward or reverse-complement based on which has higher overlap.
+    #[serde(default)]
+    pub orient_sequences: Option<bool>,
 }
 
 fn default_k() -> usize {
@@ -266,5 +271,74 @@ output = "test.ryidx"
         // Absolute path
         let absolute = Path::new("/tmp/file.txt");
         assert_eq!(resolve_path(base, absolute), PathBuf::from("/tmp/file.txt"));
+    }
+
+    #[test]
+    fn test_parse_config_with_orient_sequences() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let config_content = r#"
+[index]
+window = 50
+salt = 0x5555555555555555
+output = "test.ryidx"
+orient_sequences = true
+
+[buckets.TestBucket]
+files = ["test.fa"]
+"#;
+
+        let mut file = File::create(&config_path).unwrap();
+        file.write_all(config_content.as_bytes()).unwrap();
+
+        let config = parse_config(&config_path).unwrap();
+        assert_eq!(config.index.orient_sequences, Some(true));
+    }
+
+    #[test]
+    fn test_parse_config_orient_sequences_defaults_none() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        // Config without orient_sequences should parse with None
+        let config_content = r#"
+[index]
+window = 50
+salt = 0x5555555555555555
+output = "test.ryidx"
+
+[buckets.TestBucket]
+files = ["test.fa"]
+"#;
+
+        let mut file = File::create(&config_path).unwrap();
+        file.write_all(config_content.as_bytes()).unwrap();
+
+        let config = parse_config(&config_path).unwrap();
+        assert_eq!(config.index.orient_sequences, None);
+    }
+
+    #[test]
+    fn test_parse_config_orient_sequences_false() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let config_content = r#"
+[index]
+window = 50
+salt = 0x5555555555555555
+output = "test.ryidx"
+orient_sequences = false
+
+[buckets.TestBucket]
+files = ["test.fa"]
+"#;
+
+        let mut file = File::create(&config_path).unwrap();
+        file.write_all(config_content.as_bytes()).unwrap();
+
+        let config = parse_config(&config_path).unwrap();
+        assert_eq!(config.index.orient_sequences, Some(false));
     }
 }

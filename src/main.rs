@@ -189,6 +189,7 @@ fn main() -> Result<()> {
                 row_group_size,
                 bloom_filter,
                 bloom_fpp,
+                orient,
                 timing,
             } => {
                 // Enable timing diagnostics if requested
@@ -203,7 +204,7 @@ fn main() -> Result<()> {
                     bloom_filter_fpp: bloom_fpp,
                     ..Default::default()
                 };
-                build_parquet_index_from_config(&config, max_shard_size, Some(&options))?;
+                build_parquet_index_from_config(&config, max_shard_size, Some(&options), orient)?;
             }
 
             IndexCommands::BucketAddConfig { config: _ } => {

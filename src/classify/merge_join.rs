@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use crate::constants::{ESTIMATED_BUCKETS_PER_READ, GALLOP_THRESHOLD};
+use crate::core::gallop_for_each;
 use crate::indices::{InvertedIndex, QueryInvertedIndex};
 use crate::types::HitResult;
 
@@ -115,9 +116,9 @@ pub(super) fn merge_join(
 /// followed by binary search to find matches in the larger one.
 ///
 /// # Algorithm
-/// For each element in the smaller array:
+/// Uses `gallop_for_each` from core::orientation for the core galloping logic:
 /// 1. Exponential probe: jump 1, 2, 4, 8... positions until we overshoot
-/// 2. Binary search: search within [current_pos, current_pos + jump]
+/// 2. Binary search: search within [current_pos, current_pos + jump + 1)
 /// 3. Advance position on match or miss (leveraging sorted order)
 ///
 /// # Requirements
@@ -138,34 +139,14 @@ pub(super) fn gallop_join(
         (&ref_idx.minimizers[..], &query_idx.minimizers[..])
     };
 
-    let mut larger_pos = 0usize;
-
-    for (smaller_idx, &s_min) in smaller.iter().enumerate() {
-        // Gallop: exponential search
-        let mut jump = 1usize;
-        while larger_pos + jump < larger.len() && larger[larger_pos + jump] < s_min {
-            jump *= 2;
-        }
-
-        // Binary search in [larger_pos, larger_pos + jump] (inclusive)
-        // Note: +1 because the match could be AT position larger_pos + jump
-        let search_end = (larger_pos + jump + 1).min(larger.len());
-        match larger[larger_pos..search_end].binary_search(&s_min) {
-            Ok(rel_idx) => {
-                let larger_idx = larger_pos + rel_idx;
-                let (qi, ri) = if query_smaller {
-                    (smaller_idx, larger_idx)
-                } else {
-                    (larger_idx, smaller_idx)
-                };
-                ref_idx.accumulate_hits_for_match(query_idx, qi, ri, accumulators);
-                larger_pos = larger_idx + 1;
-            }
-            Err(rel_idx) => {
-                larger_pos += rel_idx;
-            }
-        }
-    }
+    gallop_for_each(smaller, larger, |smaller_idx, larger_idx| {
+        let (qi, ri) = if query_smaller {
+            (smaller_idx, larger_idx)
+        } else {
+            (larger_idx, smaller_idx)
+        };
+        ref_idx.accumulate_hits_for_match(query_idx, qi, ri, accumulators);
+    });
 }
 
 /// Accumulate hits from merge-join into existing accumulators.

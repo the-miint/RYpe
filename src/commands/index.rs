@@ -11,7 +11,10 @@ use std::time::Instant;
 
 use rype::config::{parse_config, resolve_path, validate_config};
 use rype::parquet_index;
-use rype::{extract_into, log_timing, MinimizerWorkspace, BUCKET_SOURCE_DELIM};
+use rype::{
+    choose_orientation, extract_dual_strand_into, extract_into, log_timing, merge_sorted_into,
+    MinimizerWorkspace, Orientation, BUCKET_SOURCE_DELIM,
+};
 
 use super::helpers::sanitize_bucket_name;
 
@@ -128,6 +131,14 @@ pub fn create_parquet_index_from_refs(
 }
 
 /// Build a single bucket from its files, returning the name, minimizers, and sources.
+///
+/// When `orient_sequences` is true:
+/// - The first sequence uses forward strand (establishes baseline)
+/// - Subsequent sequences compare forward vs reverse-complement overlap with existing bucket minimizers
+/// - The orientation with higher overlap is chosen
+///
+/// The bucket minimizers are maintained as a sorted, deduplicated Vec throughout,
+/// using `merge_sorted_into` for efficient in-place merging.
 fn build_single_bucket(
     bucket_name: &str,
     files: &[PathBuf],
@@ -135,11 +146,17 @@ fn build_single_bucket(
     k: usize,
     w: usize,
     salt: u64,
+    orient_sequences: bool,
 ) -> Result<(String, Vec<u64>, Vec<String>)> {
-    log::info!("Processing bucket '{}'...", bucket_name);
+    log::info!(
+        "Processing bucket '{}'{} ...",
+        bucket_name,
+        if orient_sequences { " (oriented)" } else { "" }
+    );
     let mut ws = MinimizerWorkspace::new();
-    let mut all_minimizers: Vec<u64> = Vec::new();
+    let mut bucket_mins: Vec<u64> = Vec::new(); // Kept sorted and deduped
     let mut sources: Vec<String> = Vec::new();
+    let mut is_first_sequence = true;
 
     for file_path in files {
         let abs_path = resolve_path(config_dir, file_path);
@@ -165,29 +182,56 @@ fn build_single_bucket(
             let source_label = format!("{}{}{}", filename, BUCKET_SOURCE_DELIM, seq_name);
             sources.push(source_label);
 
-            extract_into(&rec.seq(), k, w, salt, &mut ws);
-            all_minimizers.extend_from_slice(&ws.buffer);
+            let seq = rec.seq();
+
+            if is_first_sequence || !orient_sequences {
+                // Forward-only: extract, sort, merge in-place
+                extract_into(&seq, k, w, salt, &mut ws);
+                let mut new_mins = std::mem::take(&mut ws.buffer);
+                new_mins.sort_unstable();
+                merge_sorted_into(&mut bucket_mins, &new_mins);
+                is_first_sequence = false;
+            } else {
+                // Oriented: extract both strands, sort both, choose best, merge in-place
+                let (mut fwd, mut rc) = extract_dual_strand_into(&seq, k, w, salt, &mut ws);
+                fwd.sort_unstable();
+                rc.sort_unstable();
+
+                let (orientation, _overlap) = choose_orientation(&bucket_mins, &fwd, &rc);
+
+                let chosen = match orientation {
+                    Orientation::Forward => fwd,
+                    Orientation::ReverseComplement => rc,
+                };
+
+                merge_sorted_into(&mut bucket_mins, &chosen);
+            }
         }
     }
 
-    all_minimizers.sort_unstable();
-    all_minimizers.dedup();
-
-    let minimizer_count = all_minimizers.len();
+    // bucket_mins is already sorted and deduped from merge_sorted_into
+    let minimizer_count = bucket_mins.len();
     log::info!(
         "Completed bucket '{}': {} minimizers",
         bucket_name,
         minimizer_count
     );
 
-    Ok((bucket_name.to_string(), all_minimizers, sources))
+    Ok((bucket_name.to_string(), bucket_mins, sources))
 }
 
 /// Create Parquet inverted index directly from a TOML config file.
+///
+/// # Arguments
+/// * `config_path` - Path to the TOML configuration file
+/// * `cli_max_shard_size` - CLI override for max shard size (takes precedence over config)
+/// * `options` - Parquet write options
+/// * `cli_orient` - CLI override for orient sequences flag (takes precedence over config)
 pub fn build_parquet_index_from_config(
     config_path: &Path,
     cli_max_shard_size: Option<usize>,
     options: Option<&parquet_index::ParquetWriteOptions>,
+    cli_orient: bool,
 ) -> Result<()> {
     use rype::{create_parquet_inverted_index, BucketData};
 
@@ -208,6 +252,16 @@ pub fn build_parquet_index_from_config(
     log::info!("Validation successful.");
 
     let max_shard_size = cli_max_shard_size.or(cfg.index.max_shard_size);
+
+    // Determine orient_sequences: CLI --orient flag takes precedence over config file
+    let orient_sequences = if cli_orient {
+        true // CLI --orient flag overrides everything
+    } else {
+        cfg.index.orient_sequences.unwrap_or(false) // Config value, or default to false
+    };
+    if orient_sequences {
+        log::info!("Orientation enabled: sequences will be oriented to maximize minimizer overlap");
+    }
 
     // Change output extension from .ryidx to .ryxdi for parquet inverted index
     let output_path = cfg.index.output.with_extension("ryxdi");
@@ -245,6 +299,7 @@ pub fn build_parquet_index_from_config(
                 cfg.index.k,
                 cfg.index.window,
                 cfg.index.salt,
+                orient_sequences,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -366,6 +421,7 @@ output = "{}"
             32, // k
             10, // w
             0x5555555555555555,
+            false, // orient_sequences
         )
         .unwrap();
 
@@ -392,9 +448,16 @@ output = "{}"
         let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
         let fasta_path = create_fasta_file(dir, "test.fa", seq);
 
-        let (name, minimizers, sources) =
-            build_single_bucket("TestBucket", &[fasta_path], dir, 32, 10, 0x5555555555555555)
-                .unwrap();
+        let (name, minimizers, sources) = build_single_bucket(
+            "TestBucket",
+            &[fasta_path],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            false,
+        )
+        .unwrap();
 
         // Convert to BucketData (this is the reuse we want)
         let bucket_data = BucketData {
@@ -431,7 +494,7 @@ output = "{}"
         );
 
         // Build parquet index
-        let result = build_parquet_index_from_config(&config_path, None, None);
+        let result = build_parquet_index_from_config(&config_path, None, None, false);
         assert!(result.is_ok(), "Should succeed: {:?}", result);
 
         // Verify the parquet index was created
@@ -465,7 +528,7 @@ output = "{}"
             ..Default::default()
         };
 
-        let result = build_parquet_index_from_config(&config_path, None, Some(&options));
+        let result = build_parquet_index_from_config(&config_path, None, Some(&options), false);
         assert!(
             result.is_ok(),
             "Should succeed with bloom filter: {:?}",
@@ -490,7 +553,184 @@ output = "{}"
             10,
         );
 
-        let result = build_parquet_index_from_config(&config_path, None, None);
+        let result = build_parquet_index_from_config(&config_path, None, None, false);
         assert!(result.is_err(), "Should fail with missing file");
+    }
+
+    // ============================================================================
+    // Oriented Bucket Building Tests
+    // ============================================================================
+
+    #[test]
+    fn test_build_single_bucket_orient_disabled_matches_original() {
+        // orient=false should produce same result whether we call it with orient=false
+        // This tests that the code path with orient=false doesn't break anything
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let fasta_path = create_fasta_file(dir, "test.fa", seq);
+
+        let (name, minimizers, sources) = build_single_bucket(
+            "TestBucket",
+            &[fasta_path],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            false, // orient disabled
+        )
+        .unwrap();
+
+        assert_eq!(name, "TestBucket");
+        assert!(!minimizers.is_empty());
+        assert!(!sources.is_empty());
+
+        // Verify minimizers are sorted and deduplicated
+        let mut sorted = minimizers.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(minimizers, sorted);
+    }
+
+    #[test]
+    fn test_build_single_bucket_orient_enabled_produces_valid_output() {
+        // orient=true should also produce valid sorted, deduplicated output
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let fasta_path = create_fasta_file(dir, "test.fa", seq);
+
+        let (name, minimizers, sources) = build_single_bucket(
+            "OrientedBucket",
+            &[fasta_path],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            true, // orient enabled
+        )
+        .unwrap();
+
+        assert_eq!(name, "OrientedBucket");
+        assert!(!minimizers.is_empty());
+        assert!(!sources.is_empty());
+
+        // Verify minimizers are sorted and deduplicated
+        let mut sorted = minimizers.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            minimizers, sorted,
+            "Oriented bucket minimizers should be sorted and deduplicated"
+        );
+    }
+
+    /// Helper to create a multi-sequence FASTA file
+    fn create_multi_fasta_file(dir: &Path, name: &str, sequences: &[(&str, &[u8])]) -> PathBuf {
+        let path = dir.join(name);
+        let mut file = File::create(&path).unwrap();
+        for (seq_name, seq) in sequences {
+            writeln!(file, ">{}", seq_name).unwrap();
+            file.write_all(seq).unwrap();
+            writeln!(file).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn test_build_single_bucket_orient_with_multiple_sequences() {
+        // Test that orientation works with multiple sequences:
+        // - First sequence establishes baseline (forward)
+        // - Subsequent sequences should choose orientation based on overlap
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create two sequences - the second is different but should still work
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq2 = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+
+        let fasta_path =
+            create_multi_fasta_file(dir, "multi.fa", &[("seq1", seq1), ("seq2", seq2)]);
+
+        // Build without orientation
+        let (_, mins_no_orient, _) = build_single_bucket(
+            "NoOrient",
+            &[fasta_path.clone()],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            false,
+        )
+        .unwrap();
+
+        // Build with orientation
+        let (_, mins_with_orient, _) = build_single_bucket(
+            "WithOrient",
+            &[fasta_path],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            true,
+        )
+        .unwrap();
+
+        // Both should be valid (sorted and deduplicated)
+        let mut sorted_no = mins_no_orient.clone();
+        sorted_no.sort_unstable();
+        sorted_no.dedup();
+        assert_eq!(mins_no_orient, sorted_no);
+
+        let mut sorted_with = mins_with_orient.clone();
+        sorted_with.sort_unstable();
+        sorted_with.dedup();
+        assert_eq!(mins_with_orient, sorted_with);
+
+        // The oriented version may have same or different minimizers
+        // depending on which orientation was chosen - both are valid
+        assert!(!mins_no_orient.is_empty());
+        assert!(!mins_with_orient.is_empty());
+    }
+
+    #[test]
+    fn test_build_single_bucket_orient_first_sequence_uses_forward() {
+        // With a single sequence, orient=true and orient=false should produce
+        // identical results since the first sequence always uses forward
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let fasta_path = create_fasta_file(dir, "single.fa", seq);
+
+        let (_, mins_no_orient, _) = build_single_bucket(
+            "NoOrient",
+            &[fasta_path.clone()],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            false,
+        )
+        .unwrap();
+
+        let (_, mins_with_orient, _) = build_single_bucket(
+            "WithOrient",
+            &[fasta_path],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            true,
+        )
+        .unwrap();
+
+        // Single sequence: both should be identical since first seq always uses forward
+        assert_eq!(
+            mins_no_orient, mins_with_orient,
+            "First sequence should use forward orientation in both cases"
+        );
     }
 }

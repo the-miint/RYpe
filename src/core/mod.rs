@@ -8,6 +8,7 @@
 
 pub mod encoding;
 pub mod extraction;
+pub mod orientation;
 pub mod ring_buffer;
 pub mod workspace;
 
@@ -18,3 +19,6 @@ pub use extraction::{
     get_paired_minimizers_into, MinimizerWithPosition, Strand,
 };
 pub use workspace::MinimizerWorkspace;
+
+// Re-export orientation items
+pub use orientation::{choose_orientation, gallop_for_each, merge_sorted_into, Orientation};

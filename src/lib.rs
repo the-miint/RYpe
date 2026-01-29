@@ -86,6 +86,9 @@ pub use core::{
     MinimizerWithPosition,
 };
 
+// Orientation utilities (for bucket building)
+pub use core::{choose_orientation, merge_sorted_into, Orientation};
+
 // Constants
 pub use constants::BUCKET_SOURCE_DELIM;
 
