@@ -21,4 +21,7 @@ pub use extraction::{
 pub use workspace::MinimizerWorkspace;
 
 // Re-export orientation items
-pub use orientation::{choose_orientation, gallop_for_each, merge_sorted_into, Orientation};
+pub use orientation::{
+    choose_orientation, choose_orientation_sampled, gallop_for_each, merge_sorted_into,
+    Orientation, ORIENTATION_SAMPLE_SIZE,
+};

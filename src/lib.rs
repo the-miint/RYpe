@@ -87,7 +87,10 @@ pub use core::{
 };
 
 // Orientation utilities (for bucket building)
-pub use core::{choose_orientation, merge_sorted_into, Orientation};
+pub use core::{
+    choose_orientation, choose_orientation_sampled, merge_sorted_into, Orientation,
+    ORIENTATION_SAMPLE_SIZE,
+};
 
 // Constants
 pub use constants::BUCKET_SOURCE_DELIM;

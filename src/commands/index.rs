@@ -12,8 +12,8 @@ use std::time::Instant;
 use rype::config::{parse_config, resolve_path, validate_config};
 use rype::parquet_index;
 use rype::{
-    choose_orientation, extract_dual_strand_into, extract_into, log_timing, merge_sorted_into,
-    MinimizerWorkspace, Orientation, BUCKET_SOURCE_DELIM,
+    choose_orientation_sampled, extract_dual_strand_into, extract_into, log_timing,
+    merge_sorted_into, MinimizerWorkspace, Orientation, BUCKET_SOURCE_DELIM,
 };
 
 use super::helpers::sanitize_bucket_name;
@@ -157,6 +157,7 @@ fn build_single_bucket(
     let mut bucket_mins: Vec<u64> = Vec::new(); // Kept sorted and deduped
     let mut sources: Vec<String> = Vec::new();
     let mut is_first_sequence = true;
+    let mut sample_buffer: Vec<u64> = Vec::new(); // Reusable buffer for orientation sampling
 
     for file_path in files {
         let abs_path = resolve_path(config_dir, file_path);
@@ -197,7 +198,8 @@ fn build_single_bucket(
                 fwd.sort_unstable();
                 rc.sort_unstable();
 
-                let (orientation, _overlap) = choose_orientation(&bucket_mins, &fwd, &rc);
+                let (orientation, _overlap) =
+                    choose_orientation_sampled(&bucket_mins, &fwd, &rc, &mut sample_buffer);
 
                 let chosen = match orientation {
                     Orientation::Forward => fwd,
