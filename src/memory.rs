@@ -432,6 +432,102 @@ impl ReadMemoryProfile {
             minimizers_per_query,
         })
     }
+
+    /// Estimate Arrow buffer bytes per row based on read lengths.
+    ///
+    /// Arrow string columns use:
+    /// - Offset buffer: (batch_size + 1) * 4 bytes total for i32 offsets
+    /// - Data buffer: actual string bytes
+    /// - Validity buffer: (batch_size + 7) / 8 bytes (bit-packed)
+    ///
+    /// Note: This is an approximation. The actual per-row overhead from offsets
+    /// and validity is amortized across the batch. We include a builder overhead
+    /// factor to account for memory during RecordBatch construction.
+    ///
+    /// Adds overhead for read_id column (~32-80 bytes for Illumina IDs).
+    pub fn estimate_arrow_bytes_per_row(&self, is_paired: bool) -> usize {
+        // Number of string columns: read_id + seq1 (+ seq2 if paired)
+        let num_string_cols = if is_paired { 3 } else { 2 };
+
+        // Per-row data: sequence bytes + read_id (estimate 50 bytes for Illumina headers)
+        let read_id_bytes = 50;
+        let data_bytes = read_id_bytes + self.avg_query_length;
+
+        // Amortized offset overhead: ~4 bytes per string column per row
+        // (actual is (batch_size + 1) * 4 / batch_size ≈ 4 bytes per row for large batches)
+        let offset_overhead = 4 * num_string_cols;
+
+        // Validity bitmap: ~1 bit per column per row, rounded up
+        let validity_overhead = (num_string_cols + 7) / 8;
+
+        // Arrow ArrayData struct overhead per column (~40 bytes per array)
+        // Amortized per row for typical batch sizes (10K rows): negligible
+        // But we add a small per-row overhead to account for it
+        let array_overhead = 1;
+
+        data_bytes + offset_overhead + validity_overhead + array_overhead
+    }
+
+    /// Estimate memory per row for FASTX OwnedRecord format.
+    ///
+    /// `OwnedRecord = (i64, Vec<u8>, Option<Vec<u8>>)`:
+    /// - 8 bytes for i64 read ID
+    /// - 24 bytes `Vec<u8>` overhead for seq1 + actual sequence bytes
+    /// - 24 bytes `Option<Vec<u8>>` overhead for seq2 (if paired) + actual sequence bytes
+    pub fn estimate_owned_record_bytes(&self, is_paired: bool) -> usize {
+        // i64 read ID
+        let id_bytes = 8;
+        // Vec<u8> overhead (ptr + len + capacity on 64-bit)
+        let vec_overhead = 24;
+        // seq1: Vec overhead + actual sequence bytes
+        let seq1_bytes = vec_overhead + self.avg_read_length;
+        // seq2: Option<Vec> overhead + sequence bytes if paired
+        let seq2_bytes = if is_paired {
+            vec_overhead + self.avg_read_length
+        } else {
+            0 // None variant is zero-size for memory layout
+        };
+
+        id_bytes + seq1_bytes + seq2_bytes
+    }
+}
+
+/// Input format for memory estimation.
+///
+/// Different input formats have different memory characteristics:
+/// - FASTX: Uses `OwnedRecord (i64, Vec<u8>, Option<Vec<u8>>)`
+/// - Parquet: Uses Arrow RecordBatch with columnar string arrays
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputFormat {
+    /// FASTX input (FASTQ/FASTA files)
+    Fastx { is_paired: bool },
+    /// Parquet input with Arrow RecordBatches
+    Parquet { is_paired: bool },
+}
+
+impl InputFormat {
+    /// Get the number of prefetch buffer slots for this format.
+    pub fn prefetch_slots(&self) -> usize {
+        match self {
+            InputFormat::Fastx { .. } => FASTX_PREFETCH_BUFFER_SLOTS,
+            InputFormat::Parquet { .. } => PARQUET_PREFETCH_BUFFER_SLOTS,
+        }
+    }
+
+    /// Estimate bytes per row in the prefetch buffer for this format.
+    pub fn estimate_buffer_bytes_per_row(&self, profile: &ReadMemoryProfile) -> usize {
+        match self {
+            InputFormat::Fastx { is_paired } => profile.estimate_owned_record_bytes(*is_paired),
+            InputFormat::Parquet { is_paired } => profile.estimate_arrow_bytes_per_row(*is_paired),
+        }
+    }
+
+    /// Whether this format uses paired-end reads.
+    pub fn is_paired(&self) -> bool {
+        match self {
+            InputFormat::Fastx { is_paired } | InputFormat::Parquet { is_paired } => *is_paired,
+        }
+    }
 }
 
 /// Helper function to sample read lengths from a file.
@@ -455,6 +551,18 @@ fn sample_file_lengths(path: &std::path::Path, sample_size: usize) -> Option<(us
     Some((total_length, count))
 }
 
+/// Number of batches buffered in FASTX prefetch channel.
+/// See helpers.rs PrefetchingIoHandler which uses sync_channel(2).
+pub const FASTX_PREFETCH_BUFFER_SLOTS: usize = 2;
+
+/// Number of RecordBatches buffered in Parquet prefetch channel.
+/// See helpers.rs PrefetchingParquetReader which uses sync_channel(4).
+pub const PARQUET_PREFETCH_BUFFER_SLOTS: usize = 4;
+
+/// Default number of batches buffered in prefetch channel.
+/// Preserved for backwards compatibility - prefer using format-specific constants.
+pub const DEFAULT_PREFETCH_BUFFER_SLOTS: usize = PARQUET_PREFETCH_BUFFER_SLOTS;
+
 /// Configuration for batch memory calculation.
 #[derive(Debug, Clone)]
 pub struct MemoryConfig {
@@ -470,6 +578,55 @@ pub struct MemoryConfig {
     pub read_profile: ReadMemoryProfile,
     /// Number of buckets in the index
     pub num_buckets: usize,
+    /// Input format (determines prefetch buffer size and per-row memory)
+    pub input_format: InputFormat,
+}
+
+impl MemoryConfig {
+    /// Create a new MemoryConfig with validation.
+    ///
+    /// Returns an error if configuration values are invalid.
+    pub fn new(
+        max_memory: usize,
+        num_threads: usize,
+        index_memory: usize,
+        shard_reservation: usize,
+        read_profile: ReadMemoryProfile,
+        num_buckets: usize,
+        input_format: InputFormat,
+    ) -> Result<Self> {
+        // Validate configuration
+        if max_memory == 0 {
+            return Err(RypeError::validation("max_memory must be > 0"));
+        }
+        if num_threads == 0 {
+            return Err(RypeError::validation("num_threads must be > 0"));
+        }
+        if num_buckets == 0 {
+            return Err(RypeError::validation("num_buckets must be > 0"));
+        }
+
+        Ok(Self {
+            max_memory,
+            num_threads,
+            index_memory,
+            shard_reservation,
+            read_profile,
+            num_buckets,
+            input_format,
+        })
+    }
+
+    /// Get the number of prefetch buffer slots for the configured input format.
+    pub fn prefetch_buffer_slots(&self) -> usize {
+        self.input_format.prefetch_slots()
+    }
+
+    /// Get the estimated bytes per row in prefetch buffers.
+    pub fn buffer_bytes_per_row(&self) -> usize {
+        self.input_format
+            .estimate_buffer_bytes_per_row(&self.read_profile)
+    }
 }
 
 /// Result of batch configuration calculation.
@@ -498,7 +655,20 @@ const SAFETY_MARGIN_PERCENT: f64 = 0.10;
 const SAFETY_MARGIN_MIN_BYTES: usize = 256 * 1024 * 1024;
 
 /// Fudge factor for memory estimation (accounts for HashMap overhead, HitResults, etc.)
+///
+/// This factor accounts for:
+/// - HashMap internal overhead (load factor, bucket array)
+/// - HitResult vectors that grow during classification
+/// - Temporary allocations during minimizer extraction
+/// - Rayon's per-thread workspace overhead
 const MEMORY_FUDGE_FACTOR: f64 = 1.3;
+
+/// Builder overhead factor for Arrow RecordBatch construction.
+///
+/// Arrow builders often pre-allocate with growth strategies (1.5x-2x).
+/// This factor accounts for peak memory during RecordBatch construction
+/// in the prefetch thread before the batch is handed to the main thread.
+const ARROW_BUILDER_OVERHEAD: f64 = 1.5;
 
 /// Estimate memory usage for a single batch.
 ///
@@ -506,31 +676,88 @@ const MEMORY_FUDGE_FACTOR: f64 = 1.3;
 /// - Input records: batch_size * (72 + avg_query_length) for OwnedRecord
 /// - Minimizers: batch_size * minimizers_per_query * 16 bytes (`Vec<u64>` for fwd + rc)
 /// - QueryInvertedIndex CSR: batch_size * minimizers_per_query * 12 bytes
-/// - Accumulators: batch_size * estimated_buckets_per_read * 12 bytes (HashMap overhead)
+/// - Accumulators: batch_size * estimated_buckets_per_read * 24 bytes (HashMap overhead)
+///
+/// Returns None if arithmetic overflow occurs.
 pub fn estimate_batch_memory(
     batch_size: usize,
     profile: &ReadMemoryProfile,
     num_buckets: usize,
-) -> usize {
+) -> Option<usize> {
     // OwnedRecord: (i64, Vec<u8>, Option<Vec<u8>>) ≈ 72 bytes + sequence data
-    let record_overhead = 72;
-    let input_records = batch_size * (record_overhead + profile.avg_query_length);
+    let record_overhead: usize = 72;
+    let input_records =
+        batch_size.checked_mul(record_overhead.checked_add(profile.avg_query_length)?)?;
 
     // Minimizer vectors: Vec<u64> for forward and reverse-complement
-    let minimizer_vecs = batch_size * profile.minimizers_per_query * 16;
+    let minimizer_vecs = batch_size
+        .checked_mul(profile.minimizers_per_query)?
+        .checked_mul(16)?;
 
     // QueryInvertedIndex CSR structure
     // minimizers: Vec<u64>, offsets: Vec<u32>, read_ids: Vec<u32>
-    let query_index = batch_size * profile.minimizers_per_query * 12;
+    let query_index = batch_size
+        .checked_mul(profile.minimizers_per_query)?
+        .checked_mul(12)?;
 
     // Per-read accumulators: HashMap<u32, (u32, u32)>
     // Estimate ~4 buckets per read on average
     let estimated_buckets_per_read = 4.min(num_buckets);
-    let accumulators = batch_size * estimated_buckets_per_read * 24; // HashMap entry overhead
+    let accumulators = batch_size
+        .checked_mul(estimated_buckets_per_read)?
+        .checked_mul(24)?; // HashMap entry overhead
 
-    // Apply fudge factor
-    let base_estimate = input_records + minimizer_vecs + query_index + accumulators;
-    (base_estimate as f64 * MEMORY_FUDGE_FACTOR).round() as usize
+    // Sum components with overflow checking
+    let base_estimate = input_records
+        .checked_add(minimizer_vecs)?
+        .checked_add(query_index)?
+        .checked_add(accumulators)?;
+
+    // Apply fudge factor (safe since we're multiplying by a small factor)
+    let result = (base_estimate as f64 * MEMORY_FUDGE_FACTOR).round() as usize;
+    Some(result)
+}
+
+/// Calculate I/O buffer memory overhead.
+///
+/// The prefetch channel can hold `prefetch_buffer_slots` batches, each containing
+/// up to `batch_size` rows. This memory is shared across all parallel batches.
+///
+/// For Parquet input, includes builder overhead to account for memory during
+/// RecordBatch construction.
+///
+/// Returns None if arithmetic overflow occurs.
+fn estimate_io_buffer_memory(batch_size: usize, config: &MemoryConfig) -> Option<usize> {
+    let prefetch_slots = config.prefetch_buffer_slots();
+    let bytes_per_row = config.buffer_bytes_per_row();
+
+    let base_memory = prefetch_slots
+        .checked_mul(batch_size)?
+        .checked_mul(bytes_per_row)?;
+
+    // Apply builder overhead for Parquet (Arrow builders allocate extra capacity)
+    let result = match config.input_format {
+        InputFormat::Parquet { .. } => {
+            (base_memory as f64 * ARROW_BUILDER_OVERHEAD).round() as usize
+        }
+        InputFormat::Fastx { .. } => base_memory,
+    };
+
+    Some(result)
+}
+
+/// Calculate total memory for a batch configuration including I/O buffers.
+///
+/// Returns None if arithmetic overflow occurs.
+fn estimate_total_batch_memory(
+    batch_size: usize,
+    batch_count: usize,
+    config: &MemoryConfig,
+) -> Option<usize> {
+    let per_batch = estimate_batch_memory(batch_size, &config.read_profile, config.num_buckets)?;
+    let io_buffers = estimate_io_buffer_memory(batch_size, config)?;
+    // I/O buffers are shared, per-batch memory scales with batch_count
+    per_batch.checked_mul(batch_count)?.checked_add(io_buffers)
 }
 
 /// Calculate optimal batch configuration based on memory constraints.
@@ -539,96 +766,127 @@ pub fn estimate_batch_memory(
 /// 1. Calculate available memory after subtracting index, shard reservation, and safety margin
 /// 2. Start with batch_count = num_threads
 /// 3. Binary search for maximum batch_size that fits in (available / batch_count)
-/// 4. If too tight, reduce batch_count and retry
-/// 5. Enforce minimum batch_size of 1000
+/// 4. Validate that the result actually fits within budget
+/// 5. If too tight, reduce batch_count and retry
+/// 6. Enforce minimum batch_size of 1000
 ///
 /// Note: When using Rayon for parallel batch processing, all batch_count batches may be
 /// in flight simultaneously (worst case). The memory calculation accounts for this by
 /// dividing available memory by batch_count, ensuring peak_memory = batch_count × per_batch_memory
 /// stays within budget.
+///
+/// I/O buffer memory (prefetch channel) is also accounted for. This is shared across all
+/// parallel batches and scales with batch_size. The prefetch buffer size depends on input
+/// format: FASTX uses 2 slots, Parquet uses 4 slots.
 pub fn calculate_batch_config(config: &MemoryConfig) -> BatchConfig {
     // Calculate safety margin
     let safety_margin = (config.max_memory as f64 * SAFETY_MARGIN_PERCENT).round() as usize;
     let safety_margin = safety_margin.max(SAFETY_MARGIN_MIN_BYTES);
 
-    // Available memory for batches
-    let reserved = config.index_memory + config.shard_reservation + safety_margin;
-    let available = config.max_memory.saturating_sub(reserved);
+    // Base reserved memory (not dependent on batch_size)
+    let base_reserved = config
+        .index_memory
+        .saturating_add(config.shard_reservation)
+        .saturating_add(safety_margin);
+    let available = config.max_memory.saturating_sub(base_reserved);
 
-    // If we have very little memory, use minimum config
-    if available < estimate_batch_memory(MIN_BATCH_SIZE, &config.read_profile, config.num_buckets) {
-        return BatchConfig {
+    // Helper to create minimum config
+    let make_min_config = || {
+        let per_batch_memory =
+            estimate_batch_memory(MIN_BATCH_SIZE, &config.read_profile, config.num_buckets)
+                .unwrap_or(usize::MAX);
+        let io_buffer_memory =
+            estimate_io_buffer_memory(MIN_BATCH_SIZE, config).unwrap_or(usize::MAX);
+        BatchConfig {
             batch_size: MIN_BATCH_SIZE,
             batch_count: 1,
-            per_batch_memory: estimate_batch_memory(
-                MIN_BATCH_SIZE,
-                &config.read_profile,
-                config.num_buckets,
-            ),
-            peak_memory: reserved
-                + estimate_batch_memory(MIN_BATCH_SIZE, &config.read_profile, config.num_buckets),
-        };
+            per_batch_memory,
+            peak_memory: base_reserved
+                .saturating_add(per_batch_memory)
+                .saturating_add(io_buffer_memory),
+        }
+    };
+
+    // If we have very little memory, use minimum config
+    let min_total = estimate_total_batch_memory(MIN_BATCH_SIZE, 1, config);
+    if min_total.map_or(true, |m| available < m) {
+        return make_min_config();
     }
 
     // Try decreasing batch counts
     for batch_count in (1..=config.num_threads).rev() {
-        let memory_per_batch = available / batch_count;
-
-        // Binary search for batch_size
-        let batch_size =
-            binary_search_batch_size(memory_per_batch, &config.read_profile, config.num_buckets);
+        // Binary search for batch_size that fits within available memory
+        let batch_size = binary_search_batch_size_with_io(available, batch_count, config);
 
         if batch_size >= MIN_BATCH_SIZE {
-            let per_batch_memory =
-                estimate_batch_memory(batch_size, &config.read_profile, config.num_buckets);
-            let peak_memory = reserved + (per_batch_memory * batch_count);
+            // Validate that the result actually fits within budget
+            // This handles edge cases where binary search returns MIN_BATCH_SIZE
+            // but that still exceeds the budget with the given batch_count
+            let total = estimate_total_batch_memory(batch_size, batch_count, config);
+            if total.is_some_and(|t| t <= available) {
+                let per_batch_memory =
+                    estimate_batch_memory(batch_size, &config.read_profile, config.num_buckets)
+                        .unwrap_or(usize::MAX);
+                let io_buffer_memory =
+                    estimate_io_buffer_memory(batch_size, config).unwrap_or(usize::MAX);
+                let peak_memory = base_reserved
+                    .saturating_add(per_batch_memory.saturating_mul(batch_count))
+                    .saturating_add(io_buffer_memory);
 
-            return BatchConfig {
-                batch_size,
-                batch_count,
-                per_batch_memory,
-                peak_memory,
-            };
+                return BatchConfig {
+                    batch_size,
+                    batch_count,
+                    per_batch_memory,
+                    peak_memory,
+                };
+            }
+            // If validation failed, continue to try smaller batch_count
         }
     }
 
     // Fallback to minimum
-    let per_batch_memory =
-        estimate_batch_memory(MIN_BATCH_SIZE, &config.read_profile, config.num_buckets);
-    BatchConfig {
-        batch_size: MIN_BATCH_SIZE,
-        batch_count: 1,
-        per_batch_memory,
-        peak_memory: reserved + per_batch_memory,
-    }
+    make_min_config()
 }
 
-/// Binary search for maximum batch size that fits in memory budget.
-fn binary_search_batch_size(
+/// Binary search for maximum batch size that fits in memory budget including I/O buffers.
+///
+/// This algorithm solves the circular dependency where I/O buffer memory depends on
+/// batch_size, which in turn depends on available memory minus I/O buffers. By including
+/// I/O overhead in the target function, we find the maximum batch_size where:
+///   (per_batch_memory × batch_count) + io_buffer_memory <= memory_budget
+///
+/// Returns MIN_BATCH_SIZE if even the minimum doesn't fit (caller should validate).
+fn binary_search_batch_size_with_io(
     memory_budget: usize,
-    profile: &ReadMemoryProfile,
-    num_buckets: usize,
+    batch_count: usize,
+    config: &MemoryConfig,
 ) -> usize {
     let mut low = MIN_BATCH_SIZE;
     let mut high = MAX_BATCH_SIZE;
     let mut best = MIN_BATCH_SIZE;
 
     while low <= high {
-        // Avoid overflow: use low + (high - low) / 2 instead of (low + high) / 2
         let mid = low + (high - low) / 2;
-        let estimated = estimate_batch_memory(mid, profile, num_buckets);
+        let total_memory = estimate_total_batch_memory(mid, batch_count, config);
 
-        if estimated <= memory_budget {
+        // If overflow occurred, the value is too large
+        let fits = total_memory.is_some_and(|m| m <= memory_budget);
+
+        if fits {
             best = mid;
             low = mid + 1;
         } else {
-            high = mid.saturating_sub(1);
+            // Use saturating_sub to handle underflow when mid = 0
+            // (shouldn't happen since low starts at MIN_BATCH_SIZE, but be safe)
+            if mid == 0 {
+                break;
+            }
+            high = mid - 1;
         }
     }
 
     best
 }
-
 /// Format bytes as human-readable string.
 pub fn format_bytes(bytes: usize) -> String {
     const KB: usize = 1024;
@@ -774,8 +1032,8 @@ mod tests {
     fn test_estimate_batch_memory_scales_linearly() {
         let profile = ReadMemoryProfile::new(150, false, 64, 50);
 
-        let mem_1k = estimate_batch_memory(1000, &profile, 100);
-        let mem_2k = estimate_batch_memory(2000, &profile, 100);
+        let mem_1k = estimate_batch_memory(1000, &profile, 100).unwrap();
+        let mem_2k = estimate_batch_memory(2000, &profile, 100).unwrap();
 
         // Should roughly double (within 10% tolerance for fixed overheads)
         let ratio = mem_2k as f64 / mem_1k as f64;
@@ -791,10 +1049,28 @@ mod tests {
         let profile_short = ReadMemoryProfile::new(150, false, 64, 50);
         let profile_long = ReadMemoryProfile::new(10000, false, 64, 50);
 
-        let mem_short = estimate_batch_memory(10000, &profile_short, 100);
-        let mem_long = estimate_batch_memory(10000, &profile_long, 100);
+        let mem_short = estimate_batch_memory(10000, &profile_short, 100).unwrap();
+        let mem_long = estimate_batch_memory(10000, &profile_long, 100).unwrap();
 
         assert!(mem_long > mem_short);
+    }
+
+    #[test]
+    fn test_estimate_batch_memory_overflow_protection() {
+        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+
+        // Very large batch size that would overflow
+        let result = estimate_batch_memory(usize::MAX, &profile, 100);
+        assert!(result.is_none(), "Should return None on overflow");
+
+        // Also test with large minimizers_per_query
+        let large_profile = ReadMemoryProfile {
+            avg_read_length: 150,
+            avg_query_length: 150,
+            minimizers_per_query: usize::MAX / 2,
+        };
+        let result = estimate_batch_memory(1000000, &large_profile, 100);
+        assert!(result.is_none(), "Should return None on overflow");
     }
 
     // === Batch calculation tests ===
@@ -809,6 +1085,7 @@ mod tests {
             shard_reservation: 50 * 1024 * 1024, // 50MB
             read_profile: profile,
             num_buckets: 100,
+            input_format: InputFormat::Fastx { is_paired: false },
         };
 
         let batch_config = calculate_batch_config(&config);
@@ -834,6 +1111,7 @@ mod tests {
             shard_reservation: 0,
             read_profile: profile.clone(),
             num_buckets: 100,
+            input_format: InputFormat::Fastx { is_paired: false },
         };
 
         let config_large_index = MemoryConfig {
@@ -843,6 +1121,7 @@ mod tests {
             shard_reservation: 0,
             read_profile: profile,
             num_buckets: 100,
+            input_format: InputFormat::Fastx { is_paired: false },
         };
 
         let batch_small = calculate_batch_config(&config_small_index);
@@ -869,6 +1148,7 @@ mod tests {
             shard_reservation: 5 * 1024 * 1024,
             read_profile: profile,
             num_buckets: 100,
+            input_format: InputFormat::Fastx { is_paired: false },
         };
 
         let batch_config = calculate_batch_config(&config);
@@ -890,6 +1170,7 @@ mod tests {
             shard_reservation: 0,
             read_profile: profile,
             num_buckets: 100,
+            input_format: InputFormat::Fastx { is_paired: false },
         };
 
         let batch_config = calculate_batch_config(&config);
@@ -1005,5 +1286,281 @@ mod tests {
             50,
         );
         assert!(profile.is_none());
+    }
+
+    // ==========================================================================
+    // Phase 1 TDD Tests: I/O Buffer Memory Accounting
+    // These tests verify that memory estimation accounts for prefetch buffers
+    // and format-specific overhead (Arrow vs OwnedRecord).
+    // ==========================================================================
+
+    #[test]
+    fn test_batch_config_accounts_for_prefetch_buffer() {
+        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let config = MemoryConfig {
+            max_memory: 1024 * 1024 * 1024, // 1GB
+            num_threads: 4,
+            index_memory: 100 * 1024 * 1024,
+            shard_reservation: 0,
+            read_profile: profile.clone(),
+            num_buckets: 100,
+            input_format: InputFormat::Parquet { is_paired: false },
+        };
+
+        let batch_config = calculate_batch_config(&config);
+
+        // Peak memory should include prefetch buffer overhead
+        // Prefetch overhead = slots × batch_size × bytes_per_row
+        let prefetch_overhead = config.prefetch_buffer_slots()
+            * batch_config.batch_size
+            * config.buffer_bytes_per_row();
+
+        // Verify prefetch overhead is factored into peak memory
+        assert!(
+            batch_config.peak_memory >= prefetch_overhead,
+            "Peak memory {} should include prefetch overhead {}",
+            batch_config.peak_memory,
+            prefetch_overhead
+        );
+    }
+
+    #[test]
+    fn test_fastx_vs_parquet_uses_different_prefetch_slots() {
+        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+
+        // FASTX uses 2 slots
+        let config_fastx = MemoryConfig {
+            max_memory: 1024 * 1024 * 1024,
+            num_threads: 4,
+            index_memory: 100 * 1024 * 1024,
+            shard_reservation: 0,
+            read_profile: profile.clone(),
+            num_buckets: 100,
+            input_format: InputFormat::Fastx { is_paired: false },
+        };
+
+        // Parquet uses 4 slots
+        let config_parquet = MemoryConfig {
+            max_memory: 1024 * 1024 * 1024,
+            num_threads: 4,
+            index_memory: 100 * 1024 * 1024,
+            shard_reservation: 0,
+            read_profile: profile,
+            num_buckets: 100,
+            input_format: InputFormat::Parquet { is_paired: false },
+        };
+
+        assert_eq!(
+            config_fastx.prefetch_buffer_slots(),
+            FASTX_PREFETCH_BUFFER_SLOTS
+        );
+        assert_eq!(
+            config_parquet.prefetch_buffer_slots(),
+            PARQUET_PREFETCH_BUFFER_SLOTS
+        );
+        assert_eq!(config_fastx.prefetch_buffer_slots(), 2);
+        assert_eq!(config_parquet.prefetch_buffer_slots(), 4);
+
+        // FASTX should allow larger batch sizes due to smaller prefetch buffer
+        let batch_fastx = calculate_batch_config(&config_fastx);
+        let batch_parquet = calculate_batch_config(&config_parquet);
+
+        assert!(
+            batch_fastx.batch_size >= batch_parquet.batch_size,
+            "FASTX batch {} should be >= Parquet batch {} (fewer prefetch slots)",
+            batch_fastx.batch_size,
+            batch_parquet.batch_size
+        );
+    }
+
+    #[test]
+    fn test_owned_record_vs_arrow_bytes_estimation() {
+        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+
+        // OwnedRecord estimation for FASTX
+        let owned_bytes = profile.estimate_owned_record_bytes(false);
+        // Arrow estimation for Parquet
+        let arrow_bytes = profile.estimate_arrow_bytes_per_row(false);
+
+        // Both should be reasonable for 150bp reads
+        assert!(
+            owned_bytes > 100 && owned_bytes < 500,
+            "OwnedRecord bytes {} should be reasonable",
+            owned_bytes
+        );
+        assert!(
+            arrow_bytes > 100 && arrow_bytes < 500,
+            "Arrow bytes {} should be reasonable",
+            arrow_bytes
+        );
+
+        // OwnedRecord for paired-end should be larger
+        let owned_paired = profile.estimate_owned_record_bytes(true);
+        assert!(
+            owned_paired > owned_bytes,
+            "Paired OwnedRecord {} should be > single {}",
+            owned_paired,
+            owned_bytes
+        );
+    }
+
+    #[test]
+    fn test_read_length_affects_buffer_bytes() {
+        let profile_short = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile_long = ReadMemoryProfile::new(10000, false, 64, 50);
+
+        // Longer reads should have larger buffer bytes for both formats
+        let short_owned = profile_short.estimate_owned_record_bytes(false);
+        let long_owned = profile_long.estimate_owned_record_bytes(false);
+        assert!(long_owned > short_owned);
+
+        let short_arrow = profile_short.estimate_arrow_bytes_per_row(false);
+        let long_arrow = profile_long.estimate_arrow_bytes_per_row(false);
+        assert!(long_arrow > short_arrow);
+    }
+
+    #[test]
+    fn test_total_memory_with_io_buffers_within_budget() {
+        let profile = ReadMemoryProfile::new(5000, true, 64, 50); // paired long reads
+        let config = MemoryConfig {
+            max_memory: 8 * 1024 * 1024 * 1024, // 8GB
+            num_threads: 8,
+            index_memory: 500 * 1024 * 1024,
+            shard_reservation: 100 * 1024 * 1024,
+            read_profile: profile,
+            num_buckets: 1000,
+            input_format: InputFormat::Parquet { is_paired: true },
+        };
+
+        let batch_config = calculate_batch_config(&config);
+
+        // Total peak memory must not exceed max_memory
+        assert!(
+            batch_config.peak_memory <= config.max_memory,
+            "Peak {} exceeds max {}",
+            batch_config.peak_memory,
+            config.max_memory
+        );
+    }
+
+    #[test]
+    fn test_estimate_arrow_bytes_per_row() {
+        // Test the helper method that estimates Arrow buffer overhead
+        let profile_short = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile_long = ReadMemoryProfile::new(10000, false, 64, 50);
+
+        let bytes_short = profile_short.estimate_arrow_bytes_per_row(false);
+        let bytes_long = profile_long.estimate_arrow_bytes_per_row(false);
+
+        // Should include fixed overhead (offsets, validity, read_id)
+        // plus variable sequence data
+        assert!(
+            bytes_short > 40, // at least offset + validity + read_id overhead
+            "Short read arrow bytes {} should be > 40 (fixed overhead)",
+            bytes_short
+        );
+
+        // Longer reads should have more Arrow buffer overhead
+        assert!(
+            bytes_long > bytes_short,
+            "Long read arrow bytes {} should be > short read bytes {}",
+            bytes_long,
+            bytes_short
+        );
+
+        // The difference should roughly correspond to sequence length difference
+        let expected_diff = 10000 - 150;
+        let actual_diff = bytes_long - bytes_short;
+        assert!(
+            actual_diff >= expected_diff - 100 && actual_diff <= expected_diff + 100,
+            "Arrow bytes difference {} should be close to sequence length difference {}",
+            actual_diff,
+            expected_diff
+        );
+    }
+
+    #[test]
+    fn test_binary_search_validates_result() {
+        // Test that binary search returns valid results even in edge cases
+        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let config = MemoryConfig {
+            max_memory: 500 * 1024 * 1024, // 500MB - moderately constrained
+            num_threads: 4,
+            index_memory: 100 * 1024 * 1024,
+            shard_reservation: 50 * 1024 * 1024,
+            read_profile: profile,
+            num_buckets: 100,
+            input_format: InputFormat::Fastx { is_paired: false },
+        };
+
+        let batch_config = calculate_batch_config(&config);
+
+        // Verify the result is valid
+        let total =
+            estimate_total_batch_memory(batch_config.batch_size, batch_config.batch_count, &config);
+
+        // Calculate available memory (same as in calculate_batch_config)
+        let safety_margin = (config.max_memory as f64 * 0.10).round() as usize;
+        let safety_margin = safety_margin.max(256 * 1024 * 1024);
+        let base_reserved = config.index_memory + config.shard_reservation + safety_margin;
+        let available = config.max_memory.saturating_sub(base_reserved);
+
+        assert!(
+            total.is_some_and(|t| t <= available),
+            "Binary search result should fit in available memory"
+        );
+    }
+
+    #[test]
+    fn test_memory_config_validation() {
+        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+
+        // Valid config should succeed
+        let valid = MemoryConfig::new(
+            1024 * 1024 * 1024,
+            4,
+            100 * 1024 * 1024,
+            0,
+            profile.clone(),
+            100,
+            InputFormat::Fastx { is_paired: false },
+        );
+        assert!(valid.is_ok());
+
+        // Invalid: max_memory = 0
+        let invalid = MemoryConfig::new(
+            0,
+            4,
+            100 * 1024 * 1024,
+            0,
+            profile.clone(),
+            100,
+            InputFormat::Fastx { is_paired: false },
+        );
+        assert!(invalid.is_err());
+
+        // Invalid: num_threads = 0
+        let invalid = MemoryConfig::new(
+            1024 * 1024 * 1024,
+            0,
+            100 * 1024 * 1024,
+            0,
+            profile.clone(),
+            100,
+            InputFormat::Fastx { is_paired: false },
+        );
+        assert!(invalid.is_err());
+
+        // Invalid: num_buckets = 0
+        let invalid = MemoryConfig::new(
+            1024 * 1024 * 1024,
+            4,
+            100 * 1024 * 1024,
+            0,
+            profile,
+            0,
+            InputFormat::Fastx { is_paired: false },
+        );
+        assert!(invalid.is_err());
     }
 }

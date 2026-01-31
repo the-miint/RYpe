@@ -9,8 +9,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use rype::memory::{
-    calculate_batch_config, detect_available_memory, format_bytes, MemoryConfig, MemorySource,
-    ReadMemoryProfile,
+    calculate_batch_config, detect_available_memory, format_bytes, InputFormat, MemoryConfig,
+    MemorySource, ReadMemoryProfile,
 };
 use rype::parquet_index;
 use rype::{
@@ -65,6 +65,10 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         None
     };
 
+    // Check for Parquet input early (needed for memory estimation)
+    let input_is_parquet = is_parquet_input(&args.r1);
+    let is_paired = args.r2.is_some();
+
     // Determine effective batch size: user override or adaptive
     let effective_batch_size = if let Some(bs) = args.batch_size {
         log::info!("Using user-specified batch size: {}", bs);
@@ -94,7 +98,6 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         };
 
         // Sample read lengths from input files
-        let is_paired = args.r2.is_some();
         let read_profile = ReadMemoryProfile::from_files(
             &args.r1,
             args.r2.as_deref(),
@@ -119,6 +122,16 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         let estimated_index_mem = metadata.bucket_minimizer_counts.values().sum::<usize>() * 8;
         let num_buckets = metadata.bucket_names.len();
 
+        // Determine input format for accurate memory estimation
+        // FASTX uses 2 prefetch slots, Parquet uses 4
+        let input_format = if input_is_parquet {
+            // For Parquet, paired-end is determined by presence of sequence2 column
+            // which we don't know yet - assume based on r2 argument
+            InputFormat::Parquet { is_paired }
+        } else {
+            InputFormat::Fastx { is_paired }
+        };
+
         let mem_config = MemoryConfig {
             max_memory: mem_limit,
             num_threads: rayon::current_num_threads(),
@@ -126,21 +139,20 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
             shard_reservation: 0, // Will be updated after loading index
             read_profile,
             num_buckets,
+            input_format,
         };
 
         let batch_config = calculate_batch_config(&mem_config);
         log::info!(
-            "Adaptive batch sizing: batch_size={}, parallel_batches={}, threads={}, estimated peak memory={}",
+            "Adaptive batch sizing: batch_size={}, parallel_batches={}, threads={}, estimated peak memory={}, format={:?}",
             batch_config.batch_size,
             batch_config.batch_count,
             rayon::current_num_threads(),
-            format_bytes(batch_config.peak_memory)
+            format_bytes(batch_config.peak_memory),
+            input_format
         );
         batch_config.batch_size
     };
-
-    // Check for Parquet input
-    let input_is_parquet = is_parquet_input(&args.r1);
     if input_is_parquet && args.r2.is_some() {
         return Err(anyhow!(
             "Parquet input with separate R2 file is not supported. \
@@ -384,7 +396,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
             log_timing("batch: io_write", t_write.elapsed().as_millis());
 
             log::info!(
-                "Processed batch {} ({} row groups stacked): {} reads ({} total)",
+                "Processed batch {} ({} batches stacked): {} reads ({} total)",
                 batch_num,
                 stacked_batches.len(),
                 stacked_rows,
