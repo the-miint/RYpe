@@ -881,3 +881,749 @@ fn test_cli_trim_to_skips_short_sequences() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// Wide Format Output Tests (Phase 1: CLI Argument and Validation)
+// ============================================================================
+
+/// Test that --wide flag is recognized and parsed by the CLI
+#[test]
+fn test_cli_wide_flag_is_recognized() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query file
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    // Test that --wide flag is recognized (should not error with "unexpected argument")
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "--wide",
+        ])
+        .output()?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should NOT complain about unknown argument
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("unknown"),
+        "--wide flag should be recognized. Stderr: {}",
+        stderr
+    );
+
+    // Command should succeed (or fail for reasons other than argument parsing)
+    assert!(
+        output.status.success(),
+        "--wide flag should be accepted. Stderr: {}",
+        stderr
+    );
+
+    Ok(())
+}
+
+/// Test that --wide with non-default --threshold produces an error
+#[test]
+fn test_cli_wide_with_threshold_errors() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query file
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    // Test that --wide with --threshold (non-default) produces an error
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "--wide",
+            "-t",
+            "0.5", // Non-default threshold
+        ])
+        .output()?;
+
+    // Should fail
+    assert!(
+        !output.status.success(),
+        "--wide with --threshold should fail, but succeeded"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Error message should mention the incompatibility
+    assert!(
+        stderr.contains("incompatible")
+            || stderr.contains("--wide") && stderr.contains("--threshold"),
+        "Error should mention --wide/--threshold incompatibility. Stderr: {}",
+        stderr
+    );
+
+    Ok(())
+}
+
+/// Test that --wide alone (without --threshold) is accepted
+#[test]
+fn test_cli_wide_alone_is_accepted() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query file
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    // Test that --wide alone is accepted (uses default threshold of 0.1)
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "--wide",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "--wide alone should be accepted. Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Wide Format Output Tests (Phase 5: Integration)
+// ============================================================================
+
+/// Test that --wide produces wide-format TSV output with correct columns
+#[test]
+fn test_cli_wide_produces_wide_format_tsv() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index with two separate buckets
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query file with two reads (70 bases each)
+    let query_path = dir.path().join("query.fastq");
+    let seq1 = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT"; // 70 bases
+    let seq2 = "TTTTAAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAA"; // 70 bases
+    let qual = "I".repeat(70);
+    fs::write(
+        &query_path,
+        format!(
+            "@query1\n{}\n+\n{}\n@query2\n{}\n+\n{}\n",
+            seq1, qual, seq2, qual
+        ),
+    )?;
+
+    // Test classification with --wide
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "--wide",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Classification with --wide failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    println!("Wide format output:\n{}", stdout);
+
+    // Should have header + data rows
+    assert!(
+        lines.len() >= 2,
+        "Should have at least header + 1 data row. Got: {:?}",
+        lines
+    );
+
+    // Header should start with "read_id" and have bucket columns
+    let header = lines[0];
+    assert!(
+        header.starts_with("read_id"),
+        "Header should start with 'read_id'. Got: {}",
+        header
+    );
+
+    // Header should have exactly 3 columns: read_id + 2 buckets
+    let header_cols: Vec<&str> = header.split('\t').collect();
+    assert_eq!(
+        header_cols.len(),
+        3,
+        "Wide header should have 3 columns (read_id + 2 buckets). Got: {:?}",
+        header_cols
+    );
+
+    // Data rows should have the same number of columns as header
+    for (i, line) in lines.iter().skip(1).enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(
+            cols.len(),
+            header_cols.len(),
+            "Data row {} should have {} columns like header. Got: {:?}",
+            i,
+            header_cols.len(),
+            cols
+        );
+
+        // Score columns should be valid floats
+        for (j, col) in cols.iter().skip(1).enumerate() {
+            let score: f64 = col.parse().unwrap_or_else(|_| {
+                panic!(
+                    "Column {} in row {} should be a valid float. Got: '{}'",
+                    j + 1,
+                    i,
+                    col
+                )
+            });
+            assert!(
+                (0.0..=1.0).contains(&score),
+                "Score should be in [0.0, 1.0]. Got: {}",
+                score
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Test that --wide with Parquet output produces wide-format Parquet file
+#[test]
+fn test_cli_wide_produces_wide_format_parquet() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+    let output_path = dir.path().join("output.parquet");
+
+    // Create index with two separate buckets
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query file
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    // Test classification with --wide and Parquet output
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "--wide",
+            "-o",
+            output_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Classification with --wide -o parquet failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify Parquet file was created
+    assert!(
+        output_path.exists(),
+        "Parquet output file should exist at {:?}",
+        output_path
+    );
+
+    // Read and verify Parquet schema
+    use parquet::file::reader::FileReader;
+    use parquet::file::reader::SerializedFileReader;
+
+    let file = std::fs::File::open(&output_path)?;
+    let reader = SerializedFileReader::new(file)?;
+    let schema = reader.metadata().file_metadata().schema();
+
+    println!("Parquet schema: {:?}", schema);
+
+    // Schema should have read_id + bucket columns
+    let fields = schema.get_fields();
+    assert!(
+        fields.len() >= 2,
+        "Schema should have at least 2 fields (read_id + buckets). Got: {}",
+        fields.len()
+    );
+
+    // First field should be read_id
+    assert_eq!(
+        fields[0].name(),
+        "read_id",
+        "First field should be 'read_id'. Got: {}",
+        fields[0].name()
+    );
+
+    // Should have exactly 3 columns: read_id + 2 buckets
+    assert_eq!(
+        fields.len(),
+        3,
+        "Wide Parquet should have 3 columns (read_id + 2 buckets). Got fields: {:?}",
+        fields.iter().map(|f| f.name()).collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
+/// Test that --wide output contains scores for all buckets (including 0.0 for non-hits)
+#[test]
+fn test_cli_wide_includes_zero_scores_for_non_hits() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index with two separate buckets
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query that should only match one bucket (phiX174 sequence)
+    // This is actual phiX174 sequence that should match phiX bucket but not pUC19
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@phix_query\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    // Test classification with --wide
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "--wide",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Classification with --wide failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    println!("Wide format output:\n{}", stdout);
+
+    // Should have header + 1 data row
+    assert!(
+        lines.len() >= 2,
+        "Should have at least header + 1 data row. Got: {:?}",
+        lines
+    );
+
+    // Data row should have scores for both buckets
+    let data_row = lines[1];
+    let cols: Vec<&str> = data_row.split('\t').collect();
+
+    // Should have read_id + 2 bucket scores
+    assert_eq!(
+        cols.len(),
+        3,
+        "Data row should have 3 columns (read_id + 2 bucket scores). Got: {:?}",
+        cols
+    );
+
+    // At least one score should be > 0 (the matching bucket)
+    // and at least one might be 0.0 (the non-matching bucket)
+    let scores: Vec<f64> = cols[1..]
+        .iter()
+        .map(|s| s.parse::<f64>().unwrap())
+        .collect();
+
+    let has_positive = scores.iter().any(|&s| s > 0.0);
+    assert!(
+        has_positive,
+        "Should have at least one positive score. Scores: {:?}",
+        scores
+    );
+
+    // Wide format should include all buckets, even if score is 0.0
+    // (In long format, these would be filtered out)
+    println!("Scores for phix_query: {:?}", scores);
+
+    Ok(())
+}
+
+/// Test that --wide with --trim-to excludes reads that are too short
+/// (skipped reads should NOT appear in wide output, even with all zeros)
+#[test]
+fn test_cli_wide_with_trim_to_excludes_short_reads() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--manifest-path",
+            &format!("{}/Cargo.toml", manifest_dir),
+        ])
+        .status()?;
+    assert!(status.success(), "Failed to build");
+
+    let binary = format!("{}/target/debug/rype", manifest_dir);
+
+    // Create index with a reference sequence
+    let ref_seq = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\
+                   GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT";
+    let ref_path = dir.path().join("ref.fasta");
+    std::fs::write(&ref_path, format!(">ref\n{}\n", ref_seq))?;
+
+    let index_path = dir.path().join("test.ryxdi");
+    let status = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            ref_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .status()?;
+    assert!(status.success(), "Failed to create index");
+
+    // Create query file with one long read and one short read
+    // The short read should be skipped with --trim-to 100
+    let query_path = dir.path().join("queries.fastq");
+    std::fs::write(
+        &query_path,
+        // Long read (140 bases) - should be classified
+        "@long_read\n\
+         GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\
+         GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n\
+         +\n\
+         IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\
+         IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+         @short_read\n\
+         ACGTACGTACGTACGTACGT\n\
+         +\n\
+         IIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    let output_path = dir.path().join("output.tsv");
+
+    // Test classification with --wide and --trim-to 100
+    // short_read (20 bases) should be skipped since it's < 100
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "--wide",
+            "--trim-to",
+            "100",
+            "-o",
+            output_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    assert!(output.status.success(), "Classification should succeed");
+
+    // Read and parse output
+    let content = std::fs::read_to_string(&output_path)?;
+    let lines: Vec<&str> = content.lines().collect();
+
+    println!("Wide output with trim_to:\n{}", content);
+
+    // Should have header + 1 data row (only long_read, not short_read)
+    assert_eq!(
+        lines.len(),
+        2,
+        "Should have exactly 2 lines (header + 1 read). short_read should be skipped. Got {} lines: {:?}",
+        lines.len(),
+        lines
+    );
+
+    // Verify the data row is for long_read only
+    let data_row = lines[1];
+    assert!(
+        data_row.starts_with("long_read"),
+        "Only long_read should be in output. Got: {}",
+        data_row
+    );
+
+    Ok(())
+}

@@ -238,6 +238,7 @@ fn main() -> Result<()> {
                 timing,
                 best_hit,
                 trim_to,
+                wide,
             } => {
                 // Enable timing diagnostics if requested
                 if timing {
@@ -258,6 +259,7 @@ fn main() -> Result<()> {
                     parallel_input_rg,
                     best_hit,
                     trim_to,
+                    wide,
                 })?;
             }
 

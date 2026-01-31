@@ -39,10 +39,28 @@ pub struct ClassifyRunArgs {
     pub parallel_input_rg: usize,
     pub best_hit: bool,
     pub trim_to: Option<usize>,
+    pub wide: bool,
 }
+
+/// Default threshold value for classification.
+const DEFAULT_THRESHOLD: f64 = 0.1;
+
+/// Tolerance for floating-point threshold comparison.
+/// This is generous enough to handle typical floating-point representation issues
+/// while still catching intentional user-specified threshold values.
+const THRESHOLD_TOLERANCE: f64 = 1e-9;
 
 /// Run the classify command with the given arguments.
 pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
+    // Validate --wide incompatibility with --threshold
+    if args.wide && (args.threshold - DEFAULT_THRESHOLD).abs() > THRESHOLD_TOLERANCE {
+        return Err(anyhow!(
+            "--wide is incompatible with --threshold.\n\
+             Wide format requires all bucket scores, so no threshold filtering can be applied.\n\
+             Use --wide without --threshold, or omit --wide to use threshold filtering."
+        ));
+    }
+
     // Load negative index if provided (memory-efficient sharded filtering)
     let negative_sharded: Option<ShardedInvertedIndex> = if let Some(ref neg_path) =
         args.negative_index
@@ -187,8 +205,33 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
 
     // Set up I/O based on input format
     let output_format = OutputFormat::detect(args.output.as_ref());
-    let mut out_writer = OutputWriter::new(output_format, args.output.as_ref(), None)?;
-    out_writer.write_header(b"read_id\tbucket_name\tscore\n")?;
+
+    // For wide format: build header and bucket_ids once (reused for both writer and formatting)
+    let (wide_header, wide_bucket_ids): (Option<Vec<u8>>, Option<Vec<u32>>) = if args.wide {
+        let (header, bucket_ids) = build_wide_header(&metadata.bucket_names);
+        (Some(header), Some(bucket_ids))
+    } else {
+        (None, None)
+    };
+
+    // Create output writer and write header
+    let mut out_writer = if args.wide {
+        let mut writer = OutputWriter::new_wide(
+            output_format,
+            args.output.as_ref(),
+            &metadata.bucket_names,
+            None,
+        )?;
+        writer.write_header(wide_header.as_ref().unwrap())?;
+        writer
+    } else {
+        let mut writer = OutputWriter::new(output_format, args.output.as_ref(), None)?;
+        writer.write_header(b"read_id\tbucket_name\tscore\n")?;
+        writer
+    };
+
+    // For wide format, use threshold 0.0 to get all bucket scores
+    let effective_threshold = if args.wide { 0.0 } else { args.threshold };
 
     // Create input reader (Parquet or FASTX)
     let mut parquet_reader = if input_is_parquet {
@@ -269,6 +312,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     }
 
     // Helper closure for classification
+    // Note: uses effective_threshold (0.0 for wide format, args.threshold otherwise)
     let classify_records = |batch_refs: &[rype::QueryRecord]| -> Result<Vec<rype::HitResult>> {
         // If negative index is provided, use memory-efficient sharded filtering
         if let Some(ref neg) = negative_sharded {
@@ -282,7 +326,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                 &sharded,
                 Some(neg),
                 batch_refs,
-                args.threshold,
+                effective_threshold,
                 read_options.as_ref(),
                 args.trim_to,
             )
@@ -291,7 +335,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                 &sharded,
                 None,
                 batch_refs,
-                args.threshold,
+                effective_threshold,
                 read_options.as_ref(),
                 args.trim_to,
             )
@@ -300,7 +344,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                 &sharded,
                 None,
                 batch_refs,
-                args.threshold,
+                effective_threshold,
                 read_options.as_ref(),
                 args.trim_to,
             )
@@ -392,7 +436,11 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
             };
 
             let t_format = std::time::Instant::now();
-            let chunk_out = format_results_ref(&results, &headers);
+            let chunk_out = if let Some(ref bucket_ids) = wide_bucket_ids {
+                format_results_wide_ref(&results, &headers, bucket_ids)
+            } else {
+                format_results_ref(&results, &headers)
+            };
             log_timing("batch: format_output", t_format.elapsed().as_millis());
 
             let t_write = std::time::Instant::now();
@@ -438,7 +486,11 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
             };
 
             let t_format = std::time::Instant::now();
-            let chunk_out = format_results(&results, &headers);
+            let chunk_out = if let Some(ref bucket_ids) = wide_bucket_ids {
+                format_results_wide(&results, &headers, bucket_ids)
+            } else {
+                format_results(&results, &headers)
+            };
             log_timing("batch: format_output", t_format.elapsed().as_millis());
 
             let t_write = std::time::Instant::now();
@@ -487,4 +539,311 @@ pub fn run_aggregate(_args: ClassifyAggregateArgs) -> Result<()> {
         "aggregate command is not yet supported with Parquet indices.\n\
          This feature is pending development. Use 'classify run' for per-read classification."
     ))
+}
+
+/// Build the header line and sorted bucket IDs for wide-format output.
+///
+/// Returns a tuple of:
+/// - Header bytes: "read_id\tBucket1\tBucket2\t...\n" (tab-separated, newline-terminated)
+/// - Sorted bucket IDs: Vec<u32> in ascending order (for formatting results)
+///
+/// Bucket columns are ordered by bucket_id ascending but display bucket_name.
+pub fn build_wide_header(bucket_names: &HashMap<u32, String>) -> (Vec<u8>, Vec<u32>) {
+    // Sort bucket IDs ascending
+    let mut bucket_ids: Vec<u32> = bucket_names.keys().copied().collect();
+    bucket_ids.sort_unstable();
+
+    // Build header: "read_id\tBucket1\tBucket2\t...\n"
+    let mut header = Vec::with_capacity(256);
+    header.extend_from_slice(b"read_id");
+    for &bucket_id in &bucket_ids {
+        header.push(b'\t');
+        if let Some(name) = bucket_names.get(&bucket_id) {
+            header.extend_from_slice(name.as_bytes());
+        }
+    }
+    header.push(b'\n');
+
+    (header, bucket_ids)
+}
+
+/// Format classification results in wide format for TSV output.
+///
+/// Each **processed** read produces one row with scores for all buckets (0.0 if no hit).
+/// Scores are formatted to 4 decimal places.
+///
+/// # Output Behavior
+///
+/// Only reads that were actually processed by classification are output.
+/// Reads that were skipped (e.g., too short after `--trim-to`) are omitted entirely.
+///
+/// With wide format (threshold=0.0), any processed read will have results for all
+/// buckets. Reads with no results at all were skipped and are not included.
+///
+/// # Arguments
+/// * `results` - Classification results (may have multiple entries per read)
+/// * `headers` - Read names/IDs indexed by query_id (accepts `&[String]` or `&[&str]`)
+/// * `bucket_ids` - Sorted bucket IDs defining column order
+///
+/// # Returns
+/// Formatted bytes: "read_id\tscore1\tscore2\t...\n" for each processed read
+pub fn format_results_wide<S: AsRef<str>>(
+    results: &[rype::HitResult],
+    headers: &[S],
+    bucket_ids: &[u32],
+) -> Vec<u8> {
+    use std::io::Write;
+
+    // Group results by query_id: query_id -> (bucket_id -> score)
+    let mut scores_by_query: HashMap<i64, HashMap<u32, f64>> = HashMap::new();
+    for res in results {
+        scores_by_query
+            .entry(res.query_id)
+            .or_default()
+            .insert(res.bucket_id, res.score);
+    }
+
+    let num_buckets = bucket_ids.len();
+    let mut output = Vec::with_capacity(headers.len() * (num_buckets * 8 + 32));
+
+    // Output one row per processed read (skip reads with no results - they were skipped)
+    for (query_id, header) in headers.iter().enumerate() {
+        let Some(query_scores) = scores_by_query.get(&(query_id as i64)) else {
+            // Read was skipped (e.g., too short after trim_to) - omit from output
+            continue;
+        };
+
+        output.extend_from_slice(header.as_ref().as_bytes());
+
+        for &bucket_id in bucket_ids {
+            output.push(b'\t');
+            let score = query_scores.get(&bucket_id).copied().unwrap_or(0.0);
+            write!(&mut output, "{:.4}", score).unwrap();
+        }
+        output.push(b'\n');
+    }
+
+    output
+}
+
+/// Format classification results in wide format for TSV output (borrowed headers variant).
+///
+/// This is an alias for `format_results_wide` that accepts `&[&str]` directly.
+/// Kept for backwards compatibility and explicit type annotation.
+#[inline]
+pub fn format_results_wide_ref(
+    results: &[rype::HitResult],
+    headers: &[&str],
+    bucket_ids: &[u32],
+) -> Vec<u8> {
+    format_results_wide(results, headers, bucket_ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_wide_header_produces_correct_header() {
+        let mut bucket_names = HashMap::new();
+        bucket_names.insert(1, "Bucket_A".to_string());
+        bucket_names.insert(2, "Bucket_B".to_string());
+        bucket_names.insert(3, "Bucket_C".to_string());
+
+        let (header, bucket_ids) = build_wide_header(&bucket_names);
+
+        let header_str = String::from_utf8(header).unwrap();
+        assert_eq!(header_str, "read_id\tBucket_A\tBucket_B\tBucket_C\n");
+        assert_eq!(bucket_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_build_wide_header_orders_by_bucket_id_ascending() {
+        let mut bucket_names = HashMap::new();
+        // Insert in non-sorted order
+        bucket_names.insert(10, "Z_last".to_string());
+        bucket_names.insert(1, "A_first".to_string());
+        bucket_names.insert(5, "M_middle".to_string());
+
+        let (header, bucket_ids) = build_wide_header(&bucket_names);
+
+        let header_str = String::from_utf8(header).unwrap();
+        // Columns should be ordered by bucket_id (1, 5, 10), not alphabetically
+        assert_eq!(header_str, "read_id\tA_first\tM_middle\tZ_last\n");
+        assert_eq!(bucket_ids, vec![1, 5, 10]);
+    }
+
+    #[test]
+    fn test_build_wide_header_empty_bucket_names() {
+        let bucket_names = HashMap::new();
+
+        let (header, bucket_ids) = build_wide_header(&bucket_names);
+
+        let header_str = String::from_utf8(header).unwrap();
+        assert_eq!(header_str, "read_id\n");
+        assert!(bucket_ids.is_empty());
+    }
+
+    #[test]
+    fn test_build_wide_header_single_bucket() {
+        let mut bucket_names = HashMap::new();
+        bucket_names.insert(42, "OnlyBucket".to_string());
+
+        let (header, bucket_ids) = build_wide_header(&bucket_names);
+
+        let header_str = String::from_utf8(header).unwrap();
+        assert_eq!(header_str, "read_id\tOnlyBucket\n");
+        assert_eq!(bucket_ids, vec![42]);
+    }
+
+    // Phase 3: format_results_wide tests
+
+    #[test]
+    fn test_format_results_wide_all_buckets_have_scores() {
+        use rype::HitResult;
+
+        let results = vec![
+            HitResult {
+                query_id: 0,
+                bucket_id: 1,
+                score: 0.85,
+            },
+            HitResult {
+                query_id: 0,
+                bucket_id: 2,
+                score: 0.75,
+            },
+            HitResult {
+                query_id: 0,
+                bucket_id: 3,
+                score: 0.65,
+            },
+        ];
+        let headers = vec!["read_1".to_string()];
+        let bucket_ids = vec![1, 2, 3];
+
+        let output = format_results_wide(&results, &headers, &bucket_ids);
+        let output_str = String::from_utf8(output).unwrap();
+
+        assert_eq!(output_str, "read_1\t0.8500\t0.7500\t0.6500\n");
+    }
+
+    #[test]
+    fn test_format_results_wide_partial_results_fills_zeros() {
+        use rype::HitResult;
+
+        // Read only has scores for buckets 1 and 3, missing bucket 2
+        let results = vec![
+            HitResult {
+                query_id: 0,
+                bucket_id: 1,
+                score: 0.85,
+            },
+            HitResult {
+                query_id: 0,
+                bucket_id: 3,
+                score: 0.32,
+            },
+        ];
+        let headers = vec!["read_1".to_string()];
+        let bucket_ids = vec![1, 2, 3];
+
+        let output = format_results_wide(&results, &headers, &bucket_ids);
+        let output_str = String::from_utf8(output).unwrap();
+
+        // Bucket 2 should have 0.0000
+        assert_eq!(output_str, "read_1\t0.8500\t0.0000\t0.3200\n");
+    }
+
+    #[test]
+    fn test_format_results_wide_no_results_skips_read() {
+        // A read with no results was skipped (e.g., too short after trim_to)
+        // and should NOT appear in the output
+        use rype::HitResult;
+
+        let results: Vec<HitResult> = vec![];
+        let headers = vec!["read_1".to_string()];
+        let bucket_ids = vec![1, 2, 3];
+
+        let output = format_results_wide(&results, &headers, &bucket_ids);
+        let output_str = String::from_utf8(output).unwrap();
+
+        // Skipped reads produce empty output
+        assert_eq!(output_str, "");
+    }
+
+    #[test]
+    fn test_format_results_wide_multiple_reads() {
+        use rype::HitResult;
+
+        let results = vec![
+            HitResult {
+                query_id: 0,
+                bucket_id: 1,
+                score: 0.85,
+            },
+            HitResult {
+                query_id: 0,
+                bucket_id: 3,
+                score: 0.32,
+            },
+            HitResult {
+                query_id: 1,
+                bucket_id: 2,
+                score: 0.91,
+            },
+        ];
+        let headers = vec!["read_1".to_string(), "read_2".to_string()];
+        let bucket_ids = vec![1, 2, 3];
+
+        let output = format_results_wide(&results, &headers, &bucket_ids);
+        let output_str = String::from_utf8(output).unwrap();
+
+        let expected = "read_1\t0.8500\t0.0000\t0.3200\nread_2\t0.0000\t0.9100\t0.0000\n";
+        assert_eq!(output_str, expected);
+    }
+
+    #[test]
+    fn test_format_results_wide_scores_formatted_to_4_decimals() {
+        use rype::HitResult;
+
+        let results = vec![HitResult {
+            query_id: 0,
+            bucket_id: 1,
+            score: 0.123456789,
+        }];
+        let headers = vec!["read_1".to_string()];
+        let bucket_ids = vec![1];
+
+        let output = format_results_wide(&results, &headers, &bucket_ids);
+        let output_str = String::from_utf8(output).unwrap();
+
+        // Should be rounded to 4 decimal places
+        assert_eq!(output_str, "read_1\t0.1235\n");
+    }
+
+    #[test]
+    fn test_format_results_wide_ref_works_with_str_refs() {
+        use rype::HitResult;
+
+        let results = vec![
+            HitResult {
+                query_id: 0,
+                bucket_id: 1,
+                score: 0.85,
+            },
+            HitResult {
+                query_id: 0,
+                bucket_id: 2,
+                score: 0.75,
+            },
+        ];
+        let headers: Vec<&str> = vec!["read_1"];
+        let bucket_ids = vec![1, 2];
+
+        let output = format_results_wide_ref(&results, &headers, &bucket_ids);
+        let output_str = String::from_utf8(output).unwrap();
+
+        assert_eq!(output_str, "read_1\t0.8500\t0.7500\n");
+    }
 }

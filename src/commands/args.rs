@@ -382,6 +382,13 @@ WHEN TO USE 'run' vs 'aggregate':
         /// Values smaller than k will produce no minimizers and yield no results.
         #[arg(long, value_parser = validate_trim_to)]
         trim_to: Option<usize>,
+
+        /// Output wide-form matrix instead of long-form TSV.
+        /// Columns: read_id, then one column per bucket (ordered by bucket_id).
+        /// Each row contains scores for all buckets (0.0 if no hit).
+        /// Incompatible with --threshold (all scores must be reported).
+        #[arg(long)]
+        wide: bool,
     },
 
     /// Pool all reads for sample-level classification (higher sensitivity)

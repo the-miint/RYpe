@@ -16,7 +16,34 @@ use rype::{
     merge_sorted_into, MinimizerWorkspace, Orientation, BUCKET_SOURCE_DELIM,
 };
 
+use std::collections::HashSet;
+
 use super::helpers::sanitize_bucket_name;
+
+/// Validate that all bucket names are unique.
+///
+/// Returns an error if duplicate bucket names are found, listing them all.
+fn validate_unique_bucket_names(buckets: &[rype::BucketData]) -> Result<()> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut duplicates: Vec<&str> = Vec::new();
+
+    for bucket in buckets {
+        if !seen.insert(&bucket.bucket_name) && !duplicates.contains(&bucket.bucket_name.as_str()) {
+            duplicates.push(&bucket.bucket_name);
+        }
+    }
+
+    if duplicates.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Duplicate bucket names are not allowed. Found duplicates: {:?}\n\
+             Bucket names must be unique to avoid ambiguity in output formats.\n\
+             Consider using --separate-buckets or renaming sequences.",
+            duplicates
+        ))
+    }
+}
 
 // ============================================================================
 // Parquet Index Creation
@@ -115,6 +142,9 @@ pub fn create_parquet_index_from_refs(
         buckets.len(),
         total_minimizers
     );
+
+    // Validate bucket name uniqueness before creating index
+    validate_unique_bucket_names(&buckets)?;
 
     let manifest =
         create_parquet_inverted_index(output, buckets, k, w, salt, max_shard_bytes, options)?;
@@ -328,6 +358,9 @@ pub fn build_parquet_index_from_config(
         buckets.len(),
         total_minimizers
     );
+
+    // Validate bucket name uniqueness before creating index
+    validate_unique_bucket_names(&buckets)?;
 
     // Create parquet index
     let t_write = Instant::now();
@@ -734,5 +767,56 @@ output = "{}"
             mins_no_orient, mins_with_orient,
             "First sequence should use forward orientation in both cases"
         );
+    }
+
+    // ============================================================================
+    // Bucket Name Uniqueness Validation Tests
+    // ============================================================================
+
+    #[test]
+    fn test_validate_unique_bucket_names_accepts_unique_names() {
+        let buckets = vec![
+            BucketData {
+                bucket_id: 1,
+                bucket_name: "Bucket_A".to_string(),
+                sources: vec![],
+                minimizers: vec![],
+            },
+            BucketData {
+                bucket_id: 2,
+                bucket_name: "Bucket_B".to_string(),
+                sources: vec![],
+                minimizers: vec![],
+            },
+        ];
+        assert!(validate_unique_bucket_names(&buckets).is_ok());
+    }
+
+    #[test]
+    fn test_validate_unique_bucket_names_rejects_duplicates() {
+        let buckets = vec![
+            BucketData {
+                bucket_id: 1,
+                bucket_name: "Duplicate".to_string(),
+                sources: vec![],
+                minimizers: vec![],
+            },
+            BucketData {
+                bucket_id: 2,
+                bucket_name: "Duplicate".to_string(),
+                sources: vec![],
+                minimizers: vec![],
+            },
+        ];
+        let result = validate_unique_bucket_names(&buckets);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Duplicate"));
+    }
+
+    #[test]
+    fn test_validate_unique_bucket_names_empty_list() {
+        let buckets: Vec<BucketData> = vec![];
+        assert!(validate_unique_bucket_names(&buckets).is_ok());
     }
 }
