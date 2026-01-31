@@ -231,7 +231,8 @@ fn test_parquet_index_classification() -> Result<()> {
 
     let threshold = 0.1;
 
-    let results = classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None)?;
+    let results =
+        classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None, None)?;
 
     eprintln!("\n=== Results ===");
     eprintln!("Merge-join: {} results", results.len());
@@ -329,7 +330,7 @@ fn test_parquet_index_matches_inverted_index() -> Result<()> {
 
     // Test Parquet index
     let sharded_results =
-        classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None)?;
+        classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None, None)?;
 
     eprintln!("\n=== Results ===");
     eprintln!("Direct: {} results", direct_results.len());
@@ -403,7 +404,8 @@ fn test_parquet_index_with_multiple_shards() -> Result<()> {
 
     let threshold = 0.1;
 
-    let results = classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None)?;
+    let results =
+        classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None, None)?;
 
     eprintln!("\n=== Classification Results ===");
     eprintln!("Merge-join: {} results", results.len());
@@ -518,7 +520,8 @@ fn test_empty_query_results() -> Result<()> {
 
     let threshold = 0.1;
 
-    let results = classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None)?;
+    let results =
+        classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None, None)?;
 
     eprintln!("Results for short query: {}", results.len());
     assert!(results.is_empty(), "Short query should have no results");
@@ -548,9 +551,11 @@ fn test_high_threshold_filters_results() -> Result<()> {
     let sharded = ShardedInvertedIndex::open(&index_path)?;
 
     // Compare results at different thresholds
-    let results_low = classify_batch_sharded_merge_join(&sharded, None, &records, 0.01, None)?;
-    let results_mid = classify_batch_sharded_merge_join(&sharded, None, &records, 0.5, None)?;
-    let results_high = classify_batch_sharded_merge_join(&sharded, None, &records, 0.99, None)?;
+    let results_low =
+        classify_batch_sharded_merge_join(&sharded, None, &records, 0.01, None, None)?;
+    let results_mid = classify_batch_sharded_merge_join(&sharded, None, &records, 0.5, None, None)?;
+    let results_high =
+        classify_batch_sharded_merge_join(&sharded, None, &records, 0.99, None, None)?;
 
     eprintln!("Results at threshold 0.01: {}", results_low.len());
     eprintln!("Results at threshold 0.50: {}", results_mid.len());

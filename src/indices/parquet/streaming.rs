@@ -673,9 +673,15 @@ mod tests {
 
         let threshold = 0.1;
 
-        let results =
-            classify_batch_sharded_merge_join(&streaming_sharded, None, &records, threshold, None)
-                .unwrap();
+        let results = classify_batch_sharded_merge_join(
+            &streaming_sharded,
+            None,
+            &records,
+            threshold,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Verify we got expected matches (each query should match its own bucket perfectly)
         assert!(

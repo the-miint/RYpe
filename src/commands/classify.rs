@@ -38,6 +38,7 @@ pub struct ClassifyRunArgs {
     pub use_bloom_filter: bool,
     pub parallel_input_rg: usize,
     pub best_hit: bool,
+    pub trim_to: Option<usize>,
 }
 
 /// Run the classify command with the given arguments.
@@ -283,6 +284,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                 batch_refs,
                 args.threshold,
                 read_options.as_ref(),
+                args.trim_to,
             )
         } else if args.parallel_rg {
             classify_batch_sharded_parallel_rg(
@@ -291,6 +293,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                 batch_refs,
                 args.threshold,
                 read_options.as_ref(),
+                args.trim_to,
             )
         } else {
             classify_batch_sharded_merge_join(
@@ -299,6 +302,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                 batch_refs,
                 args.threshold,
                 read_options.as_ref(),
+                args.trim_to,
             )
         }
     };

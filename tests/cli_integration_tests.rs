@@ -696,3 +696,188 @@ fn test_cli_bucket_source_detail_by_name() -> Result<()> {
 
     Ok(())
 }
+
+/// Test that --trim-to CLI argument is recognized
+#[test]
+fn test_cli_trim_to_argument_parsing() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query file with 70-base sequence
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    // Test classification with --trim-to flag
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+            "--trim-to",
+            "50",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Classification with --trim-to failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    Ok(())
+}
+
+/// Test that --trim-to skips sequences shorter than the trim length
+#[test]
+fn test_cli_trim_to_skips_short_sequences() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query file with:
+    // - short_query: 40 bases (shorter than trim_to=50, should be SKIPPED)
+    // - long_query: 100 bases (longer than trim_to=50, should be INCLUDED)
+    // Using actual phiX174 sequences to ensure matches
+    let query_path = dir.path().join("query.fastq");
+    // short_query: 40 bases from phiX174
+    let short_seq = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGG"; // 41 bases, we need 40
+    let short_seq = &short_seq[0..40]; // exactly 40 bases
+    let short_qual = "I".repeat(40);
+    // long_query: 100 bases from phiX174
+    let long_seq = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTTGATAAAGCAGGAATTACTACTGCTTGTTTA"; // 100 bases
+    let long_qual = "I".repeat(100);
+    fs::write(
+        &query_path,
+        format!(
+            "@short_query\n{}\n+\n{}\n@long_query\n{}\n+\n{}\n",
+            short_seq, short_qual, long_seq, long_qual
+        ),
+    )?;
+
+    // Run classification with --trim-to 50
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+            "--trim-to",
+            "50",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Classification with --trim-to failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    println!("Classification output:\n{}", stdout);
+
+    // short_query (40 bases) should NOT appear in output (skipped because < 50)
+    let has_short = lines.iter().any(|l| l.contains("short_query"));
+    assert!(
+        !has_short,
+        "short_query (40 bases) should be skipped when --trim-to 50, but found in output"
+    );
+
+    // long_query (100 bases) should appear in output (trimmed to 50 and classified)
+    let has_long = lines.iter().any(|l| l.contains("long_query"));
+    assert!(
+        has_long,
+        "long_query (100 bases) should be present when --trim-to 50, but not found in output.\nOutput: {}",
+        stdout
+    );
+
+    Ok(())
+}

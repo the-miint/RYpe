@@ -3,7 +3,9 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use super::helpers::{parse_bloom_fpp, parse_max_memory_arg, parse_shard_size_arg};
+use super::helpers::{
+    parse_bloom_fpp, parse_max_memory_arg, parse_shard_size_arg, validate_trim_to,
+};
 
 #[derive(Parser)]
 #[command(name = "rype")]
@@ -369,6 +371,17 @@ WHEN TO USE 'run' vs 'aggregate':
         /// If multiple buckets tie for best score, one is chosen arbitrarily.
         #[arg(long)]
         best_hit: bool,
+
+        /// Trim sequences to first N nucleotides before classification.
+        /// Sequences shorter than N are skipped.
+        ///
+        /// For paired-end reads, R1 must be at least N bases (pairs with shorter R1 are skipped).
+        /// R2 is trimmed to min(length, N) - a short R2 does not cause the pair to be skipped.
+        ///
+        /// Recommended: N >= k (k-mer size) to ensure minimizer extraction.
+        /// Values smaller than k will produce no minimizers and yield no results.
+        #[arg(long, value_parser = validate_trim_to)]
+        trim_to: Option<usize>,
     },
 
     /// Pool all reads for sample-level classification (higher sensitivity)

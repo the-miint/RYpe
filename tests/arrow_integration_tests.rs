@@ -149,7 +149,8 @@ fn test_arrow_vs_regular_api_consistency() -> Result<()> {
         (2, query2.as_slice(), None),
         (3, query3.as_slice(), None),
     ];
-    let regular_hits = classify_batch_sharded_merge_join(&index, None, &records, threshold, None)?;
+    let regular_hits =
+        classify_batch_sharded_merge_join(&index, None, &records, threshold, None, None)?;
 
     // Arrow API
     let batch = make_test_batch(&[1, 2, 3], &[&query1, &query2, &query3]);

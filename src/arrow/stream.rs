@@ -81,6 +81,7 @@ impl<'a> ShardedStreamClassifier<'a> {
             &records,
             self.threshold,
             None,
+            None, // trim_to: not exposed in Arrow API
         )
         .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
         hits_to_record_batch(hits)

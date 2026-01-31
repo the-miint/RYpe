@@ -170,8 +170,9 @@ fn classify_arrow_batch_sharded_internal(
     best_hit_only: bool,
 ) -> Result<RecordBatch, ArrowClassifyError> {
     let records = batch_to_records(batch)?;
-    let hits = classify_batch_sharded_merge_join(sharded, negative_mins, &records, threshold, None)
-        .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
+    let hits =
+        classify_batch_sharded_merge_join(sharded, negative_mins, &records, threshold, None, None)
+            .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
 
     let hits = if best_hit_only {
         crate::classify::filter_best_hits(hits)

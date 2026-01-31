@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Rype** is a high-performance genomic sequence classification library using minimizer-based k-mer sketching in RY (purine/pyrimidine) space. It's written in Rust and provides both a Rust library, CLI tool, and C API for FFI integration.
 
+All indices are stored in Parquet format (`.ryxdi` directories).
+
 ## Build and Development Commands
 
 ### Building
@@ -41,37 +43,38 @@ LD_LIBRARY_PATH=target/debug ./c_example
 ### CLI Usage
 ```bash
 # Create an index from reference sequences
-cargo run --release -- index create -o output.ryidx -r ref1.fasta -r ref2.fasta -k 64 -w 50
+cargo run --release -- index create -o index.ryxdi -r ref1.fasta -r ref2.fasta -k 64 -w 50
+
+# Create index with one bucket per sequence
+cargo run --release -- index create -o genes.ryxdi -r genes.fasta --separate-buckets
 
 # Show index statistics
-cargo run --release -- index stats -i index.ryidx
+cargo run --release -- index stats -i index.ryxdi
 
-# Add sequences to an existing index as a new bucket
-cargo run --release -- index bucket-add -i index.ryidx -r new_ref.fasta
-
-# Merge two buckets within an index
-cargo run --release -- index bucket-merge -i index.ryidx --src 2 --dest 1
-
-# Merge multiple indices into one
-cargo run --release -- index merge -o merged.ryidx -i idx1.ryidx -i idx2.ryidx
+# Show source details for a bucket
+cargo run --release -- index bucket-source-detail -i index.ryxdi -b 1
 
 # Build index from a TOML configuration file
 cargo run --release -- index from-config -c config.toml
 
 # Classify sequences (single-end)
-cargo run --release -- classify run -i index.ryidx -1 reads.fastq -t 0.1
+cargo run --release -- classify run -i index.ryxdi -1 reads.fastq -t 0.1
 
 # Classify sequences (paired-end)
-cargo run --release -- classify run -i index.ryidx -1 reads_R1.fastq -2 reads_R2.fastq -t 0.1
+cargo run --release -- classify run -i index.ryxdi -1 reads_R1.fastq -2 reads_R2.fastq -t 0.1
+
+# Classify with negative filtering (host depletion)
+cargo run --release -- classify run -i target.ryxdi -N host.ryxdi -1 reads.fastq -t 0.1
 
 # Aggregate classification (for higher sensitivity)
-cargo run --release -- classify aggregate -i index.ryidx -1 reads.fastq -t 0.05
+cargo run --release -- classify aggregate -i index.ryxdi -1 reads.fastq -t 0.05
 
-# Create Parquet inverted index directly (recommended for large indices)
-cargo run --release --features parquet -- index create -o index.ryxdi -r ref.fasta --parquet
+# Best-hit-only classification
+cargo run --release -- classify run -i index.ryxdi -1 reads.fastq --best-hit
 
-# Classify using Parquet index (auto-detected)
-cargo run --release --features parquet -- classify run -i index.ryxdi -1 reads.fastq --use-inverted
+# Classify with sequence trimming (use first N bases only)
+# Useful when read starts are more reliable than ends
+cargo run --release -- classify run -i index.ryxdi -1 reads.fastq -t 0.1 --trim-to 100
 ```
 
 ## Architecture Overview
@@ -92,46 +95,37 @@ The library reduces sequence representation using minimizers:
 2. Select minimum hash value within each window as representative
 3. Deduplicate consecutive identical minimizers
 
-Implementation uses monotonic deque for O(n) time complexity (see `extract_into()` in src/lib.rs).
+Implementation uses monotonic deque for O(n) time complexity (see `extract_into()` in src/core.rs).
 
 ### Key Data Structures
 
-**Index** (src/lib.rs:216-389):
-- `buckets: HashMap<u32, Vec<u64>>` - Maps bucket ID to sorted, deduplicated minimizers
-- `bucket_names: HashMap<u32, String>` - Human-readable bucket names
-- `bucket_sources: HashMap<u32, Vec<String>>` - Source sequences for each bucket
-- `w: usize` - Window size for minimizer selection
-- `salt: u64` - XOR salt applied to k-mer hashes
+**InvertedIndex** (src/indices/):
+- Minimizer → bucket ID mappings for fast classification
+- Loaded from Parquet shards on-demand
 
-**MinimizerWorkspace** (src/lib.rs:54-68):
+**ShardedInvertedIndex** (src/indices/):
+- Memory-efficient sharded inverted index
+- Holds manifest; shards loaded on-demand during classification
+
+**MinimizerWorkspace** (src/core.rs):
 - Reusable workspace to avoid allocations in hot loops
 - Contains deques for forward/reverse-complement k-mer tracking
 - `buffer: Vec<u64>` - Output minimizers
 
-**HitResult** (src/lib.rs:40-45):
+**HitResult** (src/types.rs):
 - Classification result: query_id, bucket_id, score
+
+**BucketData** (src/indices/parquet/):
+- Used during index creation: bucket_id, bucket_name, sources, minimizers
 
 ### Constants Module (src/constants.rs)
 
 Centralized constants for consistency and maintainability:
 
-**Binary Format Identifiers:**
-- `SINGLE_FILE_INDEX_MAGIC` (b"RYP5") - Single-file .ryidx format
-- `MAIN_MANIFEST_MAGIC` (b"RYPM") - Sharded main index manifest
-- `MAIN_SHARD_MAGIC` (b"RYPS") - Sharded main index shards
-- `MANIFEST_MAGIC` (b"RYXM") - Inverted index manifest
-- `SHARD_MAGIC` (b"RYXS") - Inverted index shards
-
-**Version Numbers:**
-- `SINGLE_FILE_INDEX_VERSION` = 5 - Current single-file format
-- `MAIN_MANIFEST_VERSION` = 2 - Sharded main manifest
-- `MAIN_SHARD_VERSION` = 2 - Sharded main shards
-- `MANIFEST_VERSION` = 5 - Inverted manifest (supports 3-5)
-- `SHARD_VERSION` = 1 - Inverted shards
-
 **Safety Limits:**
-- `MAX_BUCKET_SIZE`, `MAX_NUM_BUCKETS`, `MAX_STRING_LENGTH` - DoS protection
-- `MAX_SHARDS`, `MAX_MAIN_SHARDS` - Shard count limits
+- `MAX_INVERTED_MINIMIZERS` - Maximum minimizers in inverted index (1 trillion)
+- `MAX_INVERTED_BUCKET_IDS` - Maximum bucket ID entries (4 billion)
+- `MAX_SEQUENCE_LENGTH` - Max sequence size for C API (2GB)
 - `MAX_READS` - Bit-packing limit (2^31 - 1)
 
 **Performance Tuning:**
@@ -139,28 +133,23 @@ Centralized constants for consistency and maintainability:
 - `QUERY_HASHSET_THRESHOLD` = 1000 - Linear vs HashSet lookup
 - `PARQUET_BATCH_SIZE`, `DEFAULT_ROW_GROUP_SIZE` - Parquet I/O sizing
 
+**Delimiters:**
+- `BUCKET_SOURCE_DELIM` = "::" - Separates filename from sequence name in bucket sources
+
 ### Core Algorithms
 
-**Minimizer Extraction** (src/lib.rs:78-169):
+**Minimizer Extraction** (src/core.rs):
 - `extract_into()` - Single-strand minimizer extraction
 - `extract_dual_strand_into()` - Forward + reverse-complement extraction
 - `get_paired_minimizers_into()` - Paired-end read handling
 
-**Classification** (src/lib.rs:394-489):
-- `classify_batch()` - Parallel batch classification with inverted index
-  - Builds maps of minimizer → query indices
-  - For each bucket, binary searches minimizers and accumulates hits
-  - Scores per-read: max(forward_score, reverse_score)
-- `aggregate_batch()` - Aggregates paired-end reads into single score
+**Classification** (src/classify.rs):
+- `classify_batch_sharded_merge_join()` - Default classification using merge-join
+- `classify_batch_sharded_parallel_rg()` - Classification with parallel row group processing
+- `classify_with_sharded_negative()` - Classification with negative filtering
 
-**Index Building** (src/lib.rs:236-254):
-- `add_record()` - Add sequence to bucket (accumulates minimizers)
-- `finalize_bucket()` - Sort and deduplicate minimizers
-
-**Serialization** (src/lib.rs:282-389):
-- Custom binary format: "RYP5" magic + version 5
-- Stores K, w, salt, then buckets with names/sources/minimizers
-- Safe deserialization with MAX_BUCKET_SIZE, MAX_STRING_LENGTH, MAX_NUM_BUCKETS checks
+**Index Building** (src/indices/parquet/):
+- `create_parquet_inverted_index()` - Create Parquet index from BucketData
 
 ### C API (src/c_api.rs)
 
@@ -188,119 +177,42 @@ FFI layer exposing core functionality to C:
 Nested subcommands using clap:
 
 **`rype index`** - Index operations:
-- `create` - Build index from FASTA/FASTQ
+- `create` - Build Parquet index from FASTA/FASTQ
 - `stats` - Show index statistics
 - `bucket-source-detail` - Show source details for a specific bucket
-- `bucket-add` - Add sequences to existing index as new bucket
-- `bucket-merge` - Merge two buckets within an index
-- `merge` - Merge multiple indices into one
+- `bucket-add` - Add sequences to existing index as new bucket (development pending)
 - `from-config` - Build index from TOML configuration file
-- `shard` - Convert single-file index to sharded format
-- `invert` - Create inverted index (bucket-partitioned shards, 1:1 with main index)
+- `bucket-add-config` - Add files using TOML config (development pending)
+- `summarize` - Show detailed minimizer statistics
 
 **`rype classify`** - Classification operations:
-- `run` - Per-read classification (uses sharded inverted index when available)
-- `batch` - Batch classify (alias for run)
+- `run` - Per-read classification
 - `aggregate` - Aggregated classification for paired-end (alias: `agg`)
+
+**`rype inspect`** - Debugging operations:
+- `matches` - Show matching minimizers between queries and buckets (not supported with Parquet)
 
 ## Important Constants
 
 - `K ∈ {16, 32, 64}` - K-mer size (configurable per-index, always uses u64 representation)
-- `MAX_BUCKET_SIZE = 1_000_000_000` - DoS protection for index loading
-- `MAX_STRING_LENGTH = 10_000` - Max name/source string length
-- `MAX_NUM_BUCKETS = 100_000` - Max buckets per index
 - `MAX_SEQUENCE_LENGTH = 2_000_000_000` - Max sequence size for C API
 
 ## Critical Implementation Details
 
 ### K-mer Encoding
-The `base_to_bit()` function (src/lib.rs:49-52) uses unsafe lookup table for performance. Invalid bases return `u64::MAX` which triggers window reset.
+The `base_to_bit()` function uses unsafe lookup table for performance. Invalid bases return `u64::MAX` which triggers window reset.
 
 ### Canonical K-mers
 K-mers and their reverse complements are treated as equivalent. Reverse complement calculated via bitwise NOT: `!kmer` in RY-space.
 
 ### Parallel Processing
 Uses `rayon` for data parallelism:
-- `classify_batch()` parallelizes minimizer extraction AND bucket scoring
+- Classification parallelizes minimizer extraction AND bucket scoring
 - `map_init()` pattern provides per-thread workspace to avoid allocations
 
-### Index File Format (version 5)
-```
-HEADER (uncompressed):
-Magic: "RYP5" (4 bytes)
-Version: u32 (4 bytes) = 5
-K: u64 (8 bytes) - must be 16, 32, or 64
-W: u64 (8 bytes)
-Salt: u64 (8 bytes)
-Num Buckets: u32 (4 bytes)
+### Parquet Index Format
 
-METADATA (uncompressed, for each bucket in sorted ID order):
-  - Minimizer count: u64
-  - Bucket ID: u32
-  - Name length: u64, then UTF-8 bytes
-  - Source count: u64
-    - For each source: length (u64), UTF-8 bytes
-
-MINIMIZERS (zstd compressed stream with delta+varint encoding):
-  - For each bucket:
-    - First minimizer: u64 little-endian (8 bytes)
-    - Remaining minimizers: delta-encoded as LEB128 varints
-```
-
-This format achieves ~65% compression compared to raw storage by:
-1. Keeping metadata uncompressed for fast `load_metadata()`
-2. Delta encoding minimizers (exploits sorted order - consecutive values are close)
-3. Varint encoding deltas (most deltas fit in 4 bytes instead of 8)
-4. zstd compression on top of the delta+varint stream
-
-### Sharded Inverted Index
-
-Inverted indexes are stored as bucket-partitioned shards with 1:1 correspondence to main index shards:
-
-```
-index.ryxdi.manifest     # Manifest describing all shards
-index.ryxdi.shard.0      # Shard 0 (corresponds to main shard 0)
-index.ryxdi.shard.1      # Shard 1 (corresponds to main shard 1)
-...
-```
-
-For a single-file main index, the inverted index has 1 shard (index.ryxdi.manifest + index.ryxdi.shard.0).
-
-**Manifest Format (RYXM v3)**:
-```
-Magic: "RYXM" (4 bytes)
-Version: 3 (u32)
-k, w, salt, source_hash (u64 each)
-total_minimizers, total_bucket_ids (u64 each)
-has_overlapping_shards: u8 (always 1 for bucket-partitioned)
-num_shards (u32)
-For each shard: shard_id (u32), min_start (u64), min_end (u64), num_minimizers (u64), num_bucket_ids (u64)
-```
-
-**Shard Format (RYXS v1)**:
-Each shard is a complete inverted index for a subset of buckets. Uses delta+varint+zstd encoding with shard metadata in header.
-
-**Key Data Structures**:
-- `ShardManifest` - Describes shard layout and totals
-- `ShardInfo` - Per-shard metadata (ID, range, counts)
-- `ShardedInvertedIndex` - Handle that holds the manifest; shards loaded on-demand during classification
-
-**Usage**:
-```bash
-# Create inverted index (automatic 1:1 shard correspondence)
-cargo run --release -- index invert -i index.ryidx
-
-# Convert single-file to sharded main index, then create inverted
-cargo run --release -- index shard -i large.ryidx -o sharded.ryidx --max-shard-size 1G
-cargo run --release -- index invert -i sharded.ryidx
-
-# Classification with inverted index
-cargo run --release -- classify run -i index.ryidx --use-inverted -1 reads.fq
-```
-
-### Parquet Inverted Index (Direct Creation)
-
-For large indices, Parquet format can be created directly from reference sequences, bypassing the main index entirely:
+All indices use Parquet format stored as `.ryxdi` directories:
 
 ```
 index.ryxdi/
@@ -329,19 +241,10 @@ has_overlapping_shards = true  # Buckets may share minimizers across shards
 ```
 
 **Benefits**:
-- Direct creation bypasses intermediate main index (saves memory)
 - Parquet provides efficient columnar storage with DELTA_BINARY_PACKED encoding
 - Streaming k-way merge enables building large indices with bounded memory
 - Human-readable TOML manifest for easy inspection
-
-**Usage**:
-```bash
-# Create Parquet inverted index directly from references
-cargo run --release --features parquet -- index create -o index.ryxdi -r refs.fa --parquet
-
-# Classify using Parquet index (auto-detected by directory format)
-cargo run --release --features parquet -- classify run -i index.ryxdi -1 reads.fq --use-inverted
-```
+- Shards loaded on-demand during classification
 
 **Memory Benefits**:
 - Manifest loads instantly (no minimizer data)
@@ -352,14 +255,13 @@ cargo run --release --features parquet -- classify run -i index.ryxdi -1 reads.f
 ### Error Handling
 - Rust API: Uses `anyhow::Result<T>` for all fallible operations
 - C API: Returns NULL on error, call `rype_get_last_error()` for details
-- Safe loading: Validates version, enforces size limits, uses safe deserialization
+- Safe loading: Validates format, enforces size limits
 
 ## Memory Management Notes
 
 ### Rust Side
 - Workspace reuse pattern minimizes allocations (pass `&mut MinimizerWorkspace`)
-- Buckets store sorted, deduplicated minimizers (Vec<u64>)
-- Classification builds temporary inverted indices per batch
+- Shards loaded on-demand, not all at once
 
 ### C API Side
 - Index ownership transferred via `Box::into_raw()` / `Box::from_raw()`
@@ -369,10 +271,10 @@ cargo run --release --features parquet -- classify run -i index.ryxdi -1 reads.f
 
 ## Testing Strategy
 
-Existing tests in src/lib.rs cover:
+Existing tests cover:
 - Minimizer extraction correctness
-- Index save/load round-trips
-- Error paths (invalid format, oversized allocations, overflow)
+- Index creation and loading
+- Classification accuracy
 - C API validation logic
 
 When adding features:
@@ -383,16 +285,15 @@ When adding features:
 
 ## Performance Considerations
 
-- **Hot path**: `extract_into()`, `classify_batch()` - avoid allocations
+- **Hot path**: `extract_into()`, classification functions - avoid allocations
 - **Deque capacity**: Pre-sized to avoid reallocation during sliding window
-- **Binary search**: Buckets must be sorted for `binary_search()` correctness
 - **Parallelism**: Batch processing amortizes thread pool overhead
 - **Inverted index**: Reduces per-bucket work from O(queries × minimizers) to O(unique_minimizers)
+- **Row group filtering**: Bloom filters can reduce I/O by rejecting row groups early
 
 ## Common Pitfalls
 
-1. **Modifying buckets after finalization**: Must call `finalize_bucket()` after `add_record()` to ensure sorted/deduplicated minimizers
-2. **K-mer size**: K must be 16, 32, or 64. K is set at index creation and stored in the index file. All merged indices must have matching K values.
-3. **C API thread safety**: Don't share RypeResultArray across threads
-4. **Index compatibility**: Version mismatch between save/load will fail
-5. **Short sequences**: Sequences < K bases produce no minimizers
+1. **K-mer size**: K must be 16, 32, or 64. K is set at index creation and stored in the index.
+2. **C API thread safety**: Don't share RypeResultArray across threads
+3. **Index compatibility**: Indices with different k, w, or salt cannot be used together for negative filtering
+4. **Short sequences**: Sequences < K bases produce no minimizers

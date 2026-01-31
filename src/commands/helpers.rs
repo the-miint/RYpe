@@ -56,6 +56,29 @@ pub fn parse_bloom_fpp(s: &str) -> Result<f64, String> {
     Ok(fpp)
 }
 
+/// Validate the --trim-to argument.
+///
+/// - Must be a positive integer greater than 0
+/// - Values smaller than typical k-mer sizes (16) will produce a warning but are allowed
+pub fn validate_trim_to(s: &str) -> Result<usize, String> {
+    let val: usize = s
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid positive integer", s))?;
+    if val == 0 {
+        return Err("trim_to must be greater than 0".to_string());
+    }
+    // Warn about very small values that won't produce useful results
+    // (minimum k-mer size is 16, so anything less won't generate minimizers)
+    if val < 16 {
+        eprintln!(
+            "Warning: --trim-to {} is smaller than the minimum k-mer size (16). \
+             This will likely produce no classification results.",
+            val
+        );
+    }
+    Ok(val)
+}
+
 /// Sanitize bucket names by replacing nonprintable characters with "_"
 pub fn sanitize_bucket_name(name: &str) -> String {
     name.chars()
