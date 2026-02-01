@@ -22,41 +22,15 @@ use super::helpers::sanitize_bucket_name;
 
 /// Validate that all bucket names are unique.
 ///
+/// Accepts any iterator of bucket name references.
 /// Returns an error if duplicate bucket names are found, listing them all.
-fn validate_unique_bucket_names(buckets: &[rype::BucketData]) -> Result<()> {
+fn validate_unique_bucket_names<'a>(names: impl Iterator<Item = &'a str>) -> Result<()> {
     let mut seen: HashSet<&str> = HashSet::new();
     let mut duplicates: Vec<&str> = Vec::new();
 
-    for bucket in buckets {
-        if !seen.insert(&bucket.bucket_name) && !duplicates.contains(&bucket.bucket_name.as_str()) {
-            duplicates.push(&bucket.bucket_name);
-        }
-    }
-
-    if duplicates.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "Duplicate bucket names are not allowed. Found duplicates: {:?}\n\
-             Bucket names must be unique to avoid ambiguity in output formats.\n\
-             Consider using --separate-buckets or renaming sequences.",
-            duplicates
-        ))
-    }
-}
-
-/// Validate bucket name uniqueness directly from a HashMap.
-///
-/// More efficient than creating temporary BucketData objects.
-fn validate_unique_bucket_names_from_map(
-    bucket_names: &std::collections::HashMap<u32, String>,
-) -> Result<()> {
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut duplicates: Vec<&str> = Vec::new();
-
-    for name in bucket_names.values() {
-        if !seen.insert(name.as_str()) && !duplicates.contains(&name.as_str()) {
-            duplicates.push(name.as_str());
+    for name in names {
+        if !seen.insert(name) && !duplicates.contains(&name) {
+            duplicates.push(name);
         }
     }
 
@@ -171,7 +145,7 @@ pub fn create_parquet_index_from_refs(
     );
 
     // Validate bucket name uniqueness before creating index
-    validate_unique_bucket_names(&buckets)?;
+    validate_unique_bucket_names(buckets.iter().map(|b| b.bucket_name.as_str()))?;
 
     let manifest =
         create_parquet_inverted_index(output, buckets, k, w, salt, max_shard_bytes, options)?;
@@ -417,7 +391,7 @@ pub fn build_parquet_index_from_config(
     );
 
     // Validate bucket name uniqueness before creating index
-    validate_unique_bucket_names(&buckets)?;
+    validate_unique_bucket_names(buckets.iter().map(|b| b.bucket_name.as_str()))?;
 
     // Create parquet index
     let t_write = Instant::now();
@@ -659,7 +633,7 @@ pub fn build_parquet_index_from_config_streaming(
     log::info!("Created {} shards total", shard_infos.len());
 
     // Validate bucket name uniqueness directly from the map
-    validate_unique_bucket_names_from_map(&bucket_names_map)?;
+    validate_unique_bucket_names(bucket_names_map.values().map(|s| s.as_str()))?;
 
     // Write bucket metadata
     write_buckets_parquet(&output_path, &bucket_names_map, &bucket_sources_map)?;
@@ -1091,40 +1065,14 @@ output = "{}"
 
     #[test]
     fn test_validate_unique_bucket_names_accepts_unique_names() {
-        let buckets = vec![
-            BucketData {
-                bucket_id: 1,
-                bucket_name: "Bucket_A".to_string(),
-                sources: vec![],
-                minimizers: vec![],
-            },
-            BucketData {
-                bucket_id: 2,
-                bucket_name: "Bucket_B".to_string(),
-                sources: vec![],
-                minimizers: vec![],
-            },
-        ];
-        assert!(validate_unique_bucket_names(&buckets).is_ok());
+        let names = ["Bucket_A", "Bucket_B"];
+        assert!(validate_unique_bucket_names(names.iter().copied()).is_ok());
     }
 
     #[test]
     fn test_validate_unique_bucket_names_rejects_duplicates() {
-        let buckets = vec![
-            BucketData {
-                bucket_id: 1,
-                bucket_name: "Duplicate".to_string(),
-                sources: vec![],
-                minimizers: vec![],
-            },
-            BucketData {
-                bucket_id: 2,
-                bucket_name: "Duplicate".to_string(),
-                sources: vec![],
-                minimizers: vec![],
-            },
-        ];
-        let result = validate_unique_bucket_names(&buckets);
+        let names = ["Duplicate", "Duplicate"];
+        let result = validate_unique_bucket_names(names.iter().copied());
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Duplicate"));
@@ -1132,8 +1080,8 @@ output = "{}"
 
     #[test]
     fn test_validate_unique_bucket_names_empty_list() {
-        let buckets: Vec<BucketData> = vec![];
-        assert!(validate_unique_bucket_names(&buckets).is_ok());
+        let names: [&str; 0] = [];
+        assert!(validate_unique_bucket_names(names.iter().copied()).is_ok());
     }
 
     // ============================================================================
