@@ -223,7 +223,6 @@ fn extract_bucket_minimizers(
     let mut bucket_mins: Vec<u64> = Vec::new(); // Kept sorted and deduped via merge_sorted_into
     let mut sources: Vec<String> = Vec::new();
     let mut is_first_sequence = true;
-    let mut sample_buffer: Vec<u64> = Vec::new(); // Reusable buffer for orientation sampling
 
     for file_path in files {
         let abs_path = resolve_path(config_dir, file_path);
@@ -257,8 +256,7 @@ fn extract_bucket_minimizers(
                 fwd.sort_unstable();
                 rc.sort_unstable();
 
-                let (orientation, _overlap) =
-                    choose_orientation_sampled(&bucket_mins, &fwd, &rc, &mut sample_buffer);
+                let (orientation, _overlap) = choose_orientation_sampled(&bucket_mins, &fwd, &rc);
 
                 let chosen = match orientation {
                     Orientation::Forward => fwd,

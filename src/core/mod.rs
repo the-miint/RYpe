@@ -22,6 +22,9 @@ pub use workspace::MinimizerWorkspace;
 
 // Re-export orientation items
 pub use orientation::{
-    choose_orientation, choose_orientation_sampled, gallop_for_each, merge_sorted_into,
-    Orientation, ORIENTATION_SAMPLE_SIZE,
+    choose_orientation, choose_orientation_sampled, merge_sorted_into, Orientation,
+    ORIENTATION_FIRST_N,
 };
+
+// Internal-only exports for crate use
+pub(crate) use orientation::gallop_for_each;

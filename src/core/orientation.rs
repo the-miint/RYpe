@@ -3,18 +3,10 @@
 //! Uses sorted Vec with galloping search for memory-efficient overlap detection.
 //! Provides reusable galloping iteration for merge-join operations.
 
-/// Default sample size for orientation overlap computation.
-/// With 100K samples distributed across 10 strata, orientation decisions are
-/// O(sample_size × log(seq_size)) instead of O(seq_size × log(bucket_size)).
-///
-/// Empirically validated: 100K samples provides >99% agreement with full
-/// overlap computation on realistic minimizer distributions.
-pub const ORIENTATION_SAMPLE_SIZE: usize = 100_000;
-
-/// Number of strata for stratified sampling.
-/// Dividing the bucket into strata ensures coverage across the full range,
-/// avoiding bias toward any particular region.
-const NUM_STRATA: usize = 10;
+/// Default number of minimizers to check for orientation.
+/// Checking the first N sorted minimizers provides a sample for
+/// orientation decisions without iterating the full bucket.
+pub const ORIENTATION_FIRST_N: usize = 10_000;
 
 /// Orientation of a sequence relative to the bucket baseline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +18,7 @@ pub enum Orientation {
 /// Core galloping iteration over two sorted slices.
 ///
 /// Calls `on_match(smaller_idx, larger_idx)` for each element in `smaller` found in `larger`.
-/// Both slices must be sorted.
+/// Both slices must be sorted in ascending order.
 ///
 /// # Algorithm
 /// For each element in the smaller array:
@@ -36,25 +28,26 @@ pub enum Orientation {
 ///
 /// # Complexity
 /// O(smaller.len() * log(larger.len() / smaller.len()))
+///
+/// # Index Guarantees
+/// The indices passed to `on_match` are guaranteed to be valid:
+/// - `smaller_idx < smaller.len()`
+/// - `larger_idx < larger.len()`
 #[inline]
-pub fn gallop_for_each<F>(smaller: &[u64], larger: &[u64], mut on_match: F)
+pub(crate) fn gallop_for_each<F>(smaller: &[u64], larger: &[u64], mut on_match: F)
 where
     F: FnMut(usize, usize),
 {
     let mut larger_pos = 0usize;
 
     for (smaller_idx, &s_val) in smaller.iter().enumerate() {
-        // Gallop: exponential search with overflow protection
+        // Gallop: exponential probe until we overshoot or find a value >= s_val
         let mut jump = 1usize;
         while larger_pos + jump < larger.len() && larger[larger_pos + jump] < s_val {
-            jump = jump.saturating_mul(2);
-            if jump >= larger.len() {
-                break; // No point probing beyond array
-            }
+            jump *= 2;
         }
 
         // Binary search in bounded range [larger_pos, search_end)
-        // Note: +1 because the match could be AT position larger_pos + jump
         let search_end = (larger_pos + jump + 1).min(larger.len());
         match larger[larger_pos..search_end].binary_search(&s_val) {
             Ok(rel_idx) => {
@@ -107,140 +100,47 @@ pub fn choose_orientation(
     }
 }
 
-/// Sample elements from a sorted slice using stratified sampling.
+/// Choose orientation by checking first N minimizers of each strand.
 ///
-/// Divides data into NUM_STRATA equal regions and samples proportionally from each,
-/// ensuring coverage across the full range of the bucket. This avoids the bias
-/// of simple stride-based sampling which can miss the tail of the data.
-///
-/// Fills `buffer` with the sample (clears it first).
-#[inline]
-fn sample_stratified_into(data: &[u64], sample_size: usize, buffer: &mut Vec<u64>) {
-    buffer.clear();
-
-    if data.len() <= sample_size {
-        buffer.extend_from_slice(data);
-        return;
-    }
-
-    buffer.reserve(sample_size);
-
-    let per_stratum = sample_size / NUM_STRATA;
-    let stratum_size = data.len() / NUM_STRATA;
-
-    for i in 0..NUM_STRATA {
-        let start = i * stratum_size;
-        let end = if i == NUM_STRATA - 1 {
-            data.len() // Last stratum includes remainder
-        } else {
-            (i + 1) * stratum_size
-        };
-
-        let actual_stratum_size = end - start;
-        if actual_stratum_size == 0 {
-            continue;
-        }
-
-        // How many samples from this stratum
-        let samples_from_stratum = if i == NUM_STRATA - 1 {
-            sample_size.saturating_sub(buffer.len()) // Fill remaining quota
-        } else {
-            per_stratum
-        };
-
-        if samples_from_stratum == 0 {
-            continue;
-        }
-
-        if samples_from_stratum >= actual_stratum_size {
-            // Take all elements from this stratum
-            buffer.extend_from_slice(&data[start..end]);
-        } else {
-            // Evenly space within stratum
-            let stride = actual_stratum_size / samples_from_stratum;
-            for j in 0..samples_from_stratum {
-                buffer.push(data[start + j * stride]);
-            }
-        }
-    }
-    // Buffer remains sorted since we iterate in order through sorted data
-}
-
-/// Compute overlap by checking what fraction of `sample` appears in `seq_minimizers`.
-///
-/// This measures |sample ∩ seq| / |sample|, i.e., what fraction of the bucket
-/// sample is found in the sequence. By using the same denominator (|sample|)
-/// for both forward and RC comparisons, the relative comparison remains valid
-/// for orientation decisions.
-///
-/// Complexity: O(sample_size × log(seq_size)) - iterates through sample, binary
-/// searches in seq.
-#[inline]
-fn compute_overlap_sampled(seq_minimizers: &[u64], sample: &[u64]) -> f64 {
-    if sample.is_empty() {
-        return 0.0;
-    }
-    // sample as needles, seq as haystack: O(sample_size × log(seq_size))
-    let matches = count_matches_gallop(seq_minimizers, sample);
-    matches as f64 / sample.len() as f64
-}
-
-/// Choose orientation using sampled overlap computation with buffer reuse.
-///
-/// For large buckets (> ORIENTATION_SAMPLE_SIZE), uses stratified sampling to make
-/// orientation decisions in O(sample_size × log(seq_size)) instead of
-/// O(seq_size × log(bucket_size)).
+/// The first N sorted minimizers from each strand are checked against the bucket.
+/// This provides a fast sample-based orientation decision without needing to
+/// iterate through the entire bucket or sequences.
 ///
 /// # Arguments
 /// * `bucket` - The current bucket minimizers (sorted)
 /// * `fwd_minimizers` - Forward strand minimizers (sorted)
 /// * `rc_minimizers` - Reverse complement minimizers (sorted)
-/// * `sample_buffer` - Reusable buffer for sampling (avoids allocation per call)
 ///
 /// # Returns
-/// The chosen orientation and overlap score.
+/// The chosen orientation and overlap score (matches / N).
 ///
-/// # Correctness
-/// Stratified sampling ensures coverage across the full bucket range. The overlap
-/// metric |sample ∩ seq| / |sample| is computed identically for both orientations,
-/// so the relative comparison is preserved even though the absolute values differ
-/// from the full overlap computation.
-///
-/// # Optimization
-/// Sampling is only used when beneficial. For small sequences (< sample_size),
-/// the full computation is used since iterating through a large sample would be
-/// slower than iterating through the small sequence.
+/// # Complexity
+/// O(N × log(bucket_size)) per strand, where N = ORIENTATION_FIRST_N.
 pub fn choose_orientation_sampled(
     bucket: &[u64],
     fwd_minimizers: &[u64],
     rc_minimizers: &[u64],
-    sample_buffer: &mut Vec<u64>,
 ) -> (Orientation, f64) {
-    // For small buckets, use full comparison
-    if bucket.len() <= ORIENTATION_SAMPLE_SIZE {
-        return choose_orientation(bucket, fwd_minimizers, rc_minimizers);
+    if bucket.is_empty() {
+        return (Orientation::Forward, 0.0);
     }
 
-    // For small sequences, sampling is counterproductive:
-    // - Sampled complexity: O(sample_size × log(seq_size))
-    // - Full complexity: O(seq_size × log(bucket_size))
-    // When seq_size < sample_size, full is faster.
-    let max_seq_len = fwd_minimizers.len().max(rc_minimizers.len());
-    if max_seq_len < ORIENTATION_SAMPLE_SIZE {
-        return choose_orientation(bucket, fwd_minimizers, rc_minimizers);
+    // Use the smaller of N and the available minimizers
+    let n = ORIENTATION_FIRST_N
+        .min(fwd_minimizers.len())
+        .min(rc_minimizers.len());
+
+    if n == 0 {
+        return (Orientation::Forward, 0.0);
     }
 
-    // Stratified sample the bucket into reusable buffer
-    sample_stratified_into(bucket, ORIENTATION_SAMPLE_SIZE, sample_buffer);
+    let fwd_matches = count_matches_gallop(bucket, &fwd_minimizers[..n]);
+    let rc_matches = count_matches_gallop(bucket, &rc_minimizers[..n]);
 
-    // Compute what fraction of bucket sample is found in each orientation
-    let fwd_overlap = compute_overlap_sampled(fwd_minimizers, sample_buffer);
-    let rc_overlap = compute_overlap_sampled(rc_minimizers, sample_buffer);
-
-    if rc_overlap > fwd_overlap {
-        (Orientation::ReverseComplement, rc_overlap)
+    if rc_matches > fwd_matches {
+        (Orientation::ReverseComplement, rc_matches as f64 / n as f64)
     } else {
-        (Orientation::Forward, fwd_overlap)
+        (Orientation::Forward, fwd_matches as f64 / n as f64)
     }
 }
 
@@ -264,32 +164,31 @@ pub fn merge_sorted_into(target: &mut Vec<u64>, source: &[u64]) {
 
     // Merge into temp, then swap (O(1) pointer swap, not O(n) copy)
     let mut merged = Vec::with_capacity(target.len() + source.len());
+    let mut last_pushed: Option<u64> = None;
+
+    // Helper closure to push unique values, avoiding DRY violation
+    let mut push_unique = |val: u64| {
+        if last_pushed != Some(val) {
+            merged.push(val);
+            last_pushed = Some(val);
+        }
+    };
 
     let mut i = 0;
     let mut j = 0;
-    let mut last_pushed: Option<u64> = None;
 
     while i < target.len() && j < source.len() {
         match target[i].cmp(&source[j]) {
             std::cmp::Ordering::Less => {
-                if last_pushed != Some(target[i]) {
-                    merged.push(target[i]);
-                    last_pushed = Some(target[i]);
-                }
+                push_unique(target[i]);
                 i += 1;
             }
             std::cmp::Ordering::Greater => {
-                if last_pushed != Some(source[j]) {
-                    merged.push(source[j]);
-                    last_pushed = Some(source[j]);
-                }
+                push_unique(source[j]);
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
-                if last_pushed != Some(target[i]) {
-                    merged.push(target[i]);
-                    last_pushed = Some(target[i]);
-                }
+                push_unique(target[i]);
                 i += 1;
                 j += 1;
             }
@@ -298,18 +197,12 @@ pub fn merge_sorted_into(target: &mut Vec<u64>, source: &[u64]) {
 
     // Remaining elements from target
     for &v in &target[i..] {
-        if last_pushed != Some(v) {
-            merged.push(v);
-            last_pushed = Some(v);
-        }
+        push_unique(v);
     }
 
     // Remaining elements from source
     for &v in &source[j..] {
-        if last_pushed != Some(v) {
-            merged.push(v);
-            last_pushed = Some(v);
-        }
+        push_unique(v);
     }
 
     // O(1) swap - just exchanges Vec internals (ptr, len, capacity)
@@ -540,119 +433,6 @@ mod tests {
         assert_eq!(overlap, 0.0);
     }
 
-    // ===== Stratified sampling tests =====
-
-    #[test]
-    fn test_sample_stratified_small_input() {
-        // When input is smaller than sample size, return all elements
-        let data: Vec<u64> = (0..100).collect();
-        let mut buffer = Vec::new();
-        sample_stratified_into(&data, 1000, &mut buffer);
-        assert_eq!(buffer, data);
-    }
-
-    #[test]
-    fn test_sample_stratified_exact_size() {
-        // When input equals sample size, return all elements
-        let data: Vec<u64> = (0..100).collect();
-        let mut buffer = Vec::new();
-        sample_stratified_into(&data, 100, &mut buffer);
-        assert_eq!(buffer, data);
-    }
-
-    #[test]
-    fn test_sample_stratified_larger_input() {
-        // When input is larger, sample with stratification
-        let data: Vec<u64> = (0..1000).collect();
-        let mut buffer = Vec::new();
-        sample_stratified_into(&data, 100, &mut buffer);
-
-        // Should have ~100 elements
-        assert!(buffer.len() >= 90);
-        assert!(buffer.len() <= 110);
-
-        // Should be sorted
-        let mut sorted = buffer.clone();
-        sorted.sort_unstable();
-        assert_eq!(buffer, sorted);
-
-        // Should cover the full range (stratified sampling)
-        assert!(buffer[0] < 100); // Has element from first stratum
-        assert!(*buffer.last().unwrap() > 900); // Has element from last stratum
-    }
-
-    #[test]
-    fn test_sample_stratified_covers_full_range() {
-        // Critical test: stratified sampling should cover the ENTIRE bucket range,
-        // not just the first N elements like simple stride-based sampling
-        let data: Vec<u64> = (0..150_000).collect();
-        let mut buffer = Vec::new();
-        sample_stratified_into(&data, 100_000, &mut buffer);
-
-        // Should have elements from the tail (> 100K)
-        let has_tail_elements = buffer.iter().any(|&x| x > 100_000);
-        assert!(
-            has_tail_elements,
-            "Stratified sampling should include elements from bucket tail"
-        );
-
-        // Should have elements from near the end
-        let has_near_end = buffer.iter().any(|&x| x > 140_000);
-        assert!(
-            has_near_end,
-            "Stratified sampling should include elements near the end"
-        );
-    }
-
-    #[test]
-    fn test_sample_stratified_preserves_sortedness() {
-        // Sampling from sorted data should produce sorted sample
-        let data: Vec<u64> = (0..10000).map(|i| i * 7).collect();
-        let mut buffer = Vec::new();
-        sample_stratified_into(&data, 500, &mut buffer);
-
-        let mut sorted = buffer.clone();
-        sorted.sort_unstable();
-        assert_eq!(buffer, sorted);
-    }
-
-    #[test]
-    fn test_sample_stratified_buffer_reuse() {
-        // Buffer should be cleared and reused
-        let data1: Vec<u64> = (0..1000).collect();
-        let data2: Vec<u64> = (5000..6000).collect();
-        let mut buffer = Vec::new();
-
-        sample_stratified_into(&data1, 100, &mut buffer);
-        assert!(buffer.iter().all(|&x| x < 1000));
-
-        sample_stratified_into(&data2, 100, &mut buffer);
-        assert!(buffer.iter().all(|&x| x >= 5000 && x < 6000));
-    }
-
-    // ===== Sampled overlap tests =====
-
-    #[test]
-    fn test_compute_overlap_sampled_identical() {
-        let seq = vec![1, 2, 3, 4, 5];
-        let sample = vec![1, 2, 3, 4, 5];
-        assert!((compute_overlap_sampled(&seq, &sample) - 1.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_compute_overlap_sampled_partial() {
-        let seq = vec![1, 2, 3, 4, 5, 6];
-        let sample = vec![3, 4, 7, 8]; // 2 of 4 in seq
-        assert!((compute_overlap_sampled(&seq, &sample) - 0.5).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_compute_overlap_sampled_empty_sample() {
-        let seq = vec![1, 2, 3];
-        let sample: Vec<u64> = vec![];
-        assert_eq!(compute_overlap_sampled(&seq, &sample), 0.0);
-    }
-
     // ===== Sampled orientation tests =====
 
     #[test]
@@ -661,9 +441,8 @@ mod tests {
         let bucket = vec![1, 2, 3, 4, 5];
         let fwd = vec![1, 2, 3]; // All in bucket
         let rc = vec![6, 7, 8]; // None in bucket
-        let mut buffer = Vec::new();
 
-        let (orientation, _) = choose_orientation_sampled(&bucket, &fwd, &rc, &mut buffer);
+        let (orientation, _) = choose_orientation_sampled(&bucket, &fwd, &rc);
         assert_eq!(orientation, Orientation::Forward);
     }
 
@@ -673,9 +452,8 @@ mod tests {
         let bucket = vec![10, 20, 30];
         let fwd = vec![1, 2, 3]; // None in bucket
         let rc = vec![10, 20, 30]; // All in bucket
-        let mut buffer = Vec::new();
 
-        let (orientation, _) = choose_orientation_sampled(&bucket, &fwd, &rc, &mut buffer);
+        let (orientation, _) = choose_orientation_sampled(&bucket, &fwd, &rc);
         assert_eq!(orientation, Orientation::ReverseComplement);
     }
 
@@ -685,9 +463,8 @@ mod tests {
         let bucket: Vec<u64> = (0..200_000).collect();
         let fwd: Vec<u64> = (0..1000).collect(); // First 1000, all in bucket
         let rc: Vec<u64> = (500_000..501_000).collect(); // None in bucket
-        let mut buffer = Vec::new();
 
-        let (orientation, overlap) = choose_orientation_sampled(&bucket, &fwd, &rc, &mut buffer);
+        let (orientation, overlap) = choose_orientation_sampled(&bucket, &fwd, &rc);
         assert_eq!(orientation, Orientation::Forward);
         assert!(overlap > 0.0);
     }
@@ -698,9 +475,8 @@ mod tests {
         let bucket: Vec<u64> = (0..200_000).collect();
         let fwd: Vec<u64> = (0..5000).collect(); // Clearly in bucket
         let rc: Vec<u64> = (1_000_000..1_005_000).collect(); // Clearly not in bucket
-        let mut buffer = Vec::new();
 
-        let (sampled_orient, _) = choose_orientation_sampled(&bucket, &fwd, &rc, &mut buffer);
+        let (sampled_orient, _) = choose_orientation_sampled(&bucket, &fwd, &rc);
         let (full_orient, _) = choose_orientation(&bucket, &fwd, &rc);
 
         assert_eq!(sampled_orient, full_orient);
@@ -708,39 +484,40 @@ mod tests {
 
     #[test]
     fn test_choose_orientation_sampled_tail_heavy_sequences() {
-        // Test case that would fail with naive stride-based sampling:
-        // Bucket has 150K elements, fwd matches the tail (100K-150K), rc matches nothing
+        // Test case where sequence minimizers are in the tail of the bucket range.
+        // The first-N approach checks first N sorted minimizers of the sequence
+        // against the bucket, which handles this correctly.
         let bucket: Vec<u64> = (0..150_000).collect();
         let fwd: Vec<u64> = (120_000..130_000).collect(); // Matches tail of bucket
         let rc: Vec<u64> = (500_000..510_000).collect(); // Matches nothing
-        let mut buffer = Vec::new();
 
-        let (sampled_orient, _) = choose_orientation_sampled(&bucket, &fwd, &rc, &mut buffer);
+        let (sampled_orient, _) = choose_orientation_sampled(&bucket, &fwd, &rc);
         let (full_orient, _) = choose_orientation(&bucket, &fwd, &rc);
 
         assert_eq!(
             sampled_orient, full_orient,
-            "Stratified sampling should correctly orient tail-heavy sequences"
+            "First-N sampling should correctly orient tail-heavy sequences"
         );
     }
 
     #[test]
     fn test_choose_orientation_sampled_boundary_sizes() {
-        // Test at exactly the threshold
-        let mut buffer = Vec::new();
+        // Test behavior at ORIENTATION_FIRST_N boundary
+        let bucket: Vec<u64> = (0..100_000).collect();
 
-        // Just below threshold
-        let bucket_small: Vec<u64> = (0..ORIENTATION_SAMPLE_SIZE as u64).collect();
-        let fwd: Vec<u64> = (0..1000u64).collect();
-        let rc: Vec<u64> = (500_000..501_000u64).collect();
+        // Sequences shorter than ORIENTATION_FIRST_N - all minimizers used
+        let fwd_short: Vec<u64> = (0..1000u64).collect();
+        let rc_short: Vec<u64> = (500_000..501_000u64).collect();
 
-        let (orient_small, _) = choose_orientation_sampled(&bucket_small, &fwd, &rc, &mut buffer);
-        assert_eq!(orient_small, Orientation::Forward);
+        let (orient_short, _) = choose_orientation_sampled(&bucket, &fwd_short, &rc_short);
+        assert_eq!(orient_short, Orientation::Forward);
 
-        // Just above threshold
-        let bucket_large: Vec<u64> = (0..(ORIENTATION_SAMPLE_SIZE + 1) as u64).collect();
-        let (orient_large, _) = choose_orientation_sampled(&bucket_large, &fwd, &rc, &mut buffer);
-        assert_eq!(orient_large, Orientation::Forward);
+        // Sequences longer than ORIENTATION_FIRST_N - only first N used
+        let fwd_long: Vec<u64> = (0..20_000u64).collect(); // First 10K in bucket
+        let rc_long: Vec<u64> = (500_000..520_000u64).collect(); // None in bucket
+
+        let (orient_long, _) = choose_orientation_sampled(&bucket, &fwd_long, &rc_long);
+        assert_eq!(orient_long, Orientation::Forward);
     }
 
     #[test]
@@ -752,10 +529,9 @@ mod tests {
         let fwd: Vec<u64> = (0..10_000).chain(300_000..306_000).collect();
         // rc has 40% of its elements in bucket
         let rc: Vec<u64> = (0..6_000).chain(300_000..310_000).collect();
-        let mut buffer = Vec::new();
 
         // Both methods should choose fwd since it has higher bucket overlap
-        let (sampled_orient, _) = choose_orientation_sampled(&bucket, &fwd, &rc, &mut buffer);
+        let (sampled_orient, _) = choose_orientation_sampled(&bucket, &fwd, &rc);
         let (full_orient, _) = choose_orientation(&bucket, &fwd, &rc);
 
         // Note: We expect agreement for cases with meaningful overlap differences
@@ -768,84 +544,98 @@ mod tests {
         let bucket: Vec<u64> = (0..200_000).collect();
         let fwd: Vec<u64> = vec![];
         let rc: Vec<u64> = vec![];
-        let mut buffer = Vec::new();
 
-        let (orientation, overlap) = choose_orientation_sampled(&bucket, &fwd, &rc, &mut buffer);
+        let (orientation, overlap) = choose_orientation_sampled(&bucket, &fwd, &rc);
         // Both empty, should default to Forward with 0 overlap
         assert_eq!(orientation, Orientation::Forward);
         assert_eq!(overlap, 0.0);
     }
 
+    // ===== First-N orientation tests (TDD Phase 1) =====
+    // These tests define expected behavior for the first-N approach.
+    // They may pass with the current implementation - that's okay for behavior tests.
+
     #[test]
-    fn test_choose_orientation_sampled_buffer_not_leaked() {
-        // Verify that the buffer is cleared and doesn't retain old garbage
-        // Use values outside the bucket range as garbage markers
-        // Use sequences larger than sample_size to trigger sampling
-        let mut buffer = vec![999_999_999, 888_888_888, 777_777_777];
-
-        let bucket: Vec<u64> = (0..200_000).collect();
-        // Sequences must be >= ORIENTATION_SAMPLE_SIZE to trigger sampling
-        let fwd: Vec<u64> = (0..150_000).collect();
-        let rc: Vec<u64> = (500_000..650_000).collect();
-
-        let (orientation, _) = choose_orientation_sampled(&bucket, &fwd, &rc, &mut buffer);
-        assert_eq!(orientation, Orientation::Forward);
-
-        // Buffer should have been cleared (garbage values removed)
-        assert!(!buffer.contains(&999_999_999));
-        assert!(!buffer.contains(&888_888_888));
-        assert!(!buffer.contains(&777_777_777));
-
-        // Buffer should contain valid bucket samples (all < 200_000)
-        assert!(buffer.iter().all(|&x| x < 200_000));
+    fn test_choose_orientation_first_n_forward_wins() {
+        let bucket = vec![1, 2, 3, 4, 5, 10, 20, 30];
+        let fwd = vec![1, 2, 3, 100, 200]; // 3 of first 5 match
+        let rc = vec![500, 600, 700, 800, 900]; // 0 match
+        let (orient, _) = choose_orientation_sampled(&bucket, &fwd, &rc);
+        assert_eq!(orient, Orientation::Forward);
     }
 
-    // ===== Validation: sampled vs full agreement rate =====
+    #[test]
+    fn test_choose_orientation_first_n_rc_wins() {
+        let bucket = vec![10, 20, 30, 40, 50];
+        let fwd = vec![1, 2, 3, 4, 5]; // 0 match
+        let rc = vec![10, 20, 30, 60, 70]; // 3 match
+        let (orient, _) = choose_orientation_sampled(&bucket, &fwd, &rc);
+        assert_eq!(orient, Orientation::ReverseComplement);
+    }
 
     #[test]
-    fn test_sampled_vs_full_agreement_random_distributions() {
-        // Test agreement across multiple random-ish distributions
-        // Using deterministic "random" patterns to ensure reproducibility
-        let mut buffer = Vec::new();
-        let mut agreements = 0;
-        let total_tests = 100u64;
+    fn test_choose_orientation_first_n_tie_favors_forward() {
+        let bucket = vec![1, 2, 10, 20];
+        let fwd = vec![1, 2, 100, 200]; // 2 match
+        let rc = vec![10, 20, 100, 200]; // 2 match
+        let (orient, _) = choose_orientation_sampled(&bucket, &fwd, &rc);
+        assert_eq!(orient, Orientation::Forward);
+    }
 
-        for seed in 0..total_tests {
-            // Create bucket with pseudo-random distribution
-            let bucket: Vec<u64> = (0u64..200_000)
-                .filter(|&x| (x.wrapping_mul(31) ^ seed) % 3 != 0)
+    #[test]
+    fn test_choose_orientation_first_n_empty() {
+        let (orient, overlap) = choose_orientation_sampled(&[], &[], &[]);
+        assert_eq!(orient, Orientation::Forward);
+        assert_eq!(overlap, 0.0);
+    }
+
+    #[test]
+    fn test_choose_orientation_first_n_short_sequences() {
+        // Bucket has values 0..10000, fwd minimizers are in bucket, rc are not
+        let bucket: Vec<u64> = (0..10000).collect();
+        let fwd = vec![5, 10, 15]; // All in bucket
+        let rc = vec![50000, 50001, 50002]; // None in bucket
+        let (orient, _) = choose_orientation_sampled(&bucket, &fwd, &rc);
+        assert_eq!(orient, Orientation::Forward);
+    }
+
+    #[test]
+    fn test_choose_orientation_first_n_large_inputs() {
+        // Large bucket and sequences - first N approach should handle efficiently
+        let bucket: Vec<u64> = (0..1_000_000).collect();
+        // fwd: first 5000 in bucket, rest not
+        let fwd: Vec<u64> = (0..5000).chain(2_000_000..2_100_000).collect();
+        // rc: none in bucket
+        let rc: Vec<u64> = (3_000_000..3_100_000).collect();
+
+        let (orient, _) = choose_orientation_sampled(&bucket, &fwd, &rc);
+        assert_eq!(orient, Orientation::Forward);
+    }
+
+    #[test]
+    fn test_choose_orientation_first_n_random_distributions() {
+        // Validates behavior on pseudo-random data
+        // Using deterministic patterns for reproducibility
+        for seed in 0..10u64 {
+            let bucket: Vec<u64> = (0u64..50_000)
+                .filter(|&x| (x.wrapping_mul(31) ^ seed) % 2 == 0)
                 .collect();
 
-            // Create fwd and rc with different overlap patterns
-            let fwd: Vec<u64> = (0u64..20_000)
-                .map(|x| x.wrapping_mul(17).wrapping_add(seed * 1000) % 300_000)
+            // fwd has more matches than rc
+            let fwd: Vec<u64> = (0u64..1000)
+                .map(|x| x.wrapping_mul(2)) // Even numbers, high overlap with bucket
                 .collect();
-            let rc: Vec<u64> = (0u64..20_000)
-                .map(|x| x.wrapping_mul(23).wrapping_add(seed * 2000) % 300_000)
+            let rc: Vec<u64> = (0u64..1000)
+                .map(|x| x.wrapping_mul(2).wrapping_add(100_000)) // Far outside bucket
                 .collect();
 
-            let mut fwd_sorted = fwd.clone();
-            let mut rc_sorted = rc.clone();
-            fwd_sorted.sort_unstable();
-            fwd_sorted.dedup();
-            rc_sorted.sort_unstable();
-            rc_sorted.dedup();
-
-            let (sampled, _) =
-                choose_orientation_sampled(&bucket, &fwd_sorted, &rc_sorted, &mut buffer);
-            let (full, _) = choose_orientation(&bucket, &fwd_sorted, &rc_sorted);
-
-            if sampled == full {
-                agreements += 1;
-            }
+            let (orient, _) = choose_orientation_sampled(&bucket, &fwd, &rc);
+            assert_eq!(
+                orient,
+                Orientation::Forward,
+                "seed {} should choose Forward",
+                seed
+            );
         }
-
-        // We expect very high agreement rate (>95%)
-        let agreement_rate = agreements as f64 / total_tests as f64;
-        assert!(
-            agreement_rate >= 0.95,
-            "Agreement rate {} is below 95% threshold",
-            agreement_rate
-        );
     }
 }

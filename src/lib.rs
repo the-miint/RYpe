@@ -89,7 +89,7 @@ pub use core::{
 // Orientation utilities (for bucket building)
 pub use core::{
     choose_orientation, choose_orientation_sampled, merge_sorted_into, Orientation,
-    ORIENTATION_SAMPLE_SIZE,
+    ORIENTATION_FIRST_N,
 };
 
 // Constants
