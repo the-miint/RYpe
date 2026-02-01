@@ -50,20 +50,6 @@ impl<T, const N: usize> RingBuffer<T, N> {
         }
     }
 
-    /// Returns true if the buffer is empty.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Returns the number of elements in the buffer.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
     /// Clears all elements from the buffer.
     #[inline]
     pub fn clear(&mut self) {
@@ -164,10 +150,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_is_empty() {
+    fn test_new_buffer_is_empty() {
         let buf: RingBuffer<i32, 8> = RingBuffer::new();
-        assert!(buf.is_empty());
-        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.front(), None);
+        assert_eq!(buf.back(), None);
     }
 
     #[test]
@@ -176,7 +162,6 @@ mod tests {
         buf.push_back(1);
         buf.push_back(2);
         buf.push_back(3);
-        assert_eq!(buf.len(), 3);
         assert_eq!(buf.front(), Some(&1));
         assert_eq!(buf.back(), Some(&3));
     }
@@ -190,7 +175,6 @@ mod tests {
         assert_eq!(buf.pop_front(), Some(1));
         assert_eq!(buf.pop_front(), Some(2));
         assert_eq!(buf.front(), Some(&3));
-        assert_eq!(buf.len(), 1);
     }
 
     #[test]
@@ -202,7 +186,6 @@ mod tests {
         assert_eq!(buf.pop_back(), Some(3));
         assert_eq!(buf.pop_back(), Some(2));
         assert_eq!(buf.back(), Some(&1));
-        assert_eq!(buf.len(), 1);
     }
 
     #[test]
@@ -211,8 +194,8 @@ mod tests {
         buf.push_back(1);
         buf.push_back(2);
         buf.clear();
-        assert!(buf.is_empty());
         assert_eq!(buf.front(), None);
+        assert_eq!(buf.back(), None);
     }
 
     #[test]
@@ -230,7 +213,7 @@ mod tests {
         assert_eq!(buf.pop_front(), Some(3));
         assert_eq!(buf.pop_front(), Some(4));
         assert_eq!(buf.pop_front(), Some(5));
-        assert!(buf.is_empty());
+        assert_eq!(buf.front(), None);
     }
 
     #[test]
@@ -242,7 +225,7 @@ mod tests {
         assert_eq!(buf.front(), Some(&(0, 12345)));
         assert_eq!(buf.back(), Some(&(1, 67890)));
         assert_eq!(buf.pop_front(), Some((0, 12345)));
-        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.front(), Some(&(1, 67890)));
     }
 
     #[test]

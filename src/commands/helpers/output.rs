@@ -255,15 +255,6 @@ impl OutputWriter {
         }
     }
 
-    /// Returns true if this writer outputs to Parquet format.
-    #[allow(dead_code)]
-    pub fn is_parquet(&self) -> bool {
-        matches!(
-            self,
-            OutputWriter::Parquet { .. } | OutputWriter::ParquetWide { .. }
-        )
-    }
-
     /// Write TSV header (no-op for Parquet).
     pub fn write_header(&mut self, header: &[u8]) -> Result<()> {
         match self {
@@ -717,19 +708,6 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.err().unwrap().to_string();
         assert!(err_msg.contains("file path"), "Error was: {}", err_msg);
-    }
-
-    #[test]
-    fn test_output_writer_is_parquet() {
-        let tmp = NamedTempFile::with_suffix(".parquet").unwrap();
-        let path = tmp.path().to_path_buf();
-        let writer = OutputWriter::new(OutputFormat::Parquet, Some(&path), None).unwrap();
-        assert!(writer.is_parquet());
-
-        let tmp2 = NamedTempFile::with_suffix(".tsv").unwrap();
-        let path2 = tmp2.path().to_path_buf();
-        let writer2 = OutputWriter::new(OutputFormat::Tsv, Some(&path2), None).unwrap();
-        assert!(!writer2.is_parquet());
     }
 
     // -------------------------------------------------------------------------

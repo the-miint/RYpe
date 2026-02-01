@@ -267,8 +267,6 @@ impl InvertedIndex {
             // Parquet min/max statistics are inclusive ranges [min, max], so we use
             // partition_point with <= for the max bound.
             //
-            // TODO: This loop is sequential - could be parallelized if bloom filter
-            // access is thread-safe and the bottleneck is CPU-bound.
             if use_bloom_filter {
                 let _t_bloom = std::time::Instant::now();
                 let mut bloom_filtered = Vec::with_capacity(stats_filtered.len());
