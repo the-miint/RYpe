@@ -89,7 +89,7 @@ pub fn create_parquet_inverted_index(
     write_buckets_parquet(output_dir, &bucket_names, &bucket_sources)?;
 
     // Stream inverted pairs to Parquet shards
-    let shard_infos = stream_to_parquet_shards(
+    let (shard_infos, has_overlapping_shards) = stream_to_parquet_shards(
         output_dir,
         buckets,
         max_shard_bytes.unwrap_or(usize::MAX),
@@ -116,7 +116,7 @@ pub fn create_parquet_inverted_index(
             format: ParquetShardFormat::Parquet,
             num_shards: shard_infos.len() as u32,
             total_entries,
-            has_overlapping_shards: true, // buckets share minimizers
+            has_overlapping_shards,
             shards: shard_infos,
         }),
     };
@@ -143,20 +143,27 @@ pub fn compute_source_hash(counts: &HashMap<u32, usize>) -> u64 {
 }
 
 /// Stream (minimizer, bucket_id) pairs to Parquet shards using k-way merge.
+///
+/// Returns a tuple of (shard_infos, has_overlapping_shards):
+/// - Sequential mode: shards may have overlapping minimizer ranges (buckets share minimizers)
+/// - Parallel mode: shards have non-overlapping minimizer ranges (range-partitioned)
 fn stream_to_parquet_shards(
     output_dir: &Path,
     buckets: Vec<BucketData>,
     max_shard_bytes: usize,
     options: &ParquetWriteOptions,
-) -> Result<Vec<InvertedShardInfo>> {
+) -> Result<(Vec<InvertedShardInfo>, bool)> {
     if buckets.is_empty() || buckets.iter().all(|b| b.minimizers.is_empty()) {
         // Empty index - create single empty shard info
-        return Ok(vec![InvertedShardInfo {
-            shard_id: 0,
-            min_minimizer: 0,
-            max_minimizer: 0,
-            num_entries: 0,
-        }]);
+        return Ok((
+            vec![InvertedShardInfo {
+                shard_id: 0,
+                min_minimizer: 0,
+                max_minimizer: 0,
+                num_entries: 0,
+            }],
+            false, // Single empty shard has no overlap
+        ));
     }
 
     // For large indices, use parallel range partitioning
@@ -169,10 +176,14 @@ fn stream_to_parquet_shards(
 
     if use_parallel && max_shard_bytes < usize::MAX {
         // Parallel: partition minimizer space and process ranges in parallel
+        // Shards are range-partitioned, so they do NOT overlap
         stream_to_shards_parallel(output_dir, buckets, max_shard_bytes, num_cpus, options)
+            .map(|shards| (shards, false))
     } else {
         // Sequential: single k-way merge
+        // Shards are created by size threshold, so buckets may share minimizers across shards
         stream_to_shards_sequential(output_dir, buckets, max_shard_bytes, options)
+            .map(|shards| (shards, true))
     }
 }
 
@@ -422,7 +433,17 @@ fn compute_range_boundaries(buckets: &[BucketData], num_partitions: usize) -> Ve
 /// This is thread-safe and produces consistent results: the same minimizer
 /// will always be sampled or not sampled, regardless of which thread processes it.
 /// This is critical for correct range boundary computation in parallel sharding.
+///
+/// Uses integer arithmetic to avoid floating-point precision issues.
 fn rand_sample(minimizer: u64, rate: f64) -> bool {
+    // Handle edge cases to avoid floating-point comparison issues
+    if rate <= 0.0 {
+        return false;
+    }
+    if rate >= 1.0 {
+        return true;
+    }
+
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -431,7 +452,10 @@ fn rand_sample(minimizer: u64, rate: f64) -> bool {
     minimizer.hash(&mut hasher);
     let hash = hasher.finish();
 
-    (hash as f64 / u64::MAX as f64) < rate
+    // Use integer comparison to avoid floating-point precision loss
+    // Convert rate to a threshold in the u64 space
+    let threshold = (u64::MAX as f64 * rate) as u64;
+    hash < threshold
 }
 
 /// Process a single partition of the minimizer space.
@@ -543,6 +567,267 @@ fn process_partition(
     }
 
     Ok(shard_infos)
+}
+
+/// Accumulates (minimizer, bucket_id) entries and tracks when to flush to a shard.
+///
+/// This struct provides size-aware accumulation for streaming shard creation,
+/// triggering flushes when the estimated in-memory size exceeds the configured threshold.
+///
+/// # Memory Estimation
+///
+/// The size threshold (`max_shard_bytes`) controls **resident memory usage**, not on-disk
+/// shard size. The actual Parquet files will typically be significantly smaller due to:
+/// - DELTA_BINARY_PACKED encoding for sorted integers
+/// - Compression (ZSTD/Snappy)
+///
+/// The estimate uses [`BYTES_PER_ENTRY`](Self::BYTES_PER_ENTRY) as an upper bound for
+/// in-memory representation (12 bytes data + padding/overhead).
+///
+/// # Thread Safety
+///
+/// `ShardAccumulator` is `Send` but not `Sync`. A single accumulator should only be
+/// used from one thread at a time. For parallel index building, use separate
+/// accumulators per thread/partition.
+///
+/// # Shard ID Limits
+///
+/// The shard ID is a `u32`, supporting up to 4 billion shards. Attempting to create
+/// more shards will return an error.
+pub struct ShardAccumulator {
+    /// Accumulated entries: (minimizer, bucket_id)
+    entries: Vec<(u64, u32)>,
+    /// Maximum bytes per shard before flush
+    max_shard_bytes: usize,
+    /// Output directory for shards
+    output_dir: PathBuf,
+    /// Current shard ID (increments on each flush)
+    current_shard_id: u32,
+    /// Parquet write options
+    options: ParquetWriteOptions,
+    /// Accumulated shard infos from completed flushes
+    shard_infos: Vec<InvertedShardInfo>,
+}
+
+/// Minimum allowed value for max_shard_bytes to prevent pathological behavior.
+/// Set to 1MB - smaller shards are inefficient due to Parquet overhead.
+pub const MIN_SHARD_BYTES: usize = 1024 * 1024;
+
+impl ShardAccumulator {
+    /// Upper bound estimate for bytes per entry in resident memory.
+    ///
+    /// This is used to estimate when to flush based on **in-memory** buffer size,
+    /// NOT on-disk Parquet size. Actual Parquet files will be smaller due to
+    /// DELTA_BINARY_PACKED encoding and compression.
+    ///
+    /// Calculation:
+    /// - 8 bytes for u64 minimizer
+    /// - 4 bytes for u32 bucket_id
+    /// - 4 bytes for Vec overhead/alignment per entry
+    ///
+    /// This is intentionally conservative to ensure we flush before exceeding
+    /// the memory target.
+    pub const BYTES_PER_ENTRY: usize = 16;
+
+    /// Create a new accumulator for size tracking only (no file writing).
+    ///
+    /// Use `with_output_dir()` for an accumulator that can flush to files.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_shard_bytes` is less than [`MIN_SHARD_BYTES`] (1MB).
+    /// Use `try_new()` for a fallible version.
+    pub fn new(max_shard_bytes: usize) -> Self {
+        assert!(
+            max_shard_bytes >= MIN_SHARD_BYTES,
+            "max_shard_bytes ({}) must be at least MIN_SHARD_BYTES ({})",
+            max_shard_bytes,
+            MIN_SHARD_BYTES
+        );
+        Self {
+            entries: Vec::new(),
+            max_shard_bytes,
+            output_dir: PathBuf::new(),
+            current_shard_id: 0,
+            options: ParquetWriteOptions::default(),
+            shard_infos: Vec::new(),
+        }
+    }
+
+    /// Create a new accumulator that writes shards to the specified directory.
+    ///
+    /// # Arguments
+    /// * `output_dir` - Directory where shards will be written (e.g., "index.ryxdi")
+    /// * `max_shard_bytes` - Maximum bytes per shard before triggering a flush
+    /// * `options` - Optional Parquet write options (compression, bloom filters, etc.)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_shard_bytes` is less than [`MIN_SHARD_BYTES`] (1MB).
+    pub fn with_output_dir(
+        output_dir: &Path,
+        max_shard_bytes: usize,
+        options: Option<&ParquetWriteOptions>,
+    ) -> Self {
+        assert!(
+            max_shard_bytes >= MIN_SHARD_BYTES,
+            "max_shard_bytes ({}) must be at least MIN_SHARD_BYTES ({})",
+            max_shard_bytes,
+            MIN_SHARD_BYTES
+        );
+        Self {
+            entries: Vec::new(),
+            max_shard_bytes,
+            output_dir: output_dir.to_path_buf(),
+            current_shard_id: 0,
+            options: options.cloned().unwrap_or_default(),
+            shard_infos: Vec::new(),
+        }
+    }
+
+    /// Returns the configured maximum shard size in bytes.
+    pub fn max_shard_bytes(&self) -> usize {
+        self.max_shard_bytes
+    }
+
+    /// Returns the estimated current size in bytes.
+    ///
+    /// Uses `capacity()` rather than `len()` to account for the actual memory
+    /// allocated by the Vec, which may be up to 2x the number of elements.
+    pub fn current_size_bytes(&self) -> usize {
+        self.entries.capacity() * Self::BYTES_PER_ENTRY
+    }
+
+    /// Returns the number of accumulated entries.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Add entries to the accumulator.
+    pub fn add_entries(&mut self, entries: &[(u64, u32)]) {
+        self.entries.extend_from_slice(entries);
+    }
+
+    /// Returns true if the accumulator should be flushed (size exceeds threshold).
+    pub fn should_flush(&self) -> bool {
+        self.current_size_bytes() >= self.max_shard_bytes
+    }
+
+    /// Flush current entries to a new shard file.
+    ///
+    /// Sorts entries by (minimizer, bucket_id), writes to Parquet, clears buffer,
+    /// and increments the shard ID for the next flush.
+    ///
+    /// Returns `Ok(None)` if the accumulator is empty (no-op).
+    /// Returns `Ok(Some(shard_info))` on successful flush.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The output directory was not configured (created with `new()` instead of `with_output_dir()`)
+    /// - The shard ID would overflow (> 4 billion shards)
+    /// - I/O errors during Parquet writing
+    pub fn flush_shard(&mut self) -> Result<Option<InvertedShardInfo>> {
+        // Empty flush is a no-op, not an error
+        if self.entries.is_empty() {
+            return Ok(None);
+        }
+
+        // Validate output_dir was configured
+        if self.output_dir.as_os_str().is_empty() {
+            return Err(RypeError::validation(format!(
+                "Cannot flush {} entries: accumulator created with new() has no output directory. \
+                 Use with_output_dir() to create an accumulator that can write files.",
+                self.entries.len()
+            )));
+        }
+
+        // Check for shard ID overflow before incrementing
+        if self.current_shard_id == u32::MAX {
+            return Err(RypeError::validation(format!(
+                "Shard ID overflow: cannot create shard {} (max is {}). \
+                 {} entries pending, {} shards already written.",
+                self.current_shard_id,
+                u32::MAX - 1,
+                self.entries.len(),
+                self.shard_infos.len()
+            )));
+        }
+
+        // Sort entries by (minimizer, bucket_id)
+        self.entries.sort_unstable();
+
+        // Extract min/max for shard info
+        let min_minimizer = self.entries.first().unwrap().0;
+        let max_minimizer = self.entries.last().unwrap().0;
+        let num_entries = self.entries.len() as u64;
+
+        // Write to parquet file
+        let shard_path = self
+            .output_dir
+            .join(files::INVERTED_DIR)
+            .join(files::inverted_shard(self.current_shard_id));
+
+        write_shard_from_pairs(&shard_path, &self.entries, &self.options)?;
+
+        // Build shard info - only after successful write
+        let shard_info = InvertedShardInfo {
+            shard_id: self.current_shard_id,
+            min_minimizer,
+            max_minimizer,
+            num_entries,
+        };
+
+        // Store shard info and increment ID only after successful write
+        self.shard_infos.push(shard_info);
+        self.current_shard_id = self.current_shard_id.checked_add(1).ok_or_else(|| {
+            RypeError::validation("Shard ID overflow after successful write".to_string())
+        })?;
+
+        // Clear buffer and release memory
+        self.entries.clear();
+        self.entries.shrink_to_fit();
+
+        Ok(Some(shard_info))
+    }
+
+    /// Finish accumulation, flushing any remaining entries.
+    ///
+    /// Returns all shard infos from this accumulator. If the accumulator is empty
+    /// and no shards were ever flushed, returns an empty Vec.
+    pub fn finish(mut self) -> Result<Vec<InvertedShardInfo>> {
+        // flush_shard handles empty case gracefully (returns Ok(None))
+        self.flush_shard()?;
+        Ok(self.shard_infos)
+    }
+}
+
+/// Write (minimizer, bucket_id) pairs to a Parquet shard file.
+///
+/// Entries must be sorted by (minimizer, bucket_id) before calling.
+fn write_shard_from_pairs(
+    path: &Path,
+    entries: &[(u64, u32)],
+    options: &ParquetWriteOptions,
+) -> Result<()> {
+    let mut writer = ShardWriter::new(path, options)?;
+
+    // Preallocate batch buffers outside the loop to avoid repeated allocations
+    let mut minimizers: Vec<u64> = Vec::with_capacity(PARQUET_BATCH_SIZE);
+    let mut bucket_ids: Vec<u32> = Vec::with_capacity(PARQUET_BATCH_SIZE);
+
+    // Write in batches
+    for chunk in entries.chunks(PARQUET_BATCH_SIZE) {
+        minimizers.clear();
+        bucket_ids.clear();
+        for &(m, b) in chunk {
+            minimizers.push(m);
+            bucket_ids.push(b);
+        }
+        writer.write_batch(&minimizers, &bucket_ids)?;
+    }
+
+    writer.finish()
 }
 
 /// Helper struct for writing a single Parquet shard.
@@ -836,5 +1121,293 @@ mod tests {
             let result2 = rand_sample(m, rate);
             assert_eq!(result1, result2, "rand_sample should be deterministic");
         }
+    }
+
+    // ========== Phase 1: ShardAccumulator Tests ==========
+
+    #[test]
+    fn test_shard_accumulator_creation() {
+        let max_bytes = MIN_SHARD_BYTES; // Use minimum valid size
+        let accumulator = ShardAccumulator::new(max_bytes);
+
+        assert_eq!(accumulator.max_shard_bytes(), max_bytes);
+        assert_eq!(accumulator.current_size_bytes(), 0);
+        assert_eq!(accumulator.entry_count(), 0);
+    }
+
+    #[test]
+    fn test_shard_accumulator_size_tracking() {
+        let max_bytes = MIN_SHARD_BYTES;
+        let mut accumulator = ShardAccumulator::new(max_bytes);
+
+        // Add some entries
+        let entries: Vec<(u64, u32)> = vec![(100, 1), (200, 2), (300, 1), (400, 3)];
+        accumulator.add_entries(&entries);
+
+        // Size is based on capacity, not length (accounts for Vec over-allocation)
+        assert_eq!(accumulator.entry_count(), 4);
+        let min_size = 4 * ShardAccumulator::BYTES_PER_ENTRY;
+        assert!(
+            accumulator.current_size_bytes() >= min_size,
+            "current_size_bytes ({}) should be >= entry_count * BYTES_PER_ENTRY ({})",
+            accumulator.current_size_bytes(),
+            min_size
+        );
+
+        // Add more entries
+        let more_entries: Vec<(u64, u32)> = vec![(500, 2), (600, 1)];
+        accumulator.add_entries(&more_entries);
+
+        assert_eq!(accumulator.entry_count(), 6);
+        let min_size = 6 * ShardAccumulator::BYTES_PER_ENTRY;
+        assert!(
+            accumulator.current_size_bytes() >= min_size,
+            "current_size_bytes ({}) should be >= entry_count * BYTES_PER_ENTRY ({})",
+            accumulator.current_size_bytes(),
+            min_size
+        );
+    }
+
+    #[test]
+    fn test_shard_accumulator_should_flush() {
+        // Use minimum valid size for testing
+        let max_bytes = MIN_SHARD_BYTES; // 1MB
+        let mut accumulator = ShardAccumulator::new(max_bytes);
+
+        // Initially should not need flush
+        assert!(!accumulator.should_flush());
+
+        // Add entries that are under threshold
+        let entries: Vec<(u64, u32)> = vec![(100, 1), (200, 2), (300, 1)];
+        accumulator.add_entries(&entries);
+        assert!(!accumulator.should_flush());
+
+        // Add enough entries to exceed MIN_SHARD_BYTES (1MB / 16 bytes = 65536 entries)
+        let entries_needed = MIN_SHARD_BYTES / ShardAccumulator::BYTES_PER_ENTRY;
+        let many_entries: Vec<(u64, u32)> = (0..entries_needed as u64)
+            .map(|i| (i * 1000, (i % 10) as u32))
+            .collect();
+        accumulator.add_entries(&many_entries);
+        assert!(accumulator.should_flush());
+    }
+
+    // ========== Phase 2: ShardAccumulator Flush Tests ==========
+
+    #[test]
+    fn test_shard_accumulator_flush_sorts_entries() {
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("test.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+
+        let max_bytes = MIN_SHARD_BYTES;
+        let mut accumulator = ShardAccumulator::with_output_dir(&output_dir, max_bytes, None);
+
+        // Add entries in unsorted order
+        let entries: Vec<(u64, u32)> = vec![
+            (500, 2),
+            (100, 1),
+            (300, 3),
+            (100, 2), // Same minimizer, different bucket
+            (200, 1),
+        ];
+        accumulator.add_entries(&entries);
+
+        // Flush and verify entries are sorted by (minimizer, bucket_id)
+        let shard_info = accumulator
+            .flush_shard()
+            .unwrap()
+            .expect("should have flushed");
+
+        // Verify shard info has correct min/max
+        assert_eq!(shard_info.min_minimizer, 100);
+        assert_eq!(shard_info.max_minimizer, 500);
+        assert_eq!(shard_info.num_entries, 5);
+
+        // Read back the parquet file and verify sorted order
+        let shard_path = output_dir.join("inverted").join("shard.0.parquet");
+        let pairs = read_shard_pairs(&shard_path).unwrap();
+
+        let expected: Vec<(u64, u32)> = vec![(100, 1), (100, 2), (200, 1), (300, 3), (500, 2)];
+        assert_eq!(
+            pairs, expected,
+            "Entries should be sorted by (minimizer, bucket_id)"
+        );
+    }
+
+    #[test]
+    fn test_shard_accumulator_flush_writes_parquet() {
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("test.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+
+        let max_bytes = MIN_SHARD_BYTES;
+        let mut accumulator = ShardAccumulator::with_output_dir(&output_dir, max_bytes, None);
+
+        let entries: Vec<(u64, u32)> = vec![(100, 1), (200, 2), (300, 1)];
+        accumulator.add_entries(&entries);
+
+        let shard_info = accumulator
+            .flush_shard()
+            .unwrap()
+            .expect("should have flushed");
+
+        // Verify parquet file was created
+        let shard_path = output_dir.join("inverted").join("shard.0.parquet");
+        assert!(shard_path.exists(), "Shard parquet file should exist");
+
+        // Verify shard info
+        assert_eq!(shard_info.shard_id, 0);
+        assert_eq!(shard_info.num_entries, 3);
+    }
+
+    #[test]
+    fn test_shard_accumulator_flush_clears_buffer() {
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("test.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+
+        let max_bytes = MIN_SHARD_BYTES;
+        let mut accumulator = ShardAccumulator::with_output_dir(&output_dir, max_bytes, None);
+
+        let entries: Vec<(u64, u32)> = vec![(100, 1), (200, 2)];
+        accumulator.add_entries(&entries);
+        assert_eq!(accumulator.entry_count(), 2);
+
+        accumulator.flush_shard().unwrap();
+
+        // Buffer should be cleared after flush
+        assert_eq!(accumulator.entry_count(), 0);
+        assert_eq!(accumulator.current_size_bytes(), 0);
+    }
+
+    #[test]
+    fn test_shard_accumulator_increments_shard_id() {
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("test.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+
+        let max_bytes = MIN_SHARD_BYTES;
+        let mut accumulator = ShardAccumulator::with_output_dir(&output_dir, max_bytes, None);
+
+        // First flush
+        accumulator.add_entries(&[(100, 1), (200, 2)]);
+        let info1 = accumulator.flush_shard().unwrap().expect("should flush");
+        assert_eq!(info1.shard_id, 0);
+
+        // Second flush
+        accumulator.add_entries(&[(300, 1), (400, 2)]);
+        let info2 = accumulator.flush_shard().unwrap().expect("should flush");
+        assert_eq!(info2.shard_id, 1);
+
+        // Third flush
+        accumulator.add_entries(&[(500, 1)]);
+        let info3 = accumulator.flush_shard().unwrap().expect("should flush");
+        assert_eq!(info3.shard_id, 2);
+
+        // Verify all shard files exist
+        assert!(output_dir.join("inverted/shard.0.parquet").exists());
+        assert!(output_dir.join("inverted/shard.1.parquet").exists());
+        assert!(output_dir.join("inverted/shard.2.parquet").exists());
+    }
+
+    // ========== Phase 3: Failure/Edge Case Tests ==========
+
+    #[test]
+    fn test_shard_accumulator_empty_flush_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("test.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+
+        let mut accumulator = ShardAccumulator::with_output_dir(&output_dir, MIN_SHARD_BYTES, None);
+
+        // Flushing empty accumulator should return Ok(None), not an error
+        let result = accumulator.flush_shard().unwrap();
+        assert!(result.is_none(), "Empty flush should return None");
+
+        // No shard file should be created
+        assert!(!output_dir.join("inverted/shard.0.parquet").exists());
+    }
+
+    #[test]
+    fn test_shard_accumulator_finish_empty_returns_empty_vec() {
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("test.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+
+        let accumulator = ShardAccumulator::with_output_dir(&output_dir, MIN_SHARD_BYTES, None);
+
+        // Finishing empty accumulator should return empty vec
+        let shard_infos = accumulator.finish().unwrap();
+        assert!(
+            shard_infos.is_empty(),
+            "finish() on empty should return empty vec"
+        );
+    }
+
+    #[test]
+    fn test_shard_accumulator_flush_without_output_dir_errors() {
+        let mut accumulator = ShardAccumulator::new(MIN_SHARD_BYTES);
+        accumulator.add_entries(&[(100, 1), (200, 2)]);
+
+        // Flushing without output_dir should error
+        let result = accumulator.flush_shard();
+        assert!(result.is_err(), "flush without output_dir should error");
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no output directory"),
+            "Error should mention missing output directory: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must be at least MIN_SHARD_BYTES")]
+    fn test_shard_accumulator_rejects_zero_max_bytes() {
+        let _ = ShardAccumulator::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be at least MIN_SHARD_BYTES")]
+    fn test_shard_accumulator_rejects_small_max_bytes() {
+        let _ = ShardAccumulator::new(1024); // 1KB is too small
+    }
+
+    #[test]
+    fn test_shard_accumulator_accepts_min_shard_bytes() {
+        // Should not panic
+        let accumulator = ShardAccumulator::new(MIN_SHARD_BYTES);
+        assert_eq!(accumulator.max_shard_bytes(), MIN_SHARD_BYTES);
+    }
+
+    /// Helper to read (minimizer, bucket_id) pairs from a shard parquet file.
+    fn read_shard_pairs(path: &Path) -> Result<Vec<(u64, u32)>> {
+        use arrow::array::{UInt32Array, UInt64Array};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let file = std::fs::File::open(path)
+            .map_err(|e| RypeError::io(path.to_path_buf(), "open shard", e))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let reader = builder.build()?;
+
+        let mut pairs = Vec::new();
+        for batch in reader {
+            let batch = batch?;
+            let minimizers = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            let bucket_ids = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                pairs.push((minimizers.value(i), bucket_ids.value(i)));
+            }
+        }
+        Ok(pairs)
     }
 }

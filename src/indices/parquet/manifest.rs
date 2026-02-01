@@ -78,7 +78,7 @@ pub struct InvertedManifest {
 }
 
 /// Per-shard metadata for inverted index.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct InvertedShardInfo {
     /// Shard identifier.
     pub shard_id: u32,

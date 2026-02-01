@@ -9,9 +9,10 @@ mod commands;
 mod logging;
 
 use commands::{
-    build_parquet_index_from_config, create_parquet_index_from_refs, inspect_matches,
-    load_index_metadata, resolve_bucket_id, run_aggregate, run_classify, ClassifyAggregateArgs,
-    ClassifyCommands, ClassifyRunArgs, Cli, Commands, IndexCommands, InspectCommands,
+    build_parquet_index_from_config, build_parquet_index_from_config_streaming,
+    create_parquet_index_from_refs, inspect_matches, load_index_metadata, resolve_bucket_id,
+    run_aggregate, run_classify, ClassifyAggregateArgs, ClassifyCommands, ClassifyRunArgs, Cli,
+    Commands, IndexCommands, InspectCommands,
 };
 
 // CLI argument definitions moved to commands/args.rs
@@ -197,14 +198,30 @@ fn main() -> Result<()> {
                     ENABLE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
 
-                // Create parquet inverted index directly
+                // Create parquet inverted index
                 let options = parquet_index::ParquetWriteOptions {
                     row_group_size,
                     bloom_filter_enabled: bloom_filter,
                     bloom_filter_fpp: bloom_fpp,
                     ..Default::default()
                 };
-                build_parquet_index_from_config(&config, max_shard_size, Some(&options), orient)?;
+
+                // Use streaming mode when max_shard_size is set (memory-bounded creation)
+                if max_shard_size.is_some() {
+                    build_parquet_index_from_config_streaming(
+                        &config,
+                        max_shard_size,
+                        Some(&options),
+                        orient,
+                    )?;
+                } else {
+                    build_parquet_index_from_config(
+                        &config,
+                        max_shard_size,
+                        Some(&options),
+                        orient,
+                    )?;
+                }
             }
 
             IndexCommands::BucketAddConfig { config: _ } => {
