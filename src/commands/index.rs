@@ -537,11 +537,17 @@ pub fn build_parquet_index_from_config_streaming(
         std::collections::HashMap::new();
     let mut total_minimizers: u64 = 0;
 
-    // Process buckets in parallel batches for better performance while bounding memory
-    // Each batch extracts minimizers in parallel, then we add to accumulator and flush
+    // Process buckets using channel-based parallelism for better CPU utilization.
+    // Compared to batch-based processing:
+    // - Eliminates batch barriers where all threads wait for slowest bucket
+    // - Rayon's work-stealing keeps cores busy as long as buckets remain
+    // - Consumer processes results as they arrive (may block during shard flushes)
+    // - Still has per-result synchronization overhead via channel
+    //
+    // Thread safety: `cfg`, `config_dir`, and `orient_sequences` are borrowed
+    // immutably across threads. Results (minimizers, sources) are moved through
+    // the channel. The consumer is sequential (shard ordering requires it).
     let t_build = Instant::now();
-    let num_threads = rayon::current_num_threads();
-    let batch_size = num_threads; // Process one batch per thread at a time
 
     // Prepare work items: (bucket_id, bucket_name, files)
     let work_items: Vec<(u32, &str, &[PathBuf])> = bucket_names_sorted
@@ -554,61 +560,102 @@ pub fn build_parquet_index_from_config_streaming(
         })
         .collect();
 
-    // Process in batches
-    for batch in work_items.chunks(batch_size) {
-        // Extract minimizers in parallel for this batch
-        #[allow(clippy::type_complexity)]
-        let batch_results: Vec<Result<(u32, String, Vec<u64>, Vec<String>)>> = batch
-            .par_iter()
-            .map(|(bucket_id, bucket_name, files)| {
-                log::info!(
-                    "Processing bucket '{}' ({}/{}){} ...",
-                    bucket_name,
-                    bucket_id,
-                    bucket_names_sorted.len(),
-                    if orient_sequences { " (oriented)" } else { "" }
-                );
+    let num_buckets = bucket_names_sorted.len();
 
-                let (minimizers, sources) = extract_bucket_minimizers(
-                    files,
-                    config_dir,
-                    cfg.index.k,
-                    cfg.index.window,
-                    cfg.index.salt,
-                    orient_sequences,
-                )?;
+    // Handle empty bucket list explicitly
+    if num_buckets == 0 {
+        return Err(anyhow!("No buckets defined in configuration"));
+    }
 
-                log::info!(
-                    "Completed bucket '{}': {} minimizers",
-                    bucket_name,
-                    minimizers.len()
-                );
+    // Type alias for channel message clarity
+    type BucketResult = Result<(u32, String, Vec<u64>, Vec<String>)>;
 
-                Ok((
-                    *bucket_id,
-                    sanitize_bucket_name(bucket_name),
-                    minimizers,
-                    sources,
-                ))
-            })
-            .collect();
+    // Track processed count for panic detection
+    let processed_count = std::sync::atomic::AtomicUsize::new(0);
+    // Cancellation signal for early exit
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
 
-        // Collect all successful results first, failing fast on any error
-        // This prevents partial state mutations if any bucket in the batch fails
-        let validated_results: Vec<(u32, String, Vec<u64>, Vec<String>)> =
-            batch_results.into_iter().collect::<Result<Vec<_>>>()?;
+    // Use std::thread::scope to allow borrowing local data while running parallel processing
+    let process_result: Result<()> = std::thread::scope(|s| {
+        // Use bounded channel to provide backpressure if consumer is slow (e.g., during disk I/O)
+        let (tx, rx) = std::sync::mpsc::sync_channel::<BucketResult>(4);
 
-        // Only after ALL batch results are validated, add to accumulator
-        for (bucket_id, bucket_name, minimizers, sources) in validated_results {
+        // Producer thread: uses rayon to process buckets in parallel, sends results through channel
+        let cancelled_ref = &cancelled;
+        let processed_ref = &processed_count;
+        s.spawn(move || {
+            work_items
+                .par_iter()
+                .panic_fuse() // Stop processing on first panic
+                .for_each_with(tx, |tx, (bucket_id, bucket_name, files)| {
+                    // Check cancellation before starting work
+                    if cancelled_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+
+                    log::info!(
+                        "Processing bucket '{}' ({}/{}){} ...",
+                        bucket_name,
+                        bucket_id,
+                        num_buckets,
+                        if orient_sequences { " (oriented)" } else { "" }
+                    );
+
+                    let result = extract_bucket_minimizers(
+                        files,
+                        config_dir,
+                        cfg.index.k,
+                        cfg.index.window,
+                        cfg.index.salt,
+                        orient_sequences,
+                    );
+
+                    let bucket_result: BucketResult = match result {
+                        Ok((minimizers, sources)) => {
+                            log::info!(
+                                "Completed bucket '{}': {} minimizers",
+                                bucket_name,
+                                minimizers.len()
+                            );
+                            Ok((
+                                *bucket_id,
+                                sanitize_bucket_name(bucket_name),
+                                minimizers,
+                                sources,
+                            ))
+                        }
+                        Err(e) => Err(e.context(format!(
+                            "Failed processing bucket '{}' (ID {})",
+                            bucket_name, bucket_id
+                        ))),
+                    };
+
+                    // Track successful send for panic detection
+                    if tx.send(bucket_result).is_ok() {
+                        processed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+        });
+
+        // Consumer: receive results as buckets complete and accumulate
+        for result in rx {
+            let (bucket_id, bucket_name, minimizers, sources) = match result {
+                Ok(data) => data,
+                Err(e) => {
+                    // Signal producers to stop on error
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(e);
+                }
+            };
+
             // Store metadata
             bucket_names_map.insert(bucket_id, bucket_name);
             bucket_sources_map.insert(bucket_id, sources);
             bucket_minimizer_counts.insert(bucket_id, minimizers.len());
             total_minimizers += minimizers.len() as u64;
 
-            // Convert to (minimizer, bucket_id) pairs and add to accumulator
-            let entries: Vec<(u64, u32)> = minimizers.iter().map(|&m| (m, bucket_id)).collect();
-            accumulator.add_entries(&entries);
+            // Add entries directly to accumulator without intermediate allocation
+            accumulator.add_entries_from_minimizers(&minimizers, bucket_id);
 
             // Flush in a loop until under threshold (after each bucket's entries)
             while accumulator.should_flush() {
@@ -622,7 +669,22 @@ pub fn build_parquet_index_from_config_streaming(
                 }
             }
         }
+
+        Ok(())
+    });
+
+    // Check for incomplete processing (panic or other failure)
+    let actual_processed = processed_count.load(std::sync::atomic::Ordering::Relaxed);
+    if actual_processed != num_buckets && process_result.is_ok() {
+        return Err(anyhow!(
+            "Index creation incomplete: processed {}/{} buckets (possible panic in worker thread)",
+            actual_processed,
+            num_buckets
+        ));
     }
+
+    process_result?;
+
     log_timing(
         "streaming_index: bucket_processing",
         t_build.elapsed().as_millis(),
@@ -1447,5 +1509,437 @@ files = ["ref2.fa"]
         );
         assert!(manifest.total_minimizers > 0, "Should have minimizers");
         assert!(manifest.total_bucket_ids > 0, "Should have bucket refs");
+    }
+
+    // ============================================================================
+    // Phase 1: Streaming Parallelism Tests (Channel-Based)
+    // These tests define expected behavior for the channel-based implementation
+    // ============================================================================
+
+    #[test]
+    fn test_streaming_no_batch_barrier_timing() {
+        // Test that parallel bucket processing doesn't suffer from batch barriers.
+        // With N buckets of varying sizes, total time should be closer to the
+        // slowest single bucket than the sum of batch maximums.
+        //
+        // Strategy: Create buckets with significantly different sequence sizes.
+        // Larger sequences take longer to process. If batching causes barriers,
+        // total time = sum of max(batch_i), but with proper parallelism,
+        // total time ≈ max(all buckets).
+        //
+        // This test uses real file I/O differences to create timing variance.
+
+        use std::time::Instant;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create buckets with vastly different sizes to create processing time variance
+        // Small buckets: ~100 bp (fast)
+        // Large buckets: ~100,000 bp (slower)
+        let small_seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+
+        // Generate large sequence
+        fn make_large_sequence(size: usize) -> Vec<u8> {
+            let base_pattern = b"ACGTACGTACGTACGTACGTACGTACGTACGT";
+            let mut seq = Vec::with_capacity(size);
+            while seq.len() < size {
+                seq.extend_from_slice(base_pattern);
+            }
+            seq.truncate(size);
+            seq
+        }
+
+        let large_seq = make_large_sequence(100_000);
+
+        // Create 8 buckets: 2 large (slow), 6 small (fast)
+        // With batch_size = num_threads (typically 4-8), if batching causes barriers:
+        // - If both large buckets end up in different batches, each batch waits for its large bucket
+        // - Total time ≈ 2 * large_bucket_time
+        // With channel-based parallelism:
+        // - Total time ≈ large_bucket_time (both large run in parallel with small)
+
+        create_fasta_file(dir, "large1.fa", &large_seq);
+        create_fasta_file(dir, "large2.fa", &large_seq);
+        for i in 0..6 {
+            create_fasta_file(dir, &format!("small{}.fa", i), small_seq);
+        }
+
+        let config_content = r#"[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "timing_test.ryidx"
+max_shard_size = 10485760
+
+[buckets.Large1]
+files = ["large1.fa"]
+
+[buckets.Large2]
+files = ["large2.fa"]
+
+[buckets.Small0]
+files = ["small0.fa"]
+
+[buckets.Small1]
+files = ["small1.fa"]
+
+[buckets.Small2]
+files = ["small2.fa"]
+
+[buckets.Small3]
+files = ["small3.fa"]
+
+[buckets.Small4]
+files = ["small4.fa"]
+
+[buckets.Small5]
+files = ["small5.fa"]
+"#;
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, config_content).unwrap();
+
+        // Time the streaming build
+        let start = Instant::now();
+        let result = build_parquet_index_from_config_streaming(&config_path, None, None, false);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok(), "Should succeed: {:?}", result);
+
+        // Verify the index was created correctly
+        let output_path = dir.join("timing_test.ryxdi");
+        assert!(output_path.exists());
+
+        use rype::ShardedInvertedIndex;
+        let index = ShardedInvertedIndex::open(&output_path).unwrap();
+        assert_eq!(index.manifest().bucket_names.len(), 8);
+
+        // Log timing for manual inspection (actual assertion would be flaky)
+        // The key insight: with proper parallelism, elapsed should be < 2x single large bucket time
+        eprintln!(
+            "test_streaming_no_batch_barrier_timing: elapsed={:?}ms",
+            elapsed.as_millis()
+        );
+
+        // We can't assert precise timing without being flaky, but we verify correctness
+        // The real verification is done in Phase 4 integration testing with profiling
+    }
+
+    #[test]
+    fn test_streaming_results_as_completed() {
+        // Test that results are accumulated incrementally as buckets complete,
+        // not batched. We verify this by checking that shards can be flushed
+        // during processing (not just at the end).
+        //
+        // With channel-based processing, shards should flush as data arrives.
+        // With batch-based, flushes only happen after each batch completes.
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create enough buckets with enough data to trigger multiple shard flushes
+        // Use small shard size to force frequent flushing
+        fn make_unique_sequence(seed: u64, length: usize) -> Vec<u8> {
+            let mut state = seed;
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match (state >> 32) % 4 {
+                        0 => b'A',
+                        1 => b'C',
+                        2 => b'G',
+                        _ => b'T',
+                    }
+                })
+                .collect()
+        }
+
+        // Create 30 buckets, each with larger unique sequences to exceed minimum shard size
+        for i in 0..30 {
+            let seq = make_unique_sequence(i * 9876, 100_000);
+            create_fasta_file(dir, &format!("bucket{}.fa", i), &seq);
+        }
+
+        // Build config
+        let mut config_content = r#"[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "incremental_test.ryidx"
+max_shard_size = 1048576
+
+"#
+        .to_string();
+
+        for i in 0..30 {
+            config_content.push_str(&format!(
+                "[buckets.Bucket{:02}]\nfiles = [\"bucket{}.fa\"]\n\n",
+                i, i
+            ));
+        }
+
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, &config_content).unwrap();
+
+        // Build with minimum shard size (1MB) to encourage multiple flushes
+        let result = build_parquet_index_from_config_streaming(
+            &config_path,
+            Some(1024 * 1024), // 1MB shards (minimum allowed)
+            None,
+            false,
+        );
+        assert!(result.is_ok(), "Should succeed: {:?}", result);
+
+        // Verify multiple shards were created (proving incremental flushing)
+        let output_path = dir.join("incremental_test.ryxdi");
+        let inverted_dir = output_path.join("inverted");
+        let shard_count = std::fs::read_dir(&inverted_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "parquet")
+                    .unwrap_or(false)
+            })
+            .count();
+
+        // With 30 buckets × ~10K minimizers each = ~300K minimizers
+        // At 1MB per shard (~65K entries), should have 4+ shards
+        assert!(
+            shard_count >= 2,
+            "Should have multiple shards from incremental flushing, got {}",
+            shard_count
+        );
+
+        // Verify index is valid and queryable
+        use rype::ShardedInvertedIndex;
+        let index = ShardedInvertedIndex::open(&output_path).unwrap();
+        assert_eq!(index.manifest().bucket_names.len(), 30);
+    }
+
+    #[test]
+    fn test_streaming_error_propagation() {
+        // Test that errors from parallel bucket processing propagate correctly.
+        // If one bucket fails (e.g., missing file), the error should be returned
+        // and processing should stop gracefully.
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create some valid files
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        create_fasta_file(dir, "valid1.fa", seq);
+        create_fasta_file(dir, "valid2.fa", seq);
+
+        // Config with one bucket referencing a non-existent file
+        let config_content = r#"[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "error_test.ryidx"
+max_shard_size = 1048576
+
+[buckets.ValidBucket1]
+files = ["valid1.fa"]
+
+[buckets.InvalidBucket]
+files = ["nonexistent_file.fa"]
+
+[buckets.ValidBucket2]
+files = ["valid2.fa"]
+"#;
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, config_content).unwrap();
+
+        // Should fail during validation (before processing starts)
+        let result = build_parquet_index_from_config_streaming(&config_path, None, None, false);
+        assert!(result.is_err(), "Should fail with missing file");
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("nonexistent")
+                || err_msg.contains("not found")
+                || err_msg.contains("does not exist"),
+            "Error should mention the missing file: {}",
+            err_msg
+        );
+
+        // Index should not be created
+        let output_path = dir.join("error_test.ryxdi");
+        assert!(
+            !output_path.exists(),
+            "Index should not be created when error occurs"
+        );
+    }
+
+    #[test]
+    fn test_streaming_error_during_processing() {
+        // Test error handling when a bucket fails DURING processing (not validation).
+        // This simulates a corrupted file or I/O error mid-stream.
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create valid files
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        create_fasta_file(dir, "valid1.fa", seq);
+        create_fasta_file(dir, "valid2.fa", seq);
+
+        // Create a file that exists but is not valid FASTA (will fail during parsing)
+        let bad_file = dir.join("corrupt.fa");
+        std::fs::write(&bad_file, b"not a valid fasta file\nno header line\n").unwrap();
+
+        // We need to bypass validation - create config manually without going through validate_config
+        // Actually, the validation checks file existence, not format. Format errors occur during processing.
+        let config_content = r#"[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "corrupt_test.ryidx"
+max_shard_size = 1048576
+
+[buckets.ValidBucket1]
+files = ["valid1.fa"]
+
+[buckets.CorruptBucket]
+files = ["corrupt.fa"]
+
+[buckets.ValidBucket2]
+files = ["valid2.fa"]
+"#;
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, config_content).unwrap();
+
+        let result = build_parquet_index_from_config_streaming(&config_path, None, None, false);
+
+        // The corrupt file might either fail (if FASTA parser rejects it) or
+        // produce empty output (if parser is lenient). Either is acceptable.
+        // The key is that it shouldn't panic or hang.
+        if result.is_err() {
+            // Error is fine - corrupt file was detected
+            eprintln!("Corrupt file detected: {}", result.unwrap_err());
+        } else {
+            // If it succeeded, verify the index is still valid
+            let output_path = dir.join("corrupt_test.ryxdi");
+            if output_path.exists() {
+                use rype::ShardedInvertedIndex;
+                let index = ShardedInvertedIndex::open(&output_path).unwrap();
+                // At least the valid buckets should be present
+                assert!(index.manifest().bucket_names.len() >= 2);
+            }
+        }
+    }
+
+    #[test]
+    fn test_streaming_channel_based_produces_same_index() {
+        // Test that streaming mode produces the same index content as non-streaming mode.
+        // This verifies that the parallelism changes don't affect correctness.
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create test sequences
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq2 = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+        let seq3 = b"AAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAACCCC";
+
+        create_fasta_file(dir, "ref1.fa", seq1);
+        create_fasta_file(dir, "ref2.fa", seq2);
+        create_fasta_file(dir, "ref3.fa", seq3);
+
+        // Build non-streaming index
+        let config_nonstream = r#"[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "nonstream.ryidx"
+
+[buckets.Alpha]
+files = ["ref1.fa"]
+
+[buckets.Beta]
+files = ["ref2.fa"]
+
+[buckets.Gamma]
+files = ["ref3.fa"]
+"#;
+        let config_path_ns = dir.join("config_nonstream.toml");
+        std::fs::write(&config_path_ns, config_nonstream).unwrap();
+
+        let result_ns = build_parquet_index_from_config(&config_path_ns, None, None, false);
+        assert!(
+            result_ns.is_ok(),
+            "Non-streaming should succeed: {:?}",
+            result_ns
+        );
+
+        // Build streaming index with same content
+        let config_stream = r#"[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "stream.ryidx"
+max_shard_size = 10485760
+
+[buckets.Alpha]
+files = ["ref1.fa"]
+
+[buckets.Beta]
+files = ["ref2.fa"]
+
+[buckets.Gamma]
+files = ["ref3.fa"]
+"#;
+        let config_path_s = dir.join("config_stream.toml");
+        std::fs::write(&config_path_s, config_stream).unwrap();
+
+        let result_s = build_parquet_index_from_config_streaming(&config_path_s, None, None, false);
+        assert!(result_s.is_ok(), "Streaming should succeed: {:?}", result_s);
+
+        // Compare the two indices
+        use rype::ShardedInvertedIndex;
+        let index_ns = ShardedInvertedIndex::open(&dir.join("nonstream.ryxdi")).unwrap();
+        let index_s = ShardedInvertedIndex::open(&dir.join("stream.ryxdi")).unwrap();
+
+        let manifest_ns = index_ns.manifest();
+        let manifest_s = index_s.manifest();
+
+        // Verify parameters match
+        assert_eq!(manifest_ns.k, manifest_s.k, "K should match");
+        assert_eq!(manifest_ns.w, manifest_s.w, "W should match");
+        assert_eq!(manifest_ns.salt, manifest_s.salt, "Salt should match");
+
+        // Verify bucket count matches
+        assert_eq!(
+            manifest_ns.bucket_names.len(),
+            manifest_s.bucket_names.len(),
+            "Bucket count should match"
+        );
+
+        // Verify bucket names match
+        let mut names_ns: Vec<_> = manifest_ns.bucket_names.values().cloned().collect();
+        let mut names_s: Vec<_> = manifest_s.bucket_names.values().cloned().collect();
+        names_ns.sort();
+        names_s.sort();
+        assert_eq!(names_ns, names_s, "Bucket names should match");
+
+        // Verify total minimizers match
+        assert_eq!(
+            manifest_ns.total_minimizers, manifest_s.total_minimizers,
+            "Total minimizers should match"
+        );
+
+        // Verify total bucket IDs match
+        assert_eq!(
+            manifest_ns.total_bucket_ids, manifest_s.total_bucket_ids,
+            "Total bucket IDs should match"
+        );
+
+        // Verify source hash matches (deterministic content)
+        assert_eq!(
+            manifest_ns.source_hash, manifest_s.source_hash,
+            "Source hash should match (deterministic content)"
+        );
     }
 }

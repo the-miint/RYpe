@@ -708,6 +708,17 @@ impl ShardAccumulator {
         self.entries.extend_from_slice(entries);
     }
 
+    /// Add entries from minimizers directly without intermediate allocation.
+    ///
+    /// This is more efficient than creating a temporary Vec of (minimizer, bucket_id)
+    /// pairs and calling `add_entries`.
+    pub fn add_entries_from_minimizers(&mut self, minimizers: &[u64], bucket_id: u32) {
+        self.entries.reserve(minimizers.len());
+        for &m in minimizers {
+            self.entries.push((m, bucket_id));
+        }
+    }
+
     /// Returns true if the accumulator should be flushed (size exceeds threshold).
     pub fn should_flush(&self) -> bool {
         self.current_size_bytes() >= self.max_shard_bytes
