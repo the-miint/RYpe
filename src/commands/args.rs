@@ -450,6 +450,88 @@ THRESHOLD:
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Compute log10(score_A / score_B) between exactly two buckets
+    #[command(after_help = "LOG-RATIO MODE:
+  Computes log10(numerator_score / denominator_score) for each read.
+  Requires exactly 2 buckets in the index.
+
+  By default, the bucket with the lower bucket_id is the numerator.
+  Use --swap-buckets to reverse the ratio direction.
+
+OUTPUT FORMAT:
+  Tab-separated: read_id<TAB>log10([BucketA] / [BucketB])<TAB>ratio
+
+EDGE CASES:
+  - numerator = 0 → 0.0
+  - denominator = 0, numerator > 0 → +infinity (inf)
+  - both = 0 → 0.0
+
+THRESHOLD:
+  The --threshold option filters reads where BOTH original scores are below
+  the threshold. Default is 0.0 (report all reads with any match).")]
+    LogRatio {
+        /// Path to index directory (.ryxdi). Must have exactly 2 buckets.
+        #[arg(short, long)]
+        index: PathBuf,
+
+        /// Forward reads. Formats: FASTA/FASTQ (.fa/.fq, optionally .gz),
+        /// Parquet (.parquet) with columns: read_id, sequence1, sequence2 (optional)
+        #[arg(short = '1', long)]
+        r1: PathBuf,
+
+        /// Reverse reads for paired-end data (optional).
+        /// Not supported with Parquet input - use sequence2 column instead.
+        #[arg(short = '2', long)]
+        r2: Option<PathBuf>,
+
+        /// Minimum score threshold for either bucket to report.
+        /// Reads where both bucket scores are below this threshold are filtered out.
+        /// Default 0.0 means all reads with any classification are reported.
+        #[arg(short, long, default_value_t = 0.0)]
+        threshold: f64,
+
+        /// Maximum memory to use (e.g., "4G", "512M", "auto").
+        #[arg(long, default_value = "auto", value_parser = parse_max_memory_arg)]
+        max_memory: usize,
+
+        /// Override automatic batch size calculation.
+        #[arg(short, long)]
+        batch_size: Option<usize>,
+
+        /// Output file path. Format auto-detected from extension:
+        /// - `.tsv` or no extension: Plain TSV
+        /// - `.tsv.gz`: Gzip-compressed TSV
+        /// - `.parquet`: Apache Parquet with zstd compression
+        /// - `-`: stdout (TSV)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Use parallel row group processing.
+        #[arg(long)]
+        parallel_rg: bool,
+
+        /// Use bloom filters for row group filtering.
+        #[arg(long)]
+        use_bloom_filter: bool,
+
+        /// Enable parallel row group reading for Parquet input files.
+        #[arg(long, default_value_t = 0)]
+        parallel_input_rg: usize,
+
+        /// Print timing diagnostics to stderr.
+        #[arg(long)]
+        timing: bool,
+
+        /// Trim sequences to first N nucleotides before classification.
+        #[arg(long, value_parser = validate_trim_to)]
+        trim_to: Option<usize>,
+
+        /// Swap numerator and denominator buckets.
+        /// By default, lower bucket_id is numerator. This flag reverses it.
+        #[arg(long)]
+        swap_buckets: bool,
+    },
 }
 
 #[derive(Subcommand)]

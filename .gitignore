@@ -36,3 +36,6 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Scratch directory for temporary test files
+/scratch/

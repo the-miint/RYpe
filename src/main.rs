@@ -11,8 +11,9 @@ mod logging;
 use commands::{
     build_parquet_index_from_config, build_parquet_index_from_config_streaming,
     create_parquet_index_from_refs, inspect_matches, load_index_metadata, resolve_bucket_id,
-    run_aggregate, run_classify, ClassifyAggregateArgs, ClassifyCommands, ClassifyRunArgs, Cli,
-    Commands, IndexCommands, InspectCommands,
+    run_aggregate, run_classify, run_log_ratio, ClassifyAggregateArgs, ClassifyCommands,
+    ClassifyLogRatioArgs, ClassifyRunArgs, Cli, Commands, CommonClassifyArgs, IndexCommands,
+    InspectCommands,
 };
 
 // CLI argument definitions moved to commands/args.rs
@@ -263,19 +264,21 @@ fn main() -> Result<()> {
                 }
 
                 run_classify(ClassifyRunArgs {
-                    index,
+                    common: CommonClassifyArgs {
+                        index,
+                        r1,
+                        r2,
+                        threshold,
+                        max_memory,
+                        batch_size,
+                        output,
+                        parallel_rg,
+                        use_bloom_filter,
+                        parallel_input_rg,
+                        trim_to,
+                    },
                     negative_index,
-                    r1,
-                    r2,
-                    threshold,
-                    max_memory,
-                    batch_size,
-                    output,
-                    parallel_rg,
-                    use_bloom_filter,
-                    parallel_input_rg,
                     best_hit,
-                    trim_to,
                     wide,
                 })?;
             }
@@ -299,6 +302,44 @@ fn main() -> Result<()> {
                     max_memory,
                     batch_size,
                     output,
+                })?;
+            }
+
+            ClassifyCommands::LogRatio {
+                index,
+                r1,
+                r2,
+                threshold,
+                max_memory,
+                batch_size,
+                output,
+                parallel_rg,
+                use_bloom_filter,
+                parallel_input_rg,
+                timing,
+                trim_to,
+                swap_buckets,
+            } => {
+                // Enable timing diagnostics if requested
+                if timing {
+                    ENABLE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                run_log_ratio(ClassifyLogRatioArgs {
+                    common: CommonClassifyArgs {
+                        index,
+                        r1,
+                        r2,
+                        threshold,
+                        max_memory,
+                        batch_size,
+                        output,
+                        parallel_rg,
+                        use_bloom_filter,
+                        parallel_input_rg,
+                        trim_to,
+                    },
+                    swap_buckets,
                 })?;
             }
         },

@@ -297,3 +297,7 @@ When adding features:
 2. **C API thread safety**: Don't share RypeResultArray across threads
 3. **Index compatibility**: Indices with different k, w, or salt cannot be used together for negative filtering
 4. **Short sequences**: Sequences < K bases produce no minimizers
+
+## Development Environment Notes
+
+- **Temporary files**: Do NOT use `/tmp` - it has insufficient space on this system. Use `scratch/` directory within the project for temporary files and test data. This directory is gitignored.

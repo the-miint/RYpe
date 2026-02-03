@@ -2,13 +2,22 @@
 //!
 //! This module is organized into focused submodules:
 //! - `arg_parsing` - CLI argument parsing utilities
+//! - `batch_config` - Batch size computation for classification
+//! - `index_loading` - Index loading for classification commands
+//! - `input_reader` - Input reader setup for classification commands
 //! - `metadata` - Bucket name and index metadata utilities
 //! - `fastx_io` - FASTA/FASTQ I/O with background prefetching
 //! - `output` - Output format detection and writing
 //! - `parquet_io` - Parquet input reading with prefetching
+//! - `log_ratio` - Log-ratio computation for two-bucket classification
 
 mod arg_parsing;
+mod batch_config;
 mod fastx_io;
+mod formatting;
+mod index_loading;
+mod input_reader;
+mod log_ratio;
 mod metadata;
 mod output;
 mod parquet_io;
@@ -19,9 +28,24 @@ mod parquet_io;
 pub use arg_parsing::{
     parse_bloom_fpp, parse_max_memory_arg, parse_shard_size_arg, validate_trim_to,
 };
+pub use batch_config::{compute_effective_batch_size, BatchSizeConfig};
 #[allow(unused_imports)]
 pub use fastx_io::OwnedRecord;
+#[allow(unused_imports)]
 pub use fastx_io::PrefetchingIoHandler;
+pub use formatting::format_classification_results;
+#[allow(unused_imports)]
+pub use index_loading::{
+    load_index_for_classification, validate_parquet_index, IndexLoadOptions, LoadedIndex,
+};
+pub use input_reader::{
+    create_input_reader, validate_input_config, ClassificationInput, InputReaderConfig,
+};
+#[allow(unused_imports)]
+pub use log_ratio::{
+    compute_log_ratio, compute_log_ratio_from_hits, filter_log_ratios_by_threshold,
+    format_log_ratio_bucket_name, format_log_ratio_output, LogRatioResult,
+};
 pub use metadata::{load_index_metadata, resolve_bucket_id, sanitize_bucket_name};
 pub use output::{OutputFormat, OutputWriter};
 #[allow(unused_imports)]

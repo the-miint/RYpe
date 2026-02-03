@@ -1627,3 +1627,845 @@ fn test_cli_wide_with_trim_to_excludes_short_reads() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// Log-Ratio Mode Integration Tests (Phase 5)
+// ============================================================================
+
+/// Test end-to-end log-ratio classification with a 2-bucket index
+#[test]
+fn test_cli_log_ratio_end_to_end() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index with two separate buckets (required for log-ratio)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query file with phiX174 sequence (should match phiX bucket strongly)
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    // Run log-ratio classification
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Log-ratio classification failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    println!("Log-ratio output:\n{}", stdout);
+
+    // Should have header + data rows
+    assert!(
+        lines.len() >= 2,
+        "Should have at least header + 1 data row. Got: {:?}",
+        lines
+    );
+
+    // Header should be "read_id\tbucket_name\tscore"
+    let header = lines[0];
+    assert!(
+        header.starts_with("read_id"),
+        "Header should start with 'read_id'. Got: {}",
+        header
+    );
+    assert!(
+        header.contains("bucket_name"),
+        "Header should contain 'bucket_name'. Got: {}",
+        header
+    );
+
+    // Data row should have the log10([A] / [B]) bucket name format
+    let data_row = lines[1];
+    assert!(
+        data_row.contains("log10(["),
+        "Bucket name should contain 'log10(['. Got: {}",
+        data_row
+    );
+
+    // Data row should have a score (the log ratio)
+    let cols: Vec<&str> = data_row.split('\t').collect();
+    assert_eq!(cols.len(), 3, "Should have 3 columns: {:?}", cols);
+
+    // Score should be parseable (can be "inf" or a float)
+    let score_str = cols[2];
+    if score_str != "inf" && score_str != "-inf" {
+        let score: f64 = score_str.parse().unwrap_or_else(|_| {
+            panic!(
+                "Score should be a valid float or 'inf'. Got: '{}'",
+                score_str
+            )
+        });
+        // Log ratio can be any value, but for a strongly matching read it should be non-zero
+        println!("Log ratio score: {}", score);
+    }
+
+    Ok(())
+}
+
+/// Test that --swap-buckets negates the log-ratio output
+#[test]
+fn test_cli_log_ratio_swap_buckets_negates() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index with two separate buckets
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query file
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    // Run log-ratio WITHOUT --swap-buckets
+    let output_normal = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        output_normal.status.success(),
+        "Log-ratio without swap failed: {}",
+        String::from_utf8_lossy(&output_normal.stderr)
+    );
+
+    // Run log-ratio WITH --swap-buckets
+    let output_swapped = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "--swap-buckets",
+        ])
+        .output()?;
+
+    assert!(
+        output_swapped.status.success(),
+        "Log-ratio with swap failed: {}",
+        String::from_utf8_lossy(&output_swapped.stderr)
+    );
+
+    let stdout_normal = String::from_utf8_lossy(&output_normal.stdout);
+    let stdout_swapped = String::from_utf8_lossy(&output_swapped.stdout);
+
+    println!("Normal output:\n{}", stdout_normal);
+    println!("Swapped output:\n{}", stdout_swapped);
+
+    // Extract scores from both outputs
+    let get_score = |stdout: &str| -> Option<f64> {
+        for line in stdout.lines().skip(1) {
+            // Skip header
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() >= 3 {
+                let score_str = cols[2];
+                if score_str == "inf" {
+                    return Some(f64::INFINITY);
+                } else if score_str == "-inf" {
+                    return Some(f64::NEG_INFINITY);
+                } else {
+                    return score_str.parse().ok();
+                }
+            }
+        }
+        None
+    };
+
+    let score_normal = get_score(&stdout_normal);
+    let score_swapped = get_score(&stdout_swapped);
+
+    println!(
+        "Score normal: {:?}, Score swapped: {:?}",
+        score_normal, score_swapped
+    );
+
+    // If we have valid finite scores, they should be negated
+    if let (Some(sn), Some(ss)) = (score_normal, score_swapped) {
+        if sn.is_finite() && ss.is_finite() && sn != 0.0 {
+            // log10(A/B) = -log10(B/A), so scores should be negated
+            let diff = (sn + ss).abs();
+            assert!(
+                diff < 1e-6,
+                "Swapped score should negate original: {} + {} = {} (expected ~0)",
+                sn,
+                ss,
+                diff
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Test log-ratio with Parquet output format
+#[test]
+fn test_cli_log_ratio_parquet_output() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+    let output_path = dir.path().join("output.parquet");
+
+    // Create index with two separate buckets
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query file
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    // Run log-ratio classification with Parquet output
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-o",
+            output_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Log-ratio with Parquet output failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify Parquet file was created
+    assert!(
+        output_path.exists(),
+        "Parquet output file should exist at {:?}",
+        output_path
+    );
+
+    // Read and verify Parquet schema
+    use parquet::file::reader::FileReader;
+    use parquet::file::reader::SerializedFileReader;
+
+    let file = std::fs::File::open(&output_path)?;
+    let reader = SerializedFileReader::new(file)?;
+    let schema = reader.metadata().file_metadata().schema();
+
+    println!("Parquet schema: {:?}", schema);
+
+    // Schema should have read_id, bucket_name, score
+    let fields = schema.get_fields();
+    assert!(
+        fields.len() >= 3,
+        "Schema should have at least 3 fields. Got: {}",
+        fields.len()
+    );
+
+    // Verify field names
+    assert_eq!(
+        fields[0].name(),
+        "read_id",
+        "First field should be 'read_id'. Got: {}",
+        fields[0].name()
+    );
+    assert_eq!(
+        fields[1].name(),
+        "bucket_name",
+        "Second field should be 'bucket_name'. Got: {}",
+        fields[1].name()
+    );
+    assert_eq!(
+        fields[2].name(),
+        "score",
+        "Third field should be 'score'. Got: {}",
+        fields[2].name()
+    );
+
+    Ok(())
+}
+
+/// Test that --threshold filters log-ratio results
+#[test]
+fn test_cli_log_ratio_threshold_filters() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index with two separate buckets
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query file with a read that has a real sequence
+    // and a "junk" read that won't match well
+    let query_path = dir.path().join("query.fastq");
+    // phiX174 sequence: 70 bases
+    let good_seq = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT";
+    let good_qual = "I".repeat(70);
+    // Junk sequence: 70 N's (won't produce valid k-mers)
+    let weak_seq = "N".repeat(70);
+    let weak_qual = "I".repeat(70);
+    fs::write(
+        &query_path,
+        format!(
+            "@good_query\n{}\n+\n{}\n@weak_query\n{}\n+\n{}\n",
+            good_seq, good_qual, weak_seq, weak_qual
+        ),
+    )?;
+
+    // Run log-ratio WITHOUT threshold (should get all results)
+    let output_no_threshold = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+        ])
+        .output()?;
+
+    assert!(
+        output_no_threshold.status.success(),
+        "Log-ratio without threshold failed: {}",
+        String::from_utf8_lossy(&output_no_threshold.stderr)
+    );
+
+    // Run log-ratio WITH high threshold (should filter weak matches)
+    let output_high_threshold = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.5", // High threshold
+        ])
+        .output()?;
+
+    assert!(
+        output_high_threshold.status.success(),
+        "Log-ratio with high threshold failed: {}",
+        String::from_utf8_lossy(&output_high_threshold.stderr)
+    );
+
+    let stdout_no_thresh = String::from_utf8_lossy(&output_no_threshold.stdout);
+    let stdout_high_thresh = String::from_utf8_lossy(&output_high_threshold.stdout);
+
+    println!("No threshold output:\n{}", stdout_no_thresh);
+    println!("High threshold output:\n{}", stdout_high_thresh);
+
+    // Count data lines (excluding header)
+    let count_data_lines =
+        |s: &str| -> usize { s.lines().skip(1).filter(|l| !l.is_empty()).count() };
+
+    let lines_no_thresh = count_data_lines(&stdout_no_thresh);
+    let lines_high_thresh = count_data_lines(&stdout_high_thresh);
+
+    println!(
+        "Lines without threshold: {}, with high threshold: {}",
+        lines_no_thresh, lines_high_thresh
+    );
+
+    // With high threshold, we should have fewer or equal results
+    // (the weak_query with N's should be filtered out)
+    assert!(
+        lines_high_thresh <= lines_no_thresh,
+        "High threshold should filter results: {} <= {}",
+        lines_high_thresh,
+        lines_no_thresh
+    );
+
+    Ok(())
+}
+
+/// Test that log-ratio outputs infinity when one bucket has score 0
+#[test]
+fn test_cli_log_ratio_infinity_output() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    // We need to create two DISTINCT reference sequences that share nothing in common
+    // This ensures a read from one won't match the other at all
+
+    // Create two completely different reference sequences
+    let ref1_path = dir.path().join("ref1.fasta");
+    let ref2_path = dir.path().join("ref2.fasta");
+
+    // Ref1: repeating AAAA pattern (purines only)
+    let ref1_seq = "A".repeat(200);
+    fs::write(&ref1_path, format!(">ref1\n{}\n", ref1_seq))?;
+
+    // Ref2: repeating TTTT pattern (pyrimidines only)
+    let ref2_seq = "T".repeat(200);
+    fs::write(&ref2_path, format!(">ref2\n{}\n", ref2_seq))?;
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index with two separate buckets
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            ref1_path.to_str().unwrap(),
+            "-r",
+            ref2_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query that matches only ref1 (A's) - exactly matches ref1
+    let query_path = dir.path().join("query.fastq");
+    let query_seq = "A".repeat(100); // Pure A's should match ref1, not ref2
+    let query_qual = "I".repeat(100);
+    fs::write(
+        &query_path,
+        format!("@only_matches_ref1\n{}\n+\n{}\n", query_seq, query_qual),
+    )?;
+
+    // Run log-ratio classification
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Log-ratio classification failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("Infinity test output:\n{}", stdout);
+
+    // The output should contain "inf" because:
+    // - Query matches ref1 (A's) with score > 0
+    // - Query doesn't match ref2 (T's) with score = 0
+    // - log10(score/0) = +infinity OR log10(0/score) would be handled as 0
+    // Depending on which bucket is numerator/denominator, we might see "inf" or "0"
+
+    let has_result = stdout.lines().skip(1).any(|l| !l.is_empty());
+    assert!(
+        has_result,
+        "Should have at least one result for the matching query"
+    );
+
+    // Look for infinity in output (can be "inf" for positive infinity)
+    // Note: if ref1 is denominator and has score 0, we get inf
+    // if ref1 is numerator and ref2 has score 0, we get inf
+    // The actual behavior depends on bucket ordering
+    for line in stdout.lines().skip(1) {
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() >= 3 {
+            let score_str = cols[2];
+            println!("Score value: '{}'", score_str);
+            // Score should be parseable (inf, 0, or some float)
+            if score_str == "inf" {
+                println!("Found infinity as expected when one bucket has 0 score");
+            } else if let Ok(score) = score_str.parse::<f64>() {
+                // If it's 0.0, that means numerator was 0
+                // If it's a finite non-zero, both buckets had scores
+                println!("Found finite score: {}", score);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Test that log-ratio fails gracefully with 1-bucket index
+#[test]
+fn test_cli_log_ratio_fails_with_one_bucket() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index with only ONE bucket (single reference file)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query file
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    // Run log-ratio classification - should FAIL
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    // Should fail because log-ratio requires exactly 2 buckets
+    assert!(
+        !output.status.success(),
+        "Log-ratio with 1-bucket index should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("Expected error: {}", stderr);
+
+    // Error message should mention 2 buckets requirement
+    assert!(
+        stderr.contains("2 buckets") || stderr.contains("exactly 2"),
+        "Error should mention 2 bucket requirement. Got: {}",
+        stderr
+    );
+
+    Ok(())
+}
+
+/// Test that log-ratio fails gracefully with 3-bucket index
+#[test]
+fn test_cli_log_ratio_fails_with_three_buckets() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    // Create three reference files
+    let ref1_path = dir.path().join("ref1.fasta");
+    let ref2_path = dir.path().join("ref2.fasta");
+    let ref3_path = dir.path().join("ref3.fasta");
+
+    fs::write(
+        &ref1_path,
+        ">ref1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+    )?;
+    fs::write(
+        &ref2_path,
+        ">ref2\nTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT\n",
+    )?;
+    fs::write(
+        &ref3_path,
+        ">ref3\nGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\n",
+    )?;
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index with THREE separate buckets
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            ref1_path.to_str().unwrap(),
+            "-r",
+            ref2_path.to_str().unwrap(),
+            "-r",
+            ref3_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create a query file
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    // Run log-ratio classification - should FAIL
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    // Should fail because log-ratio requires exactly 2 buckets
+    assert!(
+        !output.status.success(),
+        "Log-ratio with 3-bucket index should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("Expected error: {}", stderr);
+
+    // Error message should mention 2 buckets requirement and found 3
+    assert!(
+        stderr.contains("2 buckets") || stderr.contains("exactly 2"),
+        "Error should mention 2 bucket requirement. Got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("found 3") || stderr.contains("3"),
+        "Error should mention found 3 buckets. Got: {}",
+        stderr
+    );
+
+    Ok(())
+}

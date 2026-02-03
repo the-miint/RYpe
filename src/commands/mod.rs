@@ -7,7 +7,10 @@ pub mod index;
 pub mod inspect;
 
 pub use args::{ClassifyCommands, Cli, Commands, IndexCommands, InspectCommands};
-pub use classify::{run_aggregate, run_classify, ClassifyAggregateArgs, ClassifyRunArgs};
+pub use classify::{
+    run_aggregate, run_classify, run_log_ratio, ClassifyAggregateArgs, ClassifyLogRatioArgs,
+    ClassifyRunArgs, CommonClassifyArgs,
+};
 pub use helpers::{load_index_metadata, resolve_bucket_id};
 pub use index::{
     build_parquet_index_from_config, build_parquet_index_from_config_streaming,
