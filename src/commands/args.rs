@@ -265,6 +265,73 @@ CLI OPTIONS OVERRIDE CONFIG FILE:
         #[arg(short, long)]
         index: PathBuf,
     },
+
+    /// Merge two indices into one
+    #[command(after_help = "MERGE OPERATION:
+  Combines all buckets from both indices into a single output index.
+  Bucket IDs are renumbered sequentially (1, 2, 3...) with primary buckets first.
+
+REQUIREMENTS:
+  - Both indices must have the same k, w, and salt values
+  - Bucket names must be unique across both indices (no duplicates)
+
+SUBTRACTION MODE (--subtract-from-primary):
+  When enabled, minimizers present in the primary index are removed from
+  the secondary index before merging. This is useful for creating indices
+  where secondary buckets only contain sequences NOT found in primary.
+
+  Use case: Create a \"non-host\" index by subtracting host minimizers.
+
+EXAMPLES:
+  # Simple merge of two indices
+  rype index merge --index-primary bacteria.ryxdi --index-secondary phage.ryxdi -o combined.ryxdi
+
+  # Merge with subtraction (create non-host index)
+  rype index merge --index-primary host.ryxdi --index-secondary sample.ryxdi \\
+      -o non_host.ryxdi --subtract-from-primary
+
+  # Merge with compression options
+  rype index merge --index-primary idx1.ryxdi --index-secondary idx2.ryxdi \\
+      -o merged.ryxdi --zstd --bloom-filter")]
+    Merge {
+        /// Path to primary index directory (.ryxdi)
+        #[arg(long)]
+        index_primary: PathBuf,
+
+        /// Path to secondary index directory (.ryxdi)
+        #[arg(long)]
+        index_secondary: PathBuf,
+
+        /// Output path for merged index (.ryxdi directory will be created)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Remove minimizers from secondary that exist in primary.
+        /// Useful for creating indices where secondary buckets contain
+        /// only sequences NOT found in the primary index.
+        #[arg(long)]
+        subtract_from_primary: bool,
+
+        /// Row group size (rows per group). Larger = better compression.
+        #[arg(long, default_value_t = 100_000)]
+        row_group_size: usize,
+
+        /// Use Zstd compression instead of Snappy for Parquet files.
+        #[arg(long)]
+        zstd: bool,
+
+        /// Enable bloom filters for faster lookups.
+        #[arg(long)]
+        bloom_filter: bool,
+
+        /// Bloom filter false positive probability (0.0-1.0).
+        #[arg(long, default_value = "0.05", value_parser = parse_bloom_fpp)]
+        bloom_fpp: f64,
+
+        /// Print timing diagnostics to stderr for performance analysis.
+        #[arg(long)]
+        timing: bool,
+    },
 }
 
 #[derive(Subcommand)]

@@ -110,5 +110,8 @@ pub use indices::{
     ParquetReadOptions, ParquetWriteOptions,
 };
 
+// Index merge types (also available via `rype::parquet_index::merge::*`)
+pub use indices::parquet::merge::{merge_indices, MergeOptions, MergeStats};
+
 // Re-export parquet module for qualified access
 pub use indices::parquet as parquet_index;

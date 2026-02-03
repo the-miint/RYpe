@@ -16,6 +16,7 @@
 
 mod buckets;
 mod manifest;
+pub mod merge;
 mod options;
 mod streaming;
 

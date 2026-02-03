@@ -2469,3 +2469,680 @@ fn test_cli_log_ratio_fails_with_three_buckets() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// Index Merge CLI Integration Tests (Phase 5)
+// ============================================================================
+
+/// Test basic merge of two indices via CLI
+#[test]
+fn test_cli_merge_basic() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let primary_path = dir.path().join("primary.ryxdi");
+    let secondary_path = dir.path().join("secondary.ryxdi");
+    let merged_path = dir.path().join("merged.ryxdi");
+
+    // Create primary index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            primary_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Primary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create secondary index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            secondary_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Secondary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Merge the indices
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "merge",
+            "--index-primary",
+            primary_path.to_str().unwrap(),
+            "--index-secondary",
+            secondary_path.to_str().unwrap(),
+            "-o",
+            merged_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Merge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify output
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("Merge output:\n{}", stdout);
+
+    // Should print merge summary
+    assert!(
+        stdout.contains("Merge complete"),
+        "Output should indicate merge complete"
+    );
+    assert!(
+        stdout.contains("Total buckets: 2"),
+        "Should have 2 total buckets"
+    );
+
+    // Verify merged index can be opened
+    assert!(merged_path.exists(), "Merged index should exist");
+    assert!(
+        merged_path.join("manifest.toml").exists(),
+        "Manifest should exist"
+    );
+
+    // Verify stats command works on merged index
+    let output = Command::new(&binary)
+        .args(["index", "stats", "-i", merged_path.to_str().unwrap()])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Stats on merged index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stats_stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stats_stdout.contains("Buckets: 2"),
+        "Merged index should have 2 buckets. Stats:\n{}",
+        stats_stdout
+    );
+
+    Ok(())
+}
+
+/// Test merge with --subtract-from-primary flag
+#[test]
+fn test_cli_merge_with_subtraction() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let primary_path = dir.path().join("primary.ryxdi");
+    let secondary_path = dir.path().join("secondary.ryxdi");
+    let merged_path = dir.path().join("merged.ryxdi");
+
+    // Create two reference files with overlapping sequences
+    // Primary: AAAA... pattern
+    // Secondary: same AAAA... pattern plus some TTTT... (different)
+    let ref1_path = dir.path().join("ref1.fasta");
+    let ref2_path = dir.path().join("ref2.fasta");
+
+    let shared_seq = "A".repeat(200);
+    let unique_seq = "T".repeat(200);
+    fs::write(&ref1_path, format!(">shared\n{}\n", shared_seq))?;
+    fs::write(
+        &ref2_path,
+        format!(">shared_copy\n{}\n>unique\n{}\n", shared_seq, unique_seq),
+    )?;
+
+    // Create primary index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            primary_path.to_str().unwrap(),
+            "-r",
+            ref1_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Primary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create secondary index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            secondary_path.to_str().unwrap(),
+            "-r",
+            ref2_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Secondary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Merge with subtraction
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "merge",
+            "--index-primary",
+            primary_path.to_str().unwrap(),
+            "--index-secondary",
+            secondary_path.to_str().unwrap(),
+            "-o",
+            merged_path.to_str().unwrap(),
+            "--subtract-from-primary",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Merge with subtraction failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify output mentions subtraction/exclusion
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("Merge with subtraction output:\n{}", stdout);
+
+    assert!(
+        stdout.contains("Merge complete"),
+        "Output should indicate merge complete"
+    );
+    // Should mention excluded minimizers since secondary has some shared with primary
+    assert!(
+        stdout.contains("Excluded minimizers") || stdout.contains("removed"),
+        "Output should mention excluded/removed minimizers when subtraction is active"
+    );
+
+    // Verify merged index can be opened
+    assert!(merged_path.exists(), "Merged index should exist");
+
+    Ok(())
+}
+
+/// Test that merge fails with incompatible indices
+#[test]
+fn test_cli_merge_incompatible_error() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let primary_path = dir.path().join("primary.ryxdi");
+    let secondary_path = dir.path().join("secondary.ryxdi");
+    let merged_path = dir.path().join("merged.ryxdi");
+
+    // Create reference files
+    let ref1_path = dir.path().join("ref1.fasta");
+    let ref2_path = dir.path().join("ref2.fasta");
+    fs::write(
+        &ref1_path,
+        ">seq1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+    )?;
+    fs::write(
+        &ref2_path,
+        ">seq2\nTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT\n",
+    )?;
+
+    // Create primary index with k=32
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            primary_path.to_str().unwrap(),
+            "-r",
+            ref1_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Primary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create secondary index with DIFFERENT k=16 (incompatible)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            secondary_path.to_str().unwrap(),
+            "-r",
+            ref2_path.to_str().unwrap(),
+            "-k",
+            "16", // Different k!
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Secondary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Attempt to merge incompatible indices - should FAIL
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "merge",
+            "--index-primary",
+            primary_path.to_str().unwrap(),
+            "--index-secondary",
+            secondary_path.to_str().unwrap(),
+            "-o",
+            merged_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        !output.status.success(),
+        "Merge of incompatible indices should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("Expected error: {}", stderr);
+
+    // Error should mention k mismatch
+    assert!(
+        stderr.contains("k mismatch") || stderr.contains("k="),
+        "Error should mention k mismatch. Got: {}",
+        stderr
+    );
+
+    // Merged index should NOT be created
+    assert!(
+        !merged_path.exists(),
+        "Merged index should not be created on error"
+    );
+
+    Ok(())
+}
+
+/// Test that verbose flag works with merge command
+#[test]
+fn test_cli_merge_verbose_output() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let primary_path = dir.path().join("primary.ryxdi");
+    let secondary_path = dir.path().join("secondary.ryxdi");
+    let merged_path = dir.path().join("merged.ryxdi");
+
+    // Create primary index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            primary_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Primary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create secondary index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            secondary_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Secondary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Merge with --verbose flag (global flag before subcommand)
+    let output = Command::new(&binary)
+        .args([
+            "--verbose",
+            "index",
+            "merge",
+            "--index-primary",
+            primary_path.to_str().unwrap(),
+            "--index-secondary",
+            secondary_path.to_str().unwrap(),
+            "-o",
+            merged_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Merge with verbose failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verbose output goes to stderr
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("Verbose stderr:\n{}", stderr);
+
+    // Verbose output should include progress messages
+    assert!(
+        stderr.contains("Loading primary index") || stderr.contains("primary"),
+        "Verbose output should mention loading primary index. Stderr:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("Loading secondary index") || stderr.contains("secondary"),
+        "Verbose output should mention loading secondary index. Stderr:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("Validation passed") || stderr.contains("compatible"),
+        "Verbose output should mention validation. Stderr:\n{}",
+        stderr
+    );
+
+    Ok(())
+}
+
+/// Test merge with compression options (--zstd, --bloom-filter)
+#[test]
+fn test_cli_merge_with_compression_options() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let primary_path = dir.path().join("primary.ryxdi");
+    let secondary_path = dir.path().join("secondary.ryxdi");
+    let merged_path = dir.path().join("merged.ryxdi");
+
+    // Create primary index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            primary_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Primary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create secondary index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            secondary_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Secondary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Merge with compression options
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "merge",
+            "--index-primary",
+            primary_path.to_str().unwrap(),
+            "--index-secondary",
+            secondary_path.to_str().unwrap(),
+            "-o",
+            merged_path.to_str().unwrap(),
+            "--zstd",
+            "--bloom-filter",
+            "--bloom-fpp",
+            "0.01",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Merge with compression options failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify merged index exists and can be opened
+    assert!(merged_path.exists(), "Merged index should exist");
+
+    // Run stats to verify it's valid
+    let output = Command::new(&binary)
+        .args(["index", "stats", "-i", merged_path.to_str().unwrap()])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Stats on merged index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    Ok(())
+}
+
+/// Test merge fails with duplicate bucket names
+#[test]
+fn test_cli_merge_duplicate_bucket_names_error() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    // Build the binary
+    let status = Command::new("cargo")
+        .args(["build"])
+        .current_dir(manifest_dir)
+        .status()?;
+    assert!(status.success(), "Failed to build rype binary");
+
+    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let primary_path = dir.path().join("primary.ryxdi");
+    let secondary_path = dir.path().join("secondary.ryxdi");
+    let merged_path = dir.path().join("merged.ryxdi");
+
+    // Create reference file with a sequence named "duplicate_name"
+    let ref_path = dir.path().join("ref.fasta");
+    fs::write(
+        &ref_path,
+        ">duplicate_name\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+    )?;
+
+    // Create primary index with --separate-buckets (bucket name = sequence name)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            primary_path.to_str().unwrap(),
+            "-r",
+            ref_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Primary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create secondary index with SAME sequence name (will create duplicate bucket name)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            secondary_path.to_str().unwrap(),
+            "-r",
+            ref_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Secondary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Attempt to merge - should FAIL due to duplicate bucket names
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "merge",
+            "--index-primary",
+            primary_path.to_str().unwrap(),
+            "--index-secondary",
+            secondary_path.to_str().unwrap(),
+            "-o",
+            merged_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        !output.status.success(),
+        "Merge with duplicate bucket names should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("Expected error: {}", stderr);
+
+    // Error should mention duplicate bucket name
+    assert!(
+        stderr.contains("duplicate") || stderr.contains("bucket name"),
+        "Error should mention duplicate bucket name. Got: {}",
+        stderr
+    );
+
+    Ok(())
+}

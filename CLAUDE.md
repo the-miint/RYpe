@@ -57,6 +57,14 @@ cargo run --release -- index bucket-source-detail -i index.ryxdi -b 1
 # Build index from a TOML configuration file
 cargo run --release -- index from-config -c config.toml
 
+# Merge two indices into one
+cargo run --release -- index merge --index-primary idx1.ryxdi --index-secondary idx2.ryxdi -o merged.ryxdi
+
+# Merge with subtraction (remove secondary minimizers that exist in primary)
+# Useful for creating non-host indices
+cargo run --release -- index merge --index-primary host.ryxdi --index-secondary sample.ryxdi \
+    -o non_host.ryxdi --subtract-from-primary
+
 # Classify sequences (single-end)
 cargo run --release -- classify run -i index.ryxdi -1 reads.fastq -t 0.1
 
@@ -183,6 +191,7 @@ Nested subcommands using clap:
 - `bucket-add` - Add sequences to existing index as new bucket (development pending)
 - `from-config` - Build index from TOML configuration file
 - `bucket-add-config` - Add files using TOML config (development pending)
+- `merge` - Merge two indices into one (with optional subtraction)
 - `summarize` - Show detailed minimizer statistics
 
 **`rype classify`** - Classification operations:

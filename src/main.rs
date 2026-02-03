@@ -238,6 +238,95 @@ fn main() -> Result<()> {
                      Use 'rype index stats -i <index>' to view index statistics."
                 ));
             }
+
+            IndexCommands::Merge {
+                index_primary,
+                index_secondary,
+                output,
+                subtract_from_primary,
+                row_group_size,
+                zstd,
+                bloom_filter,
+                bloom_fpp,
+                timing,
+            } => {
+                use rype::parquet_index::{merge, ParquetCompression, ParquetWriteOptions};
+
+                // Enable timing diagnostics if requested
+                if timing {
+                    ENABLE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // Validate indices exist and are Parquet format
+                if !rype::is_parquet_index(&index_primary) {
+                    return Err(anyhow!(
+                        "Primary index not found or not in Parquet format: {}",
+                        index_primary.display()
+                    ));
+                }
+                if !rype::is_parquet_index(&index_secondary) {
+                    return Err(anyhow!(
+                        "Secondary index not found or not in Parquet format: {}",
+                        index_secondary.display()
+                    ));
+                }
+
+                // Build write options
+                let write_options = ParquetWriteOptions {
+                    row_group_size,
+                    compression: if zstd {
+                        ParquetCompression::Zstd
+                    } else {
+                        ParquetCompression::Snappy
+                    },
+                    bloom_filter_enabled: bloom_filter,
+                    bloom_filter_fpp: bloom_fpp,
+                    write_page_statistics: true,
+                };
+
+                // Build merge options (verbose comes from global CLI flag)
+                let merge_options = merge::MergeOptions {
+                    subtract_from_primary,
+                    verbose: args.verbose,
+                };
+
+                // Perform the merge
+                let stats = merge::merge_indices(
+                    &index_primary,
+                    &index_secondary,
+                    &output,
+                    &merge_options,
+                    Some(&write_options),
+                )?;
+
+                // Print summary (always, not just verbose)
+                println!("Merge complete:");
+                println!("  Output: {}", output.display());
+                println!("  Total buckets: {}", stats.total_buckets);
+                println!(
+                    "  Total minimizer entries: {}",
+                    stats.total_minimizer_entries
+                );
+                println!(
+                    "  Primary: {} buckets, {} entries",
+                    stats.primary_buckets, stats.primary_entries
+                );
+                if subtract_from_primary && stats.excluded_minimizers > 0 {
+                    println!(
+                        "  Secondary: {} buckets, {} entries (original: {}, removed: {})",
+                        stats.secondary_buckets,
+                        stats.secondary_entries,
+                        stats.secondary_entries_original,
+                        stats.secondary_entries_original - stats.secondary_entries
+                    );
+                    println!("  Excluded minimizers: {}", stats.excluded_minimizers);
+                } else {
+                    println!(
+                        "  Secondary: {} buckets, {} entries",
+                        stats.secondary_buckets, stats.secondary_entries
+                    );
+                }
+            }
         },
 
         Commands::Classify(classify_cmd) => match classify_cmd {
