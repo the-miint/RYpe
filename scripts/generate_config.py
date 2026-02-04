@@ -214,21 +214,77 @@ def cmd_per_file(args: argparse.Namespace) -> int:
     return 0
 
 
+def read_files_from_tsv(tsv_path: str) -> List[str]:
+    """
+    Read file paths from a TSV file with columns: file_path, group_label.
+
+    Args:
+        tsv_path: Path to TSV file
+
+    Returns:
+        List of file paths (group_label is ignored)
+
+    Raises:
+        FileNotFoundError: If TSV file doesn't exist
+        ValueError: If TSV is malformed or files are missing
+    """
+    path = Path(tsv_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"TSV file not found: {tsv_path}")
+
+    files: List[str] = []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+
+        # Validate header
+        if reader.fieldnames is None:
+            raise ValueError("TSV file is empty or has no header")
+        required_cols = {"file_path", "group_label"}
+        if not required_cols.issubset(set(reader.fieldnames)):
+            missing = required_cols - set(reader.fieldnames)
+            raise ValueError(f"TSV missing required columns: {missing}")
+
+        for row in reader:
+            file_path = row["file_path"].strip()
+            files.append(file_path)
+
+    if not files:
+        raise ValueError("TSV file contains no data rows")
+
+    # Validate all file paths exist
+    missing_files = [f for f in files if not Path(f).is_file()]
+    if missing_files:
+        raise FileNotFoundError(
+            f"Missing {len(missing_files)} file(s):\n" +
+            "\n".join(f"  {f}" for f in missing_files[:10]) +
+            (f"\n  ... and {len(missing_files) - 10} more" if len(missing_files) > 10 else "")
+        )
+
+    return files
+
+
 def cmd_unified(args: argparse.Namespace) -> int:
     """Phase 3: All sequence files go into a single bucket."""
-    # Parse extensions
-    if args.extensions:
-        extensions = {ext.strip() for ext in args.extensions.split(",")}
-    else:
-        extensions = SEQUENCE_EXTENSIONS
-
     # Validate bucket name
     validate_no_whitespace(args.bucket_name, "Bucket name")
 
-    # Scan directory for sequence files
-    files = get_sequence_files(args.directory, extensions)
-    if not files:
-        raise ValueError(f"No sequence files found in {args.directory}")
+    input_path = Path(args.input)
+
+    if input_path.is_dir():
+        # Directory mode: scan for sequence files
+        if args.extensions:
+            extensions = {ext.strip() for ext in args.extensions.split(",")}
+        else:
+            extensions = SEQUENCE_EXTENSIONS
+
+        files = get_sequence_files(str(input_path), extensions)
+        if not files:
+            raise ValueError(f"No sequence files found in {args.input}")
+    elif input_path.is_file():
+        # TSV mode: read file paths from TSV
+        files = read_files_from_tsv(str(input_path))
+    else:
+        raise FileNotFoundError(f"Input path does not exist: {args.input}")
 
     # Build single bucket containing all files
     buckets = [(args.bucket_name, files)]
@@ -417,8 +473,8 @@ def create_parser() -> argparse.ArgumentParser:
         help="All sequence files go into a single bucket",
     )
     unified_parser.add_argument(
-        "directory",
-        help="Directory containing sequence files",
+        "input",
+        help="Directory containing sequence files, or TSV file with columns: file_path, group_label",
     )
     unified_parser.add_argument(
         "-o", "--output",
@@ -439,7 +495,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--extensions",
         type=str,
         default=None,
-        help="Comma-separated list of extensions to include (default: all sequence extensions)",
+        help="Comma-separated list of extensions to include; only used in directory mode (default: all sequence extensions)",
     )
     unified_parser.set_defaults(func=cmd_unified)
 
