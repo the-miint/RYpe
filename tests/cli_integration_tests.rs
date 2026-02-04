@@ -5,8 +5,29 @@
 use anyhow::Result;
 use rype::{extract_with_positions, get_paired_minimizers_into, MinimizerWorkspace, Strand};
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 use tempfile::tempdir;
+
+static BINARY_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Build the binary once and return its path. Safe to call from multiple tests in parallel.
+fn get_binary_path() -> PathBuf {
+    BINARY_PATH
+        .get_or_init(|| {
+            let manifest_dir = env!("CARGO_MANIFEST_DIR");
+            let status = std::process::Command::new("cargo")
+                .args(["build"])
+                .current_dir(manifest_dir)
+                .status()
+                .expect("Failed to run cargo build");
+            assert!(status.success(), "Failed to build rype binary");
+
+            PathBuf::from(manifest_dir).join("target/debug/rype")
+        })
+        .clone()
+}
 
 /// Test extract_with_positions returns correct positions and strands
 #[test]
@@ -137,14 +158,7 @@ fn test_readme_bash_examples() -> Result<()> {
         "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
     )?;
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
 
     // Track which commands we've tested
     let mut tested_commands = Vec::new();
@@ -280,14 +294,7 @@ fn test_cli_index_create_and_classify() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index
@@ -368,14 +375,7 @@ fn test_cli_index_stats() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index
@@ -434,14 +434,7 @@ fn test_cli_best_hit_flag() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index with two separate buckets (one per file)
@@ -571,14 +564,7 @@ fn test_cli_bucket_source_detail_by_name() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index with two separate buckets (one per file)
@@ -709,14 +695,7 @@ fn test_cli_trim_to_argument_parsing() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index
@@ -785,14 +764,7 @@ fn test_cli_trim_to_skips_short_sequences() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index
@@ -898,14 +870,7 @@ fn test_cli_wide_flag_is_recognized() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index
@@ -981,14 +946,7 @@ fn test_cli_wide_with_threshold_errors() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index
@@ -1066,14 +1024,7 @@ fn test_cli_wide_alone_is_accepted() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index
@@ -1144,14 +1095,7 @@ fn test_cli_wide_produces_wide_format_tsv() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index with two separate buckets
@@ -1289,14 +1233,7 @@ fn test_cli_wide_produces_wide_format_parquet() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
     let output_path = dir.path().join("output.parquet");
 
@@ -1410,14 +1347,7 @@ fn test_cli_wide_includes_zero_scores_for_non_hits() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index with two separate buckets
@@ -1521,20 +1451,9 @@ fn test_cli_wide_includes_zero_scores_for_non_hits() -> Result<()> {
 /// (skipped reads should NOT appear in wide output, even with all zeros)
 #[test]
 fn test_cli_wide_with_trim_to_excludes_short_reads() -> Result<()> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let dir = tempdir()?;
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--manifest-path",
-            &format!("{}/Cargo.toml", manifest_dir),
-        ])
-        .status()?;
-    assert!(status.success(), "Failed to build");
-
-    let binary = format!("{}/target/debug/rype", manifest_dir);
+    let binary = get_binary_path();
 
     // Create index with a reference sequence
     let ref_seq = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\
@@ -1645,14 +1564,7 @@ fn test_cli_log_ratio_end_to_end() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index with two separate buckets (required for log-ratio)
@@ -1771,14 +1683,7 @@ fn test_cli_log_ratio_swap_buckets_negates() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index with two separate buckets
@@ -1914,14 +1819,7 @@ fn test_cli_log_ratio_parquet_output() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
     let output_path = dir.path().join("output.parquet");
 
@@ -2038,14 +1936,7 @@ fn test_cli_log_ratio_threshold_filters() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index with two separate buckets
@@ -2163,7 +2054,6 @@ fn test_cli_log_ratio_threshold_filters() -> Result<()> {
 /// Test that log-ratio outputs infinity when one bucket has score 0
 #[test]
 fn test_cli_log_ratio_infinity_output() -> Result<()> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let dir = tempdir()?;
 
     // We need to create two DISTINCT reference sequences that share nothing in common
@@ -2181,14 +2071,7 @@ fn test_cli_log_ratio_infinity_output() -> Result<()> {
     let ref2_seq = "T".repeat(200);
     fs::write(&ref2_path, format!(">ref2\n{}\n", ref2_seq))?;
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index with two separate buckets
@@ -2296,14 +2179,7 @@ fn test_cli_log_ratio_fails_with_one_bucket() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index with only ONE bucket (single reference file)
@@ -2369,7 +2245,6 @@ fn test_cli_log_ratio_fails_with_one_bucket() -> Result<()> {
 /// Test that log-ratio fails gracefully with 3-bucket index
 #[test]
 fn test_cli_log_ratio_fails_with_three_buckets() -> Result<()> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let dir = tempdir()?;
 
     // Create three reference files
@@ -2390,14 +2265,7 @@ fn test_cli_log_ratio_fails_with_three_buckets() -> Result<()> {
         ">ref3\nGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\n",
     )?;
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let index_path = dir.path().join("test.ryxdi");
 
     // Create index with THREE separate buckets
@@ -2487,14 +2355,7 @@ fn test_cli_merge_basic() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let primary_path = dir.path().join("primary.ryxdi");
     let secondary_path = dir.path().join("secondary.ryxdi");
     let merged_path = dir.path().join("merged.ryxdi");
@@ -2605,17 +2466,9 @@ fn test_cli_merge_basic() -> Result<()> {
 /// Test merge with --subtract-from-primary flag
 #[test]
 fn test_cli_merge_with_subtraction() -> Result<()> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let dir = tempdir()?;
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let primary_path = dir.path().join("primary.ryxdi");
     let secondary_path = dir.path().join("secondary.ryxdi");
     let merged_path = dir.path().join("merged.ryxdi");
@@ -2720,17 +2573,9 @@ fn test_cli_merge_with_subtraction() -> Result<()> {
 /// Test that merge fails with incompatible indices
 #[test]
 fn test_cli_merge_incompatible_error() -> Result<()> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let dir = tempdir()?;
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let primary_path = dir.path().join("primary.ryxdi");
     let secondary_path = dir.path().join("secondary.ryxdi");
     let merged_path = dir.path().join("merged.ryxdi");
@@ -2840,14 +2685,7 @@ fn test_cli_merge_verbose_output() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let primary_path = dir.path().join("primary.ryxdi");
     let secondary_path = dir.path().join("secondary.ryxdi");
     let merged_path = dir.path().join("merged.ryxdi");
@@ -2952,14 +2790,7 @@ fn test_cli_merge_with_compression_options() -> Result<()> {
         return Ok(());
     }
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let primary_path = dir.path().join("primary.ryxdi");
     let secondary_path = dir.path().join("secondary.ryxdi");
     let merged_path = dir.path().join("merged.ryxdi");
@@ -3049,17 +2880,9 @@ fn test_cli_merge_with_compression_options() -> Result<()> {
 /// Test merge fails with duplicate bucket names
 #[test]
 fn test_cli_merge_duplicate_bucket_names_error() -> Result<()> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let dir = tempdir()?;
 
-    // Build the binary
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()?;
-    assert!(status.success(), "Failed to build rype binary");
-
-    let binary = std::path::Path::new(manifest_dir).join("target/debug/rype");
+    let binary = get_binary_path();
     let primary_path = dir.path().join("primary.ryxdi");
     let secondary_path = dir.path().join("secondary.ryxdi");
     let merged_path = dir.path().join("merged.ryxdi");
