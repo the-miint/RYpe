@@ -424,7 +424,7 @@ def create_parser() -> argparse.ArgumentParser:
         help=f"Hash salt as hex string (default: {DEFAULT_SALT})",
     )
     common_parser.add_argument(
-        "--orient/--no-orient",
+        "--orient",
         dest="orient",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_ORIENT,
