@@ -9,11 +9,10 @@ mod commands;
 mod logging;
 
 use commands::{
-    build_parquet_index_from_config, build_parquet_index_from_config_streaming,
-    create_parquet_index_from_refs, inspect_matches, load_index_metadata, resolve_bucket_id,
-    run_aggregate, run_classify, run_log_ratio, ClassifyAggregateArgs, ClassifyCommands,
-    ClassifyLogRatioArgs, ClassifyRunArgs, Cli, Commands, CommonClassifyArgs, IndexCommands,
-    InspectCommands,
+    build_parquet_index_from_config, create_parquet_index_from_refs, inspect_matches,
+    load_index_metadata, resolve_bucket_id, run_aggregate, run_classify, run_log_ratio,
+    ClassifyAggregateArgs, ClassifyCommands, ClassifyLogRatioArgs, ClassifyRunArgs, Cli, Commands,
+    CommonClassifyArgs, IndexCommands, InspectCommands,
 };
 
 // CLI argument definitions moved to commands/args.rs
@@ -187,7 +186,7 @@ fn main() -> Result<()> {
 
             IndexCommands::FromConfig {
                 config,
-                max_shard_size,
+                max_memory,
                 row_group_size,
                 bloom_filter,
                 bloom_fpp,
@@ -207,22 +206,14 @@ fn main() -> Result<()> {
                     ..Default::default()
                 };
 
-                // Use streaming mode when max_shard_size is set (memory-bounded creation)
-                if max_shard_size.is_some() {
-                    build_parquet_index_from_config_streaming(
-                        &config,
-                        max_shard_size,
-                        Some(&options),
-                        orient,
-                    )?;
+                // max_memory: 0 means "auto" (will be detected in the function)
+                let max_memory_opt = if max_memory == 0 {
+                    None
                 } else {
-                    build_parquet_index_from_config(
-                        &config,
-                        max_shard_size,
-                        Some(&options),
-                        orient,
-                    )?;
-                }
+                    Some(max_memory)
+                };
+
+                build_parquet_index_from_config(&config, max_memory_opt, Some(&options), orient)?;
             }
 
             IndexCommands::BucketAddConfig { config: _ } => {

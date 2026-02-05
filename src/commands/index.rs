@@ -910,6 +910,7 @@ fn build_single_bucket_parallel_oriented_chunked(
 ///
 /// The bucket minimizers are maintained as a sorted, deduplicated Vec throughout,
 /// using `merge_sorted_into` for efficient in-place merging.
+#[cfg(test)]
 fn build_single_bucket(
     bucket_name: &str,
     files: &[PathBuf],
@@ -942,12 +943,12 @@ fn build_single_bucket(
 ///
 /// # Arguments
 /// * `config_path` - Path to the TOML configuration file
-/// * `cli_max_shard_size` - CLI override for max shard size (takes precedence over config)
+/// * `cli_max_memory` - CLI override for max memory (None = auto-detect)
 /// * `options` - Parquet write options
 /// * `cli_orient` - CLI override for orient sequences flag (takes precedence over config)
 pub fn build_parquet_index_from_config(
     config_path: &Path,
-    cli_max_shard_size: Option<usize>,
+    cli_max_memory: Option<usize>,
     options: Option<&parquet_index::ParquetWriteOptions>,
     cli_orient: bool,
 ) -> Result<()> {
@@ -968,8 +969,6 @@ pub fn build_parquet_index_from_config(
     log::info!("Validating file paths...");
     validate_config(&cfg, config_dir)?;
     log::info!("Validation successful.");
-
-    let max_shard_size = cli_max_shard_size.or(cfg.index.max_shard_size);
 
     // Determine orient_sequences: CLI --orient flag takes precedence over config file
     let orient_sequences = if cli_orient {
@@ -1005,56 +1004,58 @@ pub fn build_parquet_index_from_config(
         ));
     }
 
-    // Build buckets - use parallel within-bucket extraction for single-bucket case
-    let t_build = Instant::now();
+    // Build buckets - strategy depends on bucket count
     let is_single_bucket = bucket_names.len() == 1;
 
-    let bucket_results: Vec<_> = if is_single_bucket {
-        // Single bucket: use chunked parallel extraction for memory-bounded processing
-        let bucket_name = &bucket_names[0];
-        let files = &cfg.buckets[bucket_name].files;
+    if !is_single_bucket {
+        // Multiple buckets: use streaming mode for memory-bounded processing
+        // Derive shard size from max_memory (use half of memory budget for shard accumulator)
+        use rype::memory::detect_available_memory;
+        let available = cli_max_memory.unwrap_or_else(|| detect_available_memory().bytes);
+        let shard_size = available / 2;
 
-        let result = if orient_sequences {
-            // Chunked hybrid: baseline + parallel orientation in memory-bounded chunks
-            build_single_bucket_parallel_oriented_chunked(
-                bucket_name,
-                files,
-                config_dir,
-                cfg.index.k,
-                cfg.index.window,
-                cfg.index.salt,
-                None, // Auto-detect memory
-            )?
-        } else {
-            // Chunked parallel: all sequences extracted in memory-bounded chunks
-            build_single_bucket_parallel_chunked(
-                bucket_name,
-                files,
-                config_dir,
-                cfg.index.k,
-                cfg.index.window,
-                cfg.index.salt,
-                None, // Auto-detect memory
-            )?
-        };
-        vec![result]
+        log::info!(
+            "Multi-bucket index: using streaming mode (shard size: {} bytes)",
+            shard_size
+        );
+
+        return build_parquet_index_from_config_streaming(
+            config_path,
+            Some(shard_size),
+            options,
+            cli_orient,
+        );
+    }
+
+    // Single bucket: use chunked parallel extraction for memory-bounded processing
+    let t_build = Instant::now();
+    let bucket_name = &bucket_names[0];
+    let files = &cfg.buckets[bucket_name].files;
+
+    let result = if orient_sequences {
+        // Chunked hybrid: baseline + parallel orientation in memory-bounded chunks
+        build_single_bucket_parallel_oriented_chunked(
+            bucket_name,
+            files,
+            config_dir,
+            cfg.index.k,
+            cfg.index.window,
+            cfg.index.salt,
+            cli_max_memory,
+        )?
     } else {
-        // Multiple buckets: parallel across buckets (existing behavior)
-        bucket_names
-            .par_iter()
-            .map(|bucket_name| {
-                build_single_bucket(
-                    bucket_name,
-                    &cfg.buckets[bucket_name].files,
-                    config_dir,
-                    cfg.index.k,
-                    cfg.index.window,
-                    cfg.index.salt,
-                    orient_sequences,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?
+        // Chunked parallel: all sequences extracted in memory-bounded chunks
+        build_single_bucket_parallel_chunked(
+            bucket_name,
+            files,
+            config_dir,
+            cfg.index.k,
+            cfg.index.window,
+            cfg.index.salt,
+            cli_max_memory,
+        )?
     };
+    let bucket_results: Vec<_> = vec![result];
     log_timing(
         "parquet_index: bucket_building",
         t_build.elapsed().as_millis(),
@@ -1090,7 +1091,7 @@ pub fn build_parquet_index_from_config(
         cfg.index.k,
         cfg.index.window,
         cfg.index.salt,
-        max_shard_size,
+        None, // Shard size determined automatically
         options,
     )?;
     log_timing("parquet_index: write", t_write.elapsed().as_millis());

@@ -194,7 +194,6 @@ pub enum IndexCommands {
   window = 50                      # Minimizer window size
   salt = 0x5555555555555555        # Hash salt (hex)
   output = \"index.ryxdi\"           # Output path (directory will be created)
-  max_shard_size = 1073741824      # Optional: shard size (bytes)
   orient_sequences = true          # Optional: orient sequences for better overlap
 
   [buckets.BucketName]             # Define a bucket
@@ -204,16 +203,18 @@ pub enum IndexCommands {
   files = [\"other.fasta\"]
 
 CLI OPTIONS OVERRIDE CONFIG FILE:
-  --max-shard-size overrides [index].max_shard_size
+  --max-memory controls memory budget (auto-detected if not specified)
   --orient overrides [index].orient_sequences")]
     FromConfig {
         /// Path to TOML config file
         #[arg(short, long)]
         config: PathBuf,
 
-        /// Maximum shard size (e.g., "1G", overrides config)
-        #[arg(long, value_parser = parse_shard_size_arg)]
-        max_shard_size: Option<usize>,
+        /// Maximum memory to use (e.g., "8G", "512M", "auto").
+        /// Controls chunk sizes for input processing.
+        /// Default: auto-detect from system/cgroups/SLURM.
+        #[arg(long, default_value = "auto", value_parser = parse_max_memory_arg)]
+        max_memory: usize,
 
         /// Row group size (rows per group). Larger = better compression.
         #[arg(long, default_value_t = 100_000)]
