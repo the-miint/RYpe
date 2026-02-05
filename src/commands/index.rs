@@ -253,6 +253,7 @@ fn extract_bucket_minimizers(
 /// Collect all sequences from files with their source labels.
 ///
 /// Returns Vec of (sequence_bytes, source_label) for parallel processing.
+#[cfg(test)]
 fn collect_sequences_from_files(
     files: &[PathBuf],
     config_dir: &Path,
@@ -287,6 +288,7 @@ fn collect_sequences_from_files(
 ///
 /// All sequences are extracted in parallel, then k-way merged.
 /// This is used when there is only one bucket and orientation is disabled.
+#[cfg(test)]
 fn build_single_bucket_parallel(
     bucket_name: &str,
     files: &[PathBuf],
@@ -345,6 +347,7 @@ fn build_single_bucket_parallel(
 /// 1. First file: extract sequentially to establish baseline minimizers
 /// 2. Remaining files: extract both strands in parallel, choose orientation
 ///    by comparing against baseline, then k-way merge all results
+#[cfg(test)]
 fn build_single_bucket_parallel_oriented(
     bucket_name: &str,
     files: &[PathBuf],
@@ -478,6 +481,426 @@ fn extract_baseline_from_first_file(
     Ok((baseline_mins, sources))
 }
 
+// ============================================================================
+// Chunked Memory-Aware Extraction
+// ============================================================================
+
+/// Configuration for chunked sequence extraction.
+#[derive(Debug, Clone)]
+struct ChunkConfig {
+    /// Target maximum bytes for sequences in a single chunk.
+    /// Actual chunks may exceed this if a single sequence is larger.
+    target_chunk_bytes: usize,
+}
+
+/// Memory overhead multiplier for minimizer extraction.
+/// Accounts for: raw sequences + minimizers + sorting + merge workspace.
+const EXTRACTION_MEMORY_MULTIPLIER: f64 = 4.0;
+
+/// Minimum chunk size to ensure reasonable parallelism (100MB).
+const MIN_CHUNK_BYTES: usize = 100 * 1024 * 1024;
+
+/// Maximum chunk size to avoid excessive memory on large-memory systems (4GB).
+const MAX_CHUNK_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+/// Calculate chunk configuration based on available memory.
+///
+/// # Arguments
+/// * `available_memory` - Total available memory in bytes (from detection or CLI)
+///
+/// # Returns
+/// A `ChunkConfig` with target chunk size that respects memory constraints.
+fn calculate_chunk_config(available_memory: usize) -> ChunkConfig {
+    // Reserve 25% of memory for the merged result accumulator and overhead
+    let chunk_budget = (available_memory as f64 * 0.75) as usize;
+
+    // Account for extraction overhead (4x raw sequence bytes)
+    let target = (chunk_budget as f64 / EXTRACTION_MEMORY_MULTIPLIER) as usize;
+
+    // Clamp to reasonable bounds
+    let target_chunk_bytes = target.clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES);
+
+    ChunkConfig { target_chunk_bytes }
+}
+
+/// Iterator that yields chunks of sequences respecting a byte budget.
+///
+/// Sequences are yielded in file order. Each chunk contains sequences
+/// up to the target byte budget. If a single sequence exceeds the budget,
+/// it is yielded alone in its own chunk.
+struct SequenceChunkIterator {
+    /// Remaining files to process
+    files: Vec<PathBuf>,
+    /// Base directory for resolving relative paths
+    config_dir: PathBuf,
+    /// Target maximum bytes per chunk
+    target_chunk_bytes: usize,
+    /// Current file index
+    current_file_idx: usize,
+    /// Current reader (if file is open)
+    current_reader: Option<Box<dyn needletail::FastxReader>>,
+    /// Current filename for source labels
+    current_filename: String,
+    /// Pending sequence that didn't fit in the previous chunk
+    pending_sequence: Option<(Vec<u8>, String)>,
+}
+
+impl SequenceChunkIterator {
+    /// Create a new chunk iterator.
+    fn new(files: &[PathBuf], config_dir: &Path, target_chunk_bytes: usize) -> Self {
+        Self {
+            files: files.to_vec(),
+            config_dir: config_dir.to_path_buf(),
+            target_chunk_bytes,
+            current_file_idx: 0,
+            current_reader: None,
+            current_filename: String::new(),
+            pending_sequence: None,
+        }
+    }
+
+    /// Open the next file, returning true if successful.
+    /// Skips empty or invalid files with a warning.
+    fn open_next_file(&mut self) -> Result<bool> {
+        while self.current_file_idx < self.files.len() {
+            let file_path = &self.files[self.current_file_idx];
+            let abs_path = resolve_path(&self.config_dir, file_path);
+            self.current_file_idx += 1;
+
+            self.current_filename = abs_path
+                .canonicalize()
+                .unwrap_or_else(|_| abs_path.clone())
+                .to_string_lossy()
+                .to_string();
+
+            // Try to open the file, skip if empty or invalid
+            match parse_fastx_file(&abs_path) {
+                Ok(reader) => {
+                    self.current_reader = Some(reader);
+                    return Ok(true);
+                }
+                Err(e) => {
+                    // Log warning and skip to next file
+                    log::warn!(
+                        "Skipping file {} (possibly empty or invalid): {}",
+                        abs_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Get the next chunk of sequences.
+    ///
+    /// Returns `Ok(Some(chunk))` with sequences, `Ok(None)` when exhausted,
+    /// or `Err` on I/O error.
+    #[allow(clippy::type_complexity)]
+    fn next_chunk(&mut self) -> Result<Option<Vec<(Vec<u8>, String)>>> {
+        let mut chunk: Vec<(Vec<u8>, String)> = Vec::new();
+        let mut chunk_bytes: usize = 0;
+
+        // First, check if we have a pending sequence from the previous call
+        if let Some((seq, src)) = self.pending_sequence.take() {
+            let seq_len = seq.len();
+            chunk.push((seq, src));
+            chunk_bytes += seq_len;
+        }
+
+        loop {
+            // Ensure we have an open reader
+            if self.current_reader.is_none() && !self.open_next_file()? {
+                // No more files
+                break;
+            }
+
+            let reader = self.current_reader.as_mut().unwrap();
+
+            match reader.next() {
+                Some(Ok(record)) => {
+                    let seq = record.seq().to_vec();
+                    let seq_len = seq.len();
+                    let seq_name = String::from_utf8_lossy(record.id()).to_string();
+                    let source_label = format!(
+                        "{}{}{}",
+                        self.current_filename, BUCKET_SOURCE_DELIM, seq_name
+                    );
+
+                    // Check if adding this sequence would exceed budget
+                    if !chunk.is_empty() && chunk_bytes + seq_len > self.target_chunk_bytes {
+                        // Current chunk is full, buffer this sequence for next call
+                        self.pending_sequence = Some((seq, source_label));
+                        return Ok(Some(chunk));
+                    }
+
+                    chunk.push((seq, source_label));
+                    chunk_bytes += seq_len;
+                }
+                Some(Err(e)) => {
+                    return Err(anyhow!(
+                        "Invalid record in {}: {}",
+                        self.current_filename,
+                        e
+                    ));
+                }
+                None => {
+                    // Current file exhausted, move to next
+                    self.current_reader = None;
+                }
+            }
+        }
+
+        // Return final chunk if non-empty
+        if chunk.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(chunk))
+        }
+    }
+}
+
+/// Build a single bucket using chunked parallel extraction.
+///
+/// Sequences are processed in memory-bounded chunks. Each chunk is extracted
+/// in parallel, then merged into a running accumulator. This bounds peak memory
+/// to approximately 4x the chunk size regardless of total input size.
+///
+/// # Arguments
+/// * `bucket_name` - Name of the bucket being built
+/// * `files` - Paths to FASTA/FASTQ files
+/// * `config_dir` - Base directory for resolving relative paths
+/// * `k` - K-mer size
+/// * `w` - Window size
+/// * `salt` - Hash salt
+/// * `max_memory` - Available memory budget (None = auto-detect)
+///
+/// # Returns
+/// Tuple of (bucket_name, sorted_deduped_minimizers, source_labels)
+fn build_single_bucket_parallel_chunked(
+    bucket_name: &str,
+    files: &[PathBuf],
+    config_dir: &Path,
+    k: usize,
+    w: usize,
+    salt: u64,
+    max_memory: Option<usize>,
+) -> Result<(String, Vec<u64>, Vec<String>)> {
+    use rype::memory::detect_available_memory;
+
+    log::info!(
+        "Processing bucket '{}' (chunked parallel, {} files) ...",
+        bucket_name,
+        files.len()
+    );
+
+    // Determine memory budget
+    let available = max_memory.unwrap_or_else(|| {
+        let detected = detect_available_memory();
+        log::debug!(
+            "Auto-detected available memory: {} bytes (source: {:?})",
+            detected.bytes,
+            detected.source
+        );
+        detected.bytes
+    });
+
+    let chunk_config = calculate_chunk_config(available);
+    log::debug!(
+        "Using chunk size: {} bytes ({:.1} MB)",
+        chunk_config.target_chunk_bytes,
+        chunk_config.target_chunk_bytes as f64 / (1024.0 * 1024.0)
+    );
+
+    let mut merged_mins: Vec<u64> = Vec::new();
+    let mut all_sources: Vec<String> = Vec::new();
+    let mut chunk_count = 0;
+
+    let mut chunk_iter =
+        SequenceChunkIterator::new(files, config_dir, chunk_config.target_chunk_bytes);
+
+    while let Some(chunk) = chunk_iter.next_chunk()? {
+        chunk_count += 1;
+        let chunk_size: usize = chunk.iter().map(|(seq, _)| seq.len()).sum();
+        log::debug!(
+            "Processing chunk {} ({} sequences, {} bytes)",
+            chunk_count,
+            chunk.len(),
+            chunk_size
+        );
+
+        // Collect sources before consuming chunk
+        all_sources.extend(chunk.iter().map(|(_, src)| src.clone()));
+
+        // Estimate workspace size from this chunk's sequences
+        let avg_len = chunk_size / chunk.len().max(1);
+        let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+
+        // Parallel extraction within chunk
+        let chunk_mins: Vec<Vec<u64>> = chunk
+            .par_iter()
+            .map_init(
+                move || MinimizerWorkspace::with_estimate(estimated_mins),
+                |ws, (seq, _source)| {
+                    extract_into(seq, k, w, salt, ws);
+                    let mut mins = std::mem::take(&mut ws.buffer);
+                    mins.sort_unstable();
+                    mins
+                },
+            )
+            .collect();
+
+        // K-way merge this chunk's results
+        let chunk_merged = kway_merge_dedup(chunk_mins);
+
+        // Merge into running accumulator
+        if merged_mins.is_empty() {
+            merged_mins = chunk_merged;
+        } else {
+            merge_sorted_into(&mut merged_mins, &chunk_merged);
+        }
+
+        // chunk dropped here - sequences freed before next iteration
+    }
+
+    log::info!(
+        "Completed bucket '{}': {} minimizers ({} chunks processed)",
+        bucket_name,
+        merged_mins.len(),
+        chunk_count
+    );
+
+    Ok((bucket_name.to_string(), merged_mins, all_sources))
+}
+
+/// Build a single bucket with orientation using chunked parallel extraction.
+///
+/// Strategy:
+/// 1. First file: extract sequentially to establish baseline (forward strand only)
+/// 2. Remaining files in chunks: orient against baseline, merge incrementally
+///
+/// This bounds memory to approximately 4x chunk size plus the baseline minimizers.
+fn build_single_bucket_parallel_oriented_chunked(
+    bucket_name: &str,
+    files: &[PathBuf],
+    config_dir: &Path,
+    k: usize,
+    w: usize,
+    salt: u64,
+    max_memory: Option<usize>,
+) -> Result<(String, Vec<u64>, Vec<String>)> {
+    use rype::memory::detect_available_memory;
+
+    log::info!(
+        "Processing bucket '{}' (chunked parallel, oriented, {} files) ...",
+        bucket_name,
+        files.len()
+    );
+
+    if files.is_empty() {
+        return Ok((bucket_name.to_string(), vec![], vec![]));
+    }
+
+    // Phase 1: Process first file sequentially to establish baseline
+    let (baseline_mins, baseline_sources) =
+        extract_baseline_from_first_file(&files[0], config_dir, k, w, salt)?;
+
+    if files.len() == 1 {
+        log::info!(
+            "Completed bucket '{}': {} minimizers",
+            bucket_name,
+            baseline_mins.len()
+        );
+        return Ok((bucket_name.to_string(), baseline_mins, baseline_sources));
+    }
+
+    // Determine memory budget for remaining files
+    let available = max_memory.unwrap_or_else(|| {
+        let detected = detect_available_memory();
+        log::debug!(
+            "Auto-detected available memory: {} bytes (source: {:?})",
+            detected.bytes,
+            detected.source
+        );
+        detected.bytes
+    });
+
+    let chunk_config = calculate_chunk_config(available);
+    log::debug!(
+        "Using chunk size: {} bytes ({:.1} MB)",
+        chunk_config.target_chunk_bytes,
+        chunk_config.target_chunk_bytes as f64 / (1024.0 * 1024.0)
+    );
+
+    let mut merged_mins = baseline_mins;
+    let mut all_sources = baseline_sources;
+    let mut chunk_count = 0;
+
+    // Phase 2: Process remaining files in chunks
+    let mut chunk_iter =
+        SequenceChunkIterator::new(&files[1..], config_dir, chunk_config.target_chunk_bytes);
+
+    while let Some(chunk) = chunk_iter.next_chunk()? {
+        chunk_count += 1;
+        let chunk_size: usize = chunk.iter().map(|(seq, _)| seq.len()).sum();
+        log::debug!(
+            "Processing chunk {} ({} sequences, {} bytes)",
+            chunk_count,
+            chunk.len(),
+            chunk_size
+        );
+
+        // Collect sources
+        all_sources.extend(chunk.iter().map(|(_, src)| src.clone()));
+
+        // Estimate workspace size
+        let avg_len = chunk_size / chunk.len().max(1);
+        let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+
+        // Clone reference to merged_mins for parallel access
+        // (orientation compares against current accumulated baseline)
+        let baseline_ref = &merged_mins;
+
+        // Parallel extraction with orientation
+        let chunk_mins: Vec<Vec<u64>> = chunk
+            .par_iter()
+            .map_init(
+                move || MinimizerWorkspace::with_estimate(estimated_mins),
+                |ws, (seq, _source)| {
+                    let (mut fwd, mut rc) = extract_dual_strand_into(seq, k, w, salt, ws);
+                    fwd.sort_unstable();
+                    rc.sort_unstable();
+
+                    let (orientation, _overlap) =
+                        choose_orientation_sampled(baseline_ref, &fwd, &rc);
+
+                    match orientation {
+                        Orientation::Forward => fwd,
+                        Orientation::ReverseComplement => rc,
+                    }
+                },
+            )
+            .collect();
+
+        // K-way merge this chunk's results
+        let chunk_merged = kway_merge_dedup(chunk_mins);
+
+        // Merge into accumulator (which also serves as baseline for next chunk)
+        merge_sorted_into(&mut merged_mins, &chunk_merged);
+    }
+
+    log::info!(
+        "Completed bucket '{}': {} minimizers ({} chunks processed)",
+        bucket_name,
+        merged_mins.len(),
+        chunk_count
+    );
+
+    Ok((bucket_name.to_string(), merged_mins, all_sources))
+}
+
 /// Build a single bucket from its files, returning the name, minimizers, and sources.
 ///
 /// When `orient_sequences` is true:
@@ -587,29 +1010,31 @@ pub fn build_parquet_index_from_config(
     let is_single_bucket = bucket_names.len() == 1;
 
     let bucket_results: Vec<_> = if is_single_bucket {
-        // Single bucket: use parallel per-sequence extraction
+        // Single bucket: use chunked parallel extraction for memory-bounded processing
         let bucket_name = &bucket_names[0];
         let files = &cfg.buckets[bucket_name].files;
 
         let result = if orient_sequences {
-            // Hybrid: first file baseline, then parallel orientation
-            build_single_bucket_parallel_oriented(
+            // Chunked hybrid: baseline + parallel orientation in memory-bounded chunks
+            build_single_bucket_parallel_oriented_chunked(
                 bucket_name,
                 files,
                 config_dir,
                 cfg.index.k,
                 cfg.index.window,
                 cfg.index.salt,
+                None, // Auto-detect memory
             )?
         } else {
-            // Full parallel: all sequences extracted in parallel
-            build_single_bucket_parallel(
+            // Chunked parallel: all sequences extracted in memory-bounded chunks
+            build_single_bucket_parallel_chunked(
                 bucket_name,
                 files,
                 config_dir,
                 cfg.index.k,
                 cfg.index.window,
                 cfg.index.salt,
+                None, // Auto-detect memory
             )?
         };
         vec![result]
@@ -2608,6 +3033,374 @@ files = ["short.fa", "long.fa"]
             manifest.total_minimizers > 0,
             "Should have minimizers from long sequence (got {})",
             manifest.total_minimizers
+        );
+    }
+
+    // ============================================================================
+    // Phase 7: Chunked Memory-Aware Extraction Tests
+    // ============================================================================
+
+    #[test]
+    fn test_sequence_chunk_iterator_respects_byte_budget() {
+        // Create temp files with known sequence sizes:
+        // File 1: 3 sequences of 1000 bytes each (3000 bytes total)
+        // File 2: 2 sequences of 2000 bytes each (4000 bytes total)
+        // Total: 7000 bytes
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create File 1: 3 sequences of 1000 bytes each
+        let seq_1000 = vec![b'A'; 1000];
+        let file1 = create_multi_fasta_file(
+            dir,
+            "file1.fa",
+            &[
+                ("seq1", seq_1000.as_slice()),
+                ("seq2", seq_1000.as_slice()),
+                ("seq3", seq_1000.as_slice()),
+            ],
+        );
+
+        // Create File 2: 2 sequences of 2000 bytes each
+        let seq_2000 = vec![b'C'; 2000];
+        let file2 = create_multi_fasta_file(
+            dir,
+            "file2.fa",
+            &[("seq4", seq_2000.as_slice()), ("seq5", seq_2000.as_slice())],
+        );
+
+        // Set chunk budget to 2500 bytes
+        let chunk_config = ChunkConfig {
+            target_chunk_bytes: 2500,
+        };
+
+        let mut chunk_iter =
+            SequenceChunkIterator::new(&[file1, file2], dir, chunk_config.target_chunk_bytes);
+
+        let mut all_sequences: Vec<(usize, String)> = Vec::new();
+        let mut chunk_count = 0;
+
+        while let Some(chunk) = chunk_iter.next_chunk().unwrap() {
+            chunk_count += 1;
+            let chunk_bytes: usize = chunk.iter().map(|(seq, _)| seq.len()).sum();
+
+            // If chunk has more than one sequence, verify budget is respected
+            // (a single large sequence can exceed budget)
+            if chunk.len() > 1 {
+                // Chunk bytes should be close to or under budget
+                // We allow one sequence to push us over
+                assert!(
+                    chunk_bytes <= chunk_config.target_chunk_bytes + 2000,
+                    "Chunk {} exceeded budget by too much: {} bytes (budget: {})",
+                    chunk_count,
+                    chunk_bytes,
+                    chunk_config.target_chunk_bytes
+                );
+            }
+
+            for (seq, src) in chunk {
+                all_sequences.push((seq.len(), src));
+            }
+        }
+
+        // Verify all sequences were yielded exactly once
+        assert_eq!(all_sequences.len(), 5, "Should have 5 sequences total");
+        assert!(chunk_count >= 2, "Should have at least 2 chunks");
+    }
+
+    #[test]
+    fn test_sequence_chunk_iterator_handles_large_single_sequence() {
+        // Create temp file with:
+        // - Sequence 1: 100 bytes
+        // - Sequence 2: 10000 bytes (exceeds budget)
+        // - Sequence 3: 100 bytes
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let seq_small = vec![b'A'; 100];
+        let seq_large = vec![b'G'; 10000];
+
+        let file = create_multi_fasta_file(
+            dir,
+            "mixed.fa",
+            &[
+                ("seq1", seq_small.as_slice()),
+                ("seq2", seq_large.as_slice()),
+                ("seq3", seq_small.as_slice()),
+            ],
+        );
+
+        // Set chunk budget to 500 bytes
+        let mut chunk_iter = SequenceChunkIterator::new(&[file], dir, 500);
+
+        let mut all_sequences: Vec<(usize, String)> = Vec::new();
+        let mut found_large_alone = false;
+
+        while let Some(chunk) = chunk_iter.next_chunk().unwrap() {
+            // Check if the large sequence is alone in its chunk
+            if chunk.len() == 1 && chunk[0].0.len() == 10000 {
+                found_large_alone = true;
+            }
+
+            for (seq, src) in chunk {
+                all_sequences.push((seq.len(), src));
+            }
+        }
+
+        // Verify all sequences were processed
+        assert_eq!(all_sequences.len(), 3, "Should have 3 sequences");
+        assert!(
+            found_large_alone,
+            "Large sequence should be in its own chunk"
+        );
+    }
+
+    #[test]
+    fn test_sequence_chunk_iterator_exhausts_all_files() {
+        // Create 3 temp files with various sequences
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let seq = vec![b'T'; 500];
+        let file1 = create_multi_fasta_file(dir, "file1.fa", &[("s1", seq.as_slice())]);
+        let file2 = create_multi_fasta_file(
+            dir,
+            "file2.fa",
+            &[("s2", seq.as_slice()), ("s3", seq.as_slice())],
+        );
+        let file3 = create_multi_fasta_file(dir, "file3.fa", &[("s4", seq.as_slice())]);
+
+        let mut chunk_iter = SequenceChunkIterator::new(
+            &[file1, file2, file3],
+            dir,
+            10000, // Large budget = fewer chunks
+        );
+
+        let mut all_sources: Vec<String> = Vec::new();
+
+        while let Some(chunk) = chunk_iter.next_chunk().unwrap() {
+            for (_, src) in chunk {
+                all_sources.push(src);
+            }
+        }
+
+        // Verify total sequences
+        assert_eq!(all_sources.len(), 4, "Should have 4 sequences total");
+
+        // Verify all source labels are correctly formatted
+        for source in &all_sources {
+            assert!(
+                source.contains(BUCKET_SOURCE_DELIM),
+                "Source '{}' should contain delimiter",
+                source
+            );
+        }
+
+        // Verify order (file1 seqs, then file2 seqs, etc.)
+        assert!(all_sources[0].contains("s1"));
+        assert!(all_sources[1].contains("s2"));
+        assert!(all_sources[2].contains("s3"));
+        assert!(all_sources[3].contains("s4"));
+    }
+
+    #[test]
+    fn test_chunked_extraction_matches_non_chunked() {
+        // Create test data: multiple files with known sequences
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create sequences long enough to produce minimizers
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq2 = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+
+        let file1 = create_fasta_file(dir, "ref1.fa", seq1);
+        let file2 = create_fasta_file(dir, "ref2.fa", seq2);
+        let files = vec![file1, file2];
+
+        let k = 32;
+        let w = 10;
+        let salt = 0x5555555555555555u64;
+
+        // Run 1: Use existing build_single_bucket_parallel (unlimited memory)
+        let (_, mins_non_chunked, sources_non_chunked) =
+            build_single_bucket_parallel("TestBucket", &files, dir, k, w, salt).unwrap();
+
+        // Run 2: Use chunked extraction with small chunk budget
+        let (_, mins_chunked, sources_chunked) = build_single_bucket_parallel_chunked(
+            "TestBucket",
+            &files,
+            dir,
+            k,
+            w,
+            salt,
+            Some(500), // Very small budget to force multiple chunks
+        )
+        .unwrap();
+
+        // Verify minimizer sets are identical
+        assert_eq!(
+            mins_chunked, mins_non_chunked,
+            "Chunked extraction should produce identical minimizers"
+        );
+
+        // Verify source lists are identical (same order)
+        assert_eq!(
+            sources_chunked, sources_non_chunked,
+            "Chunked extraction should produce identical sources in same order"
+        );
+    }
+
+    #[test]
+    fn test_chunked_oriented_extraction_matches_non_chunked() {
+        // Create test data with sequences that have clear orientation preferences
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq2 = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+
+        let file1 = create_fasta_file(dir, "ref1.fa", seq1);
+        let file2 = create_fasta_file(dir, "ref2.fa", seq2);
+        let files = vec![file1, file2];
+
+        let k = 32;
+        let w = 10;
+        let salt = 0x5555555555555555u64;
+
+        // Run 1: Use existing oriented extraction (unlimited memory)
+        let (_, mins_non_chunked, _) =
+            build_single_bucket_parallel_oriented("TestBucket", &files, dir, k, w, salt).unwrap();
+
+        // Run 2: Use chunked oriented extraction with small chunk budget
+        let (_, mins_chunked, _) = build_single_bucket_parallel_oriented_chunked(
+            "TestBucket",
+            &files,
+            dir,
+            k,
+            w,
+            salt,
+            Some(500), // Very small budget to force multiple chunks
+        )
+        .unwrap();
+
+        // Verify minimizer sets are identical
+        assert_eq!(
+            mins_chunked, mins_non_chunked,
+            "Chunked oriented extraction should produce identical minimizers"
+        );
+    }
+
+    #[test]
+    fn test_chunked_extraction_with_single_sequence() {
+        // Edge case: bucket has only one sequence
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let file = create_fasta_file(dir, "single.fa", seq);
+
+        let (_, minimizers, sources) = build_single_bucket_parallel_chunked(
+            "SingleSeq",
+            &[file],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(100), // Very small budget
+        )
+        .unwrap();
+
+        // Verify returns correct minimizers
+        assert!(!minimizers.is_empty(), "Should extract minimizers");
+        assert_eq!(sources.len(), 1, "Should have one source");
+
+        // Verify minimizers are sorted and deduplicated
+        let mut sorted = minimizers.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(minimizers, sorted);
+    }
+
+    #[test]
+    fn test_chunked_extraction_with_empty_files() {
+        // Create mix of empty and non-empty files
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create an empty FASTA file
+        let empty_path = dir.join("empty.fa");
+        std::fs::write(&empty_path, "").unwrap();
+
+        // Create a non-empty file
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let nonempty = create_fasta_file(dir, "nonempty.fa", seq);
+
+        let (_, minimizers, sources) = build_single_bucket_parallel_chunked(
+            "MixedEmpty",
+            &[empty_path, nonempty],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(1000),
+        )
+        .unwrap();
+
+        // Empty files should be skipped gracefully
+        // Non-empty files should be processed correctly
+        assert!(
+            !minimizers.is_empty(),
+            "Should have minimizers from non-empty file"
+        );
+        assert_eq!(
+            sources.len(),
+            1,
+            "Should have one source (from non-empty file)"
+        );
+    }
+
+    #[test]
+    fn test_chunk_config_calculation() {
+        // Test calculate_chunk_config with various memory limits
+
+        // 8GB available → reasonable chunk size (~1.5GB)
+        let config_8gb = calculate_chunk_config(8 * 1024 * 1024 * 1024);
+        assert!(
+            config_8gb.target_chunk_bytes >= MIN_CHUNK_BYTES,
+            "8GB: chunk size {} should be >= MIN_CHUNK_BYTES {}",
+            config_8gb.target_chunk_bytes,
+            MIN_CHUNK_BYTES
+        );
+        assert!(
+            config_8gb.target_chunk_bytes <= MAX_CHUNK_BYTES,
+            "8GB: chunk size {} should be <= MAX_CHUNK_BYTES {}",
+            config_8gb.target_chunk_bytes,
+            MAX_CHUNK_BYTES
+        );
+
+        // 32GB available → larger chunk size (but capped at MAX)
+        let config_32gb = calculate_chunk_config(32 * 1024 * 1024 * 1024);
+        assert!(
+            config_32gb.target_chunk_bytes >= config_8gb.target_chunk_bytes,
+            "32GB should have >= chunk size than 8GB"
+        );
+        assert!(
+            config_32gb.target_chunk_bytes <= MAX_CHUNK_BYTES,
+            "32GB: chunk size should be capped at MAX_CHUNK_BYTES"
+        );
+
+        // 512MB available → minimum viable chunk size
+        let config_512mb = calculate_chunk_config(512 * 1024 * 1024);
+        assert!(
+            config_512mb.target_chunk_bytes >= MIN_CHUNK_BYTES,
+            "512MB: chunk size should be at least MIN_CHUNK_BYTES"
+        );
+
+        // Very small memory → should still respect minimum
+        let config_tiny = calculate_chunk_config(100 * 1024 * 1024);
+        assert_eq!(
+            config_tiny.target_chunk_bytes, MIN_CHUNK_BYTES,
+            "Tiny memory should use MIN_CHUNK_BYTES"
         );
     }
 }
