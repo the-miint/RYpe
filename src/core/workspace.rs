@@ -63,6 +63,36 @@ impl MinimizerWorkspace {
             estimated_minimizers: estimated_minimizers.max(ESTIMATED_MINIMIZERS_PER_SEQUENCE),
         }
     }
+
+    /// Estimate the number of minimizers for a sequence of given length.
+    ///
+    /// Uses the formula: `((seq_len - k) / w + 1) * 2` for both strands.
+    /// Falls back to `ESTIMATED_MINIMIZERS_PER_SEQUENCE` for short sequences.
+    ///
+    /// # Arguments
+    /// * `seq_len` - Length of the sequence in bases
+    /// * `k` - K-mer size
+    /// * `w` - Window size for minimizer selection
+    ///
+    /// # Returns
+    /// Estimated number of minimizers, at least `ESTIMATED_MINIMIZERS_PER_SEQUENCE`.
+    ///
+    /// # Examples
+    /// ```
+    /// use rype::MinimizerWorkspace;
+    ///
+    /// // 200bp sequence with k=32, w=10
+    /// let estimate = MinimizerWorkspace::estimate_for_length(200, 32, 10);
+    /// // ((200 - 32) / 10 + 1) * 2 = 36
+    /// assert!(estimate >= 32);
+    /// ```
+    pub fn estimate_for_length(seq_len: usize, k: usize, w: usize) -> usize {
+        if seq_len <= k {
+            ESTIMATED_MINIMIZERS_PER_SEQUENCE
+        } else {
+            (((seq_len - k) / w + 1) * 2).max(ESTIMATED_MINIMIZERS_PER_SEQUENCE)
+        }
+    }
 }
 
 impl Default for MinimizerWorkspace {

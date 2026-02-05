@@ -87,10 +87,10 @@ pub use core::{
 };
 
 // Orientation utilities (for bucket building)
-pub use core::{
-    choose_orientation, choose_orientation_sampled, merge_sorted_into, Orientation,
-    ORIENTATION_FIRST_N,
-};
+pub use core::{choose_orientation, choose_orientation_sampled, Orientation, ORIENTATION_FIRST_N};
+
+// Merge utilities
+pub use core::{kway_merge_dedup, merge_sorted_into};
 
 // Constants
 pub use constants::BUCKET_SOURCE_DELIM;

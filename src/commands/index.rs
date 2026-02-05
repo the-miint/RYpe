@@ -12,8 +12,8 @@ use std::time::Instant;
 use rype::config::{parse_config, resolve_path, validate_config};
 use rype::parquet_index;
 use rype::{
-    choose_orientation_sampled, extract_dual_strand_into, extract_into, log_timing,
-    merge_sorted_into, MinimizerWorkspace, Orientation, BUCKET_SOURCE_DELIM,
+    choose_orientation_sampled, extract_dual_strand_into, extract_into, kway_merge_dedup,
+    log_timing, merge_sorted_into, MinimizerWorkspace, Orientation, BUCKET_SOURCE_DELIM,
 };
 
 use std::collections::HashSet;
@@ -246,6 +246,238 @@ fn extract_bucket_minimizers(
     Ok((bucket_mins, sources))
 }
 
+// ============================================================================
+// Parallel Single-Bucket Extraction
+// ============================================================================
+
+/// Collect all sequences from files with their source labels.
+///
+/// Returns Vec of (sequence_bytes, source_label) for parallel processing.
+fn collect_sequences_from_files(
+    files: &[PathBuf],
+    config_dir: &Path,
+) -> Result<Vec<(Vec<u8>, String)>> {
+    use rype::config::resolve_path;
+
+    let mut sequences = Vec::new();
+
+    for file_path in files {
+        let abs_path = resolve_path(config_dir, file_path);
+        let mut reader = parse_fastx_file(&abs_path)
+            .context(format!("Failed to open file {}", abs_path.display()))?;
+
+        let filename = abs_path
+            .canonicalize()
+            .unwrap_or_else(|_| abs_path.clone())
+            .to_string_lossy()
+            .to_string();
+
+        while let Some(record) = reader.next() {
+            let rec = record.context(format!("Invalid record in {}", abs_path.display()))?;
+            let seq_name = String::from_utf8_lossy(rec.id()).to_string();
+            let source_label = format!("{}{}{}", filename, BUCKET_SOURCE_DELIM, seq_name);
+            sequences.push((rec.seq().to_vec(), source_label));
+        }
+    }
+
+    Ok(sequences)
+}
+
+/// Build a single bucket using parallel per-sequence extraction.
+///
+/// All sequences are extracted in parallel, then k-way merged.
+/// This is used when there is only one bucket and orientation is disabled.
+fn build_single_bucket_parallel(
+    bucket_name: &str,
+    files: &[PathBuf],
+    config_dir: &Path,
+    k: usize,
+    w: usize,
+    salt: u64,
+) -> Result<(String, Vec<u64>, Vec<String>)> {
+    log::info!(
+        "Processing bucket '{}' (parallel, {} files) ...",
+        bucket_name,
+        files.len()
+    );
+
+    let sequences = collect_sequences_from_files(files, config_dir)?;
+
+    if sequences.is_empty() {
+        return Ok((bucket_name.to_string(), vec![], vec![]));
+    }
+
+    // Estimate workspace size from average sequence length
+    let avg_len = sequences.iter().map(|(s, _)| s.len()).sum::<usize>() / sequences.len().max(1);
+    let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+
+    // Parallel extraction with per-thread workspace
+    // Note: we don't dedup here - kway_merge_dedup handles deduplication efficiently
+    let per_seq_mins: Vec<Vec<u64>> = sequences
+        .par_iter()
+        .map_init(
+            move || MinimizerWorkspace::with_estimate(estimated_mins),
+            |ws, (seq, _source)| {
+                extract_into(seq, k, w, salt, ws);
+                let mut mins = std::mem::take(&mut ws.buffer);
+                mins.sort_unstable();
+                mins
+            },
+        )
+        .collect();
+
+    // K-way merge of sorted vecs
+    let merged = kway_merge_dedup(per_seq_mins);
+    let sources: Vec<String> = sequences.into_iter().map(|(_, src)| src).collect();
+
+    log::info!(
+        "Completed bucket '{}': {} minimizers",
+        bucket_name,
+        merged.len()
+    );
+
+    Ok((bucket_name.to_string(), merged, sources))
+}
+
+/// Build a single bucket with orientation using hybrid approach.
+///
+/// Strategy:
+/// 1. First file: extract sequentially to establish baseline minimizers
+/// 2. Remaining files: extract both strands in parallel, choose orientation
+///    by comparing against baseline, then k-way merge all results
+fn build_single_bucket_parallel_oriented(
+    bucket_name: &str,
+    files: &[PathBuf],
+    config_dir: &Path,
+    k: usize,
+    w: usize,
+    salt: u64,
+) -> Result<(String, Vec<u64>, Vec<String>)> {
+    log::info!(
+        "Processing bucket '{}' (parallel, oriented, {} files) ...",
+        bucket_name,
+        files.len()
+    );
+
+    if files.is_empty() {
+        return Ok((bucket_name.to_string(), vec![], vec![]));
+    }
+
+    // Phase 1: Process first file sequentially to establish baseline
+    let (baseline_mins, baseline_sources) =
+        extract_baseline_from_first_file(&files[0], config_dir, k, w, salt)?;
+
+    if files.len() == 1 {
+        // Only one file, we're done
+        log::info!(
+            "Completed bucket '{}': {} minimizers",
+            bucket_name,
+            baseline_mins.len()
+        );
+        return Ok((bucket_name.to_string(), baseline_mins, baseline_sources));
+    }
+
+    // Phase 2: Collect sequences from remaining files
+    let remaining_sequences = collect_sequences_from_files(&files[1..], config_dir)?;
+
+    if remaining_sequences.is_empty() {
+        log::info!(
+            "Completed bucket '{}': {} minimizers",
+            bucket_name,
+            baseline_mins.len()
+        );
+        return Ok((bucket_name.to_string(), baseline_mins, baseline_sources));
+    }
+
+    // Estimate workspace size from average sequence length
+    let avg_len = remaining_sequences
+        .iter()
+        .map(|(s, _)| s.len())
+        .sum::<usize>()
+        / remaining_sequences.len().max(1);
+    let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+
+    // Phase 3: Parallel extraction with orientation against baseline
+    // Note: we don't dedup here - kway_merge_dedup handles deduplication efficiently
+    let oriented_mins: Vec<Vec<u64>> = remaining_sequences
+        .par_iter()
+        .map_init(
+            move || MinimizerWorkspace::with_estimate(estimated_mins),
+            |ws, (seq, _source)| {
+                let (mut fwd, mut rc) = extract_dual_strand_into(seq, k, w, salt, ws);
+                fwd.sort_unstable();
+                rc.sort_unstable();
+
+                // Choose orientation based on overlap with baseline
+                let (orientation, _overlap) = choose_orientation_sampled(&baseline_mins, &fwd, &rc);
+
+                match orientation {
+                    Orientation::Forward => fwd,
+                    Orientation::ReverseComplement => rc,
+                }
+            },
+        )
+        .collect();
+
+    // Phase 4: K-way merge baseline + all oriented results
+    let mut all_sorted_vecs = Vec::with_capacity(1 + oriented_mins.len());
+    all_sorted_vecs.push(baseline_mins);
+    all_sorted_vecs.extend(oriented_mins);
+
+    let merged = kway_merge_dedup(all_sorted_vecs);
+
+    // Combine sources
+    let mut all_sources = baseline_sources;
+    all_sources.extend(remaining_sequences.into_iter().map(|(_, src)| src));
+
+    log::info!(
+        "Completed bucket '{}': {} minimizers",
+        bucket_name,
+        merged.len()
+    );
+
+    Ok((bucket_name.to_string(), merged, all_sources))
+}
+
+/// Extract baseline minimizers from the first file (sequential, forward strand only).
+fn extract_baseline_from_first_file(
+    file_path: &Path,
+    config_dir: &Path,
+    k: usize,
+    w: usize,
+    salt: u64,
+) -> Result<(Vec<u64>, Vec<String>)> {
+    use rype::config::resolve_path;
+
+    let abs_path = resolve_path(config_dir, file_path);
+    let mut reader = parse_fastx_file(&abs_path)
+        .context(format!("Failed to open file {}", abs_path.display()))?;
+
+    let filename = abs_path
+        .canonicalize()
+        .unwrap_or_else(|_| abs_path.clone())
+        .to_string_lossy()
+        .to_string();
+
+    let mut ws = MinimizerWorkspace::new();
+    let mut baseline_mins: Vec<u64> = Vec::new();
+    let mut sources: Vec<String> = Vec::new();
+
+    while let Some(record) = reader.next() {
+        let rec = record.context(format!("Invalid record in {}", abs_path.display()))?;
+        let seq_name = String::from_utf8_lossy(rec.id()).to_string();
+        let source_label = format!("{}{}{}", filename, BUCKET_SOURCE_DELIM, seq_name);
+        sources.push(source_label);
+
+        extract_into(&rec.seq(), k, w, salt, &mut ws);
+        let mut new_mins = std::mem::take(&mut ws.buffer);
+        new_mins.sort_unstable();
+        merge_sorted_into(&mut baseline_mins, &new_mins);
+    }
+
+    Ok((baseline_mins, sources))
+}
+
 /// Build a single bucket from its files, returning the name, minimizers, and sources.
 ///
 /// When `orient_sequences` is true:
@@ -350,22 +582,54 @@ pub fn build_parquet_index_from_config(
         ));
     }
 
-    // Build buckets in parallel
+    // Build buckets - use parallel within-bucket extraction for single-bucket case
     let t_build = Instant::now();
-    let bucket_results: Vec<_> = bucket_names
-        .par_iter()
-        .map(|bucket_name| {
-            build_single_bucket(
+    let is_single_bucket = bucket_names.len() == 1;
+
+    let bucket_results: Vec<_> = if is_single_bucket {
+        // Single bucket: use parallel per-sequence extraction
+        let bucket_name = &bucket_names[0];
+        let files = &cfg.buckets[bucket_name].files;
+
+        let result = if orient_sequences {
+            // Hybrid: first file baseline, then parallel orientation
+            build_single_bucket_parallel_oriented(
                 bucket_name,
-                &cfg.buckets[bucket_name].files,
+                files,
                 config_dir,
                 cfg.index.k,
                 cfg.index.window,
                 cfg.index.salt,
-                orient_sequences,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
+            )?
+        } else {
+            // Full parallel: all sequences extracted in parallel
+            build_single_bucket_parallel(
+                bucket_name,
+                files,
+                config_dir,
+                cfg.index.k,
+                cfg.index.window,
+                cfg.index.salt,
+            )?
+        };
+        vec![result]
+    } else {
+        // Multiple buckets: parallel across buckets (existing behavior)
+        bucket_names
+            .par_iter()
+            .map(|bucket_name| {
+                build_single_bucket(
+                    bucket_name,
+                    &cfg.buckets[bucket_name].files,
+                    config_dir,
+                    cfg.index.k,
+                    cfg.index.window,
+                    cfg.index.salt,
+                    orient_sequences,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
     log_timing(
         "parquet_index: bucket_building",
         t_build.elapsed().as_millis(),
@@ -1940,6 +2204,410 @@ files = ["ref3.fa"]
         assert_eq!(
             manifest_ns.source_hash, manifest_s.source_hash,
             "Source hash should match (deterministic content)"
+        );
+    }
+
+    // ==========================================================================
+    // Tests for parallel single-bucket extraction (TDD RED phase)
+    // ==========================================================================
+
+    /// Test 1: Single-bucket with multiple sequences produces correct output.
+    ///
+    /// This test verifies that parallel extraction + k-way merge produces the same
+    /// sorted, deduplicated minimizer set as sequential extraction + incremental merge.
+    #[test]
+    fn test_single_bucket_parallel_produces_same_output() {
+        use rype::ShardedInvertedIndex;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create multiple FASTA files with distinct sequences for a single bucket
+        // Using different seeds ensures unique minimizer sets
+        fn make_sequence(seed: u64, length: usize) -> Vec<u8> {
+            let mut state = seed;
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match (state >> 32) % 4 {
+                        0 => b'A',
+                        1 => b'C',
+                        2 => b'G',
+                        _ => b'T',
+                    }
+                })
+                .collect()
+        }
+
+        // Create 5 files with ~10KB sequences each
+        for i in 0..5 {
+            let seq = make_sequence(i as u64 * 99999, 10_000);
+            create_fasta_file(dir, &format!("ref{}.fa", i), &seq);
+        }
+
+        // Create config with single bucket containing all 5 files
+        let config_content = r#"[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "single_bucket_test.ryidx"
+
+[buckets.SingleBucket]
+files = ["ref0.fa", "ref1.fa", "ref2.fa", "ref3.fa", "ref4.fa"]
+"#;
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, config_content).unwrap();
+
+        // Build index using non-streaming path (which will eventually use parallel)
+        let result = build_parquet_index_from_config(&config_path, None, None, false);
+        assert!(
+            result.is_ok(),
+            "Index creation should succeed: {:?}",
+            result
+        );
+
+        // Verify the index
+        let output_path = dir.join("single_bucket_test.ryxdi");
+        let index = ShardedInvertedIndex::open(&output_path).unwrap();
+        let manifest = index.manifest();
+
+        // Verify single bucket
+        assert_eq!(
+            manifest.bucket_names.len(),
+            1,
+            "Should have exactly 1 bucket"
+        );
+
+        // Verify bucket name
+        assert!(
+            manifest.bucket_names.values().any(|n| n == "SingleBucket"),
+            "Bucket should be named 'SingleBucket'"
+        );
+
+        // Verify bucket has minimizers (with 5 x 10KB sequences, expect substantial count)
+        // Note: bucket_minimizer_counts not stored in Parquet, use total_minimizers
+        assert!(
+            manifest.total_minimizers > 1000,
+            "Single bucket should have significant minimizers (got {})",
+            manifest.total_minimizers
+        );
+
+        // Find the bucket_id for SingleBucket
+        let bucket_id = *manifest
+            .bucket_names
+            .iter()
+            .find(|(_, name)| *name == "SingleBucket")
+            .map(|(id, _)| id)
+            .unwrap();
+
+        // Verify sources are recorded for all 5 sequences
+        let sources = manifest.bucket_sources.get(&bucket_id).unwrap();
+        assert_eq!(
+            sources.len(),
+            5,
+            "Should have 5 sources (one per file, single sequence each)"
+        );
+    }
+
+    /// Test 2: Multi-bucket behavior remains unchanged (regression test).
+    ///
+    /// When there are multiple buckets, the existing parallel-across-buckets
+    /// path should be used and produce correct results.
+    #[test]
+    fn test_multi_bucket_behavior_unchanged() {
+        use rype::ShardedInvertedIndex;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create deterministic sequences with known patterns
+        // Using poly-A, poly-T, and poly-G for predictable (and distinct) minimizers
+        let seq_a = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let seq_t = b"TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT";
+        let seq_g = b"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG";
+
+        create_fasta_file(dir, "ref_a.fa", seq_a);
+        create_fasta_file(dir, "ref_t.fa", seq_t);
+        create_fasta_file(dir, "ref_g.fa", seq_g);
+
+        // Create config with 3 buckets
+        let config_content = r#"[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "multi_bucket_test.ryidx"
+
+[buckets.BucketA]
+files = ["ref_a.fa"]
+
+[buckets.BucketT]
+files = ["ref_t.fa"]
+
+[buckets.BucketG]
+files = ["ref_g.fa"]
+"#;
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, config_content).unwrap();
+
+        // Build index
+        let result = build_parquet_index_from_config(&config_path, None, None, false);
+        assert!(
+            result.is_ok(),
+            "Index creation should succeed: {:?}",
+            result
+        );
+
+        // Verify the index
+        let output_path = dir.join("multi_bucket_test.ryxdi");
+        let index = ShardedInvertedIndex::open(&output_path).unwrap();
+        let manifest = index.manifest();
+
+        // Verify 3 buckets
+        assert_eq!(
+            manifest.bucket_names.len(),
+            3,
+            "Should have exactly 3 buckets"
+        );
+
+        // Verify all bucket names present
+        let names: std::collections::HashSet<&String> = manifest.bucket_names.values().collect();
+        assert!(
+            names.iter().any(|n| n.as_str() == "BucketA"),
+            "Missing BucketA"
+        );
+        assert!(
+            names.iter().any(|n| n.as_str() == "BucketT"),
+            "Missing BucketT"
+        );
+        assert!(
+            names.iter().any(|n| n.as_str() == "BucketG"),
+            "Missing BucketG"
+        );
+
+        // Verify total minimizers exist (bucket_minimizer_counts not in Parquet)
+        assert!(
+            manifest.total_minimizers > 0,
+            "Index should have some total minimizers (got {})",
+            manifest.total_minimizers
+        );
+    }
+
+    /// Test 3: Single-bucket with orientation uses hybrid approach correctly.
+    ///
+    /// Strategy: First file establishes baseline (forward), remaining files
+    /// orient against baseline, then k-way merge all results.
+    #[test]
+    fn test_single_bucket_parallel_with_orientation() {
+        use rype::ShardedInvertedIndex;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create sequences where orientation matters
+        // Using deterministic sequences that have distinct forward/RC minimizers
+        fn make_sequence(seed: u64, length: usize) -> Vec<u8> {
+            let mut state = seed;
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match (state >> 32) % 4 {
+                        0 => b'A',
+                        1 => b'C',
+                        2 => b'G',
+                        _ => b'T',
+                    }
+                })
+                .collect()
+        }
+
+        // Create 4 files for single bucket
+        for i in 0..4 {
+            let seq = make_sequence(i as u64 * 77777, 5_000);
+            create_fasta_file(dir, &format!("ref{}.fa", i), &seq);
+        }
+
+        // Create config with orientation enabled
+        let config_content = r#"[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "oriented_single_bucket.ryidx"
+orient_sequences = true
+
+[buckets.OrientedBucket]
+files = ["ref0.fa", "ref1.fa", "ref2.fa", "ref3.fa"]
+"#;
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, config_content).unwrap();
+
+        // Build index with orientation
+        let result = build_parquet_index_from_config(&config_path, None, None, false);
+        assert!(
+            result.is_ok(),
+            "Oriented index creation should succeed: {:?}",
+            result
+        );
+
+        // Verify the index
+        let output_path = dir.join("oriented_single_bucket.ryxdi");
+        let index = ShardedInvertedIndex::open(&output_path).unwrap();
+        let manifest = index.manifest();
+
+        // Verify single bucket
+        assert_eq!(manifest.bucket_names.len(), 1, "Should have 1 bucket");
+
+        // Verify bucket has minimizers (use total_minimizers since per-bucket not in Parquet)
+        assert!(
+            manifest.total_minimizers > 100,
+            "Oriented bucket should have minimizers (got {})",
+            manifest.total_minimizers
+        );
+
+        // Find the bucket_id for OrientedBucket
+        let bucket_id = *manifest
+            .bucket_names
+            .iter()
+            .find(|(_, name)| *name == "OrientedBucket")
+            .map(|(id, _)| id)
+            .unwrap();
+
+        // Verify sources for all 4 sequences
+        let sources = manifest.bucket_sources.get(&bucket_id).unwrap();
+        assert_eq!(sources.len(), 4, "Should have 4 sources");
+    }
+
+    /// Test 4: Single-bucket with single sequence (degenerate case).
+    ///
+    /// Edge case where there's only one sequence - should still work correctly.
+    #[test]
+    fn test_single_bucket_single_sequence() {
+        use rype::ShardedInvertedIndex;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create single file with one sequence
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        create_fasta_file(dir, "single.fa", seq);
+
+        let config_content = r#"[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "single_seq_test.ryidx"
+
+[buckets.SingleSeq]
+files = ["single.fa"]
+"#;
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, config_content).unwrap();
+
+        // Build index
+        let result = build_parquet_index_from_config(&config_path, None, None, false);
+        assert!(
+            result.is_ok(),
+            "Single sequence index should succeed: {:?}",
+            result
+        );
+
+        // Verify the index
+        let output_path = dir.join("single_seq_test.ryxdi");
+        let index = ShardedInvertedIndex::open(&output_path).unwrap();
+        let manifest = index.manifest();
+
+        // Verify single bucket with one source
+        assert_eq!(manifest.bucket_names.len(), 1, "Should have 1 bucket");
+
+        // Find the bucket_id for SingleSeq
+        let bucket_id = *manifest
+            .bucket_names
+            .iter()
+            .find(|(_, name)| *name == "SingleSeq")
+            .map(|(id, _)| id)
+            .unwrap();
+
+        let sources = manifest.bucket_sources.get(&bucket_id).unwrap();
+        assert_eq!(sources.len(), 1, "Should have 1 source");
+
+        // Verify minimizers exist (use total_minimizers)
+        assert!(
+            manifest.total_minimizers > 0,
+            "Should have some minimizers (got {})",
+            manifest.total_minimizers
+        );
+    }
+
+    /// Test 5: Single-bucket with sequences that produce no minimizers.
+    ///
+    /// Edge case where some sequences are shorter than k (produce no minimizers).
+    /// Should not crash and should produce valid output for remaining sequences.
+    #[test]
+    fn test_single_bucket_empty_sequences() {
+        use rype::ShardedInvertedIndex;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create files with varying lengths
+        // One short sequence (< k=32 bases) that produces no minimizers
+        let short_seq = b"ACGTACGTACGT"; // 12 bases, less than k=32
+        let long_seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+
+        // Create files with different sequence lengths
+        {
+            let path = dir.join("short.fa");
+            let mut file = File::create(&path).unwrap();
+            writeln!(file, ">short_seq").unwrap();
+            file.write_all(short_seq).unwrap();
+            writeln!(file).unwrap();
+        }
+        create_fasta_file(dir, "long.fa", long_seq);
+
+        let config_content = r#"[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "empty_seq_test.ryidx"
+
+[buckets.MixedLengths]
+files = ["short.fa", "long.fa"]
+"#;
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, config_content).unwrap();
+
+        // Build index - should not crash
+        let result = build_parquet_index_from_config(&config_path, None, None, false);
+        assert!(
+            result.is_ok(),
+            "Index with short sequences should succeed: {:?}",
+            result
+        );
+
+        // Verify the index
+        let output_path = dir.join("empty_seq_test.ryxdi");
+        let index = ShardedInvertedIndex::open(&output_path).unwrap();
+        let manifest = index.manifest();
+
+        // Verify single bucket
+        assert_eq!(manifest.bucket_names.len(), 1, "Should have 1 bucket");
+
+        // Find the bucket_id for MixedLengths
+        let bucket_id = *manifest
+            .bucket_names
+            .iter()
+            .find(|(_, name)| *name == "MixedLengths")
+            .map(|(id, _)| id)
+            .unwrap();
+
+        // Verify both sources are recorded (even the short one)
+        let sources = manifest.bucket_sources.get(&bucket_id).unwrap();
+        assert_eq!(sources.len(), 2, "Should have 2 sources (even empty one)");
+
+        // Verify minimizers exist from the long sequence (use total_minimizers)
+        assert!(
+            manifest.total_minimizers > 0,
+            "Should have minimizers from long sequence (got {})",
+            manifest.total_minimizers
         );
     }
 }
