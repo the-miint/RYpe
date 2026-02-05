@@ -668,6 +668,9 @@ impl SequenceChunkIterator {
 /// in parallel, then merged into a running accumulator. This bounds peak memory
 /// to approximately 4x the chunk size regardless of total input size.
 ///
+/// NOTE: This function's output accumulator grows unbounded. For bounded output
+/// memory, use `build_single_bucket_streaming` instead.
+///
 /// # Arguments
 /// * `bucket_name` - Name of the bucket being built
 /// * `files` - Paths to FASTA/FASTQ files
@@ -679,6 +682,7 @@ impl SequenceChunkIterator {
 ///
 /// # Returns
 /// Tuple of (bucket_name, sorted_deduped_minimizers, source_labels)
+#[cfg(test)]
 fn build_single_bucket_parallel_chunked(
     bucket_name: &str,
     files: &[PathBuf],
@@ -782,6 +786,10 @@ fn build_single_bucket_parallel_chunked(
 /// 2. Remaining files in chunks: orient against baseline, merge incrementally
 ///
 /// This bounds memory to approximately 4x chunk size plus the baseline minimizers.
+///
+/// NOTE: This function's output accumulator grows unbounded. For bounded output
+/// memory, use `build_single_bucket_streaming_oriented` instead.
+#[cfg(test)]
 fn build_single_bucket_parallel_oriented_chunked(
     bucket_name: &str,
     files: &[PathBuf],
@@ -901,6 +909,338 @@ fn build_single_bucket_parallel_oriented_chunked(
     Ok((bucket_name.to_string(), merged_mins, all_sources))
 }
 
+/// Result from streaming single-bucket build.
+///
+/// Unlike the tuple-based return of `build_single_bucket_parallel_chunked`,
+/// this struct contains shard metadata since minimizers are streamed to disk.
+pub struct SingleBucketResult {
+    /// Name of the bucket
+    pub bucket_name: String,
+    /// Source labels (filename::sequence_name)
+    pub sources: Vec<String>,
+    /// Metadata for each shard written to disk
+    pub shard_infos: Vec<rype::parquet_index::InvertedShardInfo>,
+    /// Total minimizers written (may include duplicates across shards)
+    pub total_minimizers: u64,
+}
+
+/// Build a single bucket using streaming shard creation.
+///
+/// Unlike `build_single_bucket_parallel_chunked`, this function streams
+/// minimizers to disk via ShardAccumulator, bounding BOTH input AND output memory.
+///
+/// # Memory Model
+/// - Input chunks: ~40% of available memory (via `calculate_chunk_config`)
+/// - Shard accumulator: ~40% of available memory (flushes to disk when full)
+/// - Workspace overhead: ~20%
+///
+/// # Arguments
+/// * `output_dir` - Directory to write shards (must exist, including inverted/ subdir)
+/// * `bucket_name` - Name of the bucket being built
+/// * `files` - Paths to FASTA/FASTQ files
+/// * `config_dir` - Base directory for resolving relative paths
+/// * `k` - K-mer size
+/// * `w` - Window size
+/// * `salt` - Hash salt
+/// * `max_memory` - Available memory budget (None = auto-detect)
+/// * `options` - Parquet write options
+#[allow(clippy::too_many_arguments)]
+fn build_single_bucket_streaming(
+    output_dir: &Path,
+    bucket_name: &str,
+    files: &[PathBuf],
+    config_dir: &Path,
+    k: usize,
+    w: usize,
+    salt: u64,
+    max_memory: Option<usize>,
+    options: Option<&rype::parquet_index::ParquetWriteOptions>,
+) -> Result<SingleBucketResult> {
+    use rype::memory::detect_available_memory;
+    use rype::parquet_index::ShardAccumulator;
+
+    const BUCKET_ID: u32 = 1;
+
+    log::info!(
+        "Processing bucket '{}' (streaming, {} files) ...",
+        bucket_name,
+        files.len()
+    );
+
+    if files.is_empty() {
+        return Ok(SingleBucketResult {
+            bucket_name: bucket_name.to_string(),
+            sources: vec![],
+            shard_infos: vec![],
+            total_minimizers: 0,
+        });
+    }
+
+    // Determine memory budget
+    let available = max_memory.unwrap_or_else(|| {
+        let detected = detect_available_memory();
+        log::debug!(
+            "Auto-detected available memory: {} bytes (source: {:?})",
+            detected.bytes,
+            detected.source
+        );
+        detected.bytes
+    });
+
+    let chunk_config = calculate_chunk_config(available);
+    // Use 40% of memory for shard accumulator, clamped to minimum
+    use rype::parquet_index::MIN_SHARD_BYTES;
+    let shard_size = ((available as f64 * 0.4) as usize).max(MIN_SHARD_BYTES);
+    // Batch size for adding entries: ~1 shard worth, capped at 128MB
+    let add_batch_entries = (shard_size / 16).min(8_000_000);
+
+    log::debug!(
+        "Streaming config: chunk size {} bytes, shard size {} bytes, batch {} entries",
+        chunk_config.target_chunk_bytes,
+        shard_size,
+        add_batch_entries
+    );
+
+    let mut accumulator = ShardAccumulator::with_output_dir(output_dir, shard_size, options);
+    let mut all_sources: Vec<String> = Vec::new();
+    let mut total_minimizers: u64 = 0;
+
+    let mut chunk_iter =
+        SequenceChunkIterator::new(files, config_dir, chunk_config.target_chunk_bytes);
+    let mut chunk_count = 0;
+
+    while let Some(chunk) = chunk_iter.next_chunk()? {
+        chunk_count += 1;
+        let chunk_size: usize = chunk.iter().map(|(seq, _)| seq.len()).sum();
+        log::debug!(
+            "Processing chunk {} ({} sequences, {} bytes)",
+            chunk_count,
+            chunk.len(),
+            chunk_size
+        );
+
+        // Collect sources before consuming chunk
+        all_sources.extend(chunk.iter().map(|(_, src)| src.clone()));
+
+        // Estimate workspace size from this chunk's sequences
+        let avg_len = chunk_size / chunk.len().max(1);
+        let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+
+        // Parallel extraction within chunk
+        let chunk_mins: Vec<Vec<u64>> = chunk
+            .par_iter()
+            .map_init(
+                move || MinimizerWorkspace::with_estimate(estimated_mins),
+                |ws, (seq, _source)| {
+                    extract_into(seq, k, w, salt, ws);
+                    let mut mins = std::mem::take(&mut ws.buffer);
+                    mins.sort_unstable();
+                    mins
+                },
+            )
+            .collect();
+
+        // K-way merge this chunk's results
+        let chunk_merged = kway_merge_dedup(chunk_mins);
+        total_minimizers += chunk_merged.len() as u64;
+
+        // Stream to accumulator in batches, checking flush threshold between batches
+        // This ensures shards don't exceed max_shard_bytes even with large chunks
+        for batch in chunk_merged.chunks(add_batch_entries) {
+            accumulator.add_entries_from_minimizers(batch, BUCKET_ID);
+
+            // Flush shards as needed to bound memory
+            while accumulator.should_flush() {
+                if let Some(shard_info) = accumulator.flush_shard()? {
+                    log::debug!(
+                        "Flushed shard {} ({} entries)",
+                        shard_info.shard_id,
+                        shard_info.num_entries
+                    );
+                }
+            }
+        }
+    }
+
+    let shard_infos = accumulator.finish()?;
+
+    log::info!(
+        "Completed bucket '{}': {} minimizers, {} shards ({} chunks processed)",
+        bucket_name,
+        total_minimizers,
+        shard_infos.len(),
+        chunk_count
+    );
+
+    Ok(SingleBucketResult {
+        bucket_name: bucket_name.to_string(),
+        sources: all_sources,
+        shard_infos,
+        total_minimizers,
+    })
+}
+
+/// Build a single bucket with orientation using streaming shard creation.
+///
+/// Strategy:
+/// 1. First file: extract to establish baseline (kept in memory)
+/// 2. Remaining files in chunks: orient against baseline, stream to accumulator
+///
+/// # Memory Model
+/// - Baseline: ~size of first file's minimizers (typically < 1MB)
+/// - Input chunks: ~40% of available memory
+/// - Shard accumulator: ~40% of available memory
+#[allow(clippy::too_many_arguments)]
+fn build_single_bucket_streaming_oriented(
+    output_dir: &Path,
+    bucket_name: &str,
+    files: &[PathBuf],
+    config_dir: &Path,
+    k: usize,
+    w: usize,
+    salt: u64,
+    max_memory: Option<usize>,
+    options: Option<&rype::parquet_index::ParquetWriteOptions>,
+) -> Result<SingleBucketResult> {
+    use rype::memory::detect_available_memory;
+    use rype::parquet_index::ShardAccumulator;
+
+    const BUCKET_ID: u32 = 1;
+
+    log::info!(
+        "Processing bucket '{}' (streaming, oriented, {} files) ...",
+        bucket_name,
+        files.len()
+    );
+
+    if files.is_empty() {
+        return Ok(SingleBucketResult {
+            bucket_name: bucket_name.to_string(),
+            sources: vec![],
+            shard_infos: vec![],
+            total_minimizers: 0,
+        });
+    }
+
+    // Phase 1: Extract baseline from first file
+    let (baseline_mins, baseline_sources) =
+        extract_baseline_from_first_file(&files[0], config_dir, k, w, salt)?;
+
+    log::debug!(
+        "Baseline established: {} minimizers from {} sources",
+        baseline_mins.len(),
+        baseline_sources.len()
+    );
+
+    // Determine memory budget
+    let available = max_memory.unwrap_or_else(|| {
+        let detected = detect_available_memory();
+        detected.bytes
+    });
+
+    let chunk_config = calculate_chunk_config(available);
+    // Use 40% of memory for shard accumulator, clamped to minimum
+    use rype::parquet_index::MIN_SHARD_BYTES;
+    let shard_size = ((available as f64 * 0.4) as usize).max(MIN_SHARD_BYTES);
+    // Batch size for adding entries: ~1 shard worth, capped at 128MB
+    let add_batch_entries = (shard_size / 16).min(8_000_000);
+
+    let mut accumulator = ShardAccumulator::with_output_dir(output_dir, shard_size, options);
+
+    // Add baseline minimizers to accumulator in batches
+    for batch in baseline_mins.chunks(add_batch_entries) {
+        accumulator.add_entries_from_minimizers(batch, BUCKET_ID);
+        while accumulator.should_flush() {
+            accumulator.flush_shard()?;
+        }
+    }
+    let mut total_minimizers = baseline_mins.len() as u64;
+    let mut all_sources = baseline_sources;
+
+    // Phase 2: Process remaining files with orientation against baseline
+    if files.len() > 1 {
+        let baseline_ref = &baseline_mins;
+
+        let mut chunk_iter =
+            SequenceChunkIterator::new(&files[1..], config_dir, chunk_config.target_chunk_bytes);
+        let mut chunk_count = 0;
+
+        while let Some(chunk) = chunk_iter.next_chunk()? {
+            chunk_count += 1;
+            let chunk_size: usize = chunk.iter().map(|(seq, _)| seq.len()).sum();
+            log::debug!(
+                "Processing chunk {} ({} sequences, {} bytes)",
+                chunk_count,
+                chunk.len(),
+                chunk_size
+            );
+
+            all_sources.extend(chunk.iter().map(|(_, src)| src.clone()));
+
+            let avg_len = chunk_size / chunk.len().max(1);
+            let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+
+            // Parallel extraction with orientation
+            let chunk_mins: Vec<Vec<u64>> = chunk
+                .par_iter()
+                .map_init(
+                    move || MinimizerWorkspace::with_estimate(estimated_mins),
+                    |ws, (seq, _source)| {
+                        let (mut fwd, mut rc) = extract_dual_strand_into(seq, k, w, salt, ws);
+                        fwd.sort_unstable();
+                        rc.sort_unstable();
+
+                        let (orientation, _overlap) =
+                            choose_orientation_sampled(baseline_ref, &fwd, &rc);
+
+                        match orientation {
+                            Orientation::Forward => fwd,
+                            Orientation::ReverseComplement => rc,
+                        }
+                    },
+                )
+                .collect();
+
+            // K-way merge this chunk's results
+            let chunk_merged = kway_merge_dedup(chunk_mins);
+            total_minimizers += chunk_merged.len() as u64;
+
+            // Stream to accumulator in batches
+            for batch in chunk_merged.chunks(add_batch_entries) {
+                accumulator.add_entries_from_minimizers(batch, BUCKET_ID);
+
+                while accumulator.should_flush() {
+                    if let Some(shard_info) = accumulator.flush_shard()? {
+                        log::debug!(
+                            "Flushed shard {} ({} entries)",
+                            shard_info.shard_id,
+                            shard_info.num_entries
+                        );
+                    }
+                }
+            }
+        }
+
+        log::debug!("Processed {} additional chunks", chunk_count);
+    }
+
+    let shard_infos = accumulator.finish()?;
+
+    log::info!(
+        "Completed bucket '{}': {} minimizers, {} shards",
+        bucket_name,
+        total_minimizers,
+        shard_infos.len()
+    );
+
+    Ok(SingleBucketResult {
+        bucket_name: bucket_name.to_string(),
+        sources: all_sources,
+        shard_infos,
+        total_minimizers,
+    })
+}
+
 /// Build a single bucket from its files, returning the name, minimizers, and sources.
 ///
 /// When `orient_sequences` is true:
@@ -952,8 +1292,6 @@ pub fn build_parquet_index_from_config(
     options: Option<&parquet_index::ParquetWriteOptions>,
     cli_orient: bool,
 ) -> Result<()> {
-    use rype::{create_parquet_inverted_index, BucketData};
-
     let t_total = Instant::now();
 
     log::info!(
@@ -1027,14 +1365,25 @@ pub fn build_parquet_index_from_config(
         );
     }
 
-    // Single bucket: use chunked parallel extraction for memory-bounded processing
-    let t_build = Instant::now();
+    // Single bucket: use streaming for memory-bounded processing
+    // This bounds BOTH input AND output memory via ShardAccumulator
+    use rype::parquet_index::{
+        compute_source_hash, create_index_directory, write_buckets_parquet, InvertedManifest,
+        ParquetManifest, ParquetShardFormat, FORMAT_MAGIC, FORMAT_VERSION,
+    };
+    use std::collections::HashMap;
+
+    const BUCKET_ID: u32 = 1;
     let bucket_name = &bucket_names[0];
     let files = &cfg.buckets[bucket_name].files;
 
+    // Create directory structure FIRST (required by ShardAccumulator)
+    create_index_directory(&output_path)?;
+
+    let t_build = Instant::now();
     let result = if orient_sequences {
-        // Chunked hybrid: baseline + parallel orientation in memory-bounded chunks
-        build_single_bucket_parallel_oriented_chunked(
+        build_single_bucket_streaming_oriented(
+            &output_path,
             bucket_name,
             files,
             config_dir,
@@ -1042,10 +1391,11 @@ pub fn build_parquet_index_from_config(
             cfg.index.window,
             cfg.index.salt,
             cli_max_memory,
+            options,
         )?
     } else {
-        // Chunked parallel: all sequences extracted in memory-bounded chunks
-        build_single_bucket_parallel_chunked(
+        build_single_bucket_streaming(
+            &output_path,
             bucket_name,
             files,
             config_dir,
@@ -1053,56 +1403,53 @@ pub fn build_parquet_index_from_config(
             cfg.index.window,
             cfg.index.salt,
             cli_max_memory,
+            options,
         )?
     };
-    let bucket_results: Vec<_> = vec![result];
     log_timing(
         "parquet_index: bucket_building",
         t_build.elapsed().as_millis(),
     );
 
-    // Convert to BucketData format for create_parquet_inverted_index
-    let buckets: Vec<BucketData> = bucket_results
-        .into_iter()
-        .enumerate()
-        .map(|(idx, (name, minimizers, sources))| BucketData {
-            bucket_id: (idx + 1) as u32,
-            bucket_name: sanitize_bucket_name(&name),
-            sources,
-            minimizers,
-        })
-        .collect();
+    // Write bucket metadata to buckets.parquet
+    let mut bucket_names_map = HashMap::new();
+    let mut bucket_sources_map = HashMap::new();
+    bucket_names_map.insert(BUCKET_ID, sanitize_bucket_name(&result.bucket_name));
+    bucket_sources_map.insert(BUCKET_ID, result.sources);
+    write_buckets_parquet(&output_path, &bucket_names_map, &bucket_sources_map)?;
 
-    let total_minimizers: usize = buckets.iter().map(|b| b.minimizers.len()).sum();
+    // Compute source hash for index compatibility checking
+    let mut bucket_min_counts = HashMap::new();
+    bucket_min_counts.insert(BUCKET_ID, result.total_minimizers as usize);
+    let source_hash = compute_source_hash(&bucket_min_counts);
+
+    // Write manifest
+    let total_entries: u64 = result.shard_infos.iter().map(|s| s.num_entries).sum();
+    let manifest = ParquetManifest {
+        magic: FORMAT_MAGIC.to_string(),
+        format_version: FORMAT_VERSION,
+        k: cfg.index.k,
+        w: cfg.index.window,
+        salt: cfg.index.salt,
+        source_hash,
+        num_buckets: 1,
+        total_minimizers: result.total_minimizers,
+        inverted: Some(InvertedManifest {
+            format: ParquetShardFormat::Parquet,
+            num_shards: result.shard_infos.len() as u32,
+            total_entries,
+            has_overlapping_shards: true,
+            shards: result.shard_infos,
+        }),
+    };
+    manifest.save(&output_path)?;
+
+    log::info!("Created streaming Parquet index:");
     log::info!(
-        "Extracted minimizers from {} buckets ({} total)",
-        buckets.len(),
-        total_minimizers
+        "  Shards: {}",
+        manifest.inverted.as_ref().unwrap().num_shards
     );
-
-    // Validate bucket name uniqueness before creating index
-    validate_unique_bucket_names(buckets.iter().map(|b| b.bucket_name.as_str()))?;
-
-    // Create parquet index
-    let t_write = Instant::now();
-    let manifest = create_parquet_inverted_index(
-        &output_path,
-        buckets,
-        cfg.index.k,
-        cfg.index.window,
-        cfg.index.salt,
-        None, // Shard size determined automatically
-        options,
-    )?;
-    log_timing("parquet_index: write", t_write.elapsed().as_millis());
-
-    log::info!("Created Parquet inverted index:");
-    log::info!("  Buckets: {}", manifest.num_buckets);
-    if let Some(ref inv) = manifest.inverted {
-        log::info!("  Shards: {}", inv.num_shards);
-        log::info!("  Total entries: {}", inv.total_entries);
-    }
-
+    log::info!("  Total entries: {}", total_entries);
     log_timing("parquet_index: total", t_total.elapsed().as_millis());
     log::info!("Done.");
 
@@ -3403,5 +3750,417 @@ files = ["short.fa", "long.fa"]
             config_tiny.target_chunk_bytes, MIN_CHUNK_BYTES,
             "Tiny memory should use MIN_CHUNK_BYTES"
         );
+    }
+
+    // =======================================================================
+    // Streaming Single-Bucket Tests (TDD RED Phase)
+    // =======================================================================
+
+    /// Test 1: Streaming single-bucket produces a valid, queryable index.
+    #[test]
+    fn test_streaming_single_bucket_produces_valid_index() {
+        use rype::ShardedInvertedIndex;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create multiple FASTA files with distinct sequences
+        fn make_sequence(seed: u64, length: usize) -> Vec<u8> {
+            let mut state = seed;
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match (state >> 32) % 4 {
+                        0 => b'A',
+                        1 => b'C',
+                        2 => b'G',
+                        _ => b'T',
+                    }
+                })
+                .collect()
+        }
+
+        // Create 3 files with ~5KB sequences each
+        for i in 0..3 {
+            let seq = make_sequence(i as u64 * 12345, 5_000);
+            create_fasta_file(dir, &format!("ref{}.fa", i), &seq);
+        }
+
+        let files: Vec<PathBuf> = (0..3).map(|i| dir.join(format!("ref{}.fa", i))).collect();
+
+        // Create output directory
+        let output_dir = dir.join("test_index.ryxdi");
+        rype::parquet_index::create_index_directory(&output_dir).unwrap();
+
+        // Call build_single_bucket_streaming
+        let result = build_single_bucket_streaming(
+            &output_dir,
+            "TestBucket",
+            &files,
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(64 * 1024 * 1024), // 64MB max_memory
+            None,
+        )
+        .unwrap();
+
+        // Verify result fields
+        assert_eq!(result.bucket_name, "TestBucket");
+        assert!(!result.sources.is_empty(), "Should have sources");
+        assert_eq!(
+            result.sources.len(),
+            3,
+            "Should have 3 sources (one per file)"
+        );
+        assert!(
+            !result.shard_infos.is_empty(),
+            "Should have at least one shard"
+        );
+        assert!(result.total_minimizers > 0, "Should have minimizers");
+
+        // Write manifest and verify index can be loaded
+        write_streaming_manifest(&output_dir, &result, 32, 10, 0x5555555555555555).unwrap();
+
+        let index = ShardedInvertedIndex::open(&output_dir).unwrap();
+        assert_eq!(
+            index.manifest().bucket_names.len(),
+            1,
+            "Should have 1 bucket"
+        );
+    }
+
+    /// Test 2: Streaming with many files creates multiple shards.
+    #[test]
+    fn test_streaming_single_bucket_with_many_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        fn make_sequence(seed: u64, length: usize) -> Vec<u8> {
+            let mut state = seed;
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match (state >> 32) % 4 {
+                        0 => b'A',
+                        1 => b'C',
+                        2 => b'G',
+                        _ => b'T',
+                    }
+                })
+                .collect()
+        }
+
+        // Create 50 files with ~200KB sequences each
+        // Each 200KB sequence produces ~20K minimizers (unique per seed)
+        // Total: ~1M minimizer entries = ~16MB of data
+        // At 1MB minimum shard size, we should get 10+ shards
+        for i in 0..50 {
+            let seq = make_sequence(i as u64 * 99999, 200_000);
+            create_fasta_file(dir, &format!("ref{}.fa", i), &seq);
+        }
+
+        let files: Vec<PathBuf> = (0..50).map(|i| dir.join(format!("ref{}.fa", i))).collect();
+
+        let output_dir = dir.join("test_index.ryxdi");
+        rype::parquet_index::create_index_directory(&output_dir).unwrap();
+
+        // Use 3MB max_memory to force shard_size close to MIN_SHARD_BYTES
+        // shard_size = max(3MB * 0.4, 1MB) = max(1.2MB, 1MB) = 1.2MB
+        let result = build_single_bucket_streaming(
+            &output_dir,
+            "ManyFiles",
+            &files,
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(3 * 1024 * 1024), // 3MB max_memory → ~1.2MB shard size
+            None,
+        )
+        .unwrap();
+
+        // Should have multiple shards with this much data at small shard size
+        assert!(
+            result.shard_infos.len() >= 2,
+            "Should have multiple shards (got {}) with {} total minimizers",
+            result.shard_infos.len(),
+            result.total_minimizers
+        );
+        assert_eq!(result.sources.len(), 50, "Should have all 50 sources");
+    }
+
+    /// Test 3: Oriented streaming uses baseline correctly.
+    #[test]
+    fn test_streaming_single_bucket_oriented_matches_baseline() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        fn make_sequence(seed: u64, length: usize) -> Vec<u8> {
+            let mut state = seed;
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match (state >> 32) % 4 {
+                        0 => b'A',
+                        1 => b'C',
+                        2 => b'G',
+                        _ => b'T',
+                    }
+                })
+                .collect()
+        }
+
+        // Create 5 files
+        for i in 0..5 {
+            let seq = make_sequence(i as u64 * 54321, 10_000);
+            create_fasta_file(dir, &format!("ref{}.fa", i), &seq);
+        }
+
+        let files: Vec<PathBuf> = (0..5).map(|i| dir.join(format!("ref{}.fa", i))).collect();
+
+        let output_dir = dir.join("test_index.ryxdi");
+        rype::parquet_index::create_index_directory(&output_dir).unwrap();
+
+        // Call oriented streaming version
+        let result = build_single_bucket_streaming_oriented(
+            &output_dir,
+            "OrientedBucket",
+            &files,
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(64 * 1024 * 1024),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.bucket_name, "OrientedBucket");
+        assert_eq!(result.sources.len(), 5, "Should have 5 sources");
+        assert!(!result.shard_infos.is_empty(), "Should have shards");
+        assert!(result.total_minimizers > 0, "Should have minimizers");
+    }
+
+    /// Test 4: Empty input returns empty result without panic.
+    #[test]
+    fn test_streaming_single_bucket_empty_input() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let output_dir = dir.join("test_index.ryxdi");
+        rype::parquet_index::create_index_directory(&output_dir).unwrap();
+
+        // Call with empty file list
+        let result = build_single_bucket_streaming(
+            &output_dir,
+            "EmptyBucket",
+            &[],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.bucket_name, "EmptyBucket");
+        assert!(result.sources.is_empty(), "Should have no sources");
+        assert!(result.shard_infos.is_empty(), "Should have no shards");
+        assert_eq!(result.total_minimizers, 0, "Should have no minimizers");
+
+        // Also test oriented version with empty input
+        let result_oriented = build_single_bucket_streaming_oriented(
+            &output_dir,
+            "EmptyOrientedBucket",
+            &[],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(result_oriented.sources.is_empty());
+        assert!(result_oriented.shard_infos.is_empty());
+    }
+
+    /// Test 5: Single file input works correctly.
+    #[test]
+    fn test_streaming_single_bucket_single_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create single file with multiple sequences
+        let path = dir.join("multi_seq.fa");
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, ">seq1").unwrap();
+        writeln!(file, "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT").unwrap();
+        writeln!(file, ">seq2").unwrap();
+        writeln!(file, "TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA").unwrap();
+        drop(file);
+
+        let output_dir = dir.join("test_index.ryxdi");
+        rype::parquet_index::create_index_directory(&output_dir).unwrap();
+
+        let result = build_single_bucket_streaming(
+            &output_dir,
+            "SingleFile",
+            &[path],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.bucket_name, "SingleFile");
+        assert_eq!(
+            result.sources.len(),
+            2,
+            "Should have 2 sources from single file"
+        );
+        assert!(!result.shard_infos.is_empty(), "Should have shards");
+        assert!(result.total_minimizers > 0, "Should have minimizers");
+    }
+
+    /// Test 6: Memory stays bounded by using ShardAccumulator (flushes to disk).
+    #[test]
+    fn test_streaming_single_bucket_memory_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        fn make_sequence(seed: u64, length: usize) -> Vec<u8> {
+            let mut state = seed;
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match (state >> 32) % 4 {
+                        0 => b'A',
+                        1 => b'C',
+                        2 => b'G',
+                        _ => b'T',
+                    }
+                })
+                .collect()
+        }
+
+        // Create many files that would exceed memory if accumulated
+        // 100 files × 200KB = 20MB of sequences → ~2M minimizers → ~32MB if accumulated
+        // This ensures multiple shards at our forced small shard size
+        for i in 0..100 {
+            let seq = make_sequence(i as u64 * 77777, 200_000);
+            create_fasta_file(dir, &format!("ref{}.fa", i), &seq);
+        }
+
+        let files: Vec<PathBuf> = (0..100).map(|i| dir.join(format!("ref{}.fa", i))).collect();
+
+        let output_dir = dir.join("test_index.ryxdi");
+        rype::parquet_index::create_index_directory(&output_dir).unwrap();
+
+        // Use 3MB max_memory to force shard_size close to MIN_SHARD_BYTES (1MB)
+        // This proves memory stays bounded via shard flushing
+        let result = build_single_bucket_streaming(
+            &output_dir,
+            "MemoryBounded",
+            &files,
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(3 * 1024 * 1024), // 3MB max_memory → ~1.2MB shard size
+            None,
+        )
+        .unwrap();
+
+        // Multiple shards proves streaming to disk worked and memory was bounded
+        assert!(
+            result.shard_infos.len() >= 3,
+            "Should have multiple shards (got {}), proving memory was bounded via flushing",
+            result.shard_infos.len()
+        );
+
+        assert_eq!(result.sources.len(), 100, "Should have all 100 sources");
+        assert!(
+            result.total_minimizers > 500_000,
+            "Should have significant minimizers"
+        );
+
+        // Verify shards were written to disk
+        let inverted_dir = output_dir.join("inverted");
+        let shard_count = std::fs::read_dir(&inverted_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "parquet")
+                    .unwrap_or(false)
+            })
+            .count();
+
+        assert_eq!(
+            shard_count,
+            result.shard_infos.len(),
+            "Disk shard count should match shard_infos"
+        );
+    }
+
+    /// Helper to write manifest for streaming single-bucket results (used by tests).
+    fn write_streaming_manifest(
+        output_dir: &Path,
+        result: &SingleBucketResult,
+        k: usize,
+        w: usize,
+        salt: u64,
+    ) -> Result<()> {
+        use rype::parquet_index::{
+            compute_source_hash, write_buckets_parquet, InvertedManifest, ParquetManifest,
+            ParquetShardFormat, FORMAT_MAGIC, FORMAT_VERSION,
+        };
+        use std::collections::HashMap;
+
+        const BUCKET_ID: u32 = 1;
+
+        // Write bucket metadata
+        let mut bucket_names = HashMap::new();
+        let mut bucket_sources = HashMap::new();
+        bucket_names.insert(BUCKET_ID, sanitize_bucket_name(&result.bucket_name));
+        bucket_sources.insert(BUCKET_ID, result.sources.clone());
+        write_buckets_parquet(output_dir, &bucket_names, &bucket_sources)?;
+
+        // Compute source hash
+        let mut bucket_min_counts = HashMap::new();
+        bucket_min_counts.insert(BUCKET_ID, result.total_minimizers as usize);
+        let source_hash = compute_source_hash(&bucket_min_counts);
+
+        // Write manifest
+        let total_entries: u64 = result.shard_infos.iter().map(|s| s.num_entries).sum();
+        let manifest = ParquetManifest {
+            magic: FORMAT_MAGIC.to_string(),
+            format_version: FORMAT_VERSION,
+            k,
+            w,
+            salt,
+            source_hash,
+            num_buckets: 1,
+            total_minimizers: result.total_minimizers,
+            inverted: Some(InvertedManifest {
+                format: ParquetShardFormat::Parquet,
+                num_shards: result.shard_infos.len() as u32,
+                total_entries,
+                has_overlapping_shards: true,
+                shards: result.shard_infos.clone(),
+            }),
+        };
+        manifest.save(output_dir)?;
+
+        Ok(())
     }
 }
