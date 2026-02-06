@@ -4,15 +4,12 @@
 //! with optional subtraction of minimizers from the secondary index that
 //! exist in the primary index.
 
-use crate::classify::collect_negative_minimizers_sharded;
 use crate::error::{Result, RypeError};
-use crate::indices::sharded::{ShardInfo, ShardManifest, ShardedInvertedIndex};
+use crate::indices::sharded::{ShardManifest, ShardedInvertedIndex};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use super::ParquetReadOptions;
 
 use super::streaming::{compute_source_hash, ShardAccumulator, MIN_SHARD_BYTES};
 use super::{
@@ -200,271 +197,212 @@ pub struct MergeStats {
     pub excluded_minimizers: usize,
 }
 
-/// Statistics collected from parallel secondary shard processing.
-#[derive(Debug, Default)]
-struct ParallelSecondaryStats {
-    /// Total entries written across all threads
-    entries_written: u64,
-    /// Total entries excluded across all threads
-    entries_excluded: u64,
-    /// Per-bucket counts after filtering (keyed by OLD bucket ID)
-    bucket_counts: HashMap<u32, u64>,
-    /// Per-bucket original counts (keyed by OLD bucket ID)
-    bucket_counts_original: HashMap<u32, u64>,
-    /// Per-bucket minimizer counts for source hash (keyed by NEW bucket ID)
-    bucket_minimizer_counts: HashMap<u32, usize>,
+/// Load all unique minimizers from a sharded index into a HashSet.
+///
+/// This loads the entire index into memory once, which is efficient when the
+/// index is small relative to the queries (e.g., 80M minimizers = ~2GB with HashSet overhead).
+///
+/// # Memory Usage
+/// HashSet overhead is approximately 24 bytes per entry (8 bytes for u64 + 16 bytes overhead).
+/// For 80M minimizers: ~2GB. For 1B minimizers: ~24GB.
+fn load_all_minimizers(index: &ShardedInvertedIndex) -> Result<HashSet<u64>> {
+    let mut minimizers = HashSet::new();
+
+    for shard_info in &index.manifest().shards {
+        let shard_path = index.shard_path(shard_info.shard_id);
+        let pairs = read_shard_pairs(&shard_path)?;
+        for (minimizer, _) in pairs {
+            minimizers.insert(minimizer);
+        }
+    }
+
+    Ok(minimizers)
 }
 
-/// Process secondary shards in parallel with streaming exclusion.
+/// Result from processing a shard with row-group parallelism.
+struct RowGroupProcessingResult {
+    /// Filtered (minimizer, new_bucket_id) pairs ready for output
+    pairs: Vec<(u64, u32)>,
+    /// Count of entries written per OLD bucket ID
+    bucket_counts: HashMap<u32, u64>,
+    /// Count of original entries per OLD bucket ID
+    bucket_counts_original: HashMap<u32, u64>,
+    /// Count of minimizers per NEW bucket ID (for source hash)
+    bucket_minimizer_counts: HashMap<u32, usize>,
+    /// Total entries excluded
+    entries_excluded: u64,
+}
+
+/// Process a single shard with row-group level parallelism.
 ///
-/// Each thread processes a subset of secondary shards with its own ShardAccumulator.
-/// Memory budget is divided among threads.
+/// This is the optimized version that parallelizes over row groups within a shard,
+/// enabling full parallelism even when there's only one shard.
 ///
 /// # Arguments
-/// * `secondary` - The secondary index
-/// * `primary` - The primary index (minimizers here trigger exclusion)
-/// * `remapping` - Bucket ID remapping for secondary
-/// * `output_dir` - Directory to write output shards
-/// * `max_shard_bytes` - Maximum bytes per shard
-/// * `start_shard_id` - Starting shard ID for output (after primary shards)
-/// * `write_options` - Optional Parquet write options
+/// * `shard_path` - Path to the shard Parquet file
+/// * `exclusion_set` - Pre-computed HashSet of minimizers to exclude
+/// * `remapping` - Mapping from old bucket IDs to new bucket IDs
 ///
 /// # Returns
-/// Tuple of (shard_infos, stats)
-fn process_secondary_shards_parallel(
-    secondary: &ShardedInvertedIndex,
-    primary: &ShardedInvertedIndex,
+/// RowGroupProcessingResult containing filtered pairs and statistics
+fn process_shard_parallel_row_groups(
+    shard_path: &Path,
+    exclusion_set: &HashSet<u64>,
     remapping: &HashMap<u32, u32>,
-    output_dir: &Path,
-    max_shard_bytes: usize,
-    start_shard_id: u32,
-    write_options: Option<&ParquetWriteOptions>,
-) -> Result<(Vec<InvertedShardInfo>, ParallelSecondaryStats)> {
-    let num_threads = rayon::current_num_threads();
-    let secondary_shards: Vec<_> = secondary.manifest().shards.iter().collect();
-    let num_secondary_shards = secondary_shards.len();
+) -> Result<RowGroupProcessingResult> {
+    use arrow::array::{UInt32Array, UInt64Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
 
-    if num_secondary_shards == 0 {
-        return Ok((Vec::new(), ParallelSecondaryStats::default()));
+    // Get row group count
+    let file = File::open(shard_path)
+        .map_err(|e| RypeError::io(shard_path.to_path_buf(), "open shard for metadata", e))?;
+    let reader = SerializedFileReader::new(file)?;
+    let num_row_groups = reader.metadata().num_row_groups();
+    drop(reader);
+
+    if num_row_groups == 0 {
+        return Ok(RowGroupProcessingResult {
+            pairs: Vec::new(),
+            bucket_counts: HashMap::new(),
+            bucket_counts_original: HashMap::new(),
+            bucket_minimizer_counts: HashMap::new(),
+            entries_excluded: 0,
+        });
     }
 
     log::debug!(
-        "Processing {} secondary shards with {} threads",
-        num_secondary_shards,
-        num_threads
+        "Processing {} row groups in parallel from {}",
+        num_row_groups,
+        shard_path.display()
     );
 
-    // Divide memory budget among threads
-    // Each thread gets max_shard_bytes / num_threads, but at least MIN_SHARD_BYTES
-    let per_thread_shard_bytes = (max_shard_bytes / num_threads).max(MIN_SHARD_BYTES);
+    // Process row groups in parallel
+    let row_group_indices: Vec<usize> = (0..num_row_groups).collect();
+    let shard_path_buf = shard_path.to_path_buf();
 
-    // Estimate max shards per thread for shard ID allocation
-    // Conservative estimate: assume each thread creates at most (num_secondary_shards / num_threads + 100) shards
-    // This accounts for potential shard splitting when flushing
-    let max_shards_per_thread: u32 =
-        (num_secondary_shards / num_threads).saturating_add(100) as u32;
+    // Type alias to satisfy clippy::type_complexity
+    type RowGroupResult = (
+        Vec<(u64, u32)>,
+        HashMap<u32, u64>,
+        HashMap<u32, u64>,
+        HashMap<u32, usize>,
+        u64,
+    );
 
-    // Validate that we won't overflow u32 shard IDs
-    // Total IDs needed = num_threads * max_shards_per_thread
-    let total_ids_needed = (num_threads as u64) * (max_shards_per_thread as u64);
-    let max_possible_id = (start_shard_id as u64).saturating_add(total_ids_needed);
-    if max_possible_id > u32::MAX as u64 {
-        return Err(RypeError::validation(format!(
-            "Shard ID overflow: start_shard_id ({}) + {} threads × {} max_shards_per_thread = {} exceeds u32::MAX ({}). \
-             Reduce parallelism or merge fewer shards.",
-            start_shard_id,
-            num_threads,
-            max_shards_per_thread,
-            max_possible_id,
-            u32::MAX
-        )));
-    }
-
-    // Use atomic counter for thread-safe shard ID allocation
-    let next_shard_id = AtomicU64::new(start_shard_id as u64);
-
-    // Process shards in parallel using try_fold for proper error propagation
-    let results: Vec<Result<(Vec<InvertedShardInfo>, ParallelSecondaryStats)>> = secondary_shards
+    let results: Vec<Result<RowGroupResult>> = row_group_indices
         .par_iter()
-        .enumerate()
-        .try_fold(
-            || -> (Vec<InvertedShardInfo>, ParallelSecondaryStats, Option<ShardAccumulator>) {
-                (Vec::new(), ParallelSecondaryStats::default(), None)
-            },
-            |mut acc, (i, shard_info)| -> Result<_> {
-                let (ref mut shard_infos, ref mut stats, ref mut maybe_accumulator) = acc;
+        .map(|&rg_idx| {
+            // Each thread opens its own file handle (OS page cache handles deduplication)
+            let file = File::open(&shard_path_buf)
+                .map_err(|e| RypeError::io(shard_path_buf.clone(), "open shard", e))?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+            let reader = builder.with_row_groups(vec![rg_idx]).build()?;
 
-                // Initialize accumulator on first use for this thread
-                if maybe_accumulator.is_none() {
-                    // Allocate a unique shard ID range for this thread's accumulator
-                    let raw_id = next_shard_id.fetch_add(max_shards_per_thread as u64, Ordering::SeqCst);
+            let mut filtered_pairs = Vec::new();
+            let mut bucket_counts: HashMap<u32, u64> = HashMap::new();
+            let mut bucket_counts_original: HashMap<u32, u64> = HashMap::new();
+            let mut bucket_minimizer_counts: HashMap<u32, usize> = HashMap::new();
+            let mut excluded = 0u64;
 
-                    // Validate the ID fits in u32 (should always pass due to upfront check, but be defensive)
-                    let thread_start_id = u32::try_from(raw_id).map_err(|_| {
+            for batch in reader {
+                let batch = batch?;
+
+                let minimizers = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| {
+                        RypeError::format(
+                            &shard_path_buf,
+                            "Expected UInt64Array for minimizer column",
+                        )
+                    })?;
+
+                let bucket_ids = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| {
+                        RypeError::format(
+                            &shard_path_buf,
+                            "Expected UInt32Array for bucket_id column",
+                        )
+                    })?;
+
+                for i in 0..batch.num_rows() {
+                    let minimizer = minimizers.value(i);
+                    let old_bucket_id = bucket_ids.value(i);
+
+                    // Track original count
+                    *bucket_counts_original.entry(old_bucket_id).or_insert(0) += 1;
+
+                    // O(1) HashSet lookup for exclusion
+                    if exclusion_set.contains(&minimizer) {
+                        excluded += 1;
+                        continue;
+                    }
+
+                    // Remap bucket ID
+                    let new_bucket_id = *remapping.get(&old_bucket_id).ok_or_else(|| {
                         RypeError::validation(format!(
-                            "Shard ID overflow: allocated ID {} exceeds u32::MAX",
-                            raw_id
+                            "Secondary bucket ID {} not found in remapping",
+                            old_bucket_id
                         ))
                     })?;
 
-                    *maybe_accumulator = Some(ShardAccumulator::with_start_shard_id(
-                        output_dir,
-                        per_thread_shard_bytes,
-                        thread_start_id,
-                        write_options,
-                    ));
+                    filtered_pairs.push((minimizer, new_bucket_id));
+                    *bucket_counts.entry(old_bucket_id).or_insert(0) += 1;
+                    *bucket_minimizer_counts.entry(new_bucket_id).or_insert(0) += 1;
                 }
-
-                let accumulator = maybe_accumulator.as_mut().unwrap();
-
-                // Initialize bucket count maps on first use
-                if stats.bucket_counts.is_empty() {
-                    for &old_id in secondary.manifest().bucket_names.keys() {
-                        stats.bucket_counts.insert(old_id, 0);
-                        stats.bucket_counts_original.insert(old_id, 0);
-                    }
-                    for &new_id in remapping.values() {
-                        stats.bucket_minimizer_counts.insert(new_id, 0);
-                    }
-                }
-
-                // Process this shard - propagate errors instead of swallowing them
-                let (written, excluded) = process_secondary_shard_with_exclusion(
-                    shard_info,
-                    secondary,
-                    primary,
-                    remapping,
-                    accumulator,
-                    &mut stats.bucket_counts,
-                    &mut stats.bucket_counts_original,
-                    &mut stats.bucket_minimizer_counts,
-                    None,
-                )
-                .map_err(|e| {
-                    RypeError::Parquet {
-                        context: format!("failed to process secondary shard {}: {}", i, e),
-                        source: None,
-                    }
-                })?;
-
-                stats.entries_written += written;
-                stats.entries_excluded += excluded;
-
-                // Check if we should flush - propagate errors
-                if accumulator.should_flush() {
-                    if let Some(info) = accumulator.flush_shard()? {
-                        shard_infos.push(info);
-                    }
-                }
-
-                Ok(acc)
-            },
-        )
-        .map(|result| -> Result<(Vec<InvertedShardInfo>, ParallelSecondaryStats)> {
-            // Handle the Result from try_fold, then finish accumulator
-            let (mut shard_infos, stats, maybe_accumulator) = result?;
-            if let Some(accumulator) = maybe_accumulator {
-                let final_infos = accumulator.finish()?;
-                shard_infos.extend(final_infos);
             }
-            Ok((shard_infos, stats))
+
+            Ok((
+                filtered_pairs,
+                bucket_counts,
+                bucket_counts_original,
+                bucket_minimizer_counts,
+                excluded,
+            ))
         })
         .collect();
 
-    // Combine results from all threads
-    let mut all_shard_infos = Vec::new();
-    let mut combined_stats = ParallelSecondaryStats::default();
+    // Merge results from all row groups
+    let mut all_pairs = Vec::new();
+    let mut combined_bucket_counts: HashMap<u32, u64> = HashMap::new();
+    let mut combined_bucket_counts_original: HashMap<u32, u64> = HashMap::new();
+    let mut combined_bucket_minimizer_counts: HashMap<u32, usize> = HashMap::new();
+    let mut total_excluded = 0u64;
 
-    // Initialize combined stats bucket maps
-    for &old_id in secondary.manifest().bucket_names.keys() {
-        combined_stats.bucket_counts.insert(old_id, 0);
-        combined_stats.bucket_counts_original.insert(old_id, 0);
-    }
-    for &new_id in remapping.values() {
-        combined_stats.bucket_minimizer_counts.insert(new_id, 0);
-    }
+    for (rg_idx, result) in results.into_iter().enumerate() {
+        let (pairs, bucket_counts, bucket_counts_original, bucket_minimizer_counts, excluded) =
+            result.map_err(|e| RypeError::Parquet {
+                context: format!("failed to process row group {}: {}", rg_idx, e),
+                source: None,
+            })?;
 
-    for result in results {
-        let (infos, stats) = result?;
-        all_shard_infos.extend(infos);
-        combined_stats.entries_written += stats.entries_written;
-        combined_stats.entries_excluded += stats.entries_excluded;
+        all_pairs.extend(pairs);
+        total_excluded += excluded;
 
-        // Merge bucket counts
-        for (k, v) in stats.bucket_counts {
-            *combined_stats.bucket_counts.entry(k).or_insert(0) += v;
+        for (k, v) in bucket_counts {
+            *combined_bucket_counts.entry(k).or_insert(0) += v;
         }
-        for (k, v) in stats.bucket_counts_original {
-            *combined_stats.bucket_counts_original.entry(k).or_insert(0) += v;
+        for (k, v) in bucket_counts_original {
+            *combined_bucket_counts_original.entry(k).or_insert(0) += v;
         }
-        for (k, v) in stats.bucket_minimizer_counts {
-            *combined_stats.bucket_minimizer_counts.entry(k).or_insert(0) += v;
+        for (k, v) in bucket_minimizer_counts {
+            *combined_bucket_minimizer_counts.entry(k).or_insert(0) += v;
         }
     }
 
-    // Sort shard infos by shard_id for deterministic output
-    all_shard_infos.sort_by_key(|s| s.shard_id);
-
-    Ok((all_shard_infos, combined_stats))
-}
-
-/// Process a single secondary shard with streaming exclusion.
-///
-/// Memory: O(shard_entries) + O(shard_overlap_with_primary)
-#[allow(clippy::too_many_arguments)]
-fn process_secondary_shard_with_exclusion(
-    shard_info: &ShardInfo,
-    secondary: &ShardedInvertedIndex,
-    primary: &ShardedInvertedIndex,
-    remapping: &HashMap<u32, u32>,
-    accumulator: &mut ShardAccumulator,
-    bucket_counts: &mut HashMap<u32, u64>,
-    bucket_counts_original: &mut HashMap<u32, u64>,
-    bucket_minimizer_counts: &mut HashMap<u32, usize>,
-    read_options: Option<&ParquetReadOptions>,
-) -> Result<(u64, u64)> {
-    // Load the secondary shard to get its minimizers
-    let sec_shard = secondary.load_shard(shard_info.shard_id)?;
-    let sec_mins = sec_shard.minimizers();
-
-    // Build PER-SHARD exclusion set
-    let shard_exclusion = collect_negative_minimizers_sharded(primary, sec_mins, read_options)
-        .map_err(|e| RypeError::Parquet {
-            context: format!("collecting per-shard exclusion minimizers: {}", e),
-            source: None,
-        })?;
-
-    // Read shard pairs
-    let shard_path = secondary.shard_path(shard_info.shard_id);
-    let pairs = read_shard_pairs(&shard_path)?;
-
-    let mut entries_written: u64 = 0;
-    let mut entries_excluded: u64 = 0;
-
-    for (minimizer, old_bucket_id) in pairs {
-        // Track original count
-        *bucket_counts_original.entry(old_bucket_id).or_insert(0) += 1;
-
-        // Skip minimizers in the per-shard exclusion set
-        if shard_exclusion.contains(&minimizer) {
-            entries_excluded += 1;
-            continue;
-        }
-
-        let new_bucket_id = *remapping.get(&old_bucket_id).ok_or_else(|| {
-            RypeError::validation(format!(
-                "Secondary bucket ID {} not found in remapping",
-                old_bucket_id
-            ))
-        })?;
-
-        accumulator.add_entries(&[(minimizer, new_bucket_id)]);
-        entries_written += 1;
-        *bucket_counts.entry(old_bucket_id).or_insert(0) += 1;
-        *bucket_minimizer_counts.entry(new_bucket_id).or_insert(0) += 1;
-    }
-
-    Ok((entries_written, entries_excluded))
+    Ok(RowGroupProcessingResult {
+        pairs: all_pairs,
+        bucket_counts: combined_bucket_counts,
+        bucket_counts_original: combined_bucket_counts_original,
+        bucket_minimizer_counts: combined_bucket_minimizer_counts,
+        entries_excluded: total_excluded,
+    })
 }
 
 /// Helper to finish a merge operation: write manifest and return stats.
@@ -720,7 +658,19 @@ pub fn merge_indices_streaming(
     // Process secondary index shards
     let secondary_shards_count = secondary.manifest().shards.len();
     if options.subtract_from_primary {
-        // Finish primary accumulator first to get primary shard infos
+        // OPTIMIZED: Pre-load ALL primary minimizers into a HashSet once
+        // This avoids the O(secondary_shards × primary_shards) complexity of the old approach
+        log::info!("Loading primary minimizers for subtraction...");
+        let primary_minimizers = load_all_minimizers(&primary)?;
+        let primary_minimizer_memory =
+            (primary_minimizers.capacity() * 24) as f64 / (1024.0 * 1024.0);
+        log::info!(
+            "Loaded {} unique primary minimizers ({:.1} MB)",
+            primary_minimizers.len(),
+            primary_minimizer_memory
+        );
+
+        // Finish primary accumulator to get primary shard infos
         let primary_shard_infos = accumulator.finish()?;
 
         // Calculate next shard ID from primary shards (to avoid overwriting them)
@@ -731,33 +681,62 @@ pub fn merge_indices_streaming(
             .map(|id| id + 1)
             .unwrap_or(0);
 
-        // Process secondary shards in PARALLEL with streaming per-shard exclusion
-        log::debug!(
-            "Processing {} secondary shards in parallel (streaming subtraction)...",
-            secondary_shards_count
-        );
-
-        let (secondary_shard_infos, parallel_stats) = process_secondary_shards_parallel(
-            &secondary,
-            &primary,
-            &remapped.secondary_id_map,
+        // Create accumulator for secondary output
+        let mut secondary_accumulator = ShardAccumulator::with_start_shard_id(
             output_path,
             max_shard_bytes,
             next_shard_id,
             write_options,
-        )?;
+        );
 
-        // Update stats from parallel processing
-        secondary_entries = parallel_stats.entries_written;
-        total_excluded = parallel_stats.entries_excluded;
-        secondary_entries_original = secondary_entries + total_excluded;
-        secondary_bucket_counts = parallel_stats.bucket_counts;
-        secondary_bucket_counts_original = parallel_stats.bucket_counts_original;
+        // Process secondary shards with row-group level parallelism
+        log::debug!(
+            "Processing {} secondary shards with row-group parallelism...",
+            secondary_shards_count
+        );
 
-        // Merge bucket minimizer counts (primary counts are already in bucket_minimizer_counts)
-        for (k, v) in parallel_stats.bucket_minimizer_counts {
-            *bucket_minimizer_counts.entry(k).or_insert(0) += v;
+        for (i, shard_info) in secondary.manifest().shards.iter().enumerate() {
+            log::debug!(
+                "  - Processing secondary shard {}/{}...",
+                i + 1,
+                secondary_shards_count
+            );
+
+            let shard_path = secondary.shard_path(shard_info.shard_id);
+
+            // Process this shard with row-group level parallelism
+            let result = process_shard_parallel_row_groups(
+                &shard_path,
+                &primary_minimizers,
+                &remapped.secondary_id_map,
+            )?;
+
+            // Update statistics
+            secondary_entries += result.pairs.len() as u64;
+            total_excluded += result.entries_excluded;
+
+            for (k, v) in result.bucket_counts {
+                *secondary_bucket_counts.entry(k).or_insert(0) += v;
+            }
+            for (k, v) in result.bucket_counts_original {
+                *secondary_bucket_counts_original.entry(k).or_insert(0) += v;
+            }
+            for (k, v) in result.bucket_minimizer_counts {
+                *bucket_minimizer_counts.entry(k).or_insert(0) += v;
+            }
+
+            // Add filtered pairs to accumulator
+            secondary_accumulator.add_entries(&result.pairs);
+
+            // Check if we should flush
+            if secondary_accumulator.should_flush() {
+                secondary_accumulator.flush_shard()?;
+            }
         }
+
+        // Finish secondary accumulator
+        let secondary_shard_infos = secondary_accumulator.finish()?;
+        secondary_entries_original = secondary_entries + total_excluded;
 
         // Combine shard infos (primary + secondary)
         let mut all_shard_infos = primary_shard_infos;
