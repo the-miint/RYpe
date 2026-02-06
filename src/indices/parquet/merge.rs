@@ -8,7 +8,7 @@ use crate::classify::collect_negative_minimizers_sharded;
 use crate::error::{Result, RypeError};
 use crate::indices::sharded::{ShardInfo, ShardManifest, ShardedInvertedIndex};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -198,425 +198,6 @@ pub struct MergeStats {
     pub secondary_entries_original: u64,
     /// Number of unique minimizers excluded by subtraction (0 if no subtraction).
     pub excluded_minimizers: usize,
-}
-
-/// Build exclusion set: secondary minimizers that exist in primary.
-///
-/// **DEPRECATED**: This function accumulates ALL shared minimizers into an unbounded HashSet,
-/// which can cause OOM for large indices with 50%+ overlap. The streaming approach in
-/// `merge_indices_streaming()` uses per-shard exclusion sets instead.
-///
-/// TODO: Remove when `merge_indices()` is removed.
-///
-/// Processes one secondary shard at a time, querying against all primary shards.
-/// Memory: O(secondary_shard) + O(primary_shard) + O(exclusion_set) -- UNBOUNDED!
-///
-/// # Arguments
-/// * `primary` - The primary index (minimizers here will be excluded from secondary)
-/// * `secondary` - The secondary index (its minimizers are checked against primary)
-/// * `read_options` - Optional Parquet read options
-/// * `verbose` - Whether to emit progress messages to stderr
-///
-/// # Returns
-/// HashSet containing all secondary minimizers that also exist in the primary index.
-#[allow(dead_code)] // TODO: Remove with merge_indices()
-fn build_exclusion_set(
-    primary: &ShardedInvertedIndex,
-    secondary: &ShardedInvertedIndex,
-    read_options: Option<&ParquetReadOptions>,
-    verbose: bool,
-) -> Result<HashSet<u64>> {
-    let mut exclusion: HashSet<u64> = HashSet::new();
-    let total_shards = secondary.manifest().shards.len();
-
-    if verbose {
-        eprintln!("Building exclusion set...");
-    }
-
-    for (i, sec_shard_info) in secondary.manifest().shards.iter().enumerate() {
-        if verbose {
-            eprintln!(
-                "  - Processing secondary shard {}/{}...",
-                i + 1,
-                total_shards
-            );
-        }
-
-        // Load the secondary shard to get its minimizers
-        let sec_shard = secondary.load_shard(sec_shard_info.shard_id)?;
-        let sec_mins = sec_shard.minimizers(); // already sorted in CSR
-
-        // REUSE existing function: find which secondary minimizers hit the primary index
-        let hitting = collect_negative_minimizers_sharded(primary, sec_mins, read_options)
-            .map_err(|e| RypeError::Parquet {
-                context: format!("collecting exclusion minimizers: {}", e),
-                source: None,
-            })?;
-        exclusion.extend(hitting);
-    }
-
-    if verbose {
-        eprintln!(
-            "  - Exclusion set: {} minimizers to remove",
-            exclusion.len()
-        );
-    }
-
-    Ok(exclusion)
-}
-
-/// Merge two indices into one.
-///
-/// **DEPRECATED**: This function builds a global exclusion set upfront which can cause OOM
-/// for large indices with significant overlap. Use [`merge_indices_streaming`] instead,
-/// which processes each secondary shard independently with bounded memory.
-///
-/// TODO: Remove this function and update callers to use `merge_indices_streaming()`.
-///
-/// Combines all buckets from both indices into a single output index. Bucket IDs
-/// are renumbered sequentially starting from 1, with primary buckets first.
-///
-/// # Arguments
-///
-/// * `primary_path` - Path to the primary index directory (.ryxdi)
-/// * `secondary_path` - Path to the secondary index directory (.ryxdi)
-/// * `output_path` - Path for the merged output index directory (.ryxdi)
-/// * `options` - Merge options (subtraction, verbose output)
-/// * `write_options` - Optional Parquet write options (compression, bloom filters, etc.)
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Either index cannot be opened
-/// - Indices are incompatible (different k, w, or salt)
-/// - Bucket names overlap between indices
-/// - Subtraction results in an empty bucket (all minimizers removed)
-/// - I/O errors during reading or writing
-#[deprecated(
-    since = "0.1.0",
-    note = "Use merge_indices_streaming() for memory-bounded merging"
-)]
-pub fn merge_indices(
-    primary_path: &Path,
-    secondary_path: &Path,
-    output_path: &Path,
-    options: &MergeOptions,
-    write_options: Option<&ParquetWriteOptions>,
-) -> Result<MergeStats> {
-    // Open both indices
-    if options.verbose {
-        eprintln!("Loading primary index: {}", primary_path.display());
-    }
-    let primary = ShardedInvertedIndex::open(primary_path)?;
-    if options.verbose {
-        eprintln!(
-            "  - k={}, w={}, salt={:#x}",
-            primary.k(),
-            primary.w(),
-            primary.salt()
-        );
-        eprintln!(
-            "  - {} buckets, {} shards",
-            primary.manifest().bucket_names.len(),
-            primary.num_shards()
-        );
-    }
-
-    if options.verbose {
-        eprintln!("Loading secondary index: {}", secondary_path.display());
-    }
-    let secondary = ShardedInvertedIndex::open(secondary_path)?;
-    if options.verbose {
-        eprintln!(
-            "  - k={}, w={}, salt={:#x}",
-            secondary.k(),
-            secondary.w(),
-            secondary.salt()
-        );
-        eprintln!(
-            "  - {} buckets, {} shards",
-            secondary.manifest().bucket_names.len(),
-            secondary.num_shards()
-        );
-    }
-
-    // Reject empty indices
-    if primary.manifest().bucket_names.is_empty() {
-        return Err(RypeError::validation(format!(
-            "Primary index '{}' is empty (0 buckets)",
-            primary_path.display()
-        )));
-    }
-    if secondary.manifest().bucket_names.is_empty() {
-        return Err(RypeError::validation(format!(
-            "Secondary index '{}' is empty (0 buckets)",
-            secondary_path.display()
-        )));
-    }
-
-    // Validate compatibility
-    validate_merge_compatibility(&primary, &secondary)?;
-    if options.verbose {
-        eprintln!("Validation passed: indices are compatible");
-    }
-
-    // Compute bucket remapping
-    let remapped = compute_bucket_remapping(primary.manifest(), secondary.manifest());
-    if options.verbose {
-        eprintln!(
-            "Bucket name check: {} unique names (0 conflicts)",
-            remapped.bucket_names.len()
-        );
-    }
-
-    // Build exclusion set if subtraction is enabled
-    let exclusion_set: HashSet<u64> = if options.subtract_from_primary {
-        build_exclusion_set(&primary, &secondary, None, options.verbose)?
-    } else {
-        HashSet::new()
-    };
-
-    // Create output directory structure
-    create_index_directory(output_path)?;
-
-    // Determine shard size (use primary's average shard size as a guide, or 64MB default)
-    let avg_shard_entries = if primary.num_shards() > 0 {
-        primary.total_minimizers() / primary.num_shards()
-    } else {
-        0
-    };
-    // Estimate ~12 bytes per entry on disk, target 64MB shards
-    let max_shard_bytes = if avg_shard_entries > 0 {
-        (avg_shard_entries * 16).max(MIN_SHARD_BYTES)
-    } else {
-        64 * 1024 * 1024 // 64MB default
-    };
-
-    // Create accumulator for output
-    let mut accumulator =
-        ShardAccumulator::with_output_dir(output_path, max_shard_bytes, write_options);
-
-    let mut primary_entries: u64 = 0;
-    let mut secondary_entries: u64 = 0;
-    let mut secondary_entries_original: u64 = 0;
-
-    // Track per-bucket counts for secondary (to detect empty buckets after subtraction)
-    let mut secondary_bucket_counts: HashMap<u32, u64> = HashMap::new();
-    let mut secondary_bucket_counts_original: HashMap<u32, u64> = HashMap::new();
-    for &old_id in secondary.manifest().bucket_names.keys() {
-        secondary_bucket_counts.insert(old_id, 0);
-        secondary_bucket_counts_original.insert(old_id, 0);
-    }
-
-    // Track per-bucket minimizer counts for source_hash (using NEW bucket IDs)
-    let mut bucket_minimizer_counts: HashMap<u32, usize> = HashMap::new();
-    for &new_id in remapped.bucket_names.keys() {
-        bucket_minimizer_counts.insert(new_id, 0);
-    }
-
-    // Process primary index shards
-    if options.verbose {
-        eprintln!("Writing merged index...");
-    }
-    let primary_shards = primary.manifest().shards.len();
-    for (i, shard_info) in primary.manifest().shards.iter().enumerate() {
-        if options.verbose {
-            eprintln!(
-                "  - Processing primary shard {}/{}...",
-                i + 1,
-                primary_shards
-            );
-        }
-
-        // Read shard pairs and remap bucket IDs
-        let shard_path = primary.shard_path(shard_info.shard_id);
-        let pairs = read_shard_pairs(&shard_path)?;
-
-        for (minimizer, old_bucket_id) in pairs {
-            let new_bucket_id = *remapped.primary_id_map.get(&old_bucket_id).ok_or_else(|| {
-                RypeError::validation(format!(
-                    "Primary bucket ID {} not found in remapping",
-                    old_bucket_id
-                ))
-            })?;
-            accumulator.add_entries(&[(minimizer, new_bucket_id)]);
-            primary_entries += 1;
-            *bucket_minimizer_counts.entry(new_bucket_id).or_insert(0) += 1;
-        }
-
-        // Check if we should flush
-        if accumulator.should_flush() {
-            accumulator.flush_shard()?;
-        }
-    }
-
-    // Process secondary index shards
-    let secondary_shards = secondary.manifest().shards.len();
-    let filtering = options.subtract_from_primary && !exclusion_set.is_empty();
-    for (i, shard_info) in secondary.manifest().shards.iter().enumerate() {
-        if options.verbose {
-            if filtering {
-                eprintln!(
-                    "  - Processing secondary shard {}/{} (with filtering)...",
-                    i + 1,
-                    secondary_shards
-                );
-            } else {
-                eprintln!(
-                    "  - Processing secondary shard {}/{}...",
-                    i + 1,
-                    secondary_shards
-                );
-            }
-        }
-
-        // Read shard pairs and remap bucket IDs
-        let shard_path = secondary.shard_path(shard_info.shard_id);
-        let pairs = read_shard_pairs(&shard_path)?;
-
-        for (minimizer, old_bucket_id) in pairs {
-            secondary_entries_original += 1;
-            *secondary_bucket_counts_original
-                .entry(old_bucket_id)
-                .or_insert(0) += 1;
-
-            // Skip minimizers in the exclusion set
-            if filtering && exclusion_set.contains(&minimizer) {
-                continue;
-            }
-
-            let new_bucket_id =
-                *remapped
-                    .secondary_id_map
-                    .get(&old_bucket_id)
-                    .ok_or_else(|| {
-                        RypeError::validation(format!(
-                            "Secondary bucket ID {} not found in remapping",
-                            old_bucket_id
-                        ))
-                    })?;
-            accumulator.add_entries(&[(minimizer, new_bucket_id)]);
-            secondary_entries += 1;
-            *bucket_minimizer_counts.entry(new_bucket_id).or_insert(0) += 1;
-
-            // Track per-bucket count (use old_bucket_id for empty bucket check)
-            *secondary_bucket_counts.entry(old_bucket_id).or_insert(0) += 1;
-        }
-
-        // Check if we should flush
-        if accumulator.should_flush() {
-            accumulator.flush_shard()?;
-        }
-    }
-
-    // Check for empty buckets after subtraction
-    if options.subtract_from_primary {
-        for (&bucket_id, &count) in &secondary_bucket_counts {
-            if count == 0 {
-                let bucket_name = secondary
-                    .manifest()
-                    .bucket_names
-                    .get(&bucket_id)
-                    .map(|s| s.as_str())
-                    .unwrap_or("<unknown>");
-                let original_count = secondary_bucket_counts_original
-                    .get(&bucket_id)
-                    .copied()
-                    .unwrap_or(0);
-                return Err(RypeError::validation(format!(
-                    "Subtraction resulted in empty bucket '{}' (id={}): all {} minimizers were removed",
-                    bucket_name,
-                    bucket_id,
-                    original_count
-                )));
-            }
-        }
-    }
-
-    // Finish accumulator (flushes remaining entries)
-    let shard_infos = accumulator.finish()?;
-
-    // Compute total entries
-    let total_entries: u64 = shard_infos.iter().map(|s| s.num_entries).sum();
-
-    // Merged indices have overlapping shard ranges because we process primary shards
-    // first, then secondary shards. Since primary and secondary may have overlapping
-    // minimizer ranges (e.g., primary has [100-300], secondary has [150-350]), the
-    // output shards will have overlapping ranges.
-    let has_overlapping_shards = true;
-
-    // Write buckets.parquet
-    write_buckets_parquet(
-        output_path,
-        &remapped.bucket_names,
-        &remapped.bucket_sources,
-    )?;
-
-    // Compute source hash for the merged index using tracked per-bucket counts
-    let source_hash = compute_source_hash(&bucket_minimizer_counts);
-
-    // Build and save manifest
-    let manifest = ParquetManifest {
-        magic: FORMAT_MAGIC.to_string(),
-        format_version: FORMAT_VERSION,
-        k: primary.k(),
-        w: primary.w(),
-        salt: primary.salt(),
-        source_hash,
-        num_buckets: remapped.bucket_names.len() as u32,
-        total_minimizers: total_entries,
-        inverted: Some(InvertedManifest {
-            format: ParquetShardFormat::Parquet,
-            num_shards: shard_infos.len() as u32,
-            total_entries,
-            has_overlapping_shards,
-            shards: shard_infos
-                .into_iter()
-                .map(|s| InvertedShardInfo {
-                    shard_id: s.shard_id,
-                    min_minimizer: s.min_minimizer,
-                    max_minimizer: s.max_minimizer,
-                    num_entries: s.num_entries,
-                })
-                .collect(),
-        }),
-    };
-
-    manifest.save(output_path)?;
-
-    let stats = MergeStats {
-        total_buckets: remapped.bucket_names.len() as u32,
-        total_minimizer_entries: total_entries,
-        primary_buckets: remapped.primary_id_map.len() as u32,
-        primary_entries,
-        secondary_buckets: remapped.secondary_id_map.len() as u32,
-        secondary_entries,
-        secondary_entries_original,
-        excluded_minimizers: exclusion_set.len(),
-    };
-
-    if options.verbose {
-        eprintln!("\nMerge complete:");
-        eprintln!("  - Output: {}", output_path.display());
-        eprintln!("  - Total buckets: {}", stats.total_buckets);
-        eprintln!(
-            "  - Total minimizer entries: {}",
-            stats.total_minimizer_entries
-        );
-        eprintln!("  - Primary entries: {}", stats.primary_entries);
-        if options.subtract_from_primary && stats.excluded_minimizers > 0 {
-            eprintln!(
-                "  - Secondary entries: {} (original: {}, removed: {})",
-                stats.secondary_entries,
-                stats.secondary_entries_original,
-                stats.secondary_entries_original - stats.secondary_entries
-            );
-        } else {
-            eprintln!("  - Secondary entries: {}", stats.secondary_entries);
-        }
-    }
-
-    Ok(stats)
 }
 
 /// Statistics collected from parallel secondary shard processing.
@@ -979,8 +560,7 @@ fn finish_merge(
 
 /// Memory-bounded merge with streaming per-shard subtraction.
 ///
-/// Unlike `merge_indices()` which builds a global exclusion set upfront (unbounded memory),
-/// this function processes each secondary shard independently, building per-shard exclusion
+/// This function processes each secondary shard independently, building per-shard exclusion
 /// sets that are dropped after each shard is processed.
 ///
 /// Memory usage: O(max_memory) regardless of total index overlap.
@@ -1741,8 +1321,15 @@ mod tests {
             subtract_from_primary: false,
             verbose: false,
         };
-        let stats = merge_indices(&primary_path, &secondary_path, &output_path, &options, None)
-            .expect("merge should succeed");
+        let stats = merge_indices_streaming(
+            &primary_path,
+            &secondary_path,
+            &output_path,
+            &options,
+            None,
+            None,
+        )
+        .expect("merge should succeed");
 
         // Verify stats
         assert_eq!(stats.total_buckets, 4);
@@ -1790,8 +1377,15 @@ mod tests {
 
         // Merge
         let options = MergeOptions::default();
-        let stats = merge_indices(&primary_path, &secondary_path, &output_path, &options, None)
-            .expect("merge should succeed");
+        let stats = merge_indices_streaming(
+            &primary_path,
+            &secondary_path,
+            &output_path,
+            &options,
+            None,
+            None,
+        )
+        .expect("merge should succeed");
 
         // Verify all entries preserved
         assert_eq!(stats.total_minimizer_entries, 10);
@@ -1815,8 +1409,15 @@ mod tests {
             create_test_index(&secondary_path, 64, 50, 0x5555, "bucket_b", vec![4, 5, 6]);
 
         let options = MergeOptions::default();
-        merge_indices(&primary_path, &secondary_path, &output_path, &options, None)
-            .expect("merge should succeed");
+        merge_indices_streaming(
+            &primary_path,
+            &secondary_path,
+            &output_path,
+            &options,
+            None,
+            None,
+        )
+        .expect("merge should succeed");
 
         // Verify directory structure
         assert!(output_path.exists(), "Output directory should exist");
@@ -1872,8 +1473,15 @@ mod tests {
         );
 
         let options = MergeOptions::default();
-        merge_indices(&primary_path, &secondary_path, &output_path, &options, None)
-            .expect("merge should succeed");
+        merge_indices_streaming(
+            &primary_path,
+            &secondary_path,
+            &output_path,
+            &options,
+            None,
+            None,
+        )
+        .expect("merge should succeed");
 
         // Open merged index and verify bucket names
         let merged = ShardedInvertedIndex::open(&output_path).unwrap();
@@ -1914,8 +1522,15 @@ mod tests {
         );
 
         let options = MergeOptions::default();
-        let stats = merge_indices(&primary_path, &secondary_path, &output_path, &options, None)
-            .expect("merge should succeed");
+        let stats = merge_indices_streaming(
+            &primary_path,
+            &secondary_path,
+            &output_path,
+            &options,
+            None,
+            None,
+        )
+        .expect("merge should succeed");
 
         // Both indices contribute all their entries
         assert_eq!(stats.primary_entries, 3);
@@ -1943,7 +1558,14 @@ mod tests {
             subtract_from_primary: false,
             verbose: true,
         };
-        let result = merge_indices(&primary_path, &secondary_path, &output_path, &options, None);
+        let result = merge_indices_streaming(
+            &primary_path,
+            &secondary_path,
+            &output_path,
+            &options,
+            None,
+            None,
+        );
         assert!(result.is_ok(), "merge with verbose should succeed");
     }
 
@@ -1981,8 +1603,15 @@ mod tests {
             subtract_from_primary: true,
             verbose: false,
         };
-        let stats = merge_indices(&primary_path, &secondary_path, &output_path, &options, None)
-            .expect("merge with subtraction should succeed");
+        let stats = merge_indices_streaming(
+            &primary_path,
+            &secondary_path,
+            &output_path,
+            &options,
+            None,
+            None,
+        )
+        .expect("merge with subtraction should succeed");
 
         // Primary: 3 entries unchanged
         assert_eq!(stats.primary_entries, 3);
@@ -2025,8 +1654,15 @@ mod tests {
             subtract_from_primary: true,
             verbose: false,
         };
-        let stats = merge_indices(&primary_path, &secondary_path, &output_path, &options, None)
-            .expect("merge with subtraction should succeed");
+        let stats = merge_indices_streaming(
+            &primary_path,
+            &secondary_path,
+            &output_path,
+            &options,
+            None,
+            None,
+        )
+        .expect("merge with subtraction should succeed");
 
         // No overlap, so secondary is unchanged
         assert_eq!(stats.secondary_entries, 3);
@@ -2058,8 +1694,15 @@ mod tests {
             subtract_from_primary: true,
             verbose: false,
         };
-        let stats = merge_indices(&primary_path, &secondary_path, &output_path, &options, None)
-            .expect("merge with subtraction should succeed");
+        let stats = merge_indices_streaming(
+            &primary_path,
+            &secondary_path,
+            &output_path,
+            &options,
+            None,
+            None,
+        )
+        .expect("merge with subtraction should succeed");
 
         // Primary should be unchanged
         assert_eq!(stats.primary_entries, 2);
@@ -2104,7 +1747,14 @@ mod tests {
             subtract_from_primary: true,
             verbose: false,
         };
-        let result = merge_indices(&primary_path, &secondary_path, &output_path, &options, None);
+        let result = merge_indices_streaming(
+            &primary_path,
+            &secondary_path,
+            &output_path,
+            &options,
+            None,
+            None,
+        );
 
         // Should fail because bucket_b would become empty
         assert!(result.is_err(), "Should fail when bucket becomes empty");
@@ -2163,8 +1813,15 @@ mod tests {
             subtract_from_primary: true,
             verbose: false,
         };
-        let stats = merge_indices(&primary_path, &secondary_path, &output_path, &options, None)
-            .expect("merge with partial subtraction should succeed");
+        let stats = merge_indices_streaming(
+            &primary_path,
+            &secondary_path,
+            &output_path,
+            &options,
+            None,
+            None,
+        )
+        .expect("merge with partial subtraction should succeed");
 
         // Primary: 2 entries
         assert_eq!(stats.primary_entries, 2);
@@ -2208,7 +1865,14 @@ mod tests {
             subtract_from_primary: true,
             verbose: true,
         };
-        let result = merge_indices(&primary_path, &secondary_path, &output_path, &options, None);
+        let result = merge_indices_streaming(
+            &primary_path,
+            &secondary_path,
+            &output_path,
+            &options,
+            None,
+            None,
+        );
         assert!(
             result.is_ok(),
             "merge with subtraction and verbose should succeed"
@@ -2237,7 +1901,14 @@ mod tests {
             create_test_index(&secondary_path, 64, 50, 0x5555, "bucket_b", vec![1, 2, 3]);
 
         let options = MergeOptions::default();
-        let result = merge_indices(&primary_path, &secondary_path, &output_path, &options, None);
+        let result = merge_indices_streaming(
+            &primary_path,
+            &secondary_path,
+            &output_path,
+            &options,
+            None,
+            None,
+        );
 
         // Empty indices cause errors - either from our validation ("empty" / "0 buckets")
         // or from missing shard files (I/O error). Either way, merge should fail.
@@ -2260,7 +1931,14 @@ mod tests {
         create_empty_index(&secondary_path, 64, 50, 0x5555);
 
         let options = MergeOptions::default();
-        let result = merge_indices(&primary_path, &secondary_path, &output_path, &options, None);
+        let result = merge_indices_streaming(
+            &primary_path,
+            &secondary_path,
+            &output_path,
+            &options,
+            None,
+            None,
+        );
 
         // Empty indices cause errors - either from our validation ("empty" / "0 buckets")
         // or from missing shard files (I/O error). Either way, merge should fail.
@@ -2357,11 +2035,12 @@ mod tests {
 
         // Merge the indices
         let merge_options = MergeOptions::default();
-        let stats = merge_indices(
+        let stats = merge_indices_streaming(
             &primary_path,
             &secondary_path,
             &output_path,
             &merge_options,
+            None,
             None,
         )
         .expect("merge should succeed");
@@ -2434,112 +2113,6 @@ mod tests {
         assert!(
             match_d.unwrap().score > 0.9,
             "Self-match should have high score"
-        );
-    }
-
-    // =========================================================================
-    // Phase 1: Streaming Subtraction Tests (RED - functions don't exist yet)
-    // =========================================================================
-
-    #[test]
-    fn test_streaming_subtract_equivalent_to_original() {
-        // Test that streaming subtraction produces identical results to build_exclusion_set()
-        let tmp = TempDir::new().unwrap();
-        let primary_path = tmp.path().join("primary.ryxdi");
-        let secondary_path = tmp.path().join("secondary.ryxdi");
-        let output_streaming = tmp.path().join("merged_streaming.ryxdi");
-        let output_original = tmp.path().join("merged_original.ryxdi");
-
-        // Create primary with minimizers [100, 200, 300, 400, 500]
-        let _primary = create_multi_bucket_index(
-            &primary_path,
-            64,
-            50,
-            0x5555,
-            vec![
-                (1, "bucket_a", vec!["a.fa".to_string()], vec![100, 200, 300]),
-                (2, "bucket_b", vec!["b.fa".to_string()], vec![400, 500]),
-            ],
-        );
-
-        // Create secondary with minimizers [200, 300, 600, 700]
-        // Expected exclusion: {200, 300}
-        let _secondary = create_multi_bucket_index(
-            &secondary_path,
-            64,
-            50,
-            0x5555,
-            vec![
-                (1, "bucket_c", vec!["c.fa".to_string()], vec![200, 600]),
-                (2, "bucket_d", vec!["d.fa".to_string()], vec![300, 700]),
-            ],
-        );
-
-        // Call original merge
-        let options = MergeOptions {
-            subtract_from_primary: true,
-            verbose: false,
-        };
-        let original_stats = merge_indices(
-            &primary_path,
-            &secondary_path,
-            &output_original,
-            &options,
-            None,
-        )
-        .expect("original merge should succeed");
-
-        // Call NEW streaming merge (this function doesn't exist yet - RED)
-        let streaming_stats = merge_indices_streaming(
-            &primary_path,
-            &secondary_path,
-            &output_streaming,
-            &options,
-            Some(64 * 1024 * 1024), // 64MB max memory
-            None,
-        )
-        .expect("streaming merge should succeed");
-
-        // Assert: identical stats
-        assert_eq!(
-            original_stats.total_buckets, streaming_stats.total_buckets,
-            "total_buckets mismatch"
-        );
-        assert_eq!(
-            original_stats.total_minimizer_entries, streaming_stats.total_minimizer_entries,
-            "total_minimizer_entries mismatch"
-        );
-        assert_eq!(
-            original_stats.primary_entries, streaming_stats.primary_entries,
-            "primary_entries mismatch"
-        );
-        assert_eq!(
-            original_stats.secondary_entries, streaming_stats.secondary_entries,
-            "secondary_entries mismatch"
-        );
-        assert_eq!(
-            original_stats.secondary_entries_original, streaming_stats.secondary_entries_original,
-            "secondary_entries_original mismatch"
-        );
-        assert_eq!(
-            original_stats.excluded_minimizers, streaming_stats.excluded_minimizers,
-            "excluded_minimizers mismatch"
-        );
-
-        // Assert: identical merged index contents
-        let original_merged = ShardedInvertedIndex::open(&output_original).unwrap();
-        let streaming_merged = ShardedInvertedIndex::open(&output_streaming).unwrap();
-
-        assert_eq!(original_merged.k(), streaming_merged.k());
-        assert_eq!(original_merged.w(), streaming_merged.w());
-        assert_eq!(original_merged.salt(), streaming_merged.salt());
-        assert_eq!(
-            original_merged.manifest().bucket_names,
-            streaming_merged.manifest().bucket_names
-        );
-        assert_eq!(
-            original_merged.total_minimizers(),
-            streaming_merged.total_minimizers()
         );
     }
 
@@ -2847,128 +2420,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_streaming_subtract_matches_sequential() {
-        // Verify streaming parallel merge produces same results as old sequential merge
-        let tmp = TempDir::new().unwrap();
-        let primary_path = tmp.path().join("primary.ryxdi");
-        let secondary_path = tmp.path().join("secondary.ryxdi");
-        let output_sequential = tmp.path().join("merged_sequential.ryxdi");
-        let output_parallel = tmp.path().join("merged_parallel.ryxdi");
-
-        // Create indices with overlapping minimizers
-        let _primary = create_multi_bucket_index(
-            &primary_path,
-            64,
-            50,
-            0x5555,
-            vec![
-                (1, "bucket_a", vec!["a.fa".to_string()], vec![100, 200, 300]),
-                (2, "bucket_b", vec!["b.fa".to_string()], vec![400, 500, 600]),
-            ],
-        );
-
-        let _secondary = create_multi_bucket_index(
-            &secondary_path,
-            64,
-            50,
-            0x5555,
-            vec![
-                (1, "bucket_c", vec!["c.fa".to_string()], vec![200, 700, 800]),
-                (
-                    2,
-                    "bucket_d",
-                    vec!["d.fa".to_string()],
-                    vec![500, 900, 1000],
-                ),
-            ],
-        );
-
-        let options = MergeOptions {
-            subtract_from_primary: true,
-            verbose: false,
-        };
-
-        // Run the old merge_indices (builds global exclusion set)
-        #[allow(deprecated)]
-        let sequential_stats = merge_indices(
-            &primary_path,
-            &secondary_path,
-            &output_sequential,
-            &options,
-            None,
-        )
-        .expect("old merge should succeed");
-
-        // Run streaming merge (parallel with rayon)
-        let parallel_stats = merge_indices_streaming(
-            &primary_path,
-            &secondary_path,
-            &output_parallel,
-            &options,
-            Some(64 * 1024 * 1024),
-            None,
-        )
-        .expect("streaming merge should succeed");
-
-        // Compare stats
-        assert_eq!(
-            sequential_stats.total_buckets, parallel_stats.total_buckets,
-            "total_buckets mismatch"
-        );
-        assert_eq!(
-            sequential_stats.total_minimizer_entries, parallel_stats.total_minimizer_entries,
-            "total_minimizer_entries mismatch"
-        );
-        assert_eq!(
-            sequential_stats.primary_entries, parallel_stats.primary_entries,
-            "primary_entries mismatch"
-        );
-        assert_eq!(
-            sequential_stats.secondary_entries, parallel_stats.secondary_entries,
-            "secondary_entries mismatch"
-        );
-        assert_eq!(
-            sequential_stats.excluded_minimizers, parallel_stats.excluded_minimizers,
-            "excluded_minimizers mismatch"
-        );
-
-        // Compare actual index contents
-        let seq_merged = ShardedInvertedIndex::open(&output_sequential).unwrap();
-        let par_merged = ShardedInvertedIndex::open(&output_parallel).unwrap();
-
-        assert_eq!(seq_merged.k(), par_merged.k());
-        assert_eq!(seq_merged.w(), par_merged.w());
-        assert_eq!(seq_merged.salt(), par_merged.salt());
-        assert_eq!(
-            seq_merged.manifest().bucket_names,
-            par_merged.manifest().bucket_names
-        );
-        assert_eq!(seq_merged.total_minimizers(), par_merged.total_minimizers());
-
-        // Load all entries and compare (sorted)
-        let mut seq_entries = Vec::new();
-        for shard_info in seq_merged.manifest().shards.iter() {
-            let shard_path = seq_merged.shard_path(shard_info.shard_id);
-            let pairs = read_shard_pairs(&shard_path).unwrap();
-            seq_entries.extend(pairs);
-        }
-        seq_entries.sort();
-
-        let mut par_entries = Vec::new();
-        for shard_info in par_merged.manifest().shards.iter() {
-            let shard_path = par_merged.shard_path(shard_info.shard_id);
-            let pairs = read_shard_pairs(&shard_path).unwrap();
-            par_entries.extend(pairs);
-        }
-        par_entries.sort();
-
-        assert_eq!(
-            seq_entries, par_entries,
-            "Sequential and parallel merge produced different entries"
-        );
-    }
-
-    #[test]
     fn test_merge_with_subtraction_classification_correctness() {
         use crate::classify::classify_batch_sharded_merge_join;
         use crate::core::extraction::extract_into;
@@ -3025,11 +2476,12 @@ mod tests {
             subtract_from_primary: true,
             verbose: false,
         };
-        let stats = merge_indices(
+        let stats = merge_indices_streaming(
             &primary_path,
             &secondary_path,
             &output_path,
             &merge_options,
+            None,
             None,
         )
         .expect("merge should succeed");

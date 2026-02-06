@@ -236,7 +236,7 @@ edition = "2021"
 
 [dependencies]
 rype = {{ path = "{}" }}
-needletail = "0.4"
+needletail = "0.6"
 anyhow = "1.0"
 tempfile = "3"
 "#,
