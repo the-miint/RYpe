@@ -676,16 +676,9 @@ fn classify_internal(
             .collect();
 
         // Classify using sharded inverted index with memory-efficient negative filtering
-        // Note: trim_to is None for C API (not yet exposed)
-        let hits = classify_with_sharded_negative(
-            &index.0,
-            neg_index,
-            &rust_queries,
-            threshold,
-            None,
-            None,
-        )
-        .map_err(|e| format!("Classification failed: {}", e))?;
+        let hits =
+            classify_with_sharded_negative(&index.0, neg_index, &rust_queries, threshold, None)
+                .map_err(|e| format!("Classification failed: {}", e))?;
 
         // Apply best-hit filter if requested
         let hits = if best_hit_only {

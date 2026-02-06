@@ -23,35 +23,6 @@ use super::merge_join::{
 };
 use super::scoring::compute_score;
 
-/// Try to trim a sequence pair, returning None if R1 is too short.
-///
-/// This function validates and trims sequences before classification:
-/// - If `trim_to` is None, returns the original sequences unchanged.
-/// - If R1 is shorter than `trim_to`, returns None (skip this record).
-/// - Otherwise, trims R1 to `trim_to` and R2 to min(len, trim_to).
-///
-/// For paired-end reads, R1 acts as the gatekeeper: if R1 is too short,
-/// the entire pair is skipped. R2 is never required to meet the threshold.
-#[inline]
-fn try_trim_record<'a>(
-    s1: &'a [u8],
-    s2: Option<&'a [u8]>,
-    trim_to: Option<usize>,
-) -> Option<(&'a [u8], Option<&'a [u8]>)> {
-    match trim_to {
-        Some(trim_len) => {
-            if s1.len() < trim_len {
-                None // R1 too short, skip
-            } else {
-                let s1_trimmed = &s1[..trim_len];
-                let s2_trimmed = s2.map(|seq| &seq[..seq.len().min(trim_len)]);
-                Some((s1_trimmed, s2_trimmed))
-            }
-        }
-        None => Some((s1, s2)),
-    }
-}
-
 /// Estimate minimizers per query from the first record in a batch.
 ///
 /// Uses the formula: ((query_length - k) / w + 1) * 2 (for both strands).
@@ -85,10 +56,9 @@ fn estimate_minimizers_from_records(records: &[QueryRecord], k: usize, w: usize)
 /// # Arguments
 /// * `sharded` - The sharded inverted index
 /// * `negative_mins` - Optional set of minimizers to exclude from queries before scoring
-/// * `records` - Batch of query records
+/// * `records` - Batch of query records (should be pre-trimmed if trimming is desired)
 /// * `threshold` - Minimum score threshold
 /// * `read_options` - Parquet read options (None = default behavior without bloom filters)
-/// * `trim_to` - Optional length to trim sequences to. Sequences shorter than this are skipped.
 ///
 /// # Returns
 /// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
@@ -98,7 +68,6 @@ pub fn classify_batch_sharded_merge_join(
     records: &[QueryRecord],
     threshold: f64,
     read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
-    trim_to: Option<usize>,
 ) -> Result<Vec<HitResult>> {
     let t_start = Instant::now();
 
@@ -116,17 +85,8 @@ pub fn classify_batch_sharded_merge_join(
         .map_init(
             || MinimizerWorkspace::with_estimate(estimated_mins),
             |ws, (_, s1, s2)| {
-                let Some((s1_eff, s2_eff)) = try_trim_record(s1, *s2, trim_to) else {
-                    return (vec![], vec![]); // Skipped: empty minimizers = no hits
-                };
-                let (ha, hb) = get_paired_minimizers_into(
-                    s1_eff,
-                    s2_eff,
-                    manifest.k,
-                    manifest.w,
-                    manifest.salt,
-                    ws,
-                );
+                let (ha, hb) =
+                    get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
                 filter_negative_mins(ha, hb, negative_mins)
             },
         )
@@ -252,10 +212,9 @@ pub fn classify_batch_sharded_merge_join(
 /// # Arguments
 /// * `sharded` - The sharded inverted index (must be Parquet format)
 /// * `negative_mins` - Optional set of minimizers to exclude from queries before scoring
-/// * `records` - Batch of query records
+/// * `records` - Batch of query records (should be pre-trimmed if trimming is desired)
 /// * `threshold` - Minimum score threshold
 /// * `_read_options` - Unused; see "Why read_options is Unused" above
-/// * `trim_to` - Optional length to trim sequences to. Sequences shorter than this are skipped.
 ///
 /// # Returns
 /// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
@@ -265,7 +224,6 @@ pub fn classify_batch_sharded_parallel_rg(
     records: &[QueryRecord],
     threshold: f64,
     _read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
-    trim_to: Option<usize>,
 ) -> Result<Vec<HitResult>> {
     use crate::indices::{get_row_group_ranges, load_row_group_pairs};
 
@@ -285,17 +243,8 @@ pub fn classify_batch_sharded_parallel_rg(
         .map_init(
             || MinimizerWorkspace::with_estimate(estimated_mins),
             |ws, (_, s1, s2)| {
-                let Some((s1_eff, s2_eff)) = try_trim_record(s1, *s2, trim_to) else {
-                    return (vec![], vec![]); // Skipped: empty minimizers = no hits
-                };
-                let (ha, hb) = get_paired_minimizers_into(
-                    s1_eff,
-                    s2_eff,
-                    manifest.k,
-                    manifest.w,
-                    manifest.salt,
-                    ws,
-                );
+                let (ha, hb) =
+                    get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
                 filter_negative_mins(ha, hb, negative_mins)
             },
         )
@@ -433,10 +382,9 @@ pub fn classify_batch_sharded_parallel_rg(
 /// # Arguments
 /// * `positive_index` - The sharded inverted index to classify against
 /// * `negative_index` - Optional sharded index containing sequences to filter out
-/// * `records` - Batch of query records
+/// * `records` - Batch of query records (should be pre-trimmed if trimming is desired)
 /// * `threshold` - Minimum score threshold
 /// * `read_options` - Parquet read options
-/// * `trim_to` - Optional length to trim sequences to. Sequences shorter than this are skipped.
 ///
 /// # Returns
 /// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
@@ -446,7 +394,6 @@ pub fn classify_with_sharded_negative(
     records: &[QueryRecord],
     threshold: f64,
     read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
-    trim_to: Option<usize>,
 ) -> Result<Vec<HitResult>> {
     // If no negative index, delegate directly to the merge-join function
     if negative_index.is_none() {
@@ -456,31 +403,21 @@ pub fn classify_with_sharded_negative(
             records,
             threshold,
             read_options,
-            trim_to,
         );
     }
 
     let negative = negative_index.unwrap();
     let manifest = positive_index.manifest();
 
-    // Step 1: Extract minimizers from all records (with trimming)
+    // Step 1: Extract minimizers from all records
     let estimated_mins = estimate_minimizers_from_records(records, manifest.k, manifest.w);
     let processed: Vec<_> = records
         .par_iter()
         .map_init(
             || MinimizerWorkspace::with_estimate(estimated_mins),
             |ws, (_, s1, s2)| {
-                let Some((s1_eff, s2_eff)) = try_trim_record(s1, *s2, trim_to) else {
-                    return (vec![], vec![]); // Skipped: empty minimizers
-                };
-                let (fwd, rc) = get_paired_minimizers_into(
-                    s1_eff,
-                    s2_eff,
-                    manifest.k,
-                    manifest.w,
-                    manifest.salt,
-                    ws,
-                );
+                let (fwd, rc) =
+                    get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
                 (fwd, rc)
             },
         )
@@ -507,7 +444,6 @@ pub fn classify_with_sharded_negative(
         records,
         threshold,
         read_options,
-        trim_to,
     )
 }
 
@@ -580,8 +516,7 @@ mod tests {
         let (_dir, index, _seqs) = create_test_index();
         let records: Vec<QueryRecord> = vec![];
 
-        let results =
-            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None, None).unwrap();
+        let results = classify_batch_sharded_merge_join(&index, None, &records, 0.1, None).unwrap();
 
         assert!(
             results.is_empty(),
@@ -596,8 +531,7 @@ mod tests {
         // Query with the same sequence used to build bucket 1
         let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
 
-        let results =
-            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None, None).unwrap();
+        let results = classify_batch_sharded_merge_join(&index, None, &records, 0.1, None).unwrap();
 
         // Should have at least one hit for bucket 1 with high score
         let bucket1_hit = results.iter().find(|r| r.query_id == 1 && r.bucket_id == 1);
@@ -617,8 +551,7 @@ mod tests {
         let records: Vec<QueryRecord> =
             vec![(1, seqs[0].as_slice(), None), (2, seqs[1].as_slice(), None)];
 
-        let results =
-            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None, None).unwrap();
+        let results = classify_batch_sharded_merge_join(&index, None, &records, 0.1, None).unwrap();
 
         // Each query should match its corresponding bucket
         let q1_b1 = results.iter().find(|r| r.query_id == 1 && r.bucket_id == 1);
@@ -644,15 +577,15 @@ mod tests {
 
         // Low threshold - should get results
         let low_results =
-            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None, None).unwrap();
+            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None).unwrap();
 
         // Medium threshold - may filter some cross-matches
         let mid_results =
-            classify_batch_sharded_merge_join(&index, None, &records, 0.5, None, None).unwrap();
+            classify_batch_sharded_merge_join(&index, None, &records, 0.5, None).unwrap();
 
         // Threshold > 1.0 - should filter everything (scores are max 1.0)
         let high_results =
-            classify_batch_sharded_merge_join(&index, None, &records, 1.01, None, None).unwrap();
+            classify_batch_sharded_merge_join(&index, None, &records, 1.01, None).unwrap();
 
         assert!(!low_results.is_empty(), "Low threshold should have results");
         assert!(
@@ -673,8 +606,7 @@ mod tests {
         let short_seq = b"ACGTACGT"; // 8 bases
         let records: Vec<QueryRecord> = vec![(1, short_seq.as_slice(), None)];
 
-        let results =
-            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None, None).unwrap();
+        let results = classify_batch_sharded_merge_join(&index, None, &records, 0.1, None).unwrap();
 
         assert!(results.is_empty(), "Short sequence should have no hits");
     }
@@ -687,7 +619,7 @@ mod tests {
 
         // First, get results without negative filtering
         let results_without =
-            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None, None).unwrap();
+            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None).unwrap();
         assert!(
             !results_without.is_empty(),
             "Should have results without filtering"
@@ -702,15 +634,9 @@ mod tests {
         let negative_mins: HashSet<u64> = ws.buffer.drain(..).collect();
 
         // With all query minimizers as negative - should filter everything
-        let results_with = classify_batch_sharded_merge_join(
-            &index,
-            Some(&negative_mins),
-            &records,
-            0.1,
-            None,
-            None,
-        )
-        .unwrap();
+        let results_with =
+            classify_batch_sharded_merge_join(&index, Some(&negative_mins), &records, 0.1, None)
+                .unwrap();
 
         assert!(
             results_with.is_empty(),
@@ -725,8 +651,7 @@ mod tests {
         // Use seq1 as read1 and seq2 as read2 (paired-end)
         let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), Some(seqs[1].as_slice()))];
 
-        let results =
-            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None, None).unwrap();
+        let results = classify_batch_sharded_merge_join(&index, None, &records, 0.1, None).unwrap();
 
         // Should have hits for both buckets (read1 matches bucket1, read2 matches bucket2)
         let b1_hit = results.iter().find(|r| r.bucket_id == 1);
@@ -808,9 +733,9 @@ mod tests {
         let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
 
         let results_standard =
-            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None, None).unwrap();
+            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None).unwrap();
         let results_sharded =
-            classify_with_sharded_negative(&index, None, &records, 0.1, None, None).unwrap();
+            classify_with_sharded_negative(&index, None, &records, 0.1, None).unwrap();
 
         assert_eq!(
             results_standard.len(),
@@ -866,11 +791,11 @@ mod tests {
 
         // Without negative filtering
         let results_without =
-            classify_with_sharded_negative(&pos_index, None, &records, 0.0, None, None).unwrap();
+            classify_with_sharded_negative(&pos_index, None, &records, 0.0, None).unwrap();
 
         // With negative filtering
         let results_with =
-            classify_with_sharded_negative(&pos_index, Some(&neg_index), &records, 0.0, None, None)
+            classify_with_sharded_negative(&pos_index, Some(&neg_index), &records, 0.0, None)
                 .unwrap();
 
         // Both should work (may or may not have hits depending on minimizer overlap)
@@ -906,8 +831,7 @@ mod tests {
 
         // All query minimizers should be filtered, resulting in no hits
         let results =
-            classify_with_sharded_negative(&index, Some(&neg_index), &records, 0.1, None, None)
-                .unwrap();
+            classify_with_sharded_negative(&index, Some(&neg_index), &records, 0.1, None).unwrap();
 
         assert!(
             results.is_empty(),
@@ -920,8 +844,7 @@ mod tests {
         let (_dir, index, _seqs) = create_test_index();
         let records: Vec<QueryRecord> = vec![];
 
-        let results =
-            classify_with_sharded_negative(&index, None, &records, 0.1, None, None).unwrap();
+        let results = classify_with_sharded_negative(&index, None, &records, 0.1, None).unwrap();
 
         assert!(
             results.is_empty(),
@@ -964,20 +887,13 @@ mod tests {
         let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
 
         // Traditional HashSet approach
-        let results_hashset = classify_batch_sharded_merge_join(
-            &index,
-            Some(&negative_set),
-            &records,
-            0.1,
-            None,
-            None,
-        )
-        .unwrap();
+        let results_hashset =
+            classify_batch_sharded_merge_join(&index, Some(&negative_set), &records, 0.1, None)
+                .unwrap();
 
         // New sharded approach
         let results_sharded =
-            classify_with_sharded_negative(&index, Some(&neg_index), &records, 0.1, None, None)
-                .unwrap();
+            classify_with_sharded_negative(&index, Some(&neg_index), &records, 0.1, None).unwrap();
 
         assert_eq!(
             results_hashset.len(),
@@ -996,335 +912,5 @@ mod tests {
                 score_sharded
             );
         }
-    }
-
-    // =========================================================================
-    // trim_to tests (Phase 3)
-    // =========================================================================
-
-    #[test]
-    fn test_classify_with_trim_to_basic() {
-        // Test that trimmed sequences still produce classification results
-        let (_dir, index, seqs) = create_test_index();
-
-        // seqs[0] is 200 bases, trim to 100
-        let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
-
-        // Classify with trim_to=100 (should trim to first 100 bases)
-        let results = classify_batch_sharded_merge_join(
-            &index,
-            None,
-            &records,
-            0.1,
-            None,
-            Some(100), // trim_to
-        )
-        .unwrap();
-
-        // Should still get a hit (though potentially lower score than full sequence)
-        assert!(
-            !results.is_empty(),
-            "Trimmed sequence should still produce hits"
-        );
-
-        // The trimmed sequence should match bucket 1 (since it's from seq[0])
-        let bucket1_hit = results.iter().find(|r| r.bucket_id == 1);
-        assert!(
-            bucket1_hit.is_some(),
-            "Should match bucket 1 even when trimmed"
-        );
-    }
-
-    #[test]
-    fn test_classify_trim_to_skips_short_sequences() {
-        // Test that sequences shorter than trim_to are skipped
-        let (_dir, index, seqs) = create_test_index();
-
-        // seqs[0] is 200 bases
-        let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
-
-        // trim_to=300 is longer than sequence (200 bases) - should skip
-        let results = classify_batch_sharded_merge_join(
-            &index,
-            None,
-            &records,
-            0.1,
-            None,
-            Some(300), // trim_to > sequence length
-        )
-        .unwrap();
-
-        assert!(
-            results.is_empty(),
-            "Sequences shorter than trim_to should be skipped"
-        );
-    }
-
-    #[test]
-    fn test_classify_trim_to_paired_end() {
-        // Test paired-end trimming: R1 must be >= trim_to, R2 uses min(len, trim_to)
-        let (_dir, index, seqs) = create_test_index();
-
-        // Both seqs are 200 bases, use them as paired-end
-        let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), Some(seqs[1].as_slice()))];
-
-        // Classify with trim_to=150 (both reads are 200, so both get trimmed)
-        let results = classify_batch_sharded_merge_join(
-            &index,
-            None,
-            &records,
-            0.1,
-            None,
-            Some(150), // trim_to
-        )
-        .unwrap();
-
-        // Should still get hits for both buckets (trimmed versions still match)
-        assert!(
-            !results.is_empty(),
-            "Trimmed paired-end should still produce hits"
-        );
-    }
-
-    #[test]
-    fn test_classify_trim_to_none_unchanged() {
-        // Test that trim_to=None produces same results as before (no trimming)
-        let (_dir, index, seqs) = create_test_index();
-
-        let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
-
-        // Without trim_to (original behavior)
-        let results_no_trim =
-            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None, None).unwrap();
-
-        // With trim_to longer than sequence (effectively no trimming)
-        let results_long_trim = classify_batch_sharded_merge_join(
-            &index,
-            None,
-            &records,
-            0.1,
-            None,
-            Some(1000), // trim_to longer than sequence
-        )
-        .unwrap();
-
-        // Both should skip (1000 > 200)
-        // Actually, if sequence < trim_to, it's skipped, so results_long_trim should be empty
-        assert!(
-            results_long_trim.is_empty(),
-            "trim_to > sequence length should skip"
-        );
-        assert!(
-            !results_no_trim.is_empty(),
-            "No trim should produce results"
-        );
-    }
-
-    #[test]
-    fn test_classify_with_sharded_negative_trim_to() {
-        // Test that trim_to works with sharded negative filtering
-        let (_dir, index, seqs) = create_test_index();
-
-        let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
-
-        // Classify with both negative filtering and trimming
-        let results = classify_with_sharded_negative(
-            &index,
-            None,
-            &records,
-            0.1,
-            None,
-            Some(100), // trim_to
-        )
-        .unwrap();
-
-        // Should produce hits (seq[0] is 200 bases, trim to 100)
-        assert!(
-            !results.is_empty(),
-            "Trimmed sequence with no negative should have hits"
-        );
-    }
-
-    #[test]
-    fn test_classify_trim_to_exact_length() {
-        // Test that trim_to == len works (edge case: no actual trimming occurs)
-        let (_dir, index, seqs) = create_test_index();
-
-        // seqs[0] is 200 bases, trim to exactly 200
-        let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
-
-        let results = classify_batch_sharded_merge_join(
-            &index,
-            None,
-            &records,
-            0.1,
-            None,
-            Some(200), // trim_to == len
-        )
-        .unwrap();
-
-        // Should work identically to no trimming
-        assert!(
-            !results.is_empty(),
-            "trim_to == sequence length should produce results"
-        );
-
-        // Compare with no trimming
-        let results_no_trim =
-            classify_batch_sharded_merge_join(&index, None, &records, 0.1, None, None).unwrap();
-        assert_eq!(
-            results.len(),
-            results_no_trim.len(),
-            "trim_to == len should match no trimming"
-        );
-        if !results.is_empty() {
-            let diff = (results[0].score - results_no_trim[0].score).abs();
-            assert!(diff < 1e-10, "Scores should be identical");
-        }
-    }
-
-    #[test]
-    fn test_classify_trim_to_less_than_k() {
-        // Test that trim_to < k produces no results (can't generate k-mers)
-        let (_dir, index, seqs) = create_test_index();
-        // index uses k=32
-
-        let records: Vec<QueryRecord> = vec![(1, seqs[0].as_slice(), None)];
-
-        // trim_to=20 is less than k=32, so no minimizers can be generated
-        let results = classify_batch_sharded_merge_join(
-            &index,
-            None,
-            &records,
-            0.0, // low threshold to catch any results
-            None,
-            Some(20), // trim_to < k
-        )
-        .unwrap();
-
-        assert!(
-            results.is_empty(),
-            "Trimming below k should yield no results (no k-mers can be generated)"
-        );
-    }
-
-    #[test]
-    fn test_classify_trim_to_paired_r1_short_r2_long() {
-        // Test paired-end behavior: R1 < trim_to skips entire pair, even if R2 is long
-        // This documents the current behavior (R1 is gatekeeper)
-        let (_dir, index, seqs) = create_test_index();
-
-        // Create a short R1 (40 bases) and long R2 (200 bases)
-        let short_r1 = generate_sequence(40, 5);
-        let long_r2 = &seqs[1]; // 200 bases
-
-        let records: Vec<QueryRecord> = vec![(1, short_r1.as_slice(), Some(long_r2.as_slice()))];
-
-        // trim_to=50 means R1 (40 bases) is too short
-        let results = classify_batch_sharded_merge_join(
-            &index,
-            None,
-            &records,
-            0.0,
-            None,
-            Some(50), // R1 (40) < 50, should skip
-        )
-        .unwrap();
-
-        // Current behavior: entire pair is skipped because R1 < trim_to
-        assert!(
-            results.is_empty(),
-            "Pair with R1 < trim_to should be skipped (R1 is gatekeeper)"
-        );
-    }
-
-    #[test]
-    fn test_classify_trim_to_paired_r1_long_r2_short() {
-        // Test paired-end behavior: R1 >= trim_to passes, R2 is trimmed to available length
-        let (_dir, index, seqs) = create_test_index();
-
-        // Create a long R1 (200 bases) and short R2 (40 bases)
-        let long_r1 = &seqs[0]; // 200 bases
-        let short_r2 = generate_sequence(40, 7);
-
-        let records: Vec<QueryRecord> = vec![(1, long_r1.as_slice(), Some(short_r2.as_slice()))];
-
-        // trim_to=50 means R1 passes, R2 is trimmed to min(40, 50) = 40
-        let results =
-            classify_batch_sharded_merge_join(&index, None, &records, 0.0, None, Some(50)).unwrap();
-
-        // R1 passes threshold, so pair should be classified
-        assert!(
-            !results.is_empty(),
-            "Pair with R1 >= trim_to should be classified (R2 uses available length)"
-        );
-    }
-
-    // =========================================================================
-    // try_trim_record unit tests
-    // =========================================================================
-
-    #[test]
-    fn test_try_trim_record_none() {
-        // No trimming: returns original sequences unchanged
-        let s1 = b"ACGTACGT";
-        let s2 = Some(b"TGCATGCA".as_slice());
-
-        let result = try_trim_record(s1.as_slice(), s2, None);
-        assert!(result.is_some());
-        let (r1, r2) = result.unwrap();
-        assert_eq!(r1, s1.as_slice());
-        assert_eq!(r2, s2);
-    }
-
-    #[test]
-    fn test_try_trim_record_r1_too_short() {
-        // R1 shorter than trim_to: returns None
-        let s1 = b"ACGT"; // 4 bases
-        let s2 = Some(b"TGCATGCATGCA".as_slice()); // 12 bases
-
-        let result = try_trim_record(s1.as_slice(), s2, Some(10));
-        assert!(result.is_none(), "R1 < trim_to should return None");
-    }
-
-    #[test]
-    fn test_try_trim_record_both_trimmed() {
-        // Both R1 and R2 longer than trim_to: both get trimmed
-        let s1 = b"ACGTACGTACGT"; // 12 bases
-        let s2 = Some(b"TGCATGCATGCA".as_slice()); // 12 bases
-
-        let result = try_trim_record(s1.as_slice(), s2, Some(5));
-        assert!(result.is_some());
-        let (r1, r2) = result.unwrap();
-        assert_eq!(r1.len(), 5);
-        assert_eq!(r1, b"ACGTA");
-        assert_eq!(r2.unwrap().len(), 5);
-        assert_eq!(r2.unwrap(), b"TGCAT");
-    }
-
-    #[test]
-    fn test_try_trim_record_r2_shorter_than_trim() {
-        // R1 long enough, R2 shorter than trim_to: R2 uses min(len, trim_to)
-        let s1 = b"ACGTACGTACGT"; // 12 bases
-        let s2 = Some(b"TGC".as_slice()); // 3 bases
-
-        let result = try_trim_record(s1.as_slice(), s2, Some(5));
-        assert!(result.is_some());
-        let (r1, r2) = result.unwrap();
-        assert_eq!(r1.len(), 5);
-        assert_eq!(r2.unwrap().len(), 3); // R2 keeps its original length (3 < 5)
-        assert_eq!(r2.unwrap(), b"TGC");
-    }
-
-    #[test]
-    fn test_try_trim_record_single_end() {
-        // Single-end read (no R2)
-        let s1 = b"ACGTACGTACGT"; // 12 bases
-
-        let result = try_trim_record(s1.as_slice(), None, Some(5));
-        assert!(result.is_some());
-        let (r1, r2) = result.unwrap();
-        assert_eq!(r1.len(), 5);
-        assert!(r2.is_none());
     }
 }

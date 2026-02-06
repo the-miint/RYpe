@@ -165,7 +165,7 @@ fn main() -> anyhow::Result<()> {
     let query_seq = b"GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTTGATAAAGCAGGAATTACTACTGCTTGTTT";
     let queries = vec![(1_i64, query_seq.as_slice(), None)];
 
-    let results = classify_batch_sharded_merge_join(&index, None, &queries, 0.1, None, None)?;
+    let results = classify_batch_sharded_merge_join(&index, None, &queries, 0.1, None)?;
     for hit in &results {
         let name = index.manifest().bucket_names.get(&hit.bucket_id).unwrap();
         println!("Query {} -> {} (score: {:.2})", hit.query_id, name, hit.score);

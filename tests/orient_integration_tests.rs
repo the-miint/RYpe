@@ -112,8 +112,7 @@ fn test_orient_flag_produces_valid_index() -> Result<()> {
 
     // Verify classification works
     let threshold = 0.1;
-    let results =
-        classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None, None)?;
+    let results = classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None)?;
 
     // Should have results for self-matches
     assert!(!results.is_empty(), "Should have classification results");
@@ -174,7 +173,7 @@ fn test_classification_with_oriented_index() -> Result<()> {
 
     let threshold = 0.1;
     let results =
-        classify_batch_sharded_merge_join(&sharded, None, &query_records, threshold, None, None)?;
+        classify_batch_sharded_merge_join(&sharded, None, &query_records, threshold, None)?;
 
     // Should have at least one result
     assert!(!results.is_empty());
@@ -226,8 +225,7 @@ fn test_orient_index_format_compatible() -> Result<()> {
 
     // Classify and verify
     let threshold = 0.01; // Low threshold to see all matches
-    let results =
-        classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None, None)?;
+    let results = classify_batch_sharded_merge_join(&sharded, None, &records, threshold, None)?;
 
     // Each query should have at least one result (self-match)
     for i in 0..seqs.len() {

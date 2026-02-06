@@ -837,7 +837,10 @@ pub const MIN_BATCH_SIZE: usize = 1000;
 /// Maximum batch size.
 /// Set high enough to allow efficient memory utilization for short reads.
 /// The memory estimation will still constrain batch sizes based on available memory.
-pub const MAX_BATCH_SIZE: usize = 5_000_000;
+/// 100_000_000 for 2x PE Illumina reads is approximately 28GB:
+/// (300 * 100_000_000) / 2**30
+/// Which if the user allocates 64GB should be totally fine.
+pub const MAX_BATCH_SIZE: usize = 100_000_000;
 
 /// Safety margin: max(256MB, 10% of max_memory)
 const SAFETY_MARGIN_PERCENT: f64 = 0.10;

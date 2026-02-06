@@ -857,6 +857,171 @@ pub fn batch_to_records_parquet_with_offset(
     Ok(records)
 }
 
+/// Convert a RecordBatch to owned records with optional trimming.
+///
+/// This function copies sequences from the Arrow buffer into owned vectors,
+/// optionally trimming them to a maximum length. This allows the RecordBatch
+/// to be dropped immediately after conversion, freeing the Arrow buffer memory.
+///
+/// # Arguments
+/// * `batch` - RecordBatch from Parquet with 'sequence1' and optional 'sequence2' columns
+/// * `headers` - Pre-extracted headers for this batch
+/// * `trim_to` - Optional maximum length for sequences. If provided, sequences longer
+///   than this are truncated. Sequences with R1 shorter than trim_to are skipped.
+/// * `id_offset` - Starting index for query_ids in this batch
+///
+/// # Returns
+/// A tuple of:
+/// - Owned records with copied (and optionally trimmed) sequences
+/// - Headers for successfully converted records (skipped records are omitted)
+///
+/// # Memory Benefit
+/// Unlike zero-copy conversion, this immediately copies only the needed data,
+/// allowing the large Arrow buffer to be dropped. For long reads with small
+/// `trim_to` values, this can reduce memory by 10-100x.
+pub fn batch_to_owned_records_trimmed(
+    batch: &RecordBatch,
+    headers: &[String],
+    trim_to: Option<usize>,
+    id_offset: usize,
+) -> Result<(Vec<OwnedRecord>, Vec<String>)> {
+    let num_rows = batch.num_rows();
+    if num_rows == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    // Get sequence columns
+    let seq_col = get_string_column(batch, "sequence1")?;
+
+    let pair_col = batch
+        .column_by_name("sequence2")
+        .map(|_| get_string_column(batch, "sequence2"))
+        .transpose()?;
+
+    let mut records = Vec::with_capacity(num_rows);
+    let mut out_headers = Vec::with_capacity(num_rows);
+
+    // Using index loop because we need to access seq_col.value(i), pair_col.value(i),
+    // and headers[i] - can't easily iterate all three together
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..num_rows {
+        let seq1 = seq_col.value(i);
+
+        // Skip if R1 is too short for trim_to requirement
+        if let Some(trim_len) = trim_to {
+            if seq1.len() < trim_len {
+                continue; // Skip this record entirely
+            }
+        }
+
+        // Calculate query_id using output record count (not input row index)
+        let sum = id_offset.checked_add(records.len()).ok_or_else(|| {
+            anyhow!(
+                "Query ID overflow: offset {} + count {}",
+                id_offset,
+                records.len()
+            )
+        })?;
+        let query_id =
+            i64::try_from(sum).map_err(|_| anyhow!("Query ID {} exceeds i64::MAX", sum))?;
+
+        // Copy and trim seq1
+        let seq1_owned = match trim_to {
+            Some(trim_len) => seq1[..trim_len.min(seq1.len())].to_vec(),
+            None => seq1.to_vec(),
+        };
+
+        // Copy and trim seq2 if present
+        let seq2_owned = pair_col.as_ref().and_then(|p| {
+            if p.is_null(i) {
+                None
+            } else {
+                let seq2 = p.value(i);
+                match trim_to {
+                    Some(trim_len) => Some(seq2[..trim_len.min(seq2.len())].to_vec()),
+                    None => Some(seq2.to_vec()),
+                }
+            }
+        });
+
+        records.push((query_id, seq1_owned, seq2_owned));
+        out_headers.push(headers[i].clone());
+    }
+
+    debug_assert_eq!(
+        records.len(),
+        out_headers.len(),
+        "Records and headers must stay synchronized"
+    );
+
+    Ok((records, out_headers))
+}
+
+/// Result of reading a batch of trimmed Parquet records.
+pub struct TrimmedBatchResult {
+    /// The accumulated owned records
+    pub records: Vec<OwnedRecord>,
+    /// The corresponding headers
+    pub headers: Vec<String>,
+    /// Number of row groups processed
+    pub rg_count: usize,
+    /// Whether the end of input was reached
+    pub reached_end: bool,
+}
+
+/// Read and accumulate trimmed records from a Parquet reader.
+///
+/// This function reads batches from the reader, converts them to owned records
+/// with trimming, and accumulates them until the target batch size is reached
+/// or end of input. The Arrow buffers are dropped after each batch conversion,
+/// keeping memory bounded.
+///
+/// # Arguments
+/// * `reader` - The Parquet reader to read from
+/// * `target_batch_size` - Stop accumulating when this many records are collected
+/// * `trim_to` - Optional trim length for sequences
+///
+/// # Returns
+/// A `TrimmedBatchResult` containing the accumulated records, headers, row group
+/// count, and whether end of input was reached.
+pub fn read_parquet_batch_trimmed(
+    reader: &mut PrefetchingParquetReader,
+    target_batch_size: usize,
+    trim_to: Option<usize>,
+) -> Result<TrimmedBatchResult> {
+    let mut records: Vec<OwnedRecord> = Vec::new();
+    let mut headers: Vec<String> = Vec::new();
+    let mut reached_end = false;
+    let mut rg_count = 0usize;
+
+    // Accumulate trimmed records until we have enough
+    while records.len() < target_batch_size {
+        let batch_opt = reader.next_batch()?;
+        let Some((record_batch, batch_headers)) = batch_opt else {
+            reached_end = true;
+            break;
+        };
+
+        rg_count += 1;
+
+        // Convert to owned records with trimming - this copies only
+        // the trimmed portion, then the RecordBatch can be dropped
+        let (batch_records, batch_hdrs) =
+            batch_to_owned_records_trimmed(&record_batch, &batch_headers, trim_to, records.len())?;
+
+        records.extend(batch_records);
+        headers.extend(batch_hdrs);
+        // record_batch dropped here, freeing Arrow buffer memory
+    }
+
+    Ok(TrimmedBatchResult {
+        records,
+        headers,
+        rg_count,
+        reached_end,
+    })
+}
+
 /// Convert multiple stacked RecordBatches to a combined QueryRecord vector with zero-copy.
 ///
 /// This function processes multiple batches together, assigning globally unique
@@ -929,7 +1094,10 @@ pub fn stacked_batches_to_records<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::LargeStringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
     use std::path::Path;
+    use std::sync::Arc;
 
     // -------------------------------------------------------------------------
     // Tests for is_parquet_input
@@ -943,5 +1111,194 @@ mod tests {
         assert!(!is_parquet_input(Path::new("input.fastq")));
         assert!(!is_parquet_input(Path::new("input.fasta")));
         assert!(!is_parquet_input(Path::new("input.parquet.gz")));
+    }
+
+    // -------------------------------------------------------------------------
+    // Tests for batch_to_owned_records_trimmed
+    // -------------------------------------------------------------------------
+
+    /// Create a test RecordBatch with sequence data (uses LargeUtf8 like real Parquet files).
+    fn make_test_batch(seqs: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "sequence1",
+            DataType::LargeUtf8,
+            false,
+        )]));
+
+        let seq_array = LargeStringArray::from_iter_values(seqs.iter().copied());
+        RecordBatch::try_new(schema, vec![Arc::new(seq_array)]).unwrap()
+    }
+
+    /// Create a test RecordBatch with paired sequences.
+    fn make_test_batch_paired(seqs1: &[&str], seqs2: &[Option<&str>]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sequence1", DataType::LargeUtf8, false),
+            Field::new("sequence2", DataType::LargeUtf8, true),
+        ]));
+
+        let seq1_array = LargeStringArray::from_iter_values(seqs1.iter().copied());
+        let seq2_array = LargeStringArray::from_iter(seqs2.iter().copied());
+        RecordBatch::try_new(schema, vec![Arc::new(seq1_array), Arc::new(seq2_array)]).unwrap()
+    }
+
+    #[test]
+    fn test_batch_to_owned_records_trimmed_no_trim() {
+        let seqs = vec!["ACGTACGTACGT", "GGGGCCCCAAAA"];
+        let batch = make_test_batch(&seqs);
+        let headers = vec!["read1".to_string(), "read2".to_string()];
+
+        let (records, out_headers) =
+            batch_to_owned_records_trimmed(&batch, &headers, None, 0).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(out_headers.len(), 2);
+        assert_eq!(records[0].1, b"ACGTACGTACGT");
+        assert_eq!(records[1].1, b"GGGGCCCCAAAA");
+        assert_eq!(out_headers[0], "read1");
+        assert_eq!(out_headers[1], "read2");
+    }
+
+    #[test]
+    fn test_batch_to_owned_records_trimmed_with_trim() {
+        let seqs = vec!["ACGTACGTACGT", "GGGGCCCCAAAA"];
+        let batch = make_test_batch(&seqs);
+        let headers = vec!["read1".to_string(), "read2".to_string()];
+
+        let (records, out_headers) =
+            batch_to_owned_records_trimmed(&batch, &headers, Some(4), 0).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(out_headers.len(), 2);
+        // Should be trimmed to first 4 bases
+        assert_eq!(records[0].1, b"ACGT");
+        assert_eq!(records[1].1, b"GGGG");
+    }
+
+    #[test]
+    fn test_batch_to_owned_records_trimmed_skip_short_reads() {
+        // One long read (12bp) and one short read (4bp)
+        let seqs = vec!["ACGTACGTACGT", "GGGG"];
+        let batch = make_test_batch(&seqs);
+        let headers = vec!["long_read".to_string(), "short_read".to_string()];
+
+        // Trim to 8bp - should skip the 4bp read
+        let (records, out_headers) =
+            batch_to_owned_records_trimmed(&batch, &headers, Some(8), 0).unwrap();
+
+        assert_eq!(records.len(), 1, "Short read should be skipped");
+        assert_eq!(out_headers.len(), 1);
+        assert_eq!(records[0].1, b"ACGTACGT");
+        assert_eq!(out_headers[0], "long_read");
+    }
+
+    #[test]
+    fn test_batch_to_owned_records_trimmed_query_id_with_offset() {
+        let seqs = vec!["ACGTACGTACGT", "GGGGCCCCAAAA"];
+        let batch = make_test_batch(&seqs);
+        let headers = vec!["read1".to_string(), "read2".to_string()];
+
+        // Start with offset 100
+        let (records, _) = batch_to_owned_records_trimmed(&batch, &headers, None, 100).unwrap();
+
+        assert_eq!(records[0].0, 100, "First query_id should be offset");
+        assert_eq!(records[1].0, 101, "Second query_id should be offset+1");
+    }
+
+    #[test]
+    fn test_batch_to_owned_records_trimmed_query_id_with_skipped_reads() {
+        // Mix of long and short reads
+        let seqs = vec!["ACGTACGTACGT", "GG", "TTTTTTTTTTTT"];
+        let batch = make_test_batch(&seqs);
+        let headers = vec![
+            "long1".to_string(),
+            "short".to_string(),
+            "long2".to_string(),
+        ];
+
+        // Trim to 8bp - middle read should be skipped
+        let (records, out_headers) =
+            batch_to_owned_records_trimmed(&batch, &headers, Some(8), 0).unwrap();
+
+        assert_eq!(records.len(), 2);
+        // Query IDs should be sequential based on OUTPUT count, not input row
+        assert_eq!(records[0].0, 0);
+        assert_eq!(records[1].0, 1);
+        assert_eq!(out_headers[0], "long1");
+        assert_eq!(out_headers[1], "long2");
+    }
+
+    #[test]
+    fn test_batch_to_owned_records_trimmed_paired_sequences() {
+        let seqs1 = vec!["ACGTACGTACGT", "GGGGCCCCAAAA"];
+        let seqs2: Vec<Option<&str>> = vec![Some("TTTTTTTTTTTT"), Some("CCCCCCCCCCCC")];
+        let batch = make_test_batch_paired(&seqs1, &seqs2);
+        let headers = vec!["read1".to_string(), "read2".to_string()];
+
+        let (records, _) = batch_to_owned_records_trimmed(&batch, &headers, Some(4), 0).unwrap();
+
+        assert_eq!(records.len(), 2);
+        // Both R1 and R2 should be trimmed
+        assert_eq!(records[0].1, b"ACGT");
+        assert_eq!(records[0].2.as_ref().unwrap(), b"TTTT");
+        assert_eq!(records[1].1, b"GGGG");
+        assert_eq!(records[1].2.as_ref().unwrap(), b"CCCC");
+    }
+
+    #[test]
+    fn test_batch_to_owned_records_trimmed_empty_batch() {
+        let seqs: Vec<&str> = vec![];
+        let batch = make_test_batch(&seqs);
+        let headers: Vec<String> = vec![];
+
+        let (records, out_headers) =
+            batch_to_owned_records_trimmed(&batch, &headers, Some(100), 0).unwrap();
+
+        assert!(records.is_empty());
+        assert!(out_headers.is_empty());
+    }
+
+    #[test]
+    fn test_batch_to_owned_records_trimmed_all_reads_too_short() {
+        let seqs = vec!["ACGT", "GGGG", "TTTT"];
+        let batch = make_test_batch(&seqs);
+        let headers = vec![
+            "read1".to_string(),
+            "read2".to_string(),
+            "read3".to_string(),
+        ];
+
+        // Trim to 100bp - all reads are shorter
+        let (records, out_headers) =
+            batch_to_owned_records_trimmed(&batch, &headers, Some(100), 0).unwrap();
+
+        assert!(records.is_empty(), "All reads should be skipped");
+        assert!(out_headers.is_empty());
+    }
+
+    #[test]
+    fn test_batch_to_owned_records_trimmed_records_headers_synchronized() {
+        // This test verifies the debug_assert is correct
+        let seqs = vec!["ACGTACGTACGT", "GG", "TTTTTTTTTTTT", "AA"];
+        let batch = make_test_batch(&seqs);
+        let headers = vec![
+            "keep1".to_string(),
+            "skip1".to_string(),
+            "keep2".to_string(),
+            "skip2".to_string(),
+        ];
+
+        let (records, out_headers) =
+            batch_to_owned_records_trimmed(&batch, &headers, Some(8), 0).unwrap();
+
+        // Records and headers must have same length
+        assert_eq!(
+            records.len(),
+            out_headers.len(),
+            "Records and headers must be synchronized"
+        );
+
+        // Verify the kept reads match the kept headers
+        assert_eq!(out_headers[0], "keep1");
+        assert_eq!(out_headers[1], "keep2");
     }
 }

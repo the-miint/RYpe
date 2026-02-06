@@ -2045,9 +2045,8 @@ mod tests {
         ];
 
         let threshold = 0.1;
-        let results =
-            classify_batch_sharded_merge_join(&merged, None, &records, threshold, None, None)
-                .expect("classification should succeed");
+        let results = classify_batch_sharded_merge_join(&merged, None, &records, threshold, None)
+            .expect("classification should succeed");
 
         // Each query should match its corresponding bucket with high score
         // Query 0 (seq_a) -> bucket 1 (bucket_a)
@@ -2482,9 +2481,8 @@ mod tests {
         let records: Vec<QueryRecord> = vec![(0, seq_primary.as_slice(), None)];
 
         let threshold = 0.1;
-        let results =
-            classify_batch_sharded_merge_join(&merged, None, &records, threshold, None, None)
-                .expect("classification should succeed");
+        let results = classify_batch_sharded_merge_join(&merged, None, &records, threshold, None)
+            .expect("classification should succeed");
 
         // Primary query should match primary bucket (bucket 1)
         let primary_match = results.iter().find(|r| r.bucket_id == 1);
@@ -2623,9 +2621,8 @@ mod tests {
         // Test 1: Primary sequence should match primary bucket (bucket 1)
         let records: Vec<QueryRecord> = vec![(0, seq_primary.as_slice(), None)];
         let threshold = 0.1;
-        let results =
-            classify_batch_sharded_merge_join(&merged, None, &records, threshold, None, None)
-                .expect("classification should succeed");
+        let results = classify_batch_sharded_merge_join(&merged, None, &records, threshold, None)
+            .expect("classification should succeed");
 
         let primary_match = results.iter().find(|r| r.bucket_id == 1);
         assert!(
@@ -2647,15 +2644,9 @@ mod tests {
 
         // Test 3: Secondary unique sequence should match secondary unique bucket
         let unique_records: Vec<QueryRecord> = vec![(0, seq_secondary_unique.as_slice(), None)];
-        let unique_results = classify_batch_sharded_merge_join(
-            &merged,
-            None,
-            &unique_records,
-            threshold,
-            None,
-            None,
-        )
-        .expect("classification should succeed");
+        let unique_results =
+            classify_batch_sharded_merge_join(&merged, None, &unique_records, threshold, None)
+                .expect("classification should succeed");
 
         let unique_match = unique_results.iter().find(|r| r.bucket_id == 3);
         assert!(

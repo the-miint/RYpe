@@ -17,8 +17,8 @@ use super::helpers::{
     compute_effective_batch_size, compute_log_ratio_from_hits, create_input_reader,
     filter_log_ratios_by_threshold, format_classification_results, format_log_ratio_bucket_name,
     format_log_ratio_output, is_parquet_input, load_index_for_classification,
-    stacked_batches_to_records, validate_input_config, BatchSizeConfig, ClassificationInput,
-    IndexLoadOptions, InputReaderConfig, OutputFormat, OutputWriter,
+    read_parquet_batch_trimmed, stacked_batches_to_records, validate_input_config, BatchSizeConfig,
+    ClassificationInput, IndexLoadOptions, InputReaderConfig, OutputFormat, OutputWriter,
 };
 
 /// Common arguments shared between classify run and log-ratio commands.
@@ -162,12 +162,19 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     };
 
     // Create input reader (Parquet or FASTX)
+    // Note: For FASTX, trim_to is handled at read time. For Parquet, it's handled
+    // during batch conversion (see Parquet processing path below).
     let mut input_reader = create_input_reader(&InputReaderConfig {
         r1_path: &args.common.r1,
         r2_path: args.common.r2.as_ref(),
         batch_size: effective_batch_size,
         parallel_input_rg: args.common.parallel_input_rg,
         is_parquet: input_is_parquet,
+        trim_to: if input_is_parquet {
+            None
+        } else {
+            args.common.trim_to
+        },
     })?;
 
     let mut total_reads = 0;
@@ -185,8 +192,21 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         );
     }
 
+    // Log which I/O path will be used for Parquet input
+    if input_is_parquet {
+        if args.common.trim_to.is_some() {
+            log::info!(
+                "Using owned-copy Parquet path with trimming (--trim-to {})",
+                args.common.trim_to.unwrap()
+            );
+        } else {
+            log::debug!("Using zero-copy Parquet path for maximum performance");
+        }
+    }
+
     // Helper closure for classification
     // Note: uses effective_threshold (0.0 for wide format, args.common.threshold otherwise)
+    // Sequences are pre-trimmed at read time when --trim-to is specified.
     let classify_records = |batch_refs: &[rype::QueryRecord]| -> Result<Vec<rype::HitResult>> {
         // If negative index is provided, use memory-efficient sharded filtering
         if let Some(ref neg) = negative_sharded {
@@ -202,7 +222,6 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                 batch_refs,
                 effective_threshold,
                 read_options.as_ref(),
-                args.common.trim_to,
             )
         } else if args.common.parallel_rg {
             classify_batch_sharded_parallel_rg(
@@ -211,7 +230,6 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                 batch_refs,
                 effective_threshold,
                 read_options.as_ref(),
-                args.common.trim_to,
             )
         } else {
             classify_batch_sharded_merge_join(
@@ -220,7 +238,6 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                 batch_refs,
                 effective_threshold,
                 read_options.as_ref(),
-                args.common.trim_to,
             )
         }
     };
@@ -231,81 +248,153 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         // Handle Parquet and FASTX differently for zero-copy optimization
         match &mut input_reader {
             ClassificationInput::Parquet(reader) => {
-                // Zero-copy Parquet path with batch stacking
-                let mut stacked_batches: Vec<(RecordBatch, Vec<String>)> = Vec::new();
-                let mut stacked_rows = 0usize;
-                let mut reached_end = false;
+                // Parquet path: use owned-copy with trimming when trim_to is set,
+                // otherwise use zero-copy for better performance with short reads.
+                if args.common.trim_to.is_some() {
+                    // Owned-copy path: use shared helper for memory-efficient trimming
+                    let result = read_parquet_batch_trimmed(
+                        reader,
+                        effective_batch_size,
+                        args.common.trim_to,
+                    )?;
 
-                // Accumulate batches until we have enough rows or run out of data
-                loop {
-                    let batch_opt = reader.next_batch()?;
-                    let Some((record_batch, headers)) = batch_opt else {
-                        reached_end = true;
+                    log_timing("batch: io_read+trim", t_io_read.elapsed().as_millis());
+
+                    if result.records.is_empty() {
                         break;
+                    }
+
+                    let is_final_batch = result.reached_end;
+                    batch_num += 1;
+                    let batch_read_count = result.records.len();
+                    total_reads += batch_read_count;
+
+                    let t_convert = std::time::Instant::now();
+                    let batch_refs: Vec<rype::QueryRecord> = result
+                        .records
+                        .iter()
+                        .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                        .collect();
+                    log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
+
+                    log::debug!(
+                        "Converted {} row groups into {} trimmed records",
+                        result.rg_count,
+                        batch_refs.len()
+                    );
+
+                    let results = classify_records(&batch_refs)?;
+                    let results = if args.best_hit {
+                        filter_best_hits(results)
+                    } else {
+                        results
                     };
 
-                    let batch_rows = record_batch.num_rows();
-                    stacked_rows += batch_rows;
-                    stacked_batches.push((record_batch, headers));
+                    let t_format = std::time::Instant::now();
+                    let chunk_out = if let Some(ref bucket_ids) = wide_bucket_ids {
+                        format_results_wide(&results, &result.headers, bucket_ids)
+                    } else {
+                        format_classification_results(
+                            &results,
+                            &result.headers,
+                            &metadata.bucket_names,
+                        )
+                    };
+                    log_timing("batch: format_output", t_format.elapsed().as_millis());
 
-                    if stacked_rows >= effective_batch_size {
+                    let t_write = std::time::Instant::now();
+                    out_writer.write_chunk(chunk_out)?;
+                    log_timing("batch: io_write", t_write.elapsed().as_millis());
+
+                    log::info!(
+                        "Processed batch {} ({} row groups): {} reads ({} total)",
+                        batch_num,
+                        result.rg_count,
+                        batch_read_count,
+                        total_reads
+                    );
+
+                    if is_final_batch {
+                        break;
+                    }
+                } else {
+                    // Zero-copy Parquet path with batch stacking (no trimming)
+                    let mut stacked_batches: Vec<(RecordBatch, Vec<String>)> = Vec::new();
+                    let mut stacked_rows = 0usize;
+                    let mut reached_end = false;
+
+                    // Accumulate batches until we have enough rows or run out of data
+                    loop {
+                        let batch_opt = reader.next_batch()?;
+                        let Some((record_batch, headers)) = batch_opt else {
+                            reached_end = true;
+                            break;
+                        };
+
+                        let batch_rows = record_batch.num_rows();
+                        stacked_rows += batch_rows;
+                        stacked_batches.push((record_batch, headers));
+
+                        if stacked_rows >= effective_batch_size {
+                            break;
+                        }
+                    }
+
+                    log_timing("batch: io_read", t_io_read.elapsed().as_millis());
+
+                    if stacked_batches.is_empty() {
+                        break;
+                    }
+
+                    let is_final_batch = reached_end;
+                    batch_num += 1;
+                    total_reads += stacked_rows;
+
+                    let t_convert = std::time::Instant::now();
+                    let (batch_refs, headers) = stacked_batches_to_records(&stacked_batches)?;
+                    log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
+
+                    log::debug!(
+                        "Stacked {} row groups into {} records",
+                        stacked_batches.len(),
+                        batch_refs.len()
+                    );
+
+                    // already_trimmed=false since we're using zero-copy (no trimming at read)
+                    let results = classify_records(&batch_refs)?;
+                    let results = if args.best_hit {
+                        filter_best_hits(results)
+                    } else {
+                        results
+                    };
+
+                    let t_format = std::time::Instant::now();
+                    let chunk_out = if let Some(ref bucket_ids) = wide_bucket_ids {
+                        format_results_wide_ref(&results, &headers, bucket_ids)
+                    } else {
+                        format_classification_results(&results, &headers, &metadata.bucket_names)
+                    };
+                    log_timing("batch: format_output", t_format.elapsed().as_millis());
+
+                    let t_write = std::time::Instant::now();
+                    out_writer.write_chunk(chunk_out)?;
+                    log_timing("batch: io_write", t_write.elapsed().as_millis());
+
+                    log::info!(
+                        "Processed batch {} ({} batches stacked): {} reads ({} total)",
+                        batch_num,
+                        stacked_batches.len(),
+                        stacked_rows,
+                        total_reads
+                    );
+
+                    if is_final_batch {
                         break;
                     }
                 }
-
-                log_timing("batch: io_read", t_io_read.elapsed().as_millis());
-
-                if stacked_batches.is_empty() {
-                    break;
-                }
-
-                let is_final_batch = reached_end;
-                batch_num += 1;
-                total_reads += stacked_rows;
-
-                let t_convert = std::time::Instant::now();
-                let (batch_refs, headers) = stacked_batches_to_records(&stacked_batches)?;
-                log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
-
-                log::debug!(
-                    "Stacked {} row groups into {} records",
-                    stacked_batches.len(),
-                    batch_refs.len()
-                );
-
-                let results = classify_records(&batch_refs)?;
-                let results = if args.best_hit {
-                    filter_best_hits(results)
-                } else {
-                    results
-                };
-
-                let t_format = std::time::Instant::now();
-                let chunk_out = if let Some(ref bucket_ids) = wide_bucket_ids {
-                    format_results_wide_ref(&results, &headers, bucket_ids)
-                } else {
-                    format_classification_results(&results, &headers, &metadata.bucket_names)
-                };
-                log_timing("batch: format_output", t_format.elapsed().as_millis());
-
-                let t_write = std::time::Instant::now();
-                out_writer.write_chunk(chunk_out)?;
-                log_timing("batch: io_write", t_write.elapsed().as_millis());
-
-                log::info!(
-                    "Processed batch {} ({} batches stacked): {} reads ({} total)",
-                    batch_num,
-                    stacked_batches.len(),
-                    stacked_rows,
-                    total_reads
-                );
-
-                if is_final_batch {
-                    break;
-                }
             }
             ClassificationInput::Fastx(io) => {
-                // FASTX path (copies sequences)
+                // FASTX path (copies sequences, trimmed at read time if trim_to set)
                 let batch_opt = io.next_batch()?;
                 log_timing("batch: io_read", t_io_read.elapsed().as_millis());
 
@@ -324,6 +413,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                     .collect();
                 log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
 
+                // already_trimmed=true since FASTX reader now trims at read time
                 let results = classify_records(&batch_refs)?;
                 let results = if args.best_hit {
                     filter_best_hits(results)
@@ -492,12 +582,19 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
     out_writer.write_header(b"read_id\tbucket_name\tscore\n")?;
 
     // Create input reader
+    // Note: For FASTX, trim_to is handled at read time. For Parquet, it's handled
+    // during batch conversion (see Parquet processing path below).
     let mut input_reader = create_input_reader(&InputReaderConfig {
         r1_path: &args.common.r1,
         r2_path: args.common.r2.as_ref(),
         batch_size: effective_batch_size,
         parallel_input_rg: args.common.parallel_input_rg,
         is_parquet: input_is_parquet,
+        trim_to: if input_is_parquet {
+            None
+        } else {
+            args.common.trim_to
+        },
     })?;
 
     log::info!(
@@ -506,10 +603,23 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
         args.common.threshold
     );
 
+    // Log which I/O path will be used for Parquet input
+    if input_is_parquet {
+        if args.common.trim_to.is_some() {
+            log::info!(
+                "Using owned-copy Parquet path with trimming (--trim-to {})",
+                args.common.trim_to.unwrap()
+            );
+        } else {
+            log::debug!("Using zero-copy Parquet path for maximum performance");
+        }
+    }
+
     let mut total_reads = 0usize;
     let mut batch_num = 0usize;
 
     // Classification closure - always use threshold 0.0 to get all scores
+    // Sequences are pre-trimmed at read time when --trim-to is specified.
     let classify_records = |batch_refs: &[rype::QueryRecord]| -> Result<Vec<rype::HitResult>> {
         if args.common.parallel_rg {
             classify_batch_sharded_parallel_rg(
@@ -518,7 +628,6 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
                 batch_refs,
                 0.0, // Always get all scores for log-ratio
                 read_options.as_ref(),
-                args.common.trim_to,
             )
         } else {
             classify_batch_sharded_merge_join(
@@ -527,7 +636,6 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
                 batch_refs,
                 0.0, // Always get all scores for log-ratio
                 read_options.as_ref(),
-                args.common.trim_to,
             )
         }
     };
@@ -537,79 +645,159 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
 
         match &mut input_reader {
             ClassificationInput::Parquet(reader) => {
-                // Parquet path with batch stacking
-                let mut stacked_batches: Vec<(RecordBatch, Vec<String>)> = Vec::new();
-                let mut stacked_rows = 0usize;
-                let mut reached_end = false;
+                // Parquet path: use owned-copy with trimming when trim_to is set,
+                // otherwise use zero-copy for better performance with short reads.
+                if args.common.trim_to.is_some() {
+                    // Owned-copy path: use shared helper for memory-efficient trimming
+                    let result = read_parquet_batch_trimmed(
+                        reader,
+                        effective_batch_size,
+                        args.common.trim_to,
+                    )?;
 
-                loop {
-                    let batch_opt = reader.next_batch()?;
-                    let Some((record_batch, headers)) = batch_opt else {
-                        reached_end = true;
-                        break;
-                    };
+                    log_timing("batch: io_read+trim", t_io_read.elapsed().as_millis());
 
-                    let batch_rows = record_batch.num_rows();
-                    stacked_rows += batch_rows;
-                    stacked_batches.push((record_batch, headers));
-
-                    if stacked_rows >= effective_batch_size {
+                    if result.records.is_empty() {
                         break;
                     }
-                }
 
-                log_timing("batch: io_read", t_io_read.elapsed().as_millis());
+                    let is_final_batch = result.reached_end;
+                    batch_num += 1;
+                    let batch_read_count = result.records.len();
+                    total_reads += batch_read_count;
 
-                if stacked_batches.is_empty() {
-                    break;
-                }
+                    let t_convert = std::time::Instant::now();
+                    let batch_refs: Vec<rype::QueryRecord> = result
+                        .records
+                        .iter()
+                        .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                        .collect();
+                    log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
 
-                let is_final_batch = reached_end;
-                batch_num += 1;
-                total_reads += stacked_rows;
-
-                let t_convert = std::time::Instant::now();
-                let (batch_refs, headers) = stacked_batches_to_records(&stacked_batches)?;
-                log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
-
-                // Classify to get all scores
-                let results = classify_records(&batch_refs)?;
-
-                // Compute log ratios
-                let t_ratio = std::time::Instant::now();
-                let mut log_ratios = compute_log_ratio_from_hits(&results, num_id, denom_id);
-                log_timing("batch: compute_log_ratio", t_ratio.elapsed().as_millis());
-
-                // Filter by threshold if needed (filter if BOTH original scores < threshold)
-                if args.common.threshold > 0.0 {
-                    filter_log_ratios_by_threshold(
-                        &mut log_ratios,
-                        &results,
-                        num_id,
-                        denom_id,
-                        args.common.threshold,
+                    log::debug!(
+                        "Converted {} row groups into {} trimmed records",
+                        result.rg_count,
+                        batch_refs.len()
                     );
-                }
 
-                // Format and write output
-                let t_format = std::time::Instant::now();
-                let chunk_out = format_log_ratio_output(&log_ratios, &headers, &ratio_bucket_name);
-                log_timing("batch: format_output", t_format.elapsed().as_millis());
+                    // Classify to get all scores
+                    let results = classify_records(&batch_refs)?;
 
-                let t_write = std::time::Instant::now();
-                out_writer.write_chunk(chunk_out)?;
-                log_timing("batch: io_write", t_write.elapsed().as_millis());
+                    // Compute log ratios
+                    let t_ratio = std::time::Instant::now();
+                    let mut log_ratios = compute_log_ratio_from_hits(&results, num_id, denom_id);
+                    log_timing("batch: compute_log_ratio", t_ratio.elapsed().as_millis());
 
-                log::info!(
-                    "Processed batch {}: {} reads ({} total), {} log-ratio results",
-                    batch_num,
-                    stacked_rows,
-                    total_reads,
-                    log_ratios.len()
-                );
+                    // Filter by threshold if needed (filter if BOTH original scores < threshold)
+                    if args.common.threshold > 0.0 {
+                        filter_log_ratios_by_threshold(
+                            &mut log_ratios,
+                            &results,
+                            num_id,
+                            denom_id,
+                            args.common.threshold,
+                        );
+                    }
 
-                if is_final_batch {
-                    break;
+                    // Format and write output
+                    let t_format = std::time::Instant::now();
+                    let chunk_out =
+                        format_log_ratio_output(&log_ratios, &result.headers, &ratio_bucket_name);
+                    log_timing("batch: format_output", t_format.elapsed().as_millis());
+
+                    let t_write = std::time::Instant::now();
+                    out_writer.write_chunk(chunk_out)?;
+                    log_timing("batch: io_write", t_write.elapsed().as_millis());
+
+                    log::info!(
+                        "Processed batch {} ({} row groups): {} reads ({} total), {} log-ratio results",
+                        batch_num,
+                        result.rg_count,
+                        batch_read_count,
+                        total_reads,
+                        log_ratios.len()
+                    );
+
+                    if is_final_batch {
+                        break;
+                    }
+                } else {
+                    // Zero-copy Parquet path with batch stacking (no trimming)
+                    let mut stacked_batches: Vec<(RecordBatch, Vec<String>)> = Vec::new();
+                    let mut stacked_rows = 0usize;
+                    let mut reached_end = false;
+
+                    loop {
+                        let batch_opt = reader.next_batch()?;
+                        let Some((record_batch, headers)) = batch_opt else {
+                            reached_end = true;
+                            break;
+                        };
+
+                        let batch_rows = record_batch.num_rows();
+                        stacked_rows += batch_rows;
+                        stacked_batches.push((record_batch, headers));
+
+                        if stacked_rows >= effective_batch_size {
+                            break;
+                        }
+                    }
+
+                    log_timing("batch: io_read", t_io_read.elapsed().as_millis());
+
+                    if stacked_batches.is_empty() {
+                        break;
+                    }
+
+                    let is_final_batch = reached_end;
+                    batch_num += 1;
+                    total_reads += stacked_rows;
+
+                    let t_convert = std::time::Instant::now();
+                    let (batch_refs, headers) = stacked_batches_to_records(&stacked_batches)?;
+                    log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
+
+                    // Classify to get all scores
+                    let results = classify_records(&batch_refs)?;
+
+                    // Compute log ratios
+                    let t_ratio = std::time::Instant::now();
+                    let mut log_ratios = compute_log_ratio_from_hits(&results, num_id, denom_id);
+                    log_timing("batch: compute_log_ratio", t_ratio.elapsed().as_millis());
+
+                    // Filter by threshold if needed (filter if BOTH original scores < threshold)
+                    if args.common.threshold > 0.0 {
+                        filter_log_ratios_by_threshold(
+                            &mut log_ratios,
+                            &results,
+                            num_id,
+                            denom_id,
+                            args.common.threshold,
+                        );
+                    }
+
+                    // Format and write output
+                    let t_format = std::time::Instant::now();
+                    let chunk_out =
+                        format_log_ratio_output(&log_ratios, &headers, &ratio_bucket_name);
+                    log_timing("batch: format_output", t_format.elapsed().as_millis());
+
+                    let t_write = std::time::Instant::now();
+                    out_writer.write_chunk(chunk_out)?;
+                    log_timing("batch: io_write", t_write.elapsed().as_millis());
+
+                    log::info!(
+                        "Processed batch {} ({} batches stacked): {} reads ({} total), {} log-ratio results",
+                        batch_num,
+                        stacked_batches.len(),
+                        stacked_rows,
+                        total_reads,
+                        log_ratios.len()
+                    );
+
+                    if is_final_batch {
+                        break;
+                    }
                 }
             }
             ClassificationInput::Fastx(io) => {

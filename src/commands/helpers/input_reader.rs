@@ -21,6 +21,9 @@ pub struct InputReaderConfig<'a> {
     pub parallel_input_rg: usize,
     /// Whether the input is in Parquet format.
     pub is_parquet: bool,
+    /// Optional trim length for sequences. When set, sequences are trimmed at read time
+    /// to reduce memory usage for long reads. Records with R1 shorter than this are skipped.
+    pub trim_to: Option<usize>,
 }
 
 /// Unified input reader for classification.
@@ -108,11 +111,12 @@ pub fn create_input_reader(config: &InputReaderConfig) -> Result<ClassificationI
             config.batch_size,
             config.r1_path
         );
-        let reader = PrefetchingIoHandler::new(
+        let reader = PrefetchingIoHandler::with_trim(
             config.r1_path,
             config.r2_path,
             None, // No output - just reading
             config.batch_size,
+            config.trim_to,
         )?;
         Ok(ClassificationInput::Fastx(reader))
     }

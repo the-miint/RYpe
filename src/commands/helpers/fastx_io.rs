@@ -62,11 +62,37 @@ impl PrefetchingIoHandler {
     ///
     /// # Returns
     /// A handler that prefetches batches in a background thread.
+    #[allow(dead_code)]
     pub fn new(
         r1_path: &Path,
         r2_path: Option<&PathBuf>,
         out_path: Option<PathBuf>,
         batch_size: usize,
+    ) -> Result<Self> {
+        Self::with_trim(r1_path, r2_path, out_path, batch_size, None)
+    }
+
+    /// Create a new prefetching I/O handler with optional sequence trimming.
+    ///
+    /// When `trim_to` is specified, sequences are trimmed at read time to reduce
+    /// memory usage for long reads. Records with R1 shorter than `trim_to` are skipped.
+    ///
+    /// # Arguments
+    /// * `r1_path` - Path to the first read file (FASTQ/FASTA, optionally gzipped)
+    /// * `r2_path` - Optional path to the second read file for paired-end
+    /// * `out_path` - Optional output path (stdout if None)
+    /// * `batch_size` - Number of records per batch
+    /// * `trim_to` - Optional maximum sequence length. Sequences longer than this are
+    ///   truncated at read time. Records with R1 shorter than this are skipped.
+    ///
+    /// # Returns
+    /// A handler that prefetches batches in a background thread.
+    pub fn with_trim(
+        r1_path: &Path,
+        r2_path: Option<&PathBuf>,
+        out_path: Option<PathBuf>,
+        batch_size: usize,
+        trim_to: Option<usize>,
     ) -> Result<Self> {
         // Clone paths for the background thread
         let r1_path = r1_path.to_path_buf();
@@ -84,7 +110,7 @@ impl PrefetchingIoHandler {
 
         // Spawn background thread for reading
         let prefetch_thread = thread::spawn(move || {
-            Self::reader_thread(r1_path, r2_path, batch_size, sender, thread_error);
+            Self::reader_thread(r1_path, r2_path, batch_size, trim_to, sender, thread_error);
         });
 
         // Set up output writer with auto-detected format
@@ -133,10 +159,16 @@ impl PrefetchingIoHandler {
     }
 
     /// Background thread function that reads batches and sends them through the channel.
+    ///
+    /// When `trim_to` is specified:
+    /// - Records with R1 shorter than `trim_to` are skipped entirely
+    /// - R1 sequences are truncated to `trim_to` length
+    /// - R2 sequences are truncated to `min(len, trim_to)` (never skip based on R2)
     fn reader_thread(
         r1_path: PathBuf,
         r2_path: Option<PathBuf>,
         batch_size: usize,
+        trim_to: Option<usize>,
         sender: SyncSender<BatchResult>,
         error_capture: Arc<FirstErrorCapture>,
     ) {
@@ -175,7 +207,7 @@ impl PrefetchingIoHandler {
             let mut records = Vec::with_capacity(batch_size);
             let mut headers = Vec::with_capacity(batch_size);
 
-            for batch_idx in 0..batch_size {
+            while records.len() < batch_size {
                 let s1_rec = match r1.next() {
                     Some(Ok(rec)) => rec,
                     Some(Err(e)) => {
@@ -185,6 +217,40 @@ impl PrefetchingIoHandler {
                         ));
                     }
                     None => break, // End of file
+                };
+
+                // Get R1 sequence - check trim_to requirement
+                let s1_seq = s1_rec.seq();
+                if let Some(trim_len) = trim_to {
+                    if s1_seq.len() < trim_len {
+                        // R1 too short - skip this record (and its R2 pair if present)
+                        if let Some(ref mut r2_reader) = r2 {
+                            // Must consume R2 to keep files in sync
+                            match r2_reader.next() {
+                                Some(Ok(_)) => {}
+                                Some(Err(e)) => {
+                                    send_error!(format!(
+                                        "Error reading R2 at record {}: {}",
+                                        global_record_id, e
+                                    ));
+                                }
+                                None => {
+                                    send_error!(format!(
+                                        "R1/R2 mismatch: R2 ended early at record {}",
+                                        global_record_id
+                                    ));
+                                }
+                            }
+                        }
+                        global_record_id += 1;
+                        continue; // Skip this record
+                    }
+                }
+
+                // Copy R1 with optional trimming
+                let s1_vec = match trim_to {
+                    Some(trim_len) => s1_seq[..trim_len.min(s1_seq.len())].to_vec(),
+                    None => s1_seq.into_owned(),
                 };
 
                 let s2_vec = if let Some(ref mut r2_reader) = r2 {
@@ -201,7 +267,14 @@ impl PrefetchingIoHandler {
                                     String::from_utf8_lossy(r2_base)
                                 ));
                             }
-                            Some(rec.seq().into_owned())
+                            // Copy R2 with optional trimming
+                            let s2_seq = rec.seq();
+                            match trim_to {
+                                Some(trim_len) => {
+                                    Some(s2_seq[..trim_len.min(s2_seq.len())].to_vec())
+                                }
+                                None => Some(s2_seq.into_owned()),
+                            }
                         }
                         Some(Err(e)) => {
                             send_error!(format!(
@@ -225,7 +298,7 @@ impl PrefetchingIoHandler {
                 // Use batch-local index (0-based within each batch) for query_id.
                 // This is intentional - the classification code maps results back
                 // to headers using this batch-local index.
-                records.push((batch_idx as i64, s1_rec.seq().into_owned(), s2_vec));
+                records.push((records.len() as i64, s1_vec, s2_vec));
                 headers.push(header);
                 global_record_id += 1;
             }
