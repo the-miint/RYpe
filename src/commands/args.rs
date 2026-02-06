@@ -313,6 +313,13 @@ EXAMPLES:
         #[arg(long)]
         subtract_from_primary: bool,
 
+        /// Maximum memory to use for merge operations (e.g., "8G", "512M", or "auto").
+        /// When "auto", detects available system memory.
+        /// Memory-bounded merging processes secondary shards one at a time to
+        /// avoid OOM on large indices with high overlap.
+        #[arg(long, default_value = "auto", value_parser = parse_max_memory_arg)]
+        max_memory: usize,
+
         /// Row group size (rows per group). Larger = better compression.
         #[arg(long, default_value_t = 100_000)]
         row_group_size: usize,

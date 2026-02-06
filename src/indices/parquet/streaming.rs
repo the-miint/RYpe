@@ -685,6 +685,47 @@ impl ShardAccumulator {
         }
     }
 
+    /// Create an accumulator for parallel processing with a specific starting shard ID.
+    ///
+    /// This is used when multiple accumulators are used in parallel, each needing
+    /// non-overlapping shard ID ranges.
+    ///
+    /// # Arguments
+    /// * `output_dir` - Directory where shards will be written (e.g., "index.ryxdi")
+    /// * `max_shard_bytes` - Maximum bytes per shard before triggering a flush
+    /// * `start_shard_id` - Starting shard ID for this accumulator
+    /// * `options` - Optional Parquet write options (compression, bloom filters, etc.)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_shard_bytes` is less than [`MIN_SHARD_BYTES`] (1MB).
+    pub fn with_start_shard_id(
+        output_dir: &Path,
+        max_shard_bytes: usize,
+        start_shard_id: u32,
+        options: Option<&ParquetWriteOptions>,
+    ) -> Self {
+        assert!(
+            max_shard_bytes >= MIN_SHARD_BYTES,
+            "max_shard_bytes ({}) must be at least MIN_SHARD_BYTES ({})",
+            max_shard_bytes,
+            MIN_SHARD_BYTES
+        );
+        Self {
+            entries: Vec::new(),
+            max_shard_bytes,
+            output_dir: output_dir.to_path_buf(),
+            current_shard_id: start_shard_id,
+            options: options.cloned().unwrap_or_default(),
+            shard_infos: Vec::new(),
+        }
+    }
+
+    /// Returns the current shard ID (the ID that will be used for the next shard).
+    pub fn current_shard_id(&self) -> u32 {
+        self.current_shard_id
+    }
+
     /// Returns the configured maximum shard size in bytes.
     pub fn max_shard_bytes(&self) -> usize {
         self.max_shard_bytes

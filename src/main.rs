@@ -235,6 +235,7 @@ fn main() -> Result<()> {
                 index_secondary,
                 output,
                 subtract_from_primary,
+                max_memory,
                 row_group_size,
                 zstd,
                 bloom_filter,
@@ -281,12 +282,13 @@ fn main() -> Result<()> {
                     verbose: args.verbose,
                 };
 
-                // Perform the merge
-                let stats = merge::merge_indices(
+                // Perform the merge using streaming (memory-bounded) merge
+                let stats = merge::merge_indices_streaming(
                     &index_primary,
                     &index_secondary,
                     &output,
                     &merge_options,
+                    Some(max_memory),
                     Some(&write_options),
                 )?;
 

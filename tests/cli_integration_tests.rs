@@ -2969,3 +2969,233 @@ fn test_cli_merge_duplicate_bucket_names_error() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// Phase 5: Memory-Bounded Merge CLI Tests
+// ============================================================================
+
+/// Test merge with explicit --max-memory flag for streaming subtraction.
+/// This tests the memory-bounded merge path that processes secondary shards
+/// one at a time to avoid OOM on large indices with high overlap.
+#[test]
+fn test_cli_merge_with_max_memory() -> Result<()> {
+    let dir = tempdir()?;
+
+    let binary = get_binary_path();
+    let primary_path = dir.path().join("primary.ryxdi");
+    let secondary_path = dir.path().join("secondary.ryxdi");
+    let merged_path = dir.path().join("merged.ryxdi");
+
+    // Create two reference files with overlapping sequences
+    let ref1_path = dir.path().join("ref1.fasta");
+    let ref2_path = dir.path().join("ref2.fasta");
+
+    // Primary: shared sequence
+    let shared_seq = "A".repeat(200);
+    fs::write(&ref1_path, format!(">shared\n{}\n", shared_seq))?;
+
+    // Secondary: same shared sequence plus unique sequences
+    let unique_seq = "T".repeat(200);
+    fs::write(
+        &ref2_path,
+        format!(">shared_copy\n{}\n>unique\n{}\n", shared_seq, unique_seq),
+    )?;
+
+    // Create primary index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            primary_path.to_str().unwrap(),
+            "-r",
+            ref1_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Primary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create secondary index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            secondary_path.to_str().unwrap(),
+            "-r",
+            ref2_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Secondary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Merge with subtraction AND explicit max-memory limit
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "merge",
+            "--index-primary",
+            primary_path.to_str().unwrap(),
+            "--index-secondary",
+            secondary_path.to_str().unwrap(),
+            "-o",
+            merged_path.to_str().unwrap(),
+            "--subtract-from-primary",
+            "--max-memory",
+            "1G",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Merge with --max-memory failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify output indicates merge completed
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("Merge with max-memory output:\n{}", stdout);
+
+    assert!(
+        stdout.contains("Merge complete"),
+        "Output should indicate merge complete"
+    );
+
+    // Should mention excluded minimizers since secondary has some shared with primary
+    assert!(
+        stdout.contains("Excluded minimizers") || stdout.contains("removed"),
+        "Output should mention excluded/removed minimizers. Got: {}",
+        stdout
+    );
+
+    // Verify merged index exists and can be opened
+    assert!(merged_path.exists(), "Merged index should exist");
+
+    // Verify we can run stats on it
+    let output = Command::new(&binary)
+        .args(["index", "stats", "-i", merged_path.to_str().unwrap()])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Stats on merged index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    Ok(())
+}
+
+/// Test that --max-memory auto detection works.
+/// When "auto" is specified, the system should detect available memory
+/// and use an appropriate fraction for the merge operation.
+#[test]
+fn test_cli_merge_max_memory_auto_detection() -> Result<()> {
+    let dir = tempdir()?;
+
+    let binary = get_binary_path();
+    let primary_path = dir.path().join("primary.ryxdi");
+    let secondary_path = dir.path().join("secondary.ryxdi");
+    let merged_path = dir.path().join("merged.ryxdi");
+
+    // Create simple reference files
+    let ref1_path = dir.path().join("ref1.fasta");
+    let ref2_path = dir.path().join("ref2.fasta");
+
+    let seq1 = "A".repeat(200);
+    let seq2 = "T".repeat(200);
+    fs::write(&ref1_path, format!(">seq1\n{}\n", seq1))?;
+    fs::write(&ref2_path, format!(">seq2\n{}\n", seq2))?;
+
+    // Create primary index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            primary_path.to_str().unwrap(),
+            "-r",
+            ref1_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Primary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create secondary index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            secondary_path.to_str().unwrap(),
+            "-r",
+            ref2_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Secondary index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Merge with --max-memory auto (should use detected system memory)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "merge",
+            "--index-primary",
+            primary_path.to_str().unwrap(),
+            "--index-secondary",
+            secondary_path.to_str().unwrap(),
+            "-o",
+            merged_path.to_str().unwrap(),
+            "--subtract-from-primary",
+            "--max-memory",
+            "auto",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Merge with --max-memory auto failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify merge completed
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("Merge with auto memory:\n{}", stdout);
+
+    assert!(
+        stdout.contains("Merge complete"),
+        "Output should indicate merge complete. Got: {}",
+        stdout
+    );
+
+    // Verify merged index exists
+    assert!(merged_path.exists(), "Merged index should exist");
+
+    Ok(())
+}
