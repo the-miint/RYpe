@@ -282,11 +282,14 @@ fn main() -> Result<()> {
                     verbose: args.verbose,
                 };
 
+                // Ensure output has .ryxdi extension (consistent with index from-config)
+                let output_path = output.with_extension("ryxdi");
+
                 // Perform the merge using streaming (memory-bounded) merge
                 let stats = merge::merge_indices_streaming(
                     &index_primary,
                     &index_secondary,
-                    &output,
+                    &output_path,
                     &merge_options,
                     Some(max_memory),
                     Some(&write_options),
@@ -294,7 +297,7 @@ fn main() -> Result<()> {
 
                 // Print summary (always, not just verbose)
                 println!("Merge complete:");
-                println!("  Output: {}", output.display());
+                println!("  Output: {}", output_path.display());
                 println!("  Total buckets: {}", stats.total_buckets);
                 println!(
                     "  Total minimizer entries: {}",
