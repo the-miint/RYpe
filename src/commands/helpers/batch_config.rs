@@ -28,6 +28,8 @@ pub struct BatchSizeConfig<'a> {
     pub is_parquet_input: bool,
     /// Path to the index
     pub index_path: &'a Path,
+    /// Optional trim-to length (caps read lengths for memory estimation)
+    pub trim_to: Option<usize>,
 }
 
 /// Result of batch size computation with logging metadata.
@@ -98,6 +100,19 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
         config.max_memory
     };
 
+    // Log trim_to setting
+    let effective_trim_to = match config.trim_to {
+        Some(0) => {
+            log::warn!("--trim-to 0 specified, treating as no trimming");
+            None
+        }
+        Some(n) => {
+            log::info!("Read trimming enabled: --trim-to {}", n);
+            Some(n)
+        }
+        None => None,
+    };
+
     // Sample read lengths from input files
     let read_profile = ReadMemoryProfile::from_files(
         config.r1_path,
@@ -105,6 +120,8 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
         1000, // sample size
         metadata.k,
         metadata.w,
+        config.is_parquet_input,
+        effective_trim_to,
     )
     .unwrap_or_else(|| {
         log::warn!("Could not sample read lengths, using default profile");
@@ -281,6 +298,7 @@ num_entries = 3
             r2_path: None,
             is_parquet_input: false,
             index_path: &index_path,
+            trim_to: None,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -300,6 +318,7 @@ num_entries = 3
             r2_path: None,
             is_parquet_input: false,
             index_path: &index_path,
+            trim_to: None,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -328,6 +347,7 @@ num_entries = 3
             r2_path: Some(r2_file.path()),
             is_parquet_input: false,
             index_path: &index_path,
+            trim_to: None,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -352,6 +372,7 @@ num_entries = 3
             r2_path: None,
             is_parquet_input: true,
             index_path: &index_path,
+            trim_to: None,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();

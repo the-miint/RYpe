@@ -97,6 +97,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         r2_path: args.common.r2.as_deref(),
         is_parquet_input: input_is_parquet,
         index_path: &args.common.index,
+        trim_to: args.common.trim_to,
     })?;
     let effective_batch_size = batch_result.batch_size;
 
@@ -472,6 +473,7 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
         r2_path: args.common.r2.as_deref(),
         is_parquet_input: input_is_parquet,
         index_path: &args.common.index,
+        trim_to: args.common.trim_to,
     })?;
     let effective_batch_size = batch_result.batch_size;
 

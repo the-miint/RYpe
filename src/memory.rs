@@ -381,11 +381,13 @@ impl ReadMemoryProfile {
     /// their average lengths for the query length calculation.
     ///
     /// # Arguments
-    /// * `r1_path` - Path to R1 FASTQ/FASTA file
-    /// * `r2_path` - Optional path to R2 FASTQ/FASTA file (for paired-end)
+    /// * `r1_path` - Path to R1 FASTQ/FASTA file (or Parquet file if `is_parquet` is true)
+    /// * `r2_path` - Optional path to R2 FASTQ/FASTA file (for paired-end, ignored for Parquet)
     /// * `sample_size` - Number of records to sample from each file
     /// * `k` - K-mer size
     /// * `w` - Window size
+    /// * `is_parquet` - Whether the input is Parquet format (uses sequence1/sequence2 columns)
+    /// * `trim_to` - Optional maximum read length (for `--trim-to` option)
     ///
     /// # Returns
     /// A `ReadMemoryProfile` based on sampled lengths, or None if sampling fails.
@@ -395,17 +397,51 @@ impl ReadMemoryProfile {
         sample_size: usize,
         k: usize,
         w: usize,
+        is_parquet: bool,
+        trim_to: Option<usize>,
     ) -> Option<Self> {
-        // Sample R1
-        let (r1_total, r1_count) = sample_file_lengths(r1_path, sample_size)?;
+        if is_parquet {
+            // For Parquet input, sequence1 and sequence2 are in the same file
+            let (total_length, count, is_paired) = sample_parquet_lengths(r1_path, sample_size)?;
+
+            // For Parquet paired-end, total_length includes both seq1 and seq2
+            // avg_query_length = total_length / count (already includes both sequences)
+            // avg_read_length = total_length / (count * 2) for paired, total_length / count for single
+            let avg_query_length = total_length / count;
+            let avg_read_length = if is_paired {
+                total_length / (count * 2)
+            } else {
+                avg_query_length
+            };
+
+            // Apply trim_to limit if specified
+            let (avg_read_length, avg_query_length) =
+                apply_trim_to_limit(avg_read_length, avg_query_length, is_paired, trim_to);
+
+            // Estimate minimizers
+            let minimizers_per_query = if avg_query_length > k {
+                ((avg_query_length - k + 1) / w).max(1) * 2
+            } else {
+                0
+            };
+
+            return Some(ReadMemoryProfile {
+                avg_read_length,
+                avg_query_length,
+                minimizers_per_query,
+            });
+        }
+
+        // FASTX input: sample R1
+        let (r1_total, r1_count) = sample_fastx_lengths(r1_path, sample_size)?;
         if r1_count == 0 {
             return None;
         }
         let avg_r1_length = r1_total / r1_count;
 
         // Sample R2 if provided
-        let (avg_query_length, avg_read_length) = if let Some(r2) = r2_path {
-            let (r2_total, r2_count) = sample_file_lengths(r2, sample_size)?;
+        let (avg_query_length, avg_read_length, is_paired) = if let Some(r2) = r2_path {
+            let (r2_total, r2_count) = sample_fastx_lengths(r2, sample_size)?;
             if r2_count == 0 {
                 return None;
             }
@@ -413,10 +449,14 @@ impl ReadMemoryProfile {
             // For paired-end: avg_query_length = R1 avg + R2 avg
             // avg_read_length = average of individual read lengths
             let avg_read = (r1_total + r2_total) / (r1_count + r2_count);
-            (avg_r1_length + avg_r2_length, avg_read)
+            (avg_r1_length + avg_r2_length, avg_read, true)
         } else {
-            (avg_r1_length, avg_r1_length)
+            (avg_r1_length, avg_r1_length, false)
         };
+
+        // Apply trim_to limit if specified
+        let (avg_read_length, avg_query_length) =
+            apply_trim_to_limit(avg_read_length, avg_query_length, is_paired, trim_to);
 
         // Estimate minimizers: roughly (length - k + 1) / w for each strand
         // Multiply by 2 for both strands, but many are duplicates
@@ -530,9 +570,49 @@ impl InputFormat {
     }
 }
 
-/// Helper function to sample read lengths from a file.
+/// Apply trim_to limit to read lengths.
+///
+/// When `--trim-to N` is specified (with N > 0), reads are trimmed to N nucleotides
+/// before classification. This function caps the estimated read lengths accordingly
+/// for accurate memory estimation.
+///
+/// Note: `trim_to = Some(0)` is treated as no trimming (same as `None`).
+///
+/// # Arguments
+/// * `avg_read_length` - Average length of individual reads (before trimming)
+/// * `avg_query_length` - Average total query length (before trimming)
+/// * `is_paired` - Whether reads are paired-end
+/// * `trim_to` - Optional trim limit (0 is treated as no limit)
+///
+/// # Returns
+/// A tuple of (capped_avg_read_length, capped_avg_query_length)
+fn apply_trim_to_limit(
+    avg_read_length: usize,
+    avg_query_length: usize,
+    is_paired: bool,
+    trim_to: Option<usize>,
+) -> (usize, usize) {
+    match trim_to {
+        Some(limit) if limit > 0 => {
+            // Cap individual read length at the trim limit
+            let capped_read_length = avg_read_length.min(limit);
+            // For paired-end, query length is sum of both reads (each capped)
+            // For single-end, query length equals read length
+            let capped_query_length = if is_paired {
+                capped_read_length * 2
+            } else {
+                capped_read_length
+            };
+            (capped_read_length, capped_query_length)
+        }
+        // None or Some(0) - no trimming
+        _ => (avg_read_length, avg_query_length),
+    }
+}
+
+/// Helper function to sample read lengths from a FASTX file.
 /// Returns (total_length, count) or None if the file cannot be read.
-fn sample_file_lengths(path: &std::path::Path, sample_size: usize) -> Option<(usize, usize)> {
+fn sample_fastx_lengths(path: &std::path::Path, sample_size: usize) -> Option<(usize, usize)> {
     use needletail::parse_fastx_file;
 
     let mut total_length: usize = 0;
@@ -549,6 +629,115 @@ fn sample_file_lengths(path: &std::path::Path, sample_size: usize) -> Option<(us
     }
 
     Some((total_length, count))
+}
+
+/// Helper function to sample read lengths from a Parquet file.
+/// Returns (total_length, count, is_paired) or None if the file cannot be read.
+///
+/// Reads the first `sample_size` rows and extracts lengths from `sequence1` and
+/// optionally `sequence2` columns.
+fn sample_parquet_lengths(
+    path: &std::path::Path,
+    sample_size: usize,
+) -> Option<(usize, usize, bool)> {
+    use arrow::array::{Array, LargeStringArray, StringArray};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+
+    // Open Parquet file
+    let file = File::open(path).ok()?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+
+    let schema = builder.schema();
+
+    // Find sequence1 column index (required)
+    let seq1_idx = schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == "sequence1")?;
+
+    // Find sequence2 column index (optional)
+    let seq2_idx = schema.fields().iter().position(|f| f.name() == "sequence2");
+
+    // Build projection mask to only read sequence columns
+    let mut col_indices = vec![seq1_idx];
+    if let Some(idx) = seq2_idx {
+        col_indices.push(idx);
+    }
+    let projection =
+        parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), col_indices.clone());
+
+    // Build reader with projection
+    let reader = builder.with_projection(projection).build().ok()?;
+
+    let mut total_length: usize = 0;
+    let mut count: usize = 0;
+    let mut is_paired = false;
+    let mut checked_paired = false;
+
+    for batch_result in reader {
+        let batch = batch_result.ok()?;
+
+        // Get sequence1 column
+        let seq1_col = batch.column_by_name("sequence1")?;
+
+        // Get sequence2 column if present
+        let seq2_col = batch.column_by_name("sequence2");
+
+        // Check if paired on first batch with data
+        if !checked_paired {
+            if let Some(col) = &seq2_col {
+                // Paired if sequence2 has any non-null values
+                is_paired = col.null_count() < col.len();
+            }
+            checked_paired = true;
+        }
+
+        // Helper to get string length from either StringArray or LargeStringArray
+        fn get_string_len(col: &dyn Array, idx: usize) -> Option<usize> {
+            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                if !arr.is_null(idx) {
+                    return Some(arr.value(idx).len());
+                }
+            } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+                if !arr.is_null(idx) {
+                    return Some(arr.value(idx).len());
+                }
+            }
+            None
+        }
+
+        for i in 0..batch.num_rows() {
+            if count >= sample_size {
+                break;
+            }
+
+            // Add sequence1 length
+            if let Some(len) = get_string_len(seq1_col.as_ref(), i) {
+                total_length += len;
+                count += 1;
+
+                // Add sequence2 length if paired
+                if is_paired {
+                    if let Some(col) = &seq2_col {
+                        if let Some(len2) = get_string_len(col.as_ref(), i) {
+                            total_length += len2;
+                        }
+                    }
+                }
+            }
+        }
+
+        if count >= sample_size {
+            break;
+        }
+    }
+
+    if count == 0 {
+        return None;
+    }
+
+    Some((total_length, count, is_paired))
 }
 
 /// Number of batches buffered in FASTX prefetch channel.
@@ -1230,9 +1419,11 @@ mod tests {
         let profile = ReadMemoryProfile::from_files(
             file.path(),
             None,
-            10, // sample size
-            64, // k
-            50, // w
+            10,    // sample size
+            64,    // k
+            50,    // w
+            false, // is_parquet
+            None,  // trim_to
         );
 
         assert!(profile.is_some());
@@ -1266,7 +1457,8 @@ mod tests {
         }
         r2.flush().unwrap();
 
-        let profile = ReadMemoryProfile::from_files(r1.path(), Some(r2.path()), 10, 64, 50);
+        let profile =
+            ReadMemoryProfile::from_files(r1.path(), Some(r2.path()), 10, 64, 50, false, None);
 
         assert!(profile.is_some());
         let profile = profile.unwrap();
@@ -1284,8 +1476,405 @@ mod tests {
             10,
             64,
             50,
+            false,
+            None,
         );
         assert!(profile.is_none());
+    }
+
+    // === Parquet sampling tests ===
+
+    #[test]
+    fn test_read_memory_profile_from_parquet_single_end() {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        use tempfile::NamedTempFile;
+
+        // Create a temp Parquet file with known sequence lengths
+        let file = NamedTempFile::new().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("read_id", DataType::Utf8, false),
+            Field::new("sequence1", DataType::Utf8, false),
+        ]));
+
+        // 3 reads of 100bp each
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["read0", "read1", "read2"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "A".repeat(100),
+                    "A".repeat(100),
+                    "A".repeat(100),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let writer_file = std::fs::File::create(file.path()).unwrap();
+        let mut writer = ArrowWriter::try_new(writer_file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let profile = ReadMemoryProfile::from_files(
+            file.path(),
+            None,
+            10,   // sample size
+            64,   // k
+            50,   // w
+            true, // is_parquet
+            None, // trim_to
+        );
+
+        assert!(profile.is_some());
+        let profile = profile.unwrap();
+        assert_eq!(profile.avg_read_length, 100);
+        assert_eq!(profile.avg_query_length, 100); // single-end
+    }
+
+    #[test]
+    fn test_read_memory_profile_from_parquet_paired_end() {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        use tempfile::NamedTempFile;
+
+        // Create a temp Parquet file with paired sequences
+        let file = NamedTempFile::new().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("read_id", DataType::Utf8, false),
+            Field::new("sequence1", DataType::Utf8, false),
+            Field::new("sequence2", DataType::Utf8, true), // nullable for paired-end
+        ]));
+
+        // 3 reads with 100bp seq1 and 150bp seq2
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["read0", "read1", "read2"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "A".repeat(100),
+                    "A".repeat(100),
+                    "A".repeat(100),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "T".repeat(150),
+                    "T".repeat(150),
+                    "T".repeat(150),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let writer_file = std::fs::File::create(file.path()).unwrap();
+        let mut writer = ArrowWriter::try_new(writer_file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let profile = ReadMemoryProfile::from_files(
+            file.path(),
+            None,
+            10,   // sample size
+            64,   // k
+            50,   // w
+            true, // is_parquet
+            None, // trim_to
+        );
+
+        assert!(profile.is_some());
+        let profile = profile.unwrap();
+        // total_length = 3 * (100 + 150) = 750
+        // count = 3
+        // avg_query_length = 750 / 3 = 250
+        // avg_read_length = 750 / 6 = 125
+        assert_eq!(profile.avg_read_length, 125);
+        assert_eq!(profile.avg_query_length, 250);
+    }
+
+    #[test]
+    fn test_read_memory_profile_from_parquet_nonexistent() {
+        let profile = ReadMemoryProfile::from_files(
+            std::path::Path::new("/nonexistent/file.parquet"),
+            None,
+            10,
+            64,
+            50,
+            true, // is_parquet
+            None, // trim_to
+        );
+        assert!(profile.is_none());
+    }
+
+    #[test]
+    fn test_sample_parquet_lengths_with_large_utf8() {
+        use arrow::array::{ArrayRef, LargeStringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        use tempfile::NamedTempFile;
+
+        // Create a temp Parquet file with LargeUtf8 columns
+        let file = NamedTempFile::new().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("read_id", DataType::LargeUtf8, false),
+            Field::new("sequence1", DataType::LargeUtf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeStringArray::from(vec!["read0", "read1"])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec![
+                    "A".repeat(200),
+                    "A".repeat(200),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let writer_file = std::fs::File::create(file.path()).unwrap();
+        let mut writer = ArrowWriter::try_new(writer_file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let profile = ReadMemoryProfile::from_files(
+            file.path(),
+            None,
+            10,   // sample size
+            64,   // k
+            50,   // w
+            true, // is_parquet
+            None, // trim_to
+        );
+
+        assert!(profile.is_some());
+        let profile = profile.unwrap();
+        assert_eq!(profile.avg_read_length, 200);
+        assert_eq!(profile.avg_query_length, 200);
+    }
+
+    // === trim_to tests ===
+
+    #[test]
+    fn test_apply_trim_to_limit_single_end() {
+        // Single-end: both read and query lengths should be capped
+        let (read_len, query_len) = apply_trim_to_limit(1000, 1000, false, Some(100));
+        assert_eq!(read_len, 100);
+        assert_eq!(query_len, 100);
+
+        // No trim: lengths unchanged
+        let (read_len, query_len) = apply_trim_to_limit(1000, 1000, false, None);
+        assert_eq!(read_len, 1000);
+        assert_eq!(query_len, 1000);
+
+        // Trim larger than read: no change
+        let (read_len, query_len) = apply_trim_to_limit(100, 100, false, Some(1000));
+        assert_eq!(read_len, 100);
+        assert_eq!(query_len, 100);
+
+        // trim_to=0 treated as no trimming
+        let (read_len, query_len) = apply_trim_to_limit(1000, 1000, false, Some(0));
+        assert_eq!(read_len, 1000);
+        assert_eq!(query_len, 1000);
+    }
+
+    #[test]
+    fn test_apply_trim_to_limit_paired_end() {
+        // Paired-end: read length capped, query = 2 * capped_read
+        let (read_len, query_len) = apply_trim_to_limit(1000, 2000, true, Some(100));
+        assert_eq!(read_len, 100);
+        assert_eq!(query_len, 200); // 2 * 100
+
+        // No trim: lengths unchanged
+        let (read_len, query_len) = apply_trim_to_limit(1000, 2000, true, None);
+        assert_eq!(read_len, 1000);
+        assert_eq!(query_len, 2000);
+
+        // trim_to=0 treated as no trimming
+        let (read_len, query_len) = apply_trim_to_limit(1000, 2000, true, Some(0));
+        assert_eq!(read_len, 1000);
+        assert_eq!(query_len, 2000);
+    }
+
+    #[test]
+    fn test_read_memory_profile_from_fastx_with_trim_to() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create a temp FASTQ file with 1000bp reads
+        let mut file = NamedTempFile::new().unwrap();
+        for i in 0..3 {
+            writeln!(file, "@read{}", i).unwrap();
+            writeln!(file, "{}", "A".repeat(1000)).unwrap();
+            writeln!(file, "+").unwrap();
+            writeln!(file, "{}", "I".repeat(1000)).unwrap();
+        }
+        file.flush().unwrap();
+
+        // Without trim_to
+        let profile =
+            ReadMemoryProfile::from_files(file.path(), None, 10, 64, 50, false, None).unwrap();
+        assert_eq!(profile.avg_read_length, 1000);
+        assert_eq!(profile.avg_query_length, 1000);
+
+        // With trim_to=100
+        let profile =
+            ReadMemoryProfile::from_files(file.path(), None, 10, 64, 50, false, Some(100)).unwrap();
+        assert_eq!(profile.avg_read_length, 100);
+        assert_eq!(profile.avg_query_length, 100);
+    }
+
+    #[test]
+    fn test_read_memory_profile_from_parquet_with_trim_to() {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        use tempfile::NamedTempFile;
+
+        // Create a temp Parquet file with 1000bp sequences
+        let file = NamedTempFile::new().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("read_id", DataType::Utf8, false),
+            Field::new("sequence1", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["read0", "read1", "read2"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "A".repeat(1000),
+                    "A".repeat(1000),
+                    "A".repeat(1000),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let writer_file = std::fs::File::create(file.path()).unwrap();
+        let mut writer = ArrowWriter::try_new(writer_file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Without trim_to
+        let profile =
+            ReadMemoryProfile::from_files(file.path(), None, 10, 64, 50, true, None).unwrap();
+        assert_eq!(profile.avg_read_length, 1000);
+        assert_eq!(profile.avg_query_length, 1000);
+
+        // With trim_to=100
+        let profile =
+            ReadMemoryProfile::from_files(file.path(), None, 10, 64, 50, true, Some(100)).unwrap();
+        assert_eq!(profile.avg_read_length, 100);
+        assert_eq!(profile.avg_query_length, 100);
+    }
+
+    #[test]
+    fn test_read_memory_profile_paired_fastx_with_trim_to() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create R1 with 1000bp reads
+        let mut r1 = NamedTempFile::new().unwrap();
+        for i in 0..3 {
+            writeln!(r1, "@read{}", i).unwrap();
+            writeln!(r1, "{}", "A".repeat(1000)).unwrap();
+            writeln!(r1, "+").unwrap();
+            writeln!(r1, "{}", "I".repeat(1000)).unwrap();
+        }
+        r1.flush().unwrap();
+
+        // Create R2 with 1000bp reads
+        let mut r2 = NamedTempFile::new().unwrap();
+        for i in 0..3 {
+            writeln!(r2, "@read{}", i).unwrap();
+            writeln!(r2, "{}", "T".repeat(1000)).unwrap();
+            writeln!(r2, "+").unwrap();
+            writeln!(r2, "{}", "I".repeat(1000)).unwrap();
+        }
+        r2.flush().unwrap();
+
+        // Without trim_to
+        let profile =
+            ReadMemoryProfile::from_files(r1.path(), Some(r2.path()), 10, 64, 50, false, None)
+                .unwrap();
+        assert_eq!(profile.avg_read_length, 1000);
+        assert_eq!(profile.avg_query_length, 2000);
+
+        // With trim_to=100: each read capped at 100, query = 200
+        let profile =
+            ReadMemoryProfile::from_files(r1.path(), Some(r2.path()), 10, 64, 50, false, Some(100))
+                .unwrap();
+        assert_eq!(profile.avg_read_length, 100);
+        assert_eq!(profile.avg_query_length, 200);
+    }
+
+    #[test]
+    fn test_read_memory_profile_paired_parquet_with_trim_to() {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        use tempfile::NamedTempFile;
+
+        // Create a temp Parquet file with paired 1000bp sequences
+        let file = NamedTempFile::new().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("read_id", DataType::Utf8, false),
+            Field::new("sequence1", DataType::Utf8, false),
+            Field::new("sequence2", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["read0", "read1", "read2"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "A".repeat(1000),
+                    "A".repeat(1000),
+                    "A".repeat(1000),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "T".repeat(1000),
+                    "T".repeat(1000),
+                    "T".repeat(1000),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let writer_file = std::fs::File::create(file.path()).unwrap();
+        let mut writer = ArrowWriter::try_new(writer_file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Without trim_to
+        let profile =
+            ReadMemoryProfile::from_files(file.path(), None, 10, 64, 50, true, None).unwrap();
+        // avg_query_length = (1000+1000)*3 / 3 = 2000
+        // avg_read_length = 6000 / 6 = 1000
+        assert_eq!(profile.avg_read_length, 1000);
+        assert_eq!(profile.avg_query_length, 2000);
+
+        // With trim_to=100: each read capped at 100, query = 200
+        let profile =
+            ReadMemoryProfile::from_files(file.path(), None, 10, 64, 50, true, Some(100)).unwrap();
+        assert_eq!(profile.avg_read_length, 100);
+        assert_eq!(profile.avg_query_length, 200);
     }
 
     // ==========================================================================
