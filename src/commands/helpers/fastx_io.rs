@@ -12,11 +12,61 @@ use rype::FirstErrorCapture;
 
 use super::output::{OutputFormat, OutputWriter};
 
-/// Owned record type: (query_id, seq1, optional_seq2)
-pub type OwnedRecord = (i64, Vec<u8>, Option<Vec<u8>>);
+/// Owned FASTX record with sequence and quality data.
+///
+/// Headers are stored separately in the `Vec<String>` returned alongside records
+/// from batch readers, avoiding duplicate storage. Use the batch-local `query_id`
+/// to index into the headers vector when writing output.
+///
+/// Quality scores are only captured when `preserve_for_output` is enabled in the reader.
+#[derive(Debug, Clone)]
+pub struct OwnedFastxRecord {
+    pub query_id: i64,
+    pub seq1: Vec<u8>,
+    pub qual1: Option<Vec<u8>>,
+    pub seq2: Option<Vec<u8>>,
+    pub qual2: Option<Vec<u8>>,
+}
+
+impl OwnedFastxRecord {
+    /// Create a new owned FASTX record.
+    pub fn new(
+        query_id: i64,
+        seq1: Vec<u8>,
+        qual1: Option<Vec<u8>>,
+        seq2: Option<Vec<u8>>,
+        qual2: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            query_id,
+            seq1,
+            qual1,
+            seq2,
+            qual2,
+        }
+    }
+
+    /// Returns true if this is a FASTQ record (has quality scores).
+    #[allow(dead_code)]
+    pub fn is_fastq(&self) -> bool {
+        self.qual1.is_some()
+    }
+
+    /// Returns true if this is a paired-end record.
+    #[allow(dead_code)]
+    pub fn is_paired(&self) -> bool {
+        self.seq2.is_some()
+    }
+
+    /// Get references to the sequences.
+    #[allow(dead_code)]
+    pub fn sequences(&self) -> (&[u8], Option<&[u8]>) {
+        (&self.seq1, self.seq2.as_deref())
+    }
+}
 
 /// Type alias for batch data sent through the prefetch channel.
-type BatchResult = Result<Option<(Vec<OwnedRecord>, Vec<String>)>>;
+type BatchResult = Result<Option<(Vec<OwnedFastxRecord>, Vec<String>)>>;
 
 /// Default timeout for waiting on prefetch batches (5 minutes).
 const DEFAULT_PREFETCH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -94,6 +144,33 @@ impl PrefetchingIoHandler {
         batch_size: usize,
         trim_to: Option<usize>,
     ) -> Result<Self> {
+        Self::with_options(r1_path, r2_path, out_path, batch_size, trim_to, false)
+    }
+
+    /// Create a new prefetching I/O handler with full options.
+    ///
+    /// This constructor provides control over all reader options including
+    /// quality score preservation for sequence output.
+    ///
+    /// # Arguments
+    /// * `r1_path` - Path to the first read file (FASTQ/FASTA, optionally gzipped)
+    /// * `r2_path` - Optional path to the second read file for paired-end
+    /// * `out_path` - Optional output path (stdout if None)
+    /// * `batch_size` - Number of records per batch
+    /// * `trim_to` - Optional maximum sequence length
+    /// * `preserve_for_output` - When true, capture quality scores for FASTQ output.
+    ///   Only enable when using `--output-sequences` to avoid wasting memory.
+    ///
+    /// # Returns
+    /// A handler that prefetches batches in a background thread.
+    pub fn with_options(
+        r1_path: &Path,
+        r2_path: Option<&PathBuf>,
+        out_path: Option<PathBuf>,
+        batch_size: usize,
+        trim_to: Option<usize>,
+        preserve_for_output: bool,
+    ) -> Result<Self> {
         // Clone paths for the background thread
         let r1_path = r1_path.to_path_buf();
         let r2_path = r2_path.cloned();
@@ -110,7 +187,15 @@ impl PrefetchingIoHandler {
 
         // Spawn background thread for reading
         let prefetch_thread = thread::spawn(move || {
-            Self::reader_thread(r1_path, r2_path, batch_size, trim_to, sender, thread_error);
+            Self::reader_thread(
+                r1_path,
+                r2_path,
+                batch_size,
+                trim_to,
+                preserve_for_output,
+                sender,
+                thread_error,
+            );
         });
 
         // Set up output writer with auto-detected format
@@ -164,11 +249,16 @@ impl PrefetchingIoHandler {
     /// - Records with R1 shorter than `trim_to` are skipped entirely
     /// - R1 sequences are truncated to `trim_to` length
     /// - R2 sequences are truncated to `min(len, trim_to)` (never skip based on R2)
+    ///
+    /// When `preserve_for_output` is true:
+    /// - Quality scores are captured for FASTQ files (needed for `--output-sequences`)
+    /// - This uses more memory, so only enable when writing sequences out
     fn reader_thread(
         r1_path: PathBuf,
         r2_path: Option<PathBuf>,
         batch_size: usize,
         trim_to: Option<usize>,
+        preserve_for_output: bool,
         sender: SyncSender<BatchResult>,
         error_capture: Arc<FirstErrorCapture>,
     ) {
@@ -247,13 +337,26 @@ impl PrefetchingIoHandler {
                     }
                 }
 
-                // Copy R1 with optional trimming
-                let s1_vec = match trim_to {
-                    Some(trim_len) => s1_seq[..trim_len.min(s1_seq.len())].to_vec(),
-                    None => s1_seq.into_owned(),
+                // Helper to trim and copy a byte slice
+                let trim_copy = |data: &[u8], trim_to: Option<usize>| -> Vec<u8> {
+                    match trim_to {
+                        Some(trim_len) => data[..trim_len.min(data.len())].to_vec(),
+                        None => data.to_vec(),
+                    }
                 };
 
-                let s2_vec = if let Some(ref mut r2_reader) = r2 {
+                // Copy R1 sequence with optional trimming
+                let s1_vec = trim_copy(&s1_seq, trim_to);
+
+                // Capture R1 quality if preserving for output and this is FASTQ
+                let q1_vec = if preserve_for_output {
+                    s1_rec.qual().map(|q| trim_copy(q, trim_to))
+                } else {
+                    None
+                };
+
+                // Handle R2 if present
+                let (s2_vec, q2_vec) = if let Some(ref mut r2_reader) = r2 {
                     match r2_reader.next() {
                         Some(Ok(rec)) => {
                             // Validate that read IDs match
@@ -267,14 +370,18 @@ impl PrefetchingIoHandler {
                                     String::from_utf8_lossy(r2_base)
                                 ));
                             }
-                            // Copy R2 with optional trimming
+                            // Copy R2 sequence with optional trimming
                             let s2_seq = rec.seq();
-                            match trim_to {
-                                Some(trim_len) => {
-                                    Some(s2_seq[..trim_len.min(s2_seq.len())].to_vec())
-                                }
-                                None => Some(s2_seq.into_owned()),
-                            }
+                            let s2 = Some(trim_copy(&s2_seq, trim_to));
+
+                            // Capture R2 quality if preserving for output
+                            let q2 = if preserve_for_output {
+                                rec.qual().map(|q| trim_copy(q, trim_to))
+                            } else {
+                                None
+                            };
+
+                            (s2, q2)
                         }
                         Some(Err(e)) => {
                             send_error!(format!(
@@ -290,7 +397,7 @@ impl PrefetchingIoHandler {
                         }
                     }
                 } else {
-                    None
+                    (None, None)
                 };
 
                 let base_id = Self::base_read_id(s1_rec.id());
@@ -298,7 +405,13 @@ impl PrefetchingIoHandler {
                 // Use batch-local index (0-based within each batch) for query_id.
                 // This is intentional - the classification code maps results back
                 // to headers using this batch-local index.
-                records.push((records.len() as i64, s1_vec, s2_vec));
+                records.push(OwnedFastxRecord::new(
+                    records.len() as i64,
+                    s1_vec,
+                    q1_vec,
+                    s2_vec,
+                    q2_vec,
+                ));
                 headers.push(header);
                 global_record_id += 1;
             }
@@ -325,7 +438,7 @@ impl PrefetchingIoHandler {
     ///
     /// Uses a timeout (default 5 minutes) to avoid hanging indefinitely
     /// if the reader thread stalls (e.g., NFS mount issues, disk errors).
-    pub fn next_batch(&mut self) -> Result<Option<(Vec<OwnedRecord>, Vec<String>)>> {
+    pub fn next_batch(&mut self) -> Result<Option<(Vec<OwnedFastxRecord>, Vec<String>)>> {
         match self.receiver.recv_timeout(self.timeout) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
@@ -384,6 +497,43 @@ impl PrefetchingIoHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -------------------------------------------------------------------------
+    // Tests for OwnedFastxRecord
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_owned_fastx_record_creation_single_end_fasta() {
+        let record = OwnedFastxRecord::new(0, b"ACGT".to_vec(), None, None, None);
+        assert_eq!(record.query_id, 0);
+        assert_eq!(record.seq1, b"ACGT");
+        assert!(!record.is_fastq());
+        assert!(!record.is_paired());
+    }
+
+    #[test]
+    fn test_owned_fastx_record_creation_paired_fastq() {
+        let record = OwnedFastxRecord::new(
+            1,
+            b"ACGT".to_vec(),
+            Some(b"IIII".to_vec()),
+            Some(b"TGCA".to_vec()),
+            Some(b"JJJJ".to_vec()),
+        );
+        assert!(record.is_fastq());
+        assert!(record.is_paired());
+        assert_eq!(record.qual1.as_ref().unwrap(), b"IIII");
+        assert_eq!(record.seq2.as_ref().unwrap(), b"TGCA");
+        assert_eq!(record.qual2.as_ref().unwrap(), b"JJJJ");
+    }
+
+    #[test]
+    fn test_owned_fastx_record_sequences_tuple() {
+        let record = OwnedFastxRecord::new(5, b"AA".to_vec(), None, Some(b"TT".to_vec()), None);
+        let (s1, s2) = record.sequences();
+        assert_eq!(s1, b"AA");
+        assert_eq!(s2.unwrap(), b"TT");
+    }
 
     // -------------------------------------------------------------------------
     // Tests for base_read_id
@@ -497,5 +647,140 @@ mod tests {
             PrefetchingIoHandler::base_read_id(b"READ1  extra  spaces"),
             b"READ1"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Tests for preserve_for_output (quality score preservation)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_reader_preserves_quality_when_requested() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "@read1\nACGT\n+\nIIII").unwrap();
+        tmp.flush().unwrap();
+
+        // preserve_for_output = true
+        let mut handler = PrefetchingIoHandler::with_options(
+            tmp.path(),
+            None,
+            None,
+            100,
+            None,
+            true, // preserve_for_output
+        )
+        .unwrap();
+
+        let (records, _) = handler.next_batch().unwrap().unwrap();
+        assert!(records[0].is_fastq());
+        assert_eq!(records[0].qual1.as_ref().unwrap(), b"IIII");
+    }
+
+    #[test]
+    fn test_reader_skips_quality_when_not_requested() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "@read1\nACGT\n+\nIIII").unwrap();
+        tmp.flush().unwrap();
+
+        // preserve_for_output = false (default behavior)
+        let mut handler =
+            PrefetchingIoHandler::with_trim(tmp.path(), None, None, 100, None).unwrap();
+
+        let (records, _) = handler.next_batch().unwrap().unwrap();
+        assert!(!records[0].is_fastq()); // qual1 is None
+        assert!(records[0].qual1.is_none());
+    }
+
+    #[test]
+    fn test_reader_paired_quality_when_requested() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create paired FASTQ files
+        let mut tmp_r1 = NamedTempFile::new().unwrap();
+        writeln!(tmp_r1, "@read1/1\nACGT\n+\nIIII").unwrap();
+        tmp_r1.flush().unwrap();
+
+        let mut tmp_r2 = NamedTempFile::new().unwrap();
+        writeln!(tmp_r2, "@read1/2\nTGCA\n+\nJJJJ").unwrap();
+        tmp_r2.flush().unwrap();
+
+        let r2_path = tmp_r2.path().to_path_buf();
+
+        // preserve_for_output = true
+        let mut handler = PrefetchingIoHandler::with_options(
+            tmp_r1.path(),
+            Some(&r2_path),
+            None,
+            100,
+            None,
+            true, // preserve_for_output
+        )
+        .unwrap();
+
+        let (records, _) = handler.next_batch().unwrap().unwrap();
+        assert!(records[0].is_fastq());
+        assert!(records[0].is_paired());
+        assert_eq!(records[0].qual1.as_ref().unwrap(), b"IIII");
+        assert_eq!(records[0].qual2.as_ref().unwrap(), b"JJJJ");
+        assert_eq!(records[0].seq2.as_ref().unwrap(), b"TGCA");
+    }
+
+    #[test]
+    fn test_reader_fasta_has_no_quality() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, ">read1\nACGT").unwrap();
+        tmp.flush().unwrap();
+
+        // Even with preserve_for_output = true, FASTA has no quality
+        let mut handler = PrefetchingIoHandler::with_options(
+            tmp.path(),
+            None,
+            None,
+            100,
+            None,
+            true, // preserve_for_output
+        )
+        .unwrap();
+
+        let (records, _) = handler.next_batch().unwrap().unwrap();
+        assert!(!records[0].is_fastq());
+        assert!(records[0].qual1.is_none());
+    }
+
+    #[test]
+    fn test_reader_quality_trimmed_with_sequence() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        // 8bp sequence and quality
+        writeln!(tmp, "@read1\nACGTACGT\n+\nIIIIJJJJ").unwrap();
+        tmp.flush().unwrap();
+
+        // preserve_for_output = true with trim_to = 4
+        let mut handler = PrefetchingIoHandler::with_options(
+            tmp.path(),
+            None,
+            None,
+            100,
+            Some(4), // trim_to
+            true,    // preserve_for_output
+        )
+        .unwrap();
+
+        let (records, _) = handler.next_batch().unwrap().unwrap();
+        // Sequence should be trimmed to 4bp
+        assert_eq!(records[0].seq1, b"ACGT");
+        // Quality should also be trimmed to 4bp
+        assert_eq!(records[0].qual1.as_ref().unwrap(), b"IIII");
     }
 }

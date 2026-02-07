@@ -19,6 +19,7 @@ use super::helpers::{
     format_log_ratio_output, is_parquet_input, load_index_for_classification,
     read_parquet_batch_trimmed, stacked_batches_to_records, validate_input_config, BatchSizeConfig,
     ClassificationInput, IndexLoadOptions, InputReaderConfig, OutputFormat, OutputWriter,
+    SequenceWriter,
 };
 
 /// Common arguments shared between classify run and log-ratio commands.
@@ -164,18 +165,21 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     // Create input reader (Parquet or FASTX)
     // Note: For FASTX, trim_to is handled at read time. For Parquet, it's handled
     // during batch conversion (see Parquet processing path below).
-    let mut input_reader = create_input_reader(&InputReaderConfig {
-        r1_path: &args.common.r1,
-        r2_path: args.common.r2.as_ref(),
-        batch_size: effective_batch_size,
-        parallel_input_rg: args.common.parallel_input_rg,
-        is_parquet: input_is_parquet,
-        trim_to: if input_is_parquet {
-            None
-        } else {
-            args.common.trim_to
+    let mut input_reader = create_input_reader(
+        &InputReaderConfig {
+            r1_path: &args.common.r1,
+            r2_path: args.common.r2.as_ref(),
+            batch_size: effective_batch_size,
+            parallel_input_rg: args.common.parallel_input_rg,
+            is_parquet: input_is_parquet,
+            trim_to: if input_is_parquet {
+                None
+            } else {
+                args.common.trim_to
+            },
         },
-    })?;
+        false, // Not writing sequences in run command
+    )?;
 
     let mut total_reads = 0;
     let mut batch_num = 0;
@@ -273,7 +277,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                     let batch_refs: Vec<rype::QueryRecord> = result
                         .records
                         .iter()
-                        .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                        .map(|rec| (rec.query_id, rec.seq1.as_slice(), rec.seq2.as_deref()))
                         .collect();
                     log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
 
@@ -409,7 +413,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                 let t_convert = std::time::Instant::now();
                 let batch_refs: Vec<rype::QueryRecord> = owned_records
                     .iter()
-                    .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                    .map(|rec| (rec.query_id, rec.seq1.as_slice(), rec.seq2.as_deref()))
                     .collect();
                 log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
 
@@ -475,6 +479,10 @@ pub fn run_aggregate(_args: ClassifyAggregateArgs) -> Result<()> {
 pub struct ClassifyLogRatioArgs {
     pub common: CommonClassifyArgs,
     pub swap_buckets: bool,
+    /// Output path for passing sequences (gzipped FASTA/FASTQ).
+    pub output_sequences: Option<PathBuf>,
+    /// If true, pass sequences with POSITIVE log-ratio (default: pass NEGATIVE/zero).
+    pub passing_is_positive: bool,
 }
 
 /// Validate that the index has exactly two buckets and return their IDs and names.
@@ -504,6 +512,38 @@ fn validate_two_bucket_index(
     Ok((num_id, denom_id, num_name, denom_name))
 }
 
+/// Validate sequence output configuration.
+///
+/// # Errors
+/// Returns an error if:
+/// - Parquet input is used with `--output-sequences` (not supported)
+/// - `--trim-to` is used with `--output-sequences` (would output incomplete sequences)
+fn validate_seq_output(
+    is_parquet: bool,
+    has_trim_to: bool,
+    output_sequences: Option<&std::path::Path>,
+) -> Result<()> {
+    let Some(_path) = output_sequences else {
+        return Ok(());
+    };
+
+    if is_parquet {
+        return Err(anyhow!(
+            "--output-sequences is not supported with Parquet input.\n\
+             Use FASTX (FASTA/FASTQ) input files for sequence output."
+        ));
+    }
+
+    if has_trim_to {
+        return Err(anyhow!(
+            "--output-sequences is not supported with --trim-to.\n\
+             Trimmed sequences would be incomplete. Remove --trim-to to output full sequences."
+        ));
+    }
+
+    Ok(())
+}
+
 /// Run the log-ratio classify command with the given arguments.
 ///
 /// Computes log10(numerator_score / denominator_score) for each read.
@@ -514,6 +554,16 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
 
     // Validate input configuration
     validate_input_config(input_is_parquet, args.common.r2.as_ref())?;
+
+    // Validate sequence output configuration
+    validate_seq_output(
+        input_is_parquet,
+        args.common.trim_to.is_some(),
+        args.output_sequences.as_deref(),
+    )?;
+
+    // Determine if we need to preserve quality scores for sequence output
+    let preserve_for_output = args.output_sequences.is_some();
 
     // Load index (validates, loads metadata, sharded index, and read options)
     let loaded_index = load_index_for_classification(
@@ -584,18 +634,37 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
     // Create input reader
     // Note: For FASTX, trim_to is handled at read time. For Parquet, it's handled
     // during batch conversion (see Parquet processing path below).
-    let mut input_reader = create_input_reader(&InputReaderConfig {
-        r1_path: &args.common.r1,
-        r2_path: args.common.r2.as_ref(),
-        batch_size: effective_batch_size,
-        parallel_input_rg: args.common.parallel_input_rg,
-        is_parquet: input_is_parquet,
-        trim_to: if input_is_parquet {
-            None
-        } else {
-            args.common.trim_to
+    let mut input_reader = create_input_reader(
+        &InputReaderConfig {
+            r1_path: &args.common.r1,
+            r2_path: args.common.r2.as_ref(),
+            batch_size: effective_batch_size,
+            parallel_input_rg: args.common.parallel_input_rg,
+            is_parquet: input_is_parquet,
+            trim_to: if input_is_parquet {
+                None
+            } else {
+                args.common.trim_to
+            },
         },
-    })?;
+        preserve_for_output,
+    )?;
+
+    // Create sequence writer if --output-sequences is specified
+    let is_paired = args.common.r2.is_some();
+    let mut seq_writer = args
+        .output_sequences
+        .as_ref()
+        .map(|p| SequenceWriter::new(p, is_paired))
+        .transpose()?;
+
+    if seq_writer.is_some() {
+        log::info!(
+            "Sequence output enabled: {} (passing_is_positive={})",
+            args.output_sequences.as_ref().unwrap().display(),
+            args.passing_is_positive
+        );
+    }
 
     log::info!(
         "Starting log-ratio classification (batch_size={}, threshold={})",
@@ -670,7 +739,7 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
                     let batch_refs: Vec<rype::QueryRecord> = result
                         .records
                         .iter()
-                        .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                        .map(|rec| (rec.query_id, rec.seq1.as_slice(), rec.seq2.as_deref()))
                         .collect();
                     log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
 
@@ -816,7 +885,7 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
                 let t_convert = std::time::Instant::now();
                 let batch_refs: Vec<rype::QueryRecord> = owned_records
                     .iter()
-                    .map(|(id, s1, s2)| (*id, s1.as_slice(), s2.as_deref()))
+                    .map(|rec| (rec.query_id, rec.seq1.as_slice(), rec.seq2.as_deref()))
                     .collect();
                 log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
 
@@ -837,6 +906,32 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
                         denom_id,
                         args.common.threshold,
                     );
+                }
+
+                // Write passing sequences if --output-sequences is specified
+                if let Some(ref mut writer) = seq_writer {
+                    let t_seq_write = std::time::Instant::now();
+                    for lr in &log_ratios {
+                        debug_assert!(
+                            !lr.log_ratio.is_nan(),
+                            "NaN log-ratio for query_id={} should not occur",
+                            lr.query_id
+                        );
+                        let passes = if args.passing_is_positive {
+                            // Pass POSITIVE: > 0.0 or +inf (exclude 0.0, -inf, NaN)
+                            lr.log_ratio > 0.0
+                                || (lr.log_ratio.is_infinite() && lr.log_ratio.is_sign_positive())
+                        } else {
+                            // Pass NEGATIVE/ZERO: <= 0.0 or -inf (exclude +inf, NaN)
+                            lr.log_ratio <= 0.0
+                                || (lr.log_ratio.is_infinite() && lr.log_ratio.is_sign_negative())
+                        };
+                        if passes {
+                            let idx = lr.query_id as usize;
+                            writer.write_record(&owned_records[idx], headers[idx].as_bytes())?;
+                        }
+                    }
+                    log_timing("batch: seq_write", t_seq_write.elapsed().as_millis());
                 }
 
                 // Format and write output
@@ -865,6 +960,15 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
     );
     out_writer.finish()?;
     input_reader.finish()?;
+
+    // Finish sequence writer if used
+    if let Some(writer) = seq_writer {
+        writer.finish()?;
+        log::info!(
+            "Sequence output complete: {}",
+            args.output_sequences.as_ref().unwrap().display()
+        );
+    }
 
     Ok(())
 }
@@ -1247,5 +1351,42 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("exactly 2 buckets"));
         assert!(err.contains("found 0"));
+    }
+
+    // Phase 5: validate_seq_output tests
+
+    #[test]
+    fn test_validate_seq_output_rejects_parquet_input() {
+        use std::path::Path;
+
+        let result = validate_seq_output(true, false, Some(Path::new("out.fastq.gz")));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Parquet input"));
+    }
+
+    #[test]
+    fn test_validate_seq_output_rejects_trim_to() {
+        use std::path::Path;
+
+        let result = validate_seq_output(false, true, Some(Path::new("out.fastq.gz")));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("--trim-to"));
+    }
+
+    #[test]
+    fn test_validate_seq_output_accepts_valid_config() {
+        use std::path::Path;
+
+        let result = validate_seq_output(false, false, Some(Path::new("out.fastq.gz")));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_seq_output_accepts_none_output() {
+        // No output_sequences is always valid
+        let result = validate_seq_output(true, true, None);
+        assert!(result.is_ok());
     }
 }

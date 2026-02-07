@@ -606,6 +606,17 @@ THRESHOLD:
         /// By default, lower bucket_id is numerator. This flag reverses it.
         #[arg(long)]
         swap_buckets: bool,
+
+        /// Output passing sequences to gzipped FASTA/FASTQ.
+        /// For paired-end: foo.fastq.gz creates foo.R1.fastq.gz and foo.R2.fastq.gz.
+        /// Not supported with Parquet input or --trim-to.
+        #[arg(long)]
+        output_sequences: Option<PathBuf>,
+
+        /// Pass sequences with POSITIVE log-ratio (default: pass NEGATIVE/zero).
+        /// Requires --output-sequences.
+        #[arg(long, requires = "output_sequences")]
+        passing_is_positive: bool,
     },
 }
 

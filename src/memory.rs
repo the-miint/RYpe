@@ -508,12 +508,16 @@ impl ReadMemoryProfile {
         data_bytes + offset_overhead + validity_overhead + array_overhead
     }
 
-    /// Estimate memory per row for FASTX OwnedRecord format.
+    /// Estimate memory per row for FASTX OwnedFastxRecord format.
     ///
-    /// `OwnedRecord = (i64, Vec<u8>, Option<Vec<u8>>)`:
-    /// - 8 bytes for i64 read ID
+    /// `OwnedFastxRecord` contains:
+    /// - 8 bytes for i64 query_id
     /// - 24 bytes `Vec<u8>` overhead for seq1 + actual sequence bytes
+    /// - 24 bytes `Option<Vec<u8>>` overhead for qual1 (usually None unless preserving for output)
     /// - 24 bytes `Option<Vec<u8>>` overhead for seq2 (if paired) + actual sequence bytes
+    /// - 24 bytes `Option<Vec<u8>>` overhead for qual2 (if paired, usually None)
+    ///
+    /// Headers are stored in a separate `Vec<String>`, not in the record struct.
     pub fn estimate_owned_record_bytes(&self, is_paired: bool) -> usize {
         // i64 read ID
         let id_bytes = 8;
@@ -535,7 +539,7 @@ impl ReadMemoryProfile {
 /// Input format for memory estimation.
 ///
 /// Different input formats have different memory characteristics:
-/// - FASTX: Uses `OwnedRecord (i64, Vec<u8>, Option<Vec<u8>>)`
+/// - FASTX: Uses `OwnedFastxRecord` struct with owned sequence data
 /// - Parquet: Uses Arrow RecordBatch with columnar string arrays
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputFormat {
@@ -865,7 +869,7 @@ const ARROW_BUILDER_OVERHEAD: f64 = 1.5;
 /// Estimate memory usage for a single batch.
 ///
 /// Memory components:
-/// - Input records: batch_size * (72 + avg_query_length) for OwnedRecord
+/// - Input records: batch_size * (72 + avg_query_length) for OwnedFastxRecord
 /// - Minimizers: batch_size * minimizers_per_query * 16 bytes (`Vec<u64>` for fwd + rc)
 /// - QueryInvertedIndex CSR: batch_size * minimizers_per_query * 12 bytes
 /// - Accumulators: batch_size * estimated_buckets_per_read * 24 bytes (HashMap overhead)
@@ -876,7 +880,7 @@ pub fn estimate_batch_memory(
     profile: &ReadMemoryProfile,
     num_buckets: usize,
 ) -> Option<usize> {
-    // OwnedRecord: (i64, Vec<u8>, Option<Vec<u8>>) ≈ 72 bytes + sequence data
+    // OwnedFastxRecord overhead ≈ 72 bytes + sequence data
     let record_overhead: usize = 72;
     let input_records =
         batch_size.checked_mul(record_overhead.checked_add(profile.avg_query_length)?)?;
@@ -1883,7 +1887,7 @@ mod tests {
     // ==========================================================================
     // Phase 1 TDD Tests: I/O Buffer Memory Accounting
     // These tests verify that memory estimation accounts for prefetch buffers
-    // and format-specific overhead (Arrow vs OwnedRecord).
+    // and format-specific overhead (Arrow vs OwnedFastxRecord).
     // ==========================================================================
 
     #[test]
@@ -1966,10 +1970,10 @@ mod tests {
     }
 
     #[test]
-    fn test_owned_record_vs_arrow_bytes_estimation() {
+    fn test_owned_fastx_record_vs_arrow_bytes_estimation() {
         let profile = ReadMemoryProfile::new(150, false, 64, 50);
 
-        // OwnedRecord estimation for FASTX
+        // OwnedFastxRecord estimation for FASTX
         let owned_bytes = profile.estimate_owned_record_bytes(false);
         // Arrow estimation for Parquet
         let arrow_bytes = profile.estimate_arrow_bytes_per_row(false);
@@ -1977,7 +1981,7 @@ mod tests {
         // Both should be reasonable for 150bp reads
         assert!(
             owned_bytes > 100 && owned_bytes < 500,
-            "OwnedRecord bytes {} should be reasonable",
+            "OwnedFastxRecord bytes {} should be reasonable",
             owned_bytes
         );
         assert!(
@@ -1986,11 +1990,11 @@ mod tests {
             arrow_bytes
         );
 
-        // OwnedRecord for paired-end should be larger
+        // OwnedFastxRecord for paired-end should be larger
         let owned_paired = profile.estimate_owned_record_bytes(true);
         assert!(
             owned_paired > owned_bytes,
-            "Paired OwnedRecord {} should be > single {}",
+            "Paired OwnedFastxRecord {} should be > single {}",
             owned_paired,
             owned_bytes
         );

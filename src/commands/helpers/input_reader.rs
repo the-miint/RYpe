@@ -72,21 +72,14 @@ pub fn validate_input_config(is_parquet: bool, r2_path: Option<&PathBuf>) -> Res
 /// Create an input reader based on the configuration.
 ///
 /// Creates either a Parquet or FASTX reader depending on the input format.
-/// Logs reader configuration details.
 ///
-/// # Arguments
-///
-/// * `config` - Input reader configuration
-///
-/// # Returns
-///
-/// A `ClassificationInput` enum containing the appropriate reader type.
-///
-/// # Errors
-///
-/// Returns an error if the reader cannot be created (e.g., file not found,
-/// invalid format, I/O error).
-pub fn create_input_reader(config: &InputReaderConfig) -> Result<ClassificationInput> {
+/// `preserve_for_output` controls whether quality scores are captured in FASTX records.
+/// This is a separate parameter (not part of `InputReaderConfig`) to make the opt-in
+/// explicit — it uses ~25% more memory and should only be enabled for `--output-sequences`.
+pub fn create_input_reader(
+    config: &InputReaderConfig,
+    preserve_for_output: bool,
+) -> Result<ClassificationInput> {
     if config.is_parquet {
         let parallel_rg_opt = if config.parallel_input_rg > 0 {
             Some(config.parallel_input_rg)
@@ -107,16 +100,18 @@ pub fn create_input_reader(config: &InputReaderConfig) -> Result<ClassificationI
         Ok(ClassificationInput::Parquet(reader))
     } else {
         log::debug!(
-            "Using prefetching FASTX input reader (batch_size={}) for {:?}",
+            "Using prefetching FASTX input reader (batch_size={}, preserve_for_output={}) for {:?}",
             config.batch_size,
+            preserve_for_output,
             config.r1_path
         );
-        let reader = PrefetchingIoHandler::with_trim(
+        let reader = PrefetchingIoHandler::with_options(
             config.r1_path,
             config.r2_path,
             None, // No output - just reading
             config.batch_size,
             config.trim_to,
+            preserve_for_output,
         )?;
         Ok(ClassificationInput::Fastx(reader))
     }

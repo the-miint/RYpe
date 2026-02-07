@@ -3199,3 +3199,407 @@ fn test_cli_merge_max_memory_auto_detection() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// Phase 6: Log-Ratio Sequence Output Integration Tests
+// ============================================================================
+
+/// Helper to read and decompress a gzipped file.
+fn read_gzipped(path: &std::path::Path) -> String {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).unwrap();
+    let mut decoder = GzDecoder::new(file);
+    let mut content = String::new();
+    decoder.read_to_string(&mut content).unwrap();
+    content
+}
+
+/// Test that --output-sequences outputs reads with NEGATIVE/ZERO log-ratio by default.
+///
+/// Creates a 2-bucket index where:
+/// - Bucket 1 (phiX): numerator in log-ratio
+/// - Bucket 2 (pUC19): denominator in log-ratio
+///
+/// Log-ratio = log10(phiX_score / pUC19_score)
+/// - A read matching only phiX has log-ratio = +inf (excluded by default)
+/// - A read matching only pUC19 has log-ratio = -inf (included by default)
+/// - A read matching both equally has log-ratio = 0 (included by default)
+#[test]
+fn test_log_ratio_output_sequences_negative() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create 2-bucket index with --separate-buckets
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create query file with two reads:
+    // - phiX read: matches only phiX -> log-ratio = +inf (excluded)
+    // - pUC19 read: matches only pUC19 -> log-ratio = -inf or 0 (included)
+    // Using real sequences from the reference files.
+    let phix_seq = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT";
+    let puc19_seq = "TCGCGCGTTTCGGTGATGACGGTGAAAACCTCTGACACATGCAGCTCCCGGAGACGGTCACAGCTTGTCT";
+
+    let query_path = dir.path().join("reads.fastq");
+    fs::write(
+        &query_path,
+        format!(
+            "@phix_read\n{}\n+\n{}\n@puc19_read\n{}\n+\n{}\n",
+            phix_seq,
+            "I".repeat(phix_seq.len()),
+            puc19_seq,
+            "I".repeat(puc19_seq.len())
+        ),
+    )?;
+
+    // Run log-ratio with --output-sequences (default: pass negative/zero)
+    let output_sequences_path = dir.path().join("filtered.fastq.gz");
+    let tsv_output_path = dir.path().join("results.tsv");
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-o",
+            tsv_output_path.to_str().unwrap(),
+            "--output-sequences",
+            output_sequences_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Log-ratio with --output-sequences failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Debug: show TSV output
+    let tsv_content = fs::read_to_string(&tsv_output_path)?;
+    println!("TSV output:\n{}", tsv_content);
+
+    // Verify the output file exists
+    assert!(
+        output_sequences_path.exists(),
+        "Output sequences file should exist"
+    );
+
+    // Read and verify the gzipped output
+    let content = read_gzipped(&output_sequences_path);
+    println!("Output sequences content:\n{}", content);
+
+    // The pUC19 read should have log-ratio <= 0 and be output
+    assert!(
+        content.contains("@puc19_read"),
+        "pUC19 read with negative/zero log-ratio should be in output"
+    );
+    assert!(
+        content.contains(puc19_seq),
+        "pUC19 sequence should be preserved in output"
+    );
+
+    // The phiX read has log-ratio = +inf and should NOT be output
+    assert!(
+        !content.contains("@phix_read"),
+        "phiX read with positive log-ratio (+inf) should NOT be in output"
+    );
+
+    // Should be valid FASTQ format
+    assert!(
+        content.contains("+\n"),
+        "Should have FASTQ quality separator"
+    );
+
+    Ok(())
+}
+
+/// Test that --passing-is-positive outputs reads with POSITIVE log-ratio only.
+///
+/// With --passing-is-positive:
+/// - phiX read: log-ratio = +inf -> INCLUDED
+/// - pUC19 read: log-ratio = 0 or -inf -> EXCLUDED (0 is not positive)
+#[test]
+fn test_log_ratio_output_sequences_positive_flag() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create 2-bucket index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create query with reads:
+    // - phix_read: matches only phiX -> log-ratio = +inf (INCLUDED with --passing-is-positive)
+    // - puc19_read: matches only pUC19 -> log-ratio = 0 or -inf (EXCLUDED, 0 is not > 0)
+    let phix_seq = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT";
+    let puc19_seq = "TCGCGCGTTTCGGTGATGACGGTGAAAACCTCTGACACATGCAGCTCCCGGAGACGGTCACAGCTTGTCT";
+
+    let query_path = dir.path().join("reads.fastq");
+    fs::write(
+        &query_path,
+        format!(
+            "@phix_read\n{}\n+\n{}\n@puc19_read\n{}\n+\n{}\n",
+            phix_seq,
+            "I".repeat(phix_seq.len()),
+            puc19_seq,
+            "I".repeat(puc19_seq.len())
+        ),
+    )?;
+
+    // Run with --passing-is-positive
+    let output_sequences_path = dir.path().join("filtered.fastq.gz");
+    let tsv_output_path = dir.path().join("results.tsv");
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-o",
+            tsv_output_path.to_str().unwrap(),
+            "--output-sequences",
+            output_sequences_path.to_str().unwrap(),
+            "--passing-is-positive",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Log-ratio with --passing-is-positive failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Debug: show TSV output
+    let tsv_content = fs::read_to_string(&tsv_output_path)?;
+    println!("TSV output:\n{}", tsv_content);
+
+    // Verify output file exists
+    assert!(
+        output_sequences_path.exists(),
+        "Output sequences file should exist"
+    );
+
+    // Read and verify
+    let content = read_gzipped(&output_sequences_path);
+    println!("Output sequences (passing-is-positive):\n{}", content);
+
+    // phiX read has log-ratio = +inf and should be INCLUDED
+    assert!(
+        content.contains("@phix_read"),
+        "phiX read with positive log-ratio (+inf) should be in output with --passing-is-positive"
+    );
+    assert!(
+        content.contains(phix_seq),
+        "phiX sequence should be preserved in output"
+    );
+
+    // pUC19 read has log-ratio = 0 and should be EXCLUDED (0 is not > 0)
+    assert!(
+        !content.contains("@puc19_read"),
+        "pUC19 read with log-ratio 0 should NOT be in output when --passing-is-positive"
+    );
+
+    Ok(())
+}
+
+/// Test that paired-end output creates foo.R1.fastq.gz and foo.R2.fastq.gz files.
+///
+/// Uses a pUC19-matching read (log-ratio <= 0) which passes with default settings.
+#[test]
+fn test_log_ratio_paired_creates_r1_r2_files() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create 2-bucket index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create paired-end query files (R1 and R2)
+    // Use pUC19-matching sequence which has log-ratio <= 0 (passes with default)
+    let r1_path = dir.path().join("reads_R1.fastq");
+    let r2_path = dir.path().join("reads_R2.fastq");
+
+    // pUC19-matching R1 sequence (log-ratio <= 0, should be output with default settings)
+    let puc19_r1 = "TCGCGCGTTTCGGTGATGACGGTGAAAACCTCTGACACATGCAGCTCCCGGAGACGGTCACAGCTTGTCT";
+    // R2 sequence (can be anything, just testing paired-end file creation)
+    let puc19_r2 = "GTAAGCGGATGCCGGGAGCAGACAAGCCCGTCAGGGCGCGTCAGCGGGTGTTGGCGGGTGTCGGGGCTGG";
+
+    fs::write(
+        &r1_path,
+        format!("@read1\n{}\n+\n{}\n", puc19_r1, "I".repeat(puc19_r1.len())),
+    )?;
+    fs::write(
+        &r2_path,
+        format!("@read1\n{}\n+\n{}\n", puc19_r2, "J".repeat(puc19_r2.len())),
+    )?;
+
+    // Run log-ratio with paired-end and --output-sequences
+    let output_sequences_path = dir.path().join("filtered.fastq.gz");
+    let tsv_output_path = dir.path().join("results.tsv");
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            r1_path.to_str().unwrap(),
+            "-2",
+            r2_path.to_str().unwrap(),
+            "-o",
+            tsv_output_path.to_str().unwrap(),
+            "--output-sequences",
+            output_sequences_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Log-ratio paired with --output-sequences failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Debug: show TSV output
+    let tsv_content = fs::read_to_string(&tsv_output_path)?;
+    println!("TSV output:\n{}", tsv_content);
+
+    // Verify R1 and R2 output files were created
+    let r1_output_path = dir.path().join("filtered.R1.fastq.gz");
+    let r2_output_path = dir.path().join("filtered.R2.fastq.gz");
+
+    assert!(
+        r1_output_path.exists(),
+        "R1 output file (filtered.R1.fastq.gz) should exist"
+    );
+    assert!(
+        r2_output_path.exists(),
+        "R2 output file (filtered.R2.fastq.gz) should exist"
+    );
+
+    // The original path should NOT exist for paired-end (only R1/R2)
+    assert!(
+        !output_sequences_path.exists(),
+        "Original path should not exist for paired-end; R1/R2 paths used instead"
+    );
+
+    // Read and verify R1 content
+    let r1_content = read_gzipped(&r1_output_path);
+    println!("R1 output content:\n{}", r1_content);
+    assert!(
+        r1_content.contains("@read1"),
+        "R1 should contain the read header"
+    );
+    assert!(
+        r1_content.contains(puc19_r1),
+        "R1 should contain the R1 sequence"
+    );
+
+    // Read and verify R2 content
+    let r2_content = read_gzipped(&r2_output_path);
+    println!("R2 output content:\n{}", r2_content);
+    assert!(
+        r2_content.contains("@read1"),
+        "R2 should contain the read header"
+    );
+    assert!(
+        r2_content.contains(puc19_r2),
+        "R2 should contain the R2 sequence"
+    );
+
+    Ok(())
+}

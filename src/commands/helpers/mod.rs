@@ -21,6 +21,7 @@ mod log_ratio;
 mod metadata;
 mod output;
 mod parquet_io;
+mod seq_writer;
 
 // Re-export everything for backward compatibility.
 // Some items are marked #[allow(dead_code)] in their modules as they provide
@@ -30,7 +31,7 @@ pub use arg_parsing::{
 };
 pub use batch_config::{compute_effective_batch_size, BatchSizeConfig};
 #[allow(unused_imports)]
-pub use fastx_io::OwnedRecord;
+pub use fastx_io::OwnedFastxRecord;
 #[allow(unused_imports)]
 pub use fastx_io::PrefetchingIoHandler;
 pub use formatting::format_classification_results;
@@ -54,3 +55,5 @@ pub use parquet_io::{
     is_parquet_input, read_parquet_batch_trimmed, stacked_batches_to_records, ParquetInputReader,
     PrefetchingParquetReader, TrimmedBatchResult,
 };
+#[allow(unused_imports)]
+pub use seq_writer::{SeqFormat, SequenceWriter};

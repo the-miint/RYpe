@@ -404,6 +404,8 @@ fn main() -> Result<()> {
                 timing,
                 trim_to,
                 swap_buckets,
+                output_sequences,
+                passing_is_positive,
             } => {
                 // Enable timing diagnostics if requested
                 if timing {
@@ -425,6 +427,8 @@ fn main() -> Result<()> {
                         trim_to,
                     },
                     swap_buckets,
+                    output_sequences,
+                    passing_is_positive,
                 })?;
             }
         },

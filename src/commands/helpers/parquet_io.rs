@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use rype::{FirstErrorCapture, QueryRecord};
 
-use super::fastx_io::OwnedRecord;
+use super::fastx_io::OwnedFastxRecord;
 
 /// Check if a file path indicates Parquet input.
 pub fn is_parquet_input(path: &Path) -> bool {
@@ -157,7 +157,7 @@ impl ParquetInputReader {
     pub fn next_batch(
         &mut self,
         batch_size: usize,
-    ) -> Result<Option<(Vec<OwnedRecord>, Vec<String>)>> {
+    ) -> Result<Option<(Vec<OwnedFastxRecord>, Vec<String>)>> {
         let mut records = Vec::with_capacity(batch_size);
         let mut headers = Vec::with_capacity(batch_size);
 
@@ -198,7 +198,13 @@ impl ParquetInputReader {
                         .map(|arr| arr.value(idx).as_bytes().to_vec());
 
                     // Use batch-local index for query_id (will be adjusted in output)
-                    records.push((records.len() as i64, sequence1, sequence2));
+                    records.push(OwnedFastxRecord::new(
+                        records.len() as i64,
+                        sequence1,
+                        None, // qual1 - not available in Parquet input
+                        sequence2,
+                        None, // qual2 - not available in Parquet input
+                    ));
                     headers.push(read_id);
                     self.global_record_id += 1;
                     self.current_idx += 1;
@@ -884,7 +890,7 @@ pub fn batch_to_owned_records_trimmed(
     headers: &[String],
     trim_to: Option<usize>,
     id_offset: usize,
-) -> Result<(Vec<OwnedRecord>, Vec<String>)> {
+) -> Result<(Vec<OwnedFastxRecord>, Vec<String>)> {
     let num_rows = batch.num_rows();
     if num_rows == 0 {
         return Ok((Vec::new(), Vec::new()));
@@ -944,7 +950,10 @@ pub fn batch_to_owned_records_trimmed(
             }
         });
 
-        records.push((query_id, seq1_owned, seq2_owned));
+        records.push(OwnedFastxRecord::new(
+            query_id, seq1_owned, None, // qual1 - not available in Parquet input
+            seq2_owned, None, // qual2 - not available in Parquet input
+        ));
         out_headers.push(headers[i].clone());
     }
 
@@ -960,7 +969,7 @@ pub fn batch_to_owned_records_trimmed(
 /// Result of reading a batch of trimmed Parquet records.
 pub struct TrimmedBatchResult {
     /// The accumulated owned records
-    pub records: Vec<OwnedRecord>,
+    pub records: Vec<OwnedFastxRecord>,
     /// The corresponding headers
     pub headers: Vec<String>,
     /// Number of row groups processed
@@ -989,7 +998,7 @@ pub fn read_parquet_batch_trimmed(
     target_batch_size: usize,
     trim_to: Option<usize>,
 ) -> Result<TrimmedBatchResult> {
-    let mut records: Vec<OwnedRecord> = Vec::new();
+    let mut records: Vec<OwnedFastxRecord> = Vec::new();
     let mut headers: Vec<String> = Vec::new();
     let mut reached_end = false;
     let mut rg_count = 0usize;
@@ -1152,8 +1161,8 @@ mod tests {
 
         assert_eq!(records.len(), 2);
         assert_eq!(out_headers.len(), 2);
-        assert_eq!(records[0].1, b"ACGTACGTACGT");
-        assert_eq!(records[1].1, b"GGGGCCCCAAAA");
+        assert_eq!(records[0].seq1, b"ACGTACGTACGT");
+        assert_eq!(records[1].seq1, b"GGGGCCCCAAAA");
         assert_eq!(out_headers[0], "read1");
         assert_eq!(out_headers[1], "read2");
     }
@@ -1170,8 +1179,8 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(out_headers.len(), 2);
         // Should be trimmed to first 4 bases
-        assert_eq!(records[0].1, b"ACGT");
-        assert_eq!(records[1].1, b"GGGG");
+        assert_eq!(records[0].seq1, b"ACGT");
+        assert_eq!(records[1].seq1, b"GGGG");
     }
 
     #[test]
@@ -1187,7 +1196,7 @@ mod tests {
 
         assert_eq!(records.len(), 1, "Short read should be skipped");
         assert_eq!(out_headers.len(), 1);
-        assert_eq!(records[0].1, b"ACGTACGT");
+        assert_eq!(records[0].seq1, b"ACGTACGT");
         assert_eq!(out_headers[0], "long_read");
     }
 
@@ -1200,8 +1209,11 @@ mod tests {
         // Start with offset 100
         let (records, _) = batch_to_owned_records_trimmed(&batch, &headers, None, 100).unwrap();
 
-        assert_eq!(records[0].0, 100, "First query_id should be offset");
-        assert_eq!(records[1].0, 101, "Second query_id should be offset+1");
+        assert_eq!(records[0].query_id, 100, "First query_id should be offset");
+        assert_eq!(
+            records[1].query_id, 101,
+            "Second query_id should be offset+1"
+        );
     }
 
     #[test]
@@ -1221,8 +1233,8 @@ mod tests {
 
         assert_eq!(records.len(), 2);
         // Query IDs should be sequential based on OUTPUT count, not input row
-        assert_eq!(records[0].0, 0);
-        assert_eq!(records[1].0, 1);
+        assert_eq!(records[0].query_id, 0);
+        assert_eq!(records[1].query_id, 1);
         assert_eq!(out_headers[0], "long1");
         assert_eq!(out_headers[1], "long2");
     }
@@ -1238,10 +1250,10 @@ mod tests {
 
         assert_eq!(records.len(), 2);
         // Both R1 and R2 should be trimmed
-        assert_eq!(records[0].1, b"ACGT");
-        assert_eq!(records[0].2.as_ref().unwrap(), b"TTTT");
-        assert_eq!(records[1].1, b"GGGG");
-        assert_eq!(records[1].2.as_ref().unwrap(), b"CCCC");
+        assert_eq!(records[0].seq1, b"ACGT");
+        assert_eq!(records[0].seq2.as_ref().unwrap(), b"TTTT");
+        assert_eq!(records[1].seq1, b"GGGG");
+        assert_eq!(records[1].seq2.as_ref().unwrap(), b"CCCC");
     }
 
     #[test]
