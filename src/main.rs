@@ -391,10 +391,10 @@ fn main() -> Result<()> {
             }
 
             ClassifyCommands::LogRatio {
-                index,
+                numerator,
+                denominator,
                 r1,
                 r2,
-                threshold,
                 max_memory,
                 batch_size,
                 output,
@@ -403,9 +403,9 @@ fn main() -> Result<()> {
                 parallel_input_rg,
                 timing,
                 trim_to,
-                swap_buckets,
                 output_sequences,
                 passing_is_positive,
+                numerator_skip_threshold,
             } => {
                 // Enable timing diagnostics if requested
                 if timing {
@@ -413,22 +413,20 @@ fn main() -> Result<()> {
                 }
 
                 run_log_ratio(ClassifyLogRatioArgs {
-                    common: CommonClassifyArgs {
-                        index,
-                        r1,
-                        r2,
-                        threshold,
-                        max_memory,
-                        batch_size,
-                        output,
-                        parallel_rg,
-                        use_bloom_filter,
-                        parallel_input_rg,
-                        trim_to,
-                    },
-                    swap_buckets,
+                    numerator,
+                    denominator,
+                    r1,
+                    r2,
+                    max_memory,
+                    batch_size,
+                    output,
+                    parallel_rg,
+                    use_bloom_filter,
+                    parallel_input_rg,
+                    trim_to,
                     output_sequences,
                     passing_is_positive,
+                    numerator_skip_threshold,
                 })?;
             }
         },

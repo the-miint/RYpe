@@ -526,29 +526,40 @@ THRESHOLD:
         output: Option<PathBuf>,
     },
 
-    /// Compute log10(score_A / score_B) between exactly two buckets
+    /// Compute log10(numerator_score / denominator_score) using two single-bucket indices
     #[command(after_help = "LOG-RATIO MODE:
-  Computes log10(numerator_score / denominator_score) for each read.
-  Requires exactly 2 buckets in the index.
+  Computes log10(numerator_score / denominator_score) for each read using
+  two separate single-bucket indices.
 
-  By default, the bucket with the lower bucket_id is the numerator.
-  Use --swap-buckets to reverse the ratio direction.
+  Reads are first classified against the numerator index. Reads with zero
+  numerator score are assigned -inf (fast path). If --numerator-skip-threshold
+  is set, reads exceeding that threshold are assigned +inf (fast path).
+  Only remaining reads are classified against the denominator index.
 
 OUTPUT FORMAT:
-  Tab-separated: read_id<TAB>log10([BucketA] / [BucketB])<TAB>ratio
+  Tab-separated: read_id<TAB>log10([Num] / [Denom])<TAB>score<TAB>fast_path
+
+  fast_path column: 'none' (exact), 'num_zero' (-inf), 'num_high' (+inf)
 
 EDGE CASES:
-  - numerator = 0 → 0.0
-  - denominator = 0, numerator > 0 → +infinity (inf)
-  - both = 0 → 0.0
+  - numerator = 0 → -inf (fast path: num_zero)
+  - denominator = 0, numerator > 0 → +inf
+  - both = 0 → -inf (fast path: num_zero)
 
-THRESHOLD:
-  The --threshold option filters reads where BOTH original scores are below
-  the threshold. Default is 0.0 (report all reads with any match).")]
+EXAMPLES:
+  # Basic log-ratio with two indices
+  rype classify log-ratio -n numerator.ryxdi -d denominator.ryxdi -1 reads.fq
+
+  # With fast-path skip threshold
+  rype classify log-ratio -n num.ryxdi -d denom.ryxdi -1 reads.fq --numerator-skip-threshold 0.01")]
     LogRatio {
-        /// Path to index directory (.ryxdi). Must have exactly 2 buckets.
-        #[arg(short, long)]
-        index: PathBuf,
+        /// Path to numerator index directory (.ryxdi). Must have exactly 1 bucket.
+        #[arg(short = 'n', long)]
+        numerator: PathBuf,
+
+        /// Path to denominator index directory (.ryxdi). Must have exactly 1 bucket.
+        #[arg(short = 'd', long)]
+        denominator: PathBuf,
 
         /// Forward reads. Formats: FASTA/FASTQ (.fa/.fq, optionally .gz),
         /// Parquet (.parquet) with columns: read_id, sequence1, sequence2 (optional)
@@ -559,12 +570,6 @@ THRESHOLD:
         /// Not supported with Parquet input - use sequence2 column instead.
         #[arg(short = '2', long)]
         r2: Option<PathBuf>,
-
-        /// Minimum score threshold for either bucket to report.
-        /// Reads where both bucket scores are below this threshold are filtered out.
-        /// Default 0.0 means all reads with any classification are reported.
-        #[arg(short, long, default_value_t = 0.0)]
-        threshold: f64,
 
         /// Maximum memory to use (e.g., "4G", "512M", "auto").
         #[arg(long, default_value = "auto", value_parser = parse_max_memory_arg)]
@@ -602,21 +607,22 @@ THRESHOLD:
         #[arg(long, value_parser = validate_trim_to)]
         trim_to: Option<usize>,
 
-        /// Swap numerator and denominator buckets.
-        /// By default, lower bucket_id is numerator. This flag reverses it.
-        #[arg(long)]
-        swap_buckets: bool,
-
         /// Output passing sequences to gzipped FASTA/FASTQ.
         /// For paired-end: foo.fastq.gz creates foo.R1.fastq.gz and foo.R2.fastq.gz.
         /// Not supported with Parquet input or --trim-to.
         #[arg(long)]
         output_sequences: Option<PathBuf>,
 
-        /// Pass sequences with POSITIVE log-ratio (default: pass NEGATIVE/zero).
+        /// Pass sequences with POSITIVE log-ratio; excludes zero (default: pass NEGATIVE/zero).
         /// Requires --output-sequences.
         #[arg(long, requires = "output_sequences")]
         passing_is_positive: bool,
+
+        /// Skip denominator classification for reads with numerator score >= this value.
+        /// These reads are assigned +inf with fast_path=num_high.
+        /// Must be between 0.0 (exclusive) and 1.0 (inclusive).
+        #[arg(long)]
+        numerator_skip_threshold: Option<f64>,
     },
 }
 

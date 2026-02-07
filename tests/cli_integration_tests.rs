@@ -1551,7 +1551,7 @@ fn test_cli_wide_with_trim_to_excludes_short_reads() -> Result<()> {
 // Log-Ratio Mode Integration Tests (Phase 5)
 // ============================================================================
 
-/// Test end-to-end log-ratio classification with a 2-bucket index
+/// Test end-to-end log-ratio classification with two single-bucket indices
 #[test]
 fn test_cli_log_ratio_end_to_end() -> Result<()> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -1565,47 +1565,66 @@ fn test_cli_log_ratio_end_to_end() -> Result<()> {
     }
 
     let binary = get_binary_path();
-    let index_path = dir.path().join("test.ryxdi");
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
 
-    // Create index with two separate buckets (required for log-ratio)
+    // Create separate single-bucket indices
     let output = Command::new(&binary)
         .args([
             "index",
             "create",
             "-o",
-            index_path.to_str().unwrap(),
+            num_path.to_str().unwrap(),
             "-r",
             phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Numerator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
             "-r",
             puc19_path.to_str().unwrap(),
             "-k",
             "32",
             "-w",
             "10",
-            "--separate-buckets",
         ])
         .output()?;
-
     assert!(
         output.status.success(),
-        "Index creation failed: {}",
+        "Denominator index creation failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Create a query file with phiX174 sequence (should match phiX bucket strongly)
+    // Create a query file with phiX174 sequence (should match numerator strongly)
     let query_path = dir.path().join("query.fastq");
     fs::write(
         &query_path,
         "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
     )?;
 
-    // Run log-ratio classification
+    // Run log-ratio classification with two indices
     let output = Command::new(&binary)
         .args([
             "classify",
             "log-ratio",
-            "-i",
-            index_path.to_str().unwrap(),
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
             "-1",
             query_path.to_str().unwrap(),
         ])
@@ -1629,50 +1648,51 @@ fn test_cli_log_ratio_end_to_end() -> Result<()> {
         lines
     );
 
-    // Header should be "read_id\tbucket_name\tscore"
+    // Header should be "read_id\tbucket_name\tscore\tfast_path"
     let header = lines[0];
-    assert!(
-        header.starts_with("read_id"),
-        "Header should start with 'read_id'. Got: {}",
-        header
-    );
-    assert!(
-        header.contains("bucket_name"),
-        "Header should contain 'bucket_name'. Got: {}",
+    assert_eq!(
+        header, "read_id\tbucket_name\tscore\tfast_path",
+        "Unexpected header: {}",
         header
     );
 
-    // Data row should have the log10([A] / [B]) bucket name format
+    // Data row should have 4 columns
     let data_row = lines[1];
+    let cols: Vec<&str> = data_row.split('\t').collect();
+    assert_eq!(cols.len(), 4, "Should have 4 columns: {:?}", cols);
+
+    // Bucket name should have log10([...] / [...]) format
     assert!(
-        data_row.contains("log10(["),
+        cols[1].contains("log10(["),
         "Bucket name should contain 'log10(['. Got: {}",
-        data_row
+        cols[1]
     );
 
-    // Data row should have a score (the log ratio)
-    let cols: Vec<&str> = data_row.split('\t').collect();
-    assert_eq!(cols.len(), 3, "Should have 3 columns: {:?}", cols);
-
-    // Score should be parseable (can be "inf" or a float)
+    // Score should be parseable
     let score_str = cols[2];
     if score_str != "inf" && score_str != "-inf" {
-        let score: f64 = score_str.parse().unwrap_or_else(|_| {
+        let _score: f64 = score_str.parse().unwrap_or_else(|_| {
             panic!(
                 "Score should be a valid float or 'inf'. Got: '{}'",
                 score_str
             )
         });
-        // Log ratio can be any value, but for a strongly matching read it should be non-zero
-        println!("Log ratio score: {}", score);
     }
+
+    // fast_path should be a valid value
+    let fast_path = cols[3];
+    assert!(
+        fast_path == "none" || fast_path == "num_zero" || fast_path == "num_high",
+        "fast_path should be none/num_zero/num_high. Got: {}",
+        fast_path
+    );
 
     Ok(())
 }
 
-/// Test that --swap-buckets negates the log-ratio output
+/// Test that swapping numerator/denominator negates the log-ratio output
 #[test]
-fn test_cli_log_ratio_swap_buckets_negates() -> Result<()> {
+fn test_cli_log_ratio_swap_indices_negates() -> Result<()> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let dir = tempdir()?;
 
@@ -1684,74 +1704,94 @@ fn test_cli_log_ratio_swap_buckets_negates() -> Result<()> {
     }
 
     let binary = get_binary_path();
-    let index_path = dir.path().join("test.ryxdi");
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
 
-    // Create index with two separate buckets
+    // Create separate single-bucket indices
     let output = Command::new(&binary)
         .args([
             "index",
             "create",
             "-o",
-            index_path.to_str().unwrap(),
+            num_path.to_str().unwrap(),
             "-r",
             phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Numerator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
             "-r",
             puc19_path.to_str().unwrap(),
             "-k",
             "32",
             "-w",
             "10",
-            "--separate-buckets",
         ])
         .output()?;
-
     assert!(
         output.status.success(),
-        "Index creation failed: {}",
+        "Denominator index creation failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Create a query file
+    // Create query with sequence matching BOTH references partially
+    // Use a chimeric read so we get a finite score (not inf/-inf)
+    let phix_half = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCG";
+    let puc19_half = "TCGCGCGTTTCGGTGATGACGGTGAAAACCTCTGACACAT";
+    let chimera = format!("{}{}", phix_half, puc19_half);
+    let qual = "I".repeat(chimera.len());
     let query_path = dir.path().join("query.fastq");
-    fs::write(
-        &query_path,
-        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
-    )?;
+    fs::write(&query_path, format!("@query1\n{}\n+\n{}\n", chimera, qual))?;
 
-    // Run log-ratio WITHOUT --swap-buckets
+    // Run log-ratio: phiX as numerator, pUC19 as denominator
     let output_normal = Command::new(&binary)
         .args([
             "classify",
             "log-ratio",
-            "-i",
-            index_path.to_str().unwrap(),
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
             "-1",
             query_path.to_str().unwrap(),
         ])
         .output()?;
-
     assert!(
         output_normal.status.success(),
-        "Log-ratio without swap failed: {}",
+        "Log-ratio failed: {}",
         String::from_utf8_lossy(&output_normal.stderr)
     );
 
-    // Run log-ratio WITH --swap-buckets
+    // Run log-ratio: SWAPPED (pUC19 as numerator, phiX as denominator)
     let output_swapped = Command::new(&binary)
         .args([
             "classify",
             "log-ratio",
-            "-i",
-            index_path.to_str().unwrap(),
+            "-n",
+            denom_path.to_str().unwrap(),
+            "-d",
+            num_path.to_str().unwrap(),
             "-1",
             query_path.to_str().unwrap(),
-            "--swap-buckets",
         ])
         .output()?;
-
     assert!(
         output_swapped.status.success(),
-        "Log-ratio with swap failed: {}",
+        "Swapped log-ratio failed: {}",
         String::from_utf8_lossy(&output_swapped.stderr)
     );
 
@@ -1761,10 +1801,9 @@ fn test_cli_log_ratio_swap_buckets_negates() -> Result<()> {
     println!("Normal output:\n{}", stdout_normal);
     println!("Swapped output:\n{}", stdout_swapped);
 
-    // Extract scores from both outputs
+    // Extract scores from both outputs (4 columns now)
     let get_score = |stdout: &str| -> Option<f64> {
         for line in stdout.lines().skip(1) {
-            // Skip header
             let cols: Vec<&str> = line.split('\t').collect();
             if cols.len() >= 3 {
                 let score_str = cols[2];
@@ -1791,7 +1830,6 @@ fn test_cli_log_ratio_swap_buckets_negates() -> Result<()> {
     // If we have valid finite scores, they should be negated
     if let (Some(sn), Some(ss)) = (score_normal, score_swapped) {
         if sn.is_finite() && ss.is_finite() && sn != 0.0 {
-            // log10(A/B) = -log10(B/A), so scores should be negated
             let diff = (sn + ss).abs();
             assert!(
                 diff < 1e-6,
@@ -1806,7 +1844,7 @@ fn test_cli_log_ratio_swap_buckets_negates() -> Result<()> {
     Ok(())
 }
 
-/// Test log-ratio with Parquet output format
+/// Test log-ratio with Parquet output format using two single-bucket indices
 #[test]
 fn test_cli_log_ratio_parquet_output() -> Result<()> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -1820,31 +1858,48 @@ fn test_cli_log_ratio_parquet_output() -> Result<()> {
     }
 
     let binary = get_binary_path();
-    let index_path = dir.path().join("test.ryxdi");
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
     let output_path = dir.path().join("output.parquet");
 
-    // Create index with two separate buckets
+    // Create separate single-bucket indices
     let output = Command::new(&binary)
         .args([
             "index",
             "create",
             "-o",
-            index_path.to_str().unwrap(),
+            num_path.to_str().unwrap(),
             "-r",
             phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Numerator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
             "-r",
             puc19_path.to_str().unwrap(),
             "-k",
             "32",
             "-w",
             "10",
-            "--separate-buckets",
         ])
         .output()?;
-
     assert!(
         output.status.success(),
-        "Index creation failed: {}",
+        "Denominator index creation failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -1860,8 +1915,10 @@ fn test_cli_log_ratio_parquet_output() -> Result<()> {
         .args([
             "classify",
             "log-ratio",
-            "-i",
-            index_path.to_str().unwrap(),
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
             "-1",
             query_path.to_str().unwrap(),
             "-o",
@@ -1892,7 +1949,7 @@ fn test_cli_log_ratio_parquet_output() -> Result<()> {
 
     println!("Parquet schema: {:?}", schema);
 
-    // Schema should have read_id, bucket_name, score
+    // Schema should have read_id, bucket_name, score (and possibly fast_path)
     let fields = schema.get_fields();
     assert!(
         fields.len() >= 3,
@@ -1900,7 +1957,6 @@ fn test_cli_log_ratio_parquet_output() -> Result<()> {
         fields.len()
     );
 
-    // Verify field names
     assert_eq!(
         fields[0].name(),
         "read_id",
@@ -1923,9 +1979,9 @@ fn test_cli_log_ratio_parquet_output() -> Result<()> {
     Ok(())
 }
 
-/// Test that --threshold filters log-ratio results
+/// Test --numerator-skip-threshold assigns fast_path=num_high
 #[test]
-fn test_cli_log_ratio_threshold_filters() -> Result<()> {
+fn test_cli_log_ratio_numerator_skip_threshold() -> Result<()> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let dir = tempdir()?;
 
@@ -1937,15 +1993,246 @@ fn test_cli_log_ratio_threshold_filters() -> Result<()> {
     }
 
     let binary = get_binary_path();
-    let index_path = dir.path().join("test.ryxdi");
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
 
-    // Create index with two separate buckets
+    // Create separate single-bucket indices
     let output = Command::new(&binary)
         .args([
             "index",
             "create",
             "-o",
-            index_path.to_str().unwrap(),
+            num_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Numerator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Denominator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Query matching ONLY phiX (numerator) strongly
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    // Run with very low skip threshold so the phiX-matching read triggers num_high
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "--numerator-skip-threshold",
+            "0.01",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Log-ratio with skip threshold failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("Skip threshold output:\n{}", stdout);
+
+    // Should have 4 columns with fast_path
+    for line in stdout.lines().skip(1) {
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 4, "Should have 4 columns: {:?}", cols);
+
+        // The phiX read should have high numerator score >= 0.01 -> num_high + inf
+        let score_str = cols[2];
+        let fast_path = cols[3];
+        assert_eq!(
+            score_str, "inf",
+            "Score should be inf for num_high fast path. Got: {}",
+            score_str
+        );
+        assert_eq!(
+            fast_path, "num_high",
+            "Fast path should be num_high. Got: {}",
+            fast_path
+        );
+    }
+
+    Ok(())
+}
+
+/// Test fast-path num_zero: query matching only denominator -> -inf + num_zero
+#[test]
+fn test_cli_log_ratio_fast_path_num_zero() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
+
+    // phiX is numerator, pUC19 is denominator
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            num_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Numerator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Denominator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Query matching ONLY pUC19 (denominator) -> numerator score = 0 -> num_zero fast path
+    let query_path = dir.path().join("query.fastq");
+    let puc19_seq = "TCGCGCGTTTCGGTGATGACGGTGAAAACCTCTGACACATGCAGCTCCCGGAGACGGTCACAGCTTGTCT";
+    fs::write(
+        &query_path,
+        format!(
+            "@puc19_only\n{}\n+\n{}\n",
+            puc19_seq,
+            "I".repeat(puc19_seq.len())
+        ),
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Log-ratio failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("num_zero fast path output:\n{}", stdout);
+
+    // Should have header + at least 1 data row
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines.len() >= 2, "Should have at least header + 1 data row");
+
+    // Data row should show -inf with num_zero fast path
+    let data_row = lines[1];
+    let cols: Vec<&str> = data_row.split('\t').collect();
+    assert_eq!(cols.len(), 4, "Should have 4 columns: {:?}", cols);
+    assert_eq!(
+        cols[2], "-inf",
+        "Score should be -inf for num_zero. Got: {}",
+        cols[2]
+    );
+    assert_eq!(
+        cols[3], "num_zero",
+        "Fast path should be num_zero. Got: {}",
+        cols[3]
+    );
+
+    Ok(())
+}
+
+/// Test that log-ratio fails when a multi-bucket index is used as numerator
+#[test]
+fn test_cli_log_ratio_fails_with_multi_bucket_index() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let multi_path = dir.path().join("multi.ryxdi");
+    let single_path = dir.path().join("single.ryxdi");
+
+    // Create a 2-bucket index (invalid for log-ratio numerator/denominator)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            multi_path.to_str().unwrap(),
             "-r",
             phix_path.to_str().unwrap(),
             "-r",
@@ -1957,383 +2244,270 @@ fn test_cli_log_ratio_threshold_filters() -> Result<()> {
             "--separate-buckets",
         ])
         .output()?;
-
     assert!(
         output.status.success(),
-        "Index creation failed: {}",
+        "Multi-bucket index creation failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Create a query file with a read that has a real sequence
-    // and a "junk" read that won't match well
-    let query_path = dir.path().join("query.fastq");
-    // phiX174 sequence: 70 bases
-    let good_seq = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT";
-    let good_qual = "I".repeat(70);
-    // Junk sequence: 70 N's (won't produce valid k-mers)
-    let weak_seq = "N".repeat(70);
-    let weak_qual = "I".repeat(70);
-    fs::write(
-        &query_path,
-        format!(
-            "@good_query\n{}\n+\n{}\n@weak_query\n{}\n+\n{}\n",
-            good_seq, good_qual, weak_seq, weak_qual
-        ),
-    )?;
-
-    // Run log-ratio WITHOUT threshold (should get all results)
-    let output_no_threshold = Command::new(&binary)
-        .args([
-            "classify",
-            "log-ratio",
-            "-i",
-            index_path.to_str().unwrap(),
-            "-1",
-            query_path.to_str().unwrap(),
-            "-t",
-            "0.0",
-        ])
-        .output()?;
-
-    assert!(
-        output_no_threshold.status.success(),
-        "Log-ratio without threshold failed: {}",
-        String::from_utf8_lossy(&output_no_threshold.stderr)
-    );
-
-    // Run log-ratio WITH high threshold (should filter weak matches)
-    let output_high_threshold = Command::new(&binary)
-        .args([
-            "classify",
-            "log-ratio",
-            "-i",
-            index_path.to_str().unwrap(),
-            "-1",
-            query_path.to_str().unwrap(),
-            "-t",
-            "0.5", // High threshold
-        ])
-        .output()?;
-
-    assert!(
-        output_high_threshold.status.success(),
-        "Log-ratio with high threshold failed: {}",
-        String::from_utf8_lossy(&output_high_threshold.stderr)
-    );
-
-    let stdout_no_thresh = String::from_utf8_lossy(&output_no_threshold.stdout);
-    let stdout_high_thresh = String::from_utf8_lossy(&output_high_threshold.stdout);
-
-    println!("No threshold output:\n{}", stdout_no_thresh);
-    println!("High threshold output:\n{}", stdout_high_thresh);
-
-    // Count data lines (excluding header)
-    let count_data_lines =
-        |s: &str| -> usize { s.lines().skip(1).filter(|l| !l.is_empty()).count() };
-
-    let lines_no_thresh = count_data_lines(&stdout_no_thresh);
-    let lines_high_thresh = count_data_lines(&stdout_high_thresh);
-
-    println!(
-        "Lines without threshold: {}, with high threshold: {}",
-        lines_no_thresh, lines_high_thresh
-    );
-
-    // With high threshold, we should have fewer or equal results
-    // (the weak_query with N's should be filtered out)
-    assert!(
-        lines_high_thresh <= lines_no_thresh,
-        "High threshold should filter results: {} <= {}",
-        lines_high_thresh,
-        lines_no_thresh
-    );
-
-    Ok(())
-}
-
-/// Test that log-ratio outputs infinity when one bucket has score 0
-#[test]
-fn test_cli_log_ratio_infinity_output() -> Result<()> {
-    let dir = tempdir()?;
-
-    // We need to create two DISTINCT reference sequences that share nothing in common
-    // This ensures a read from one won't match the other at all
-
-    // Create two completely different reference sequences
-    let ref1_path = dir.path().join("ref1.fasta");
-    let ref2_path = dir.path().join("ref2.fasta");
-
-    // Ref1: repeating AAAA pattern (purines only)
-    let ref1_seq = "A".repeat(200);
-    fs::write(&ref1_path, format!(">ref1\n{}\n", ref1_seq))?;
-
-    // Ref2: repeating TTTT pattern (pyrimidines only)
-    let ref2_seq = "T".repeat(200);
-    fs::write(&ref2_path, format!(">ref2\n{}\n", ref2_seq))?;
-
-    let binary = get_binary_path();
-    let index_path = dir.path().join("test.ryxdi");
-
-    // Create index with two separate buckets
+    // Create a valid single-bucket index
     let output = Command::new(&binary)
         .args([
             "index",
             "create",
             "-o",
-            index_path.to_str().unwrap(),
+            single_path.to_str().unwrap(),
             "-r",
-            ref1_path.to_str().unwrap(),
-            "-r",
-            ref2_path.to_str().unwrap(),
-            "-k",
-            "32",
-            "-w",
-            "10",
-            "--separate-buckets",
-        ])
-        .output()?;
-
-    assert!(
-        output.status.success(),
-        "Index creation failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // Create a query that matches only ref1 (A's) - exactly matches ref1
-    let query_path = dir.path().join("query.fastq");
-    let query_seq = "A".repeat(100); // Pure A's should match ref1, not ref2
-    let query_qual = "I".repeat(100);
-    fs::write(
-        &query_path,
-        format!("@only_matches_ref1\n{}\n+\n{}\n", query_seq, query_qual),
-    )?;
-
-    // Run log-ratio classification
-    let output = Command::new(&binary)
-        .args([
-            "classify",
-            "log-ratio",
-            "-i",
-            index_path.to_str().unwrap(),
-            "-1",
-            query_path.to_str().unwrap(),
-        ])
-        .output()?;
-
-    assert!(
-        output.status.success(),
-        "Log-ratio classification failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("Infinity test output:\n{}", stdout);
-
-    // The output should contain "inf" because:
-    // - Query matches ref1 (A's) with score > 0
-    // - Query doesn't match ref2 (T's) with score = 0
-    // - log10(score/0) = +infinity OR log10(0/score) would be handled as 0
-    // Depending on which bucket is numerator/denominator, we might see "inf" or "0"
-
-    let has_result = stdout.lines().skip(1).any(|l| !l.is_empty());
-    assert!(
-        has_result,
-        "Should have at least one result for the matching query"
-    );
-
-    // Look for infinity in output (can be "inf" for positive infinity)
-    // Note: if ref1 is denominator and has score 0, we get inf
-    // if ref1 is numerator and ref2 has score 0, we get inf
-    // The actual behavior depends on bucket ordering
-    for line in stdout.lines().skip(1) {
-        if line.is_empty() {
-            continue;
-        }
-        let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() >= 3 {
-            let score_str = cols[2];
-            println!("Score value: '{}'", score_str);
-            // Score should be parseable (inf, 0, or some float)
-            if score_str == "inf" {
-                println!("Found infinity as expected when one bucket has 0 score");
-            } else if let Ok(score) = score_str.parse::<f64>() {
-                // If it's 0.0, that means numerator was 0
-                // If it's a finite non-zero, both buckets had scores
-                println!("Found finite score: {}", score);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Test that log-ratio fails gracefully with 1-bucket index
-#[test]
-fn test_cli_log_ratio_fails_with_one_bucket() -> Result<()> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let dir = tempdir()?;
-
-    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
-    if !phix_path.exists() {
-        eprintln!("Skipping test: example FASTA file not found");
-        return Ok(());
-    }
-
-    let binary = get_binary_path();
-    let index_path = dir.path().join("test.ryxdi");
-
-    // Create index with only ONE bucket (single reference file)
-    let output = Command::new(&binary)
-        .args([
-            "index",
-            "create",
-            "-o",
-            index_path.to_str().unwrap(),
-            "-r",
-            phix_path.to_str().unwrap(),
+            puc19_path.to_str().unwrap(),
             "-k",
             "32",
             "-w",
             "10",
         ])
         .output()?;
-
     assert!(
         output.status.success(),
-        "Index creation failed: {}",
+        "Single-bucket index creation failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Create a query file
     let query_path = dir.path().join("query.fastq");
     fs::write(
         &query_path,
         "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
     )?;
 
-    // Run log-ratio classification - should FAIL
+    // Use multi-bucket index as numerator -> should fail with "exactly 1 bucket"
     let output = Command::new(&binary)
         .args([
             "classify",
             "log-ratio",
-            "-i",
-            index_path.to_str().unwrap(),
+            "-n",
+            multi_path.to_str().unwrap(),
+            "-d",
+            single_path.to_str().unwrap(),
             "-1",
             query_path.to_str().unwrap(),
         ])
         .output()?;
 
-    // Should fail because log-ratio requires exactly 2 buckets
     assert!(
         !output.status.success(),
-        "Log-ratio with 1-bucket index should fail"
+        "Log-ratio with multi-bucket numerator should fail"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     println!("Expected error: {}", stderr);
 
-    // Error message should mention 2 buckets requirement
     assert!(
-        stderr.contains("2 buckets") || stderr.contains("exactly 2"),
-        "Error should mention 2 bucket requirement. Got: {}",
+        stderr.contains("exactly 1 bucket") || stderr.contains("1 bucket"),
+        "Error should mention exactly 1 bucket requirement. Got: {}",
         stderr
     );
 
     Ok(())
 }
 
-/// Test that log-ratio fails gracefully with 3-bucket index
+/// Test that log-ratio fails with incompatible indices (different k values)
 #[test]
-fn test_cli_log_ratio_fails_with_three_buckets() -> Result<()> {
+fn test_cli_log_ratio_fails_incompatible_indices() -> Result<()> {
     let dir = tempdir()?;
 
-    // Create three reference files
     let ref1_path = dir.path().join("ref1.fasta");
     let ref2_path = dir.path().join("ref2.fasta");
-    let ref3_path = dir.path().join("ref3.fasta");
-
-    fs::write(
-        &ref1_path,
-        ">ref1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
-    )?;
-    fs::write(
-        &ref2_path,
-        ">ref2\nTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT\n",
-    )?;
-    fs::write(
-        &ref3_path,
-        ">ref3\nGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\n",
-    )?;
+    fs::write(&ref1_path, format!(">ref1\n{}\n", "A".repeat(200)))?;
+    fs::write(&ref2_path, format!(">ref2\n{}\n", "T".repeat(200)))?;
 
     let binary = get_binary_path();
-    let index_path = dir.path().join("test.ryxdi");
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
 
-    // Create index with THREE separate buckets
+    // Create numerator with k=32
     let output = Command::new(&binary)
         .args([
             "index",
             "create",
             "-o",
-            index_path.to_str().unwrap(),
+            num_path.to_str().unwrap(),
             "-r",
             ref1_path.to_str().unwrap(),
-            "-r",
-            ref2_path.to_str().unwrap(),
-            "-r",
-            ref3_path.to_str().unwrap(),
             "-k",
             "32",
             "-w",
             "10",
-            "--separate-buckets",
         ])
         .output()?;
-
     assert!(
         output.status.success(),
-        "Index creation failed: {}",
+        "Numerator index creation failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Create a query file
+    // Create denominator with k=16 (INCOMPATIBLE)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
+            "-r",
+            ref2_path.to_str().unwrap(),
+            "-k",
+            "16",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Denominator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
     let query_path = dir.path().join("query.fastq");
     fs::write(
         &query_path,
-        "@query1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+        format!("@query1\n{}\n+\n{}\n", "A".repeat(100), "I".repeat(100)),
     )?;
 
-    // Run log-ratio classification - should FAIL
+    // Should fail due to k mismatch
     let output = Command::new(&binary)
         .args([
             "classify",
             "log-ratio",
-            "-i",
-            index_path.to_str().unwrap(),
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
             "-1",
             query_path.to_str().unwrap(),
         ])
         .output()?;
 
-    // Should fail because log-ratio requires exactly 2 buckets
     assert!(
         !output.status.success(),
-        "Log-ratio with 3-bucket index should fail"
+        "Log-ratio with incompatible k should fail"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     println!("Expected error: {}", stderr);
 
-    // Error message should mention 2 buckets requirement and found 3
     assert!(
-        stderr.contains("2 buckets") || stderr.contains("exactly 2"),
-        "Error should mention 2 bucket requirement. Got: {}",
+        stderr.contains("k") || stderr.contains("mismatch") || stderr.contains("compatible"),
+        "Error should mention k mismatch. Got: {}",
         stderr
     );
+
+    Ok(())
+}
+
+/// Test that --numerator-skip-threshold rejects invalid values (zero, negative, >1)
+#[test]
+fn test_cli_log_ratio_fails_invalid_skip_threshold() -> Result<()> {
+    let dir = tempdir()?;
+
+    let ref_path = dir.path().join("ref.fasta");
+    fs::write(&ref_path, format!(">ref\n{}\n", "A".repeat(200)))?;
+
+    let binary = get_binary_path();
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
+
+    // Create both indices
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            num_path.to_str().unwrap(),
+            "-r",
+            ref_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(output.status.success());
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
+            "-r",
+            ref_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(output.status.success());
+
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        format!("@query1\n{}\n+\n{}\n", "A".repeat(100), "I".repeat(100)),
+    )?;
+
+    // Test threshold = 0.0 (should fail)
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "--numerator-skip-threshold",
+            "0.0",
+        ])
+        .output()?;
+    assert!(!output.status.success(), "threshold=0.0 should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("found 3") || stderr.contains("3"),
-        "Error should mention found 3 buckets. Got: {}",
+        stderr.contains("between 0.0 (exclusive) and 1.0 (inclusive)"),
+        "Got: {}",
         stderr
     );
+
+    // Test threshold = -0.5 (should fail)
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "--numerator-skip-threshold",
+            "-0.5",
+        ])
+        .output()?;
+    assert!(!output.status.success(), "negative threshold should fail");
+
+    // Test threshold = 1.5 (should fail)
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "--numerator-skip-threshold",
+            "1.5",
+        ])
+        .output()?;
+    assert!(!output.status.success(), "threshold > 1.0 should fail");
 
     Ok(())
 }
@@ -3216,16 +3390,11 @@ fn read_gzipped(path: &std::path::Path) -> String {
     content
 }
 
-/// Test that --output-sequences outputs reads with NEGATIVE/ZERO log-ratio by default.
+/// Test --output-sequences outputs reads with NEGATIVE log-ratio (default).
 ///
-/// Creates a 2-bucket index where:
-/// - Bucket 1 (phiX): numerator in log-ratio
-/// - Bucket 2 (pUC19): denominator in log-ratio
-///
-/// Log-ratio = log10(phiX_score / pUC19_score)
-/// - A read matching only phiX has log-ratio = +inf (excluded by default)
-/// - A read matching only pUC19 has log-ratio = -inf (included by default)
-/// - A read matching both equally has log-ratio = 0 (included by default)
+/// With two single-bucket indices (phiX=numerator, pUC19=denominator):
+/// - A read matching only phiX (numerator) has log-ratio = +inf (excluded)
+/// - A read matching only pUC19 (denominator) has log-ratio = -inf (included)
 #[test]
 fn test_log_ratio_output_sequences_negative() -> Result<()> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -3239,36 +3408,50 @@ fn test_log_ratio_output_sequences_negative() -> Result<()> {
     }
 
     let binary = get_binary_path();
-    let index_path = dir.path().join("test.ryxdi");
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
 
-    // Create 2-bucket index with --separate-buckets
+    // Create separate single-bucket indices
     let output = Command::new(&binary)
         .args([
             "index",
             "create",
             "-o",
-            index_path.to_str().unwrap(),
+            num_path.to_str().unwrap(),
             "-r",
             phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Numerator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
             "-r",
             puc19_path.to_str().unwrap(),
             "-k",
             "32",
             "-w",
             "10",
-            "--separate-buckets",
         ])
         .output()?;
     assert!(
         output.status.success(),
-        "Index creation failed: {}",
+        "Denominator index creation failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Create query file with two reads:
-    // - phiX read: matches only phiX -> log-ratio = +inf (excluded)
-    // - pUC19 read: matches only pUC19 -> log-ratio = -inf or 0 (included)
-    // Using real sequences from the reference files.
     let phix_seq = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT";
     let puc19_seq = "TCGCGCGTTTCGGTGATGACGGTGAAAACCTCTGACACATGCAGCTCCCGGAGACGGTCACAGCTTGTCT";
 
@@ -3284,15 +3467,16 @@ fn test_log_ratio_output_sequences_negative() -> Result<()> {
         ),
     )?;
 
-    // Run log-ratio with --output-sequences (default: pass negative/zero)
     let output_sequences_path = dir.path().join("filtered.fastq.gz");
     let tsv_output_path = dir.path().join("results.tsv");
     let output = Command::new(&binary)
         .args([
             "classify",
             "log-ratio",
-            "-i",
-            index_path.to_str().unwrap(),
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
             "-1",
             query_path.to_str().unwrap(),
             "-o",
@@ -3308,37 +3492,33 @@ fn test_log_ratio_output_sequences_negative() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Debug: show TSV output
     let tsv_content = fs::read_to_string(&tsv_output_path)?;
     println!("TSV output:\n{}", tsv_content);
 
-    // Verify the output file exists
     assert!(
         output_sequences_path.exists(),
         "Output sequences file should exist"
     );
 
-    // Read and verify the gzipped output
     let content = read_gzipped(&output_sequences_path);
     println!("Output sequences content:\n{}", content);
 
-    // The pUC19 read should have log-ratio <= 0 and be output
+    // pUC19 read: numerator=0 -> -inf -> included by default
     assert!(
         content.contains("@puc19_read"),
-        "pUC19 read with negative/zero log-ratio should be in output"
+        "pUC19 read with -inf log-ratio should be in output"
     );
     assert!(
         content.contains(puc19_seq),
         "pUC19 sequence should be preserved in output"
     );
 
-    // The phiX read has log-ratio = +inf and should NOT be output
+    // phiX read: numerator>0, denominator=0 -> +inf -> excluded by default
     assert!(
         !content.contains("@phix_read"),
-        "phiX read with positive log-ratio (+inf) should NOT be in output"
+        "phiX read with +inf log-ratio should NOT be in output"
     );
 
-    // Should be valid FASTQ format
     assert!(
         content.contains("+\n"),
         "Should have FASTQ quality separator"
@@ -3347,11 +3527,11 @@ fn test_log_ratio_output_sequences_negative() -> Result<()> {
     Ok(())
 }
 
-/// Test that --passing-is-positive outputs reads with POSITIVE log-ratio only.
+/// Test --passing-is-positive outputs reads with POSITIVE log-ratio only.
 ///
-/// With --passing-is-positive:
-/// - phiX read: log-ratio = +inf -> INCLUDED
-/// - pUC19 read: log-ratio = 0 or -inf -> EXCLUDED (0 is not positive)
+/// With two single-bucket indices and --passing-is-positive:
+/// - phiX read (numerator match): log-ratio = +inf -> INCLUDED
+/// - pUC19 read (denominator match): log-ratio = -inf -> EXCLUDED
 #[test]
 fn test_log_ratio_output_sequences_positive_flag() -> Result<()> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -3365,35 +3545,50 @@ fn test_log_ratio_output_sequences_positive_flag() -> Result<()> {
     }
 
     let binary = get_binary_path();
-    let index_path = dir.path().join("test.ryxdi");
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
 
-    // Create 2-bucket index
+    // Create separate single-bucket indices
     let output = Command::new(&binary)
         .args([
             "index",
             "create",
             "-o",
-            index_path.to_str().unwrap(),
+            num_path.to_str().unwrap(),
             "-r",
             phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Numerator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
             "-r",
             puc19_path.to_str().unwrap(),
             "-k",
             "32",
             "-w",
             "10",
-            "--separate-buckets",
         ])
         .output()?;
     assert!(
         output.status.success(),
-        "Index creation failed: {}",
+        "Denominator index creation failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Create query with reads:
-    // - phix_read: matches only phiX -> log-ratio = +inf (INCLUDED with --passing-is-positive)
-    // - puc19_read: matches only pUC19 -> log-ratio = 0 or -inf (EXCLUDED, 0 is not > 0)
     let phix_seq = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT";
     let puc19_seq = "TCGCGCGTTTCGGTGATGACGGTGAAAACCTCTGACACATGCAGCTCCCGGAGACGGTCACAGCTTGTCT";
 
@@ -3409,15 +3604,16 @@ fn test_log_ratio_output_sequences_positive_flag() -> Result<()> {
         ),
     )?;
 
-    // Run with --passing-is-positive
     let output_sequences_path = dir.path().join("filtered.fastq.gz");
     let tsv_output_path = dir.path().join("results.tsv");
     let output = Command::new(&binary)
         .args([
             "classify",
             "log-ratio",
-            "-i",
-            index_path.to_str().unwrap(),
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
             "-1",
             query_path.to_str().unwrap(),
             "-o",
@@ -3434,34 +3630,31 @@ fn test_log_ratio_output_sequences_positive_flag() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Debug: show TSV output
     let tsv_content = fs::read_to_string(&tsv_output_path)?;
     println!("TSV output:\n{}", tsv_content);
 
-    // Verify output file exists
     assert!(
         output_sequences_path.exists(),
         "Output sequences file should exist"
     );
 
-    // Read and verify
     let content = read_gzipped(&output_sequences_path);
     println!("Output sequences (passing-is-positive):\n{}", content);
 
-    // phiX read has log-ratio = +inf and should be INCLUDED
+    // phiX read: numerator>0, denom=0 -> +inf -> INCLUDED with --passing-is-positive
     assert!(
         content.contains("@phix_read"),
-        "phiX read with positive log-ratio (+inf) should be in output with --passing-is-positive"
+        "phiX read with +inf log-ratio should be in output with --passing-is-positive"
     );
     assert!(
         content.contains(phix_seq),
         "phiX sequence should be preserved in output"
     );
 
-    // pUC19 read has log-ratio = 0 and should be EXCLUDED (0 is not > 0)
+    // pUC19 read: numerator=0 -> -inf -> EXCLUDED
     assert!(
         !content.contains("@puc19_read"),
-        "pUC19 read with log-ratio 0 should NOT be in output when --passing-is-positive"
+        "pUC19 read with -inf log-ratio should NOT be in output when --passing-is-positive"
     );
 
     Ok(())
@@ -3469,7 +3662,7 @@ fn test_log_ratio_output_sequences_positive_flag() -> Result<()> {
 
 /// Test that paired-end output creates foo.R1.fastq.gz and foo.R2.fastq.gz files.
 ///
-/// Uses a pUC19-matching read (log-ratio <= 0) which passes with default settings.
+/// Uses a pUC19-matching read (log-ratio = -inf) which passes with default settings.
 #[test]
 fn test_log_ratio_paired_creates_r1_r2_files() -> Result<()> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -3483,40 +3676,56 @@ fn test_log_ratio_paired_creates_r1_r2_files() -> Result<()> {
     }
 
     let binary = get_binary_path();
-    let index_path = dir.path().join("test.ryxdi");
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
 
-    // Create 2-bucket index
+    // Create separate single-bucket indices
     let output = Command::new(&binary)
         .args([
             "index",
             "create",
             "-o",
-            index_path.to_str().unwrap(),
+            num_path.to_str().unwrap(),
             "-r",
             phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Numerator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
             "-r",
             puc19_path.to_str().unwrap(),
             "-k",
             "32",
             "-w",
             "10",
-            "--separate-buckets",
         ])
         .output()?;
     assert!(
         output.status.success(),
-        "Index creation failed: {}",
+        "Denominator index creation failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
     // Create paired-end query files (R1 and R2)
-    // Use pUC19-matching sequence which has log-ratio <= 0 (passes with default)
+    // Use pUC19-matching sequence: numerator=0 -> -inf -> passes with default
     let r1_path = dir.path().join("reads_R1.fastq");
     let r2_path = dir.path().join("reads_R2.fastq");
 
-    // pUC19-matching R1 sequence (log-ratio <= 0, should be output with default settings)
     let puc19_r1 = "TCGCGCGTTTCGGTGATGACGGTGAAAACCTCTGACACATGCAGCTCCCGGAGACGGTCACAGCTTGTCT";
-    // R2 sequence (can be anything, just testing paired-end file creation)
     let puc19_r2 = "GTAAGCGGATGCCGGGAGCAGACAAGCCCGTCAGGGCGCGTCAGCGGGTGTTGGCGGGTGTCGGGGCTGG";
 
     fs::write(
@@ -3528,15 +3737,16 @@ fn test_log_ratio_paired_creates_r1_r2_files() -> Result<()> {
         format!("@read1\n{}\n+\n{}\n", puc19_r2, "J".repeat(puc19_r2.len())),
     )?;
 
-    // Run log-ratio with paired-end and --output-sequences
     let output_sequences_path = dir.path().join("filtered.fastq.gz");
     let tsv_output_path = dir.path().join("results.tsv");
     let output = Command::new(&binary)
         .args([
             "classify",
             "log-ratio",
-            "-i",
-            index_path.to_str().unwrap(),
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
             "-1",
             r1_path.to_str().unwrap(),
             "-2",
@@ -3554,11 +3764,9 @@ fn test_log_ratio_paired_creates_r1_r2_files() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Debug: show TSV output
     let tsv_content = fs::read_to_string(&tsv_output_path)?;
     println!("TSV output:\n{}", tsv_content);
 
-    // Verify R1 and R2 output files were created
     let r1_output_path = dir.path().join("filtered.R1.fastq.gz");
     let r2_output_path = dir.path().join("filtered.R2.fastq.gz");
 
@@ -3571,13 +3779,12 @@ fn test_log_ratio_paired_creates_r1_r2_files() -> Result<()> {
         "R2 output file (filtered.R2.fastq.gz) should exist"
     );
 
-    // The original path should NOT exist for paired-end (only R1/R2)
+    // Original path should NOT exist for paired-end (only R1/R2)
     assert!(
         !output_sequences_path.exists(),
         "Original path should not exist for paired-end; R1/R2 paths used instead"
     );
 
-    // Read and verify R1 content
     let r1_content = read_gzipped(&r1_output_path);
     println!("R1 output content:\n{}", r1_content);
     assert!(
@@ -3589,7 +3796,6 @@ fn test_log_ratio_paired_creates_r1_r2_files() -> Result<()> {
         "R1 should contain the R1 sequence"
     );
 
-    // Read and verify R2 content
     let r2_content = read_gzipped(&r2_output_path);
     println!("R2 output content:\n{}", r2_content);
     assert!(

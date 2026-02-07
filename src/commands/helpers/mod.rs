@@ -44,8 +44,8 @@ pub use input_reader::{
 };
 #[allow(unused_imports)]
 pub use log_ratio::{
-    compute_log_ratio, compute_log_ratio_from_hits, filter_log_ratios_by_threshold,
-    format_log_ratio_bucket_name, format_log_ratio_output, LogRatioResult,
+    compute_log_ratio, format_log_ratio_bucket_name, format_log_ratio_output, FastPath,
+    LogRatioResult,
 };
 pub use metadata::{load_index_metadata, resolve_bucket_id, sanitize_bucket_name};
 pub use output::{OutputFormat, OutputWriter};

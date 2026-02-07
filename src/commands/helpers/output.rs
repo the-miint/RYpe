@@ -78,12 +78,13 @@ pub enum OutputWriter {
     Tsv(BufWriter<Box<dyn Write + Send>>),
     /// Gzip-compressed TSV output. Uses Option to allow taking ownership for proper finalization.
     TsvGz(Option<BufWriter<GzEncoder<File>>>),
-    /// Parquet output with batched writing (long format: read_id, bucket_name, score)
+    /// Parquet output with batched writing (long format: read_id, bucket_name, score[, fast_path])
     Parquet {
         writer: ArrowWriter<File>,
         read_ids: Vec<String>,
         bucket_names: Vec<String>,
         scores: Vec<f64>,
+        fast_paths: Option<Vec<String>>,
         batch_size: usize,
     },
     /// Parquet output with wide format (read_id, bucket_1_score, bucket_2_score, ...)
@@ -109,6 +110,19 @@ impl OutputWriter {
         format: OutputFormat,
         path: Option<&PathBuf>,
         parquet_batch_size: Option<usize>,
+    ) -> Result<Self> {
+        Self::new_long(format, path, parquet_batch_size, false)
+    }
+
+    /// Create a new long-format output writer with optional fast_path column.
+    ///
+    /// When `include_fast_path` is true, Parquet output includes a 4th `fast_path` string column
+    /// and the TSV parser accepts 4 columns instead of 3.
+    pub fn new_long(
+        format: OutputFormat,
+        path: Option<&PathBuf>,
+        parquet_batch_size: Option<usize>,
+        include_fast_path: bool,
     ) -> Result<Self> {
         // Check for stdout
         let is_stdout = OutputFormat::is_stdout(path);
@@ -144,19 +158,28 @@ impl OutputWriter {
                 let file = File::create(path)
                     .with_context(|| format!("Failed to create output file: {:?}", path))?;
 
-                // Define schema: (read_id: Utf8, bucket_name: Utf8, score: Float64)
-                let schema = Arc::new(Schema::new(vec![
+                // Define schema: (read_id, bucket_name, score[, fast_path])
+                let mut fields = vec![
                     Field::new("read_id", DataType::Utf8, false),
                     Field::new("bucket_name", DataType::Utf8, false),
                     Field::new("score", DataType::Float64, false),
-                ]));
+                ];
+                if include_fast_path {
+                    fields.push(Field::new("fast_path", DataType::Utf8, false));
+                }
+                let schema = Arc::new(Schema::new(fields));
 
-                // Use zstd compression and dictionary encoding for bucket_name (categorical)
+                // Use zstd compression and dictionary encoding for categorical columns
                 let bucket_name_col = ColumnPath::new(vec!["bucket_name".to_string()]);
-                let props = WriterProperties::builder()
+                let mut props_builder = WriterProperties::builder()
                     .set_compression(parquet::basic::Compression::ZSTD(ZstdLevel::default()))
-                    .set_column_dictionary_enabled(bucket_name_col, true)
-                    .build();
+                    .set_column_dictionary_enabled(bucket_name_col, true);
+                if include_fast_path {
+                    let fast_path_col = ColumnPath::new(vec!["fast_path".to_string()]);
+                    props_builder =
+                        props_builder.set_column_dictionary_enabled(fast_path_col, true);
+                }
+                let props = props_builder.build();
 
                 let writer = ArrowWriter::try_new(file, schema, Some(props))
                     .context("Failed to create Parquet writer")?;
@@ -168,6 +191,11 @@ impl OutputWriter {
                     read_ids: Vec::with_capacity(batch_size),
                     bucket_names: Vec::with_capacity(batch_size),
                     scores: Vec::with_capacity(batch_size),
+                    fast_paths: if include_fast_path {
+                        Some(Vec::with_capacity(batch_size))
+                    } else {
+                        None
+                    },
                     batch_size,
                 })
             }
@@ -298,6 +326,7 @@ impl OutputWriter {
                 read_ids,
                 bucket_names,
                 scores,
+                fast_paths,
                 batch_size,
             } => {
                 read_ids.push(read_id.to_string());
@@ -306,7 +335,7 @@ impl OutputWriter {
 
                 // Flush if buffer is full
                 if read_ids.len() >= *batch_size {
-                    Self::flush_parquet_batch(writer, read_ids, bucket_names, scores)?;
+                    Self::flush_parquet_batch(writer, read_ids, bucket_names, scores, fast_paths)?;
                 }
                 Ok(())
             }
@@ -337,21 +366,23 @@ impl OutputWriter {
                 read_ids,
                 bucket_names,
                 scores,
+                fast_paths,
                 batch_size,
             } => {
                 // Parse TSV lines and buffer for Parquet
+                let expected_cols = if fast_paths.is_some() { 4 } else { 3 };
                 let text = String::from_utf8_lossy(&data);
                 for line in text.lines() {
                     if line.is_empty() {
                         continue;
                     }
                     let parts: Vec<&str> = line.split('\t').collect();
-                    // Validate exact column count (read_id, bucket_name, score)
-                    if parts.len() != 3 {
+                    if parts.len() != expected_cols {
                         return Err(anyhow!(
-                            "Long format line has {} columns, expected 3 (read_id, bucket_name, score). \
+                            "Long format line has {} columns, expected {}. \
                              Line starts with: '{}'",
                             parts.len(),
+                            expected_cols,
                             parts.first().unwrap_or(&"<empty>")
                         ));
                     }
@@ -361,10 +392,19 @@ impl OutputWriter {
                         format!("Invalid score value '{}' for read '{}'", parts[2], parts[0])
                     })?;
                     scores.push(score);
+                    if let Some(ref mut fps) = fast_paths {
+                        fps.push(parts[3].to_string());
+                    }
 
                     // Flush if buffer is full
                     if read_ids.len() >= *batch_size {
-                        Self::flush_parquet_batch(writer, read_ids, bucket_names, scores)?;
+                        Self::flush_parquet_batch(
+                            writer,
+                            read_ids,
+                            bucket_names,
+                            scores,
+                            fast_paths,
+                        )?;
                     }
                 }
                 Ok(())
@@ -425,6 +465,7 @@ impl OutputWriter {
         read_ids: &mut Vec<String>,
         bucket_names: &mut Vec<String>,
         scores: &mut Vec<f64>,
+        fast_paths: &mut Option<Vec<String>>,
     ) -> Result<()> {
         if read_ids.is_empty() {
             return Ok(());
@@ -446,15 +487,24 @@ impl OutputWriter {
             score_builder.append_value(score);
         }
 
-        let batch = RecordBatch::try_from_iter(vec![
+        let mut columns: Vec<(&str, ArrayRef)> = vec![
             ("read_id", Arc::new(read_id_builder.finish()) as ArrayRef),
             (
                 "bucket_name",
                 Arc::new(bucket_name_builder.finish()) as ArrayRef,
             ),
             ("score", Arc::new(score_builder.finish()) as ArrayRef),
-        ])
-        .context("Failed to create RecordBatch")?;
+        ];
+
+        if let Some(ref mut fps) = fast_paths {
+            let mut fp_builder = StringBuilder::with_capacity(fps.len(), fps.len() * 16);
+            for fp in fps.iter() {
+                fp_builder.append_value(fp);
+            }
+            columns.push(("fast_path", Arc::new(fp_builder.finish()) as ArrayRef));
+        }
+
+        let batch = RecordBatch::try_from_iter(columns).context("Failed to create RecordBatch")?;
 
         writer
             .write(&batch)
@@ -464,6 +514,9 @@ impl OutputWriter {
         read_ids.clear();
         bucket_names.clear();
         scores.clear();
+        if let Some(ref mut fps) = fast_paths {
+            fps.clear();
+        }
 
         Ok(())
     }
@@ -555,10 +608,11 @@ impl OutputWriter {
                 read_ids,
                 bucket_names,
                 scores,
+                fast_paths,
                 ..
             } => {
                 // Flush remaining buffered records
-                Self::flush_parquet_batch(writer, read_ids, bucket_names, scores)?;
+                Self::flush_parquet_batch(writer, read_ids, bucket_names, scores, fast_paths)?;
                 writer.finish().context("Failed to finish Parquet file")?;
                 Ok(())
             }
