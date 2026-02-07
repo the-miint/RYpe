@@ -3809,3 +3809,507 @@ fn test_log_ratio_paired_creates_r1_r2_files() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_cli_from_config_subtract_nonexistent_index() -> Result<()> {
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+
+    // Create a minimal FASTA file
+    let ref_path = dir.path().join("ref.fasta");
+    fs::write(&ref_path, format!(">seq1\n{}\n", "A".repeat(200)))?;
+
+    // Write a valid TOML config
+    let config_path = dir.path().join("config.toml");
+    let config_content = format!(
+        r#"
+[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "output.ryxdi"
+
+[buckets.TestBucket]
+files = ["{}"]
+"#,
+        ref_path.to_str().unwrap()
+    );
+    fs::write(&config_path, config_content)?;
+
+    // Run from-config with --subtract-from pointing to nonexistent index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "from-config",
+            "-c",
+            config_path.to_str().unwrap(),
+            "--subtract-from",
+            dir.path().join("nonexistent.ryxdi").to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        !output.status.success(),
+        "Should fail with nonexistent subtraction index"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nonexistent.ryxdi"),
+        "Error should mention the bad path, got: {}",
+        stderr
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_cli_from_config_subtract_incompatible_index() -> Result<()> {
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+
+    // Create a FASTA file
+    let ref_path = dir.path().join("ref.fasta");
+    fs::write(&ref_path, format!(">seq1\n{}\n", "A".repeat(200)))?;
+
+    // Build a subtraction index with k=32, w=10
+    let subtract_path = dir.path().join("subtract.ryxdi");
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            subtract_path.to_str().unwrap(),
+            "-r",
+            ref_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Subtraction index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Write config with DIFFERENT k=64, w=50 (incompatible)
+    let config_path = dir.path().join("config.toml");
+    let config_content = format!(
+        r#"
+[index]
+k = 64
+window = 50
+salt = 0x5555555555555555
+output = "output.ryxdi"
+
+[buckets.TestBucket]
+files = ["{}"]
+"#,
+        ref_path.to_str().unwrap()
+    );
+    fs::write(&config_path, config_content)?;
+
+    // Run from-config with incompatible --subtract-from
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "from-config",
+            "-c",
+            config_path.to_str().unwrap(),
+            "--subtract-from",
+            subtract_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        !output.status.success(),
+        "Should fail with incompatible subtraction index"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mismatch"),
+        "Error should mention mismatch, got: {}",
+        stderr
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_cli_from_config_subtract_removes_minimizers() -> Result<()> {
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+
+    // Create reference files with overlapping sequences
+    let shared_seq = "A".repeat(200);
+    let unique_seq = "T".repeat(200);
+
+    let ref_shared = dir.path().join("ref_shared.fasta");
+    fs::write(&ref_shared, format!(">shared\n{}\n", shared_seq))?;
+
+    let ref_main = dir.path().join("ref_main.fasta");
+    fs::write(
+        &ref_main,
+        format!(">shared_copy\n{}\n>unique\n{}\n", shared_seq, unique_seq),
+    )?;
+
+    // Build subtraction index from the shared sequence
+    let subtract_path = dir.path().join("subtract.ryxdi");
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            subtract_path.to_str().unwrap(),
+            "-r",
+            ref_shared.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Subtraction index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Build from-config WITHOUT subtraction
+    let config_no_sub = dir.path().join("config_no_sub.toml");
+    let config_content = format!(
+        r#"
+[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "output_no_sub.ryxdi"
+
+[buckets.MainBucket]
+files = ["{}"]
+"#,
+        ref_main.to_str().unwrap()
+    );
+    fs::write(&config_no_sub, &config_content)?;
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "from-config",
+            "-c",
+            config_no_sub.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation without subtraction failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Build from-config WITH subtraction
+    let config_with_sub = dir.path().join("config_with_sub.toml");
+    let config_content_sub = format!(
+        r#"
+[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "output_with_sub.ryxdi"
+
+[buckets.MainBucket]
+files = ["{}"]
+"#,
+        ref_main.to_str().unwrap()
+    );
+    fs::write(&config_with_sub, &config_content_sub)?;
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "from-config",
+            "-c",
+            config_with_sub.to_str().unwrap(),
+            "--subtract-from",
+            subtract_path.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation with subtraction failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Compare stats: subtracted index should have fewer total entries
+    let stats_no_sub = Command::new(&binary)
+        .args([
+            "index",
+            "stats",
+            "-i",
+            dir.path().join("output_no_sub.ryxdi").to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(stats_no_sub.status.success());
+
+    let stats_with_sub = Command::new(&binary)
+        .args([
+            "index",
+            "stats",
+            "-i",
+            dir.path().join("output_with_sub.ryxdi").to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(stats_with_sub.status.success());
+
+    let no_sub_stdout = String::from_utf8_lossy(&stats_no_sub.stdout);
+    let with_sub_stdout = String::from_utf8_lossy(&stats_with_sub.stdout);
+
+    // Parse total minimizers from stats output (stdout)
+    fn parse_total_minimizers(output: &str) -> u64 {
+        for line in output.lines() {
+            if line.contains("Total minimizers:") {
+                return line
+                    .split(':')
+                    .last()
+                    .unwrap()
+                    .trim()
+                    .replace(',', "")
+                    .parse()
+                    .unwrap();
+            }
+        }
+        panic!("Could not find 'Total minimizers' in output:\n{}", output);
+    }
+
+    let mins_no_sub = parse_total_minimizers(&no_sub_stdout);
+    let mins_with_sub = parse_total_minimizers(&with_sub_stdout);
+
+    println!("Minimizers without subtraction: {}", mins_no_sub);
+    println!("Minimizers with subtraction: {}", mins_with_sub);
+
+    assert!(
+        mins_with_sub < mins_no_sub,
+        "Subtracted index should have fewer minimizers: {} should be < {}",
+        mins_with_sub,
+        mins_no_sub
+    );
+
+    // Also verify the subtracted index is valid (stats didn't error)
+    assert!(
+        mins_with_sub > 0,
+        "Subtracted index should still have some minimizers (the unique sequence)"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_cli_from_config_subtract_multibucket() -> Result<()> {
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+
+    // Create sequences: shared overlap + two unique per-bucket sequences
+    let shared_seq = "A".repeat(200);
+    let unique_a = "T".repeat(200);
+    let unique_b = "C".repeat(200);
+
+    let ref_shared = dir.path().join("ref_shared.fasta");
+    fs::write(&ref_shared, format!(">shared\n{}\n", shared_seq))?;
+
+    let ref_a = dir.path().join("ref_a.fasta");
+    fs::write(
+        &ref_a,
+        format!(">shared_a\n{}\n>unique_a\n{}\n", shared_seq, unique_a),
+    )?;
+
+    let ref_b = dir.path().join("ref_b.fasta");
+    fs::write(
+        &ref_b,
+        format!(">shared_b\n{}\n>unique_b\n{}\n", shared_seq, unique_b),
+    )?;
+
+    // Build subtraction index from shared sequence
+    let subtract_path = dir.path().join("subtract.ryxdi");
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            subtract_path.to_str().unwrap(),
+            "-r",
+            ref_shared.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Subtraction index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Build multi-bucket from-config WITHOUT subtraction
+    let config_no_sub = dir.path().join("config_no_sub.toml");
+    fs::write(
+        &config_no_sub,
+        format!(
+            r#"
+[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "multi_no_sub.ryxdi"
+
+[buckets.BucketA]
+files = ["{}"]
+
+[buckets.BucketB]
+files = ["{}"]
+"#,
+            ref_a.to_str().unwrap(),
+            ref_b.to_str().unwrap()
+        ),
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "from-config",
+            "-c",
+            config_no_sub.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Multi-bucket index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Build multi-bucket from-config WITH subtraction
+    let config_with_sub = dir.path().join("config_with_sub.toml");
+    fs::write(
+        &config_with_sub,
+        format!(
+            r#"
+[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "multi_with_sub.ryxdi"
+
+[buckets.BucketA]
+files = ["{}"]
+
+[buckets.BucketB]
+files = ["{}"]
+"#,
+            ref_a.to_str().unwrap(),
+            ref_b.to_str().unwrap()
+        ),
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "from-config",
+            "-c",
+            config_with_sub.to_str().unwrap(),
+            "--subtract-from",
+            subtract_path.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Multi-bucket index with subtraction failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Compare stats
+    let stats_no_sub = Command::new(&binary)
+        .args([
+            "index",
+            "stats",
+            "-i",
+            dir.path().join("multi_no_sub.ryxdi").to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(stats_no_sub.status.success());
+
+    let stats_with_sub = Command::new(&binary)
+        .args([
+            "index",
+            "stats",
+            "-i",
+            dir.path().join("multi_with_sub.ryxdi").to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(stats_with_sub.status.success());
+
+    let no_sub_stdout = String::from_utf8_lossy(&stats_no_sub.stdout);
+    let with_sub_stdout = String::from_utf8_lossy(&stats_with_sub.stdout);
+
+    fn parse_total_minimizers(output: &str) -> u64 {
+        for line in output.lines() {
+            if line.contains("Total minimizers:") {
+                return line
+                    .split(':')
+                    .last()
+                    .unwrap()
+                    .trim()
+                    .replace(',', "")
+                    .parse()
+                    .unwrap();
+            }
+        }
+        panic!("Could not find 'Total minimizers' in output:\n{}", output);
+    }
+
+    fn parse_buckets(output: &str) -> u64 {
+        for line in output.lines() {
+            if line.contains("Buckets:") {
+                return line.split(':').last().unwrap().trim().parse().unwrap();
+            }
+        }
+        panic!("Could not find 'Buckets' in output:\n{}", output);
+    }
+
+    // Verify both have 2 buckets
+    assert_eq!(
+        parse_buckets(&no_sub_stdout),
+        2,
+        "Should have 2 buckets without subtraction"
+    );
+    assert_eq!(
+        parse_buckets(&with_sub_stdout),
+        2,
+        "Should have 2 buckets with subtraction"
+    );
+
+    let mins_no_sub = parse_total_minimizers(&no_sub_stdout);
+    let mins_with_sub = parse_total_minimizers(&with_sub_stdout);
+
+    println!(
+        "Multi-bucket minimizers without subtraction: {}",
+        mins_no_sub
+    );
+    println!(
+        "Multi-bucket minimizers with subtraction: {}",
+        mins_with_sub
+    );
+
+    assert!(
+        mins_with_sub < mins_no_sub,
+        "Subtracted multi-bucket index should have fewer minimizers: {} should be < {}",
+        mins_with_sub,
+        mins_no_sub
+    );
+
+    assert!(
+        mins_with_sub > 0,
+        "Subtracted index should still have minimizers from unique sequences"
+    );
+
+    Ok(())
+}

@@ -203,9 +203,14 @@ pub struct MergeStats {
 /// index is small relative to the queries (e.g., 80M minimizers = ~2GB with HashSet overhead).
 ///
 /// # Memory Usage
+///
 /// HashSet overhead is approximately 24 bytes per entry (8 bytes for u64 + 16 bytes overhead).
 /// For 80M minimizers: ~2GB. For 1B minimizers: ~24GB.
-fn load_all_minimizers(index: &ShardedInvertedIndex) -> Result<HashSet<u64>> {
+///
+/// Callers should check available memory before calling this function for large
+/// indices. For memory-constrained environments, consider the streaming merge
+/// approach in [`merge_indices_streaming`] instead.
+pub fn load_all_minimizers(index: &ShardedInvertedIndex) -> Result<HashSet<u64>> {
     let mut minimizers = HashSet::new();
 
     for shard_info in &index.manifest().shards {

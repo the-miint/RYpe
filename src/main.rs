@@ -192,6 +192,7 @@ fn main() -> Result<()> {
                 bloom_fpp,
                 orient,
                 timing,
+                subtract_from,
             } => {
                 // Enable timing diagnostics if requested
                 if timing {
@@ -213,7 +214,13 @@ fn main() -> Result<()> {
                     Some(max_memory)
                 };
 
-                build_parquet_index_from_config(&config, max_memory_opt, Some(&options), orient)?;
+                build_parquet_index_from_config(
+                    &config,
+                    max_memory_opt,
+                    Some(&options),
+                    orient,
+                    subtract_from.as_deref(),
+                )?;
             }
 
             IndexCommands::BucketAddConfig { config: _ } => {

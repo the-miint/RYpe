@@ -46,6 +46,37 @@ fn validate_unique_bucket_names<'a>(names: impl Iterator<Item = &'a str>) -> Res
     }
 }
 
+/// Validate that a subtraction index is compatible with the config being built.
+///
+/// Checks that k, w, and salt match between the config and the subtraction index.
+fn validate_subtraction_compatibility(
+    cfg: &rype::config::ConfigFile,
+    subtract_index: &rype::ShardedInvertedIndex,
+) -> Result<()> {
+    if subtract_index.k() != cfg.index.k {
+        return Err(anyhow!(
+            "k mismatch: config has k={}, subtraction index has k={}",
+            cfg.index.k,
+            subtract_index.k()
+        ));
+    }
+    if subtract_index.w() != cfg.index.window {
+        return Err(anyhow!(
+            "w mismatch: config has w={}, subtraction index has w={}",
+            cfg.index.window,
+            subtract_index.w()
+        ));
+    }
+    if subtract_index.salt() != cfg.index.salt {
+        return Err(anyhow!(
+            "salt mismatch: config has salt={:#x}, subtraction index has salt={:#x}",
+            cfg.index.salt,
+            subtract_index.salt()
+        ));
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Parquet Index Creation
 // ============================================================================
@@ -1291,6 +1322,7 @@ pub fn build_parquet_index_from_config(
     cli_max_memory: Option<usize>,
     options: Option<&parquet_index::ParquetWriteOptions>,
     cli_orient: bool,
+    subtract_from: Option<&Path>,
 ) -> Result<()> {
     let t_total = Instant::now();
 
@@ -1318,7 +1350,52 @@ pub fn build_parquet_index_from_config(
         log::info!("Orientation enabled: sequences will be oriented to maximize minimizer overlap");
     }
 
-    // Change output extension from .ryidx to .ryxdi for parquet inverted index
+    // Load and validate subtraction index if specified
+    let exclusion_set = if let Some(subtract_path) = subtract_from {
+        use rype::{load_all_minimizers, ShardedInvertedIndex};
+
+        log::info!(
+            "Loading subtraction index from: {}",
+            subtract_path.display()
+        );
+        let subtract_index = ShardedInvertedIndex::open(subtract_path).with_context(|| {
+            format!(
+                "Failed to open subtraction index: {}",
+                subtract_path.display()
+            )
+        })?;
+
+        validate_subtraction_compatibility(&cfg, &subtract_index)?;
+
+        let excl = load_all_minimizers(&subtract_index)?;
+
+        // Check that exclusion set fits comfortably in memory
+        // HashSet overhead is ~24 bytes per entry (8 bytes u64 + 16 bytes overhead)
+        let excl_bytes = excl.len() * 24;
+        let available =
+            cli_max_memory.unwrap_or_else(|| rype::memory::detect_available_memory().bytes);
+        if excl_bytes > available / 2 {
+            return Err(anyhow!(
+                "Subtraction index too large: {} minimizers (~{}) would use more than \
+                 half of available memory (~{}). Use 'index merge --subtract-from-primary' \
+                 for streaming subtraction of large indices, or increase --max-memory.",
+                excl.len(),
+                rype::memory::format_bytes(excl_bytes),
+                rype::memory::format_bytes(available),
+            ));
+        }
+
+        log::info!(
+            "Loaded {} unique minimizers from subtraction index (~{})",
+            excl.len(),
+            rype::memory::format_bytes(excl_bytes),
+        );
+        Some(excl)
+    } else {
+        None
+    };
+
+    // Ensure output has .ryxdi extension for Parquet format
     let output_path = cfg.index.output.with_extension("ryxdi");
     let output_path = resolve_path(config_dir, &output_path);
 
@@ -1345,16 +1422,22 @@ pub fn build_parquet_index_from_config(
     // Build buckets - strategy depends on bucket count
     let is_single_bucket = bucket_names.len() == 1;
 
-    if !is_single_bucket {
-        // Multiple buckets: use streaming mode for memory-bounded processing
-        // Derive shard size from max_memory (use half of memory budget for shard accumulator)
+    // When subtracting, always use streaming path (even for single bucket)
+    // to avoid modifying build_single_bucket_streaming
+    if !is_single_bucket || exclusion_set.is_some() {
+        // Multiple buckets (or subtraction active): use streaming mode
         use rype::memory::detect_available_memory;
         let available = cli_max_memory.unwrap_or_else(|| detect_available_memory().bytes);
         let shard_size = available / 2;
 
         log::info!(
-            "Multi-bucket index: using streaming mode (shard size: {} bytes)",
-            shard_size
+            "Using streaming mode (shard size: {} bytes){}",
+            shard_size,
+            if exclusion_set.is_some() {
+                " with subtraction"
+            } else {
+                ""
+            }
         );
 
         return build_parquet_index_from_config_streaming(
@@ -1362,6 +1445,7 @@ pub fn build_parquet_index_from_config(
             Some(shard_size),
             options,
             cli_orient,
+            exclusion_set.as_ref(),
         );
     }
 
@@ -1482,6 +1566,7 @@ pub fn build_parquet_index_from_config_streaming(
     cli_max_shard_size: Option<usize>,
     options: Option<&parquet_index::ParquetWriteOptions>,
     cli_orient: bool,
+    exclusion_set: Option<&HashSet<u64>>,
 ) -> Result<()> {
     use rype::parquet_index::{
         compute_source_hash, create_index_directory, write_buckets_parquet, InvertedManifest,
@@ -1675,6 +1760,7 @@ pub fn build_parquet_index_from_config_streaming(
         });
 
         // Consumer: receive results as buckets complete and accumulate
+        let mut total_excluded: u64 = 0;
         for result in rx {
             let (bucket_id, bucket_name, minimizers, sources) = match result {
                 Ok(data) => data,
@@ -1684,6 +1770,23 @@ pub fn build_parquet_index_from_config_streaming(
                     return Err(e);
                 }
             };
+
+            // Filter out excluded minimizers if subtraction is active
+            let mut minimizers = minimizers;
+            if let Some(excl) = exclusion_set {
+                let original_len = minimizers.len();
+                minimizers.retain(|m| !excl.contains(m));
+                let excluded = original_len - minimizers.len();
+                if excluded > 0 {
+                    total_excluded += excluded as u64;
+                    log::info!(
+                        "Bucket '{}': excluded {} of {} minimizers via subtraction",
+                        bucket_name,
+                        excluded,
+                        original_len
+                    );
+                }
+            }
 
             // Store metadata
             bucket_names_map.insert(bucket_id, bucket_name);
@@ -1705,6 +1808,13 @@ pub fn build_parquet_index_from_config_streaming(
                     );
                 }
             }
+        }
+
+        if total_excluded > 0 {
+            log::info!(
+                "Subtraction complete: excluded {} minimizer entries total",
+                total_excluded
+            );
         }
 
         Ok(())
@@ -1918,7 +2028,7 @@ output = "{}"
         );
 
         // Build parquet index
-        let result = build_parquet_index_from_config(&config_path, None, None, false);
+        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
         assert!(result.is_ok(), "Should succeed: {:?}", result);
 
         // Verify the parquet index was created
@@ -1952,7 +2062,8 @@ output = "{}"
             ..Default::default()
         };
 
-        let result = build_parquet_index_from_config(&config_path, None, Some(&options), false);
+        let result =
+            build_parquet_index_from_config(&config_path, None, Some(&options), false, None);
         assert!(
             result.is_ok(),
             "Should succeed with bloom filter: {:?}",
@@ -1977,7 +2088,7 @@ output = "{}"
             10,
         );
 
-        let result = build_parquet_index_from_config(&config_path, None, None, false);
+        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
         assert!(result.is_err(), "Should fail with missing file");
     }
 
@@ -2368,7 +2479,8 @@ files = ["ref2.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build streaming index
-        let result = build_parquet_index_from_config_streaming(&config_path, None, None, false);
+        let result =
+            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
         assert!(
             result.is_ok(),
             "Streaming index creation should succeed: {:?}",
@@ -2461,6 +2573,7 @@ max_shard_size = 1048576
             Some(1024 * 1024), // 1MB
             None,
             false,
+            None,
         );
         assert!(result.is_ok(), "Should succeed: {:?}", result);
 
@@ -2513,7 +2626,8 @@ files = ["ref2.fa"]
         let config_path = dir.join("config.toml");
         std::fs::write(&config_path, config_content).unwrap();
 
-        let result = build_parquet_index_from_config_streaming(&config_path, None, None, false);
+        let result =
+            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
         assert!(result.is_ok(), "Should succeed: {:?}", result);
 
         // Load and verify manifest
@@ -2638,7 +2752,8 @@ files = ["small5.fa"]
 
         // Time the streaming build
         let start = Instant::now();
-        let result = build_parquet_index_from_config_streaming(&config_path, None, None, false);
+        let result =
+            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
         let elapsed = start.elapsed();
 
         assert!(result.is_ok(), "Should succeed: {:?}", result);
@@ -2724,6 +2839,7 @@ max_shard_size = 1048576
             Some(1024 * 1024), // 1MB shards (minimum allowed)
             None,
             false,
+            None,
         );
         assert!(result.is_ok(), "Should succeed: {:?}", result);
 
@@ -2790,7 +2906,8 @@ files = ["valid2.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Should fail during validation (before processing starts)
-        let result = build_parquet_index_from_config_streaming(&config_path, None, None, false);
+        let result =
+            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
         assert!(result.is_err(), "Should fail with missing file");
 
         let err_msg = result.unwrap_err().to_string();
@@ -2848,7 +2965,8 @@ files = ["valid2.fa"]
         let config_path = dir.join("config.toml");
         std::fs::write(&config_path, config_content).unwrap();
 
-        let result = build_parquet_index_from_config_streaming(&config_path, None, None, false);
+        let result =
+            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
 
         // The corrupt file might either fail (if FASTA parser rejects it) or
         // produce empty output (if parser is lenient). Either is acceptable.
@@ -2904,7 +3022,7 @@ files = ["ref3.fa"]
         let config_path_ns = dir.join("config_nonstream.toml");
         std::fs::write(&config_path_ns, config_nonstream).unwrap();
 
-        let result_ns = build_parquet_index_from_config(&config_path_ns, None, None, false);
+        let result_ns = build_parquet_index_from_config(&config_path_ns, None, None, false, None);
         assert!(
             result_ns.is_ok(),
             "Non-streaming should succeed: {:?}",
@@ -2931,7 +3049,8 @@ files = ["ref3.fa"]
         let config_path_s = dir.join("config_stream.toml");
         std::fs::write(&config_path_s, config_stream).unwrap();
 
-        let result_s = build_parquet_index_from_config_streaming(&config_path_s, None, None, false);
+        let result_s =
+            build_parquet_index_from_config_streaming(&config_path_s, None, None, false, None);
         assert!(result_s.is_ok(), "Streaming should succeed: {:?}", result_s);
 
         // Compare the two indices
@@ -3032,7 +3151,7 @@ files = ["ref0.fa", "ref1.fa", "ref2.fa", "ref3.fa", "ref4.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index using non-streaming path (which will eventually use parallel)
-        let result = build_parquet_index_from_config(&config_path, None, None, false);
+        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
         assert!(
             result.is_ok(),
             "Index creation should succeed: {:?}",
@@ -3123,7 +3242,7 @@ files = ["ref_g.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index
-        let result = build_parquet_index_from_config(&config_path, None, None, false);
+        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
         assert!(
             result.is_ok(),
             "Index creation should succeed: {:?}",
@@ -3214,7 +3333,7 @@ files = ["ref0.fa", "ref1.fa", "ref2.fa", "ref3.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index with orientation
-        let result = build_parquet_index_from_config(&config_path, None, None, false);
+        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
         assert!(
             result.is_ok(),
             "Oriented index creation should succeed: {:?}",
@@ -3276,7 +3395,7 @@ files = ["single.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index
-        let result = build_parquet_index_from_config(&config_path, None, None, false);
+        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
         assert!(
             result.is_ok(),
             "Single sequence index should succeed: {:?}",
@@ -3349,7 +3468,7 @@ files = ["short.fa", "long.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index - should not crash
-        let result = build_parquet_index_from_config(&config_path, None, None, false);
+        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
         assert!(
             result.is_ok(),
             "Index with short sequences should succeed: {:?}",

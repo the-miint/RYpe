@@ -204,7 +204,14 @@ pub enum IndexCommands {
 
 CLI OPTIONS OVERRIDE CONFIG FILE:
   --max-memory controls memory budget (auto-detected if not specified)
-  --orient overrides [index].orient_sequences")]
+  --orient overrides [index].orient_sequences
+
+SUBTRACTION MODE (--subtract-from):
+  Removes minimizers present in an existing index from all buckets during build.
+  Useful for host depletion: build a non-host index in one step.
+  The subtraction index must have matching k, w, and salt values.
+
+  Example: rype index from-config -c config.toml --subtract-from host.ryxdi")]
     FromConfig {
         /// Path to TOML config file
         #[arg(short, long)]
@@ -238,6 +245,13 @@ CLI OPTIONS OVERRIDE CONFIG FILE:
         /// Print timing diagnostics to stderr for performance analysis.
         #[arg(long)]
         timing: bool,
+
+        /// Subtract minimizers from an existing index before building.
+        /// Removes any minimizer that exists in the subtraction index.
+        /// Useful for host depletion: build a non-host index in one step.
+        /// The subtraction index must have the same k, w, and salt values.
+        #[arg(long)]
+        subtract_from: Option<PathBuf>,
     },
 
     /// Add files to existing index using TOML config (development pending)
