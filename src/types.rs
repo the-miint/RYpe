@@ -14,6 +14,9 @@ pub struct IndexMetadata {
     pub bucket_names: HashMap<u32, String>,
     pub bucket_sources: HashMap<u32, Vec<String>>,
     pub bucket_minimizer_counts: HashMap<u32, usize>,
+    /// Number of entries in the largest inverted index shard (0 if no shards).
+    /// Used for estimating shard loading memory during adaptive batch sizing.
+    pub largest_shard_entries: u64,
 }
 
 /// Query ID, Bucket ID, Score

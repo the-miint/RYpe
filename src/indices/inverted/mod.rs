@@ -322,6 +322,7 @@ mod tests {
             bucket_names: HashMap::new(),
             bucket_sources: HashMap::new(),
             bucket_minimizer_counts: buckets.iter().map(|(&id, v)| (id, v.len())).collect(),
+            largest_shard_entries: 0,
         };
 
         InvertedIndex::build_from_bucket_map(64, 50, 0x1234, &buckets, &metadata)
@@ -370,6 +371,7 @@ mod tests {
             bucket_names: HashMap::new(),
             bucket_sources: HashMap::new(),
             bucket_minimizer_counts: HashMap::new(),
+            largest_shard_entries: 0,
         };
 
         let inverted = InvertedIndex::build_from_bucket_map(64, 50, 0, &buckets, &metadata);
@@ -393,6 +395,7 @@ mod tests {
             bucket_names: HashMap::new(),
             bucket_sources: HashMap::new(),
             bucket_minimizer_counts: buckets.iter().map(|(&id, v)| (id, v.len())).collect(),
+            largest_shard_entries: 0,
         };
 
         let inverted = InvertedIndex::build_from_bucket_map(64, 50, 0, &buckets, &metadata);
@@ -420,6 +423,7 @@ mod tests {
             bucket_names: HashMap::new(),
             bucket_sources: HashMap::new(),
             bucket_minimizer_counts: buckets.iter().map(|(&id, v)| (id, v.len())).collect(),
+            largest_shard_entries: 0,
         };
 
         let inverted = InvertedIndex::build_from_bucket_map(64, 50, 0, &buckets, &metadata);

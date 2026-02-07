@@ -507,6 +507,7 @@ fn test_inverted_index_build_from_bucket_map() {
         bucket_names,
         bucket_sources: HashMap::new(),
         bucket_minimizer_counts: bucket_map.iter().map(|(&id, v)| (id, v.len())).collect(),
+        largest_shard_entries: 0,
     };
 
     let inverted = InvertedIndex::build_from_bucket_map(32, 10, 0x12345, &bucket_map, &metadata);

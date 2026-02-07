@@ -83,6 +83,11 @@ pub fn load_index_metadata(path: &Path) -> Result<IndexMetadata> {
     if rype::is_parquet_index(path) {
         let manifest = rype::ParquetManifest::load(path)?;
         let (bucket_names, bucket_sources) = rype::parquet_index::read_buckets_parquet(path)?;
+        let largest_shard_entries = manifest
+            .inverted
+            .as_ref()
+            .and_then(|inv| inv.shards.iter().map(|s| s.num_entries).max())
+            .unwrap_or(0);
         return Ok(IndexMetadata {
             k: manifest.k,
             w: manifest.w,
@@ -90,6 +95,7 @@ pub fn load_index_metadata(path: &Path) -> Result<IndexMetadata> {
             bucket_names,
             bucket_sources,
             bucket_minimizer_counts: HashMap::new(),
+            largest_shard_entries,
         });
     }
 
@@ -317,5 +323,181 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.err().unwrap().to_string();
         assert!(err_msg.contains("not found"), "Error was: {}", err_msg);
+    }
+
+    // =========================================================================
+    // Regression: load_index_metadata must populate largest_shard_entries
+    // =========================================================================
+
+    /// Helper to create a minimal Parquet index with known shard entries.
+    fn create_test_index_for_metadata() -> tempfile::TempDir {
+        use std::fs;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let index_path = dir.path().join("test.ryxdi");
+        fs::create_dir(&index_path).unwrap();
+
+        // Manifest with 2 shards: 1000 and 3000 entries
+        let manifest = r#"magic = "RYPE_PARQUET_V1"
+format_version = 1
+k = 64
+w = 50
+salt = "0x5555555555555555"
+source_hash = "0xDEADBEEF"
+num_buckets = 2
+total_minimizers = 4000
+
+[inverted]
+num_shards = 2
+total_entries = 4000
+has_overlapping_shards = false
+
+[[inverted.shards]]
+shard_id = 0
+min_minimizer = "0x0000000000000001"
+max_minimizer = "0x0000000000000064"
+num_entries = 1000
+
+[[inverted.shards]]
+shard_id = 1
+min_minimizer = "0x0000000000000065"
+max_minimizer = "0x00000000000000C8"
+num_entries = 3000
+"#;
+        fs::write(index_path.join("manifest.toml"), manifest).unwrap();
+
+        // Create minimal buckets.parquet
+        use arrow::array::{
+            ArrayRef, LargeListBuilder, LargeStringArray, LargeStringBuilder, UInt32Array,
+        };
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("bucket_id", DataType::UInt32, false),
+            Field::new("bucket_name", DataType::LargeUtf8, false),
+            Field::new(
+                "sources",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
+                false,
+            ),
+        ]));
+
+        let mut list_builder = LargeListBuilder::new(LargeStringBuilder::new());
+        list_builder.values().append_value("source0");
+        list_builder.append(true);
+        list_builder.values().append_value("source1");
+        list_builder.append(true);
+        let sources_array: ArrayRef = Arc::new(list_builder.finish());
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec!["bucket0", "bucket1"])) as ArrayRef,
+                sources_array,
+            ],
+        )
+        .unwrap();
+
+        let file = fs::File::create(index_path.join("buckets.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Create inverted directory (not strictly needed for metadata loading
+        // but keeps the index structure valid)
+        fs::create_dir(index_path.join("inverted")).unwrap();
+
+        dir
+    }
+
+    /// load_index_metadata must read shard info from manifest and populate
+    /// largest_shard_entries with the max num_entries across shards.
+    #[test]
+    fn test_load_index_metadata_populates_shard_entries() {
+        let dir = create_test_index_for_metadata();
+        let index_path = dir.path().join("test.ryxdi");
+
+        let metadata = load_index_metadata(&index_path).unwrap();
+
+        // The manifest has 2 shards: 1000 and 3000 entries.
+        // largest_shard_entries should be 3000.
+        assert_eq!(
+            metadata.largest_shard_entries, 3000,
+            "Should pick the max shard num_entries; got {}",
+            metadata.largest_shard_entries
+        );
+    }
+
+    /// When the manifest has no inverted section, largest_shard_entries
+    /// should default to 0.
+    #[test]
+    fn test_load_index_metadata_no_inverted_returns_zero() {
+        use std::fs;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let index_path = dir.path().join("noinv.ryxdi");
+        fs::create_dir(&index_path).unwrap();
+
+        // Manifest without inverted section
+        let manifest = r#"magic = "RYPE_PARQUET_V1"
+format_version = 1
+k = 64
+w = 50
+salt = "0x5555555555555555"
+source_hash = "0xDEADBEEF"
+num_buckets = 1
+total_minimizers = 0
+"#;
+        fs::write(index_path.join("manifest.toml"), manifest).unwrap();
+
+        // Still need buckets.parquet for the load to succeed
+        use arrow::array::{
+            ArrayRef, LargeListBuilder, LargeStringArray, LargeStringBuilder, UInt32Array,
+        };
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("bucket_id", DataType::UInt32, false),
+            Field::new("bucket_name", DataType::LargeUtf8, false),
+            Field::new(
+                "sources",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
+                false,
+            ),
+        ]));
+
+        let mut list_builder = LargeListBuilder::new(LargeStringBuilder::new());
+        list_builder.values().append_value("src");
+        list_builder.append(true);
+        let sources_array: ArrayRef = Arc::new(list_builder.finish());
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec!["b0"])) as ArrayRef,
+                sources_array,
+            ],
+        )
+        .unwrap();
+
+        let file = fs::File::create(index_path.join("buckets.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let metadata = load_index_metadata(&index_path).unwrap();
+        assert_eq!(
+            metadata.largest_shard_entries, 0,
+            "No inverted section should give largest_shard_entries=0, got {}",
+            metadata.largest_shard_entries
+        );
     }
 }

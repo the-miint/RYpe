@@ -960,20 +960,17 @@ fn estimate_total_batch_memory(
 ///
 /// Algorithm:
 /// 1. Calculate available memory after subtracting index, shard reservation, and safety margin
-/// 2. Start with batch_count = num_threads
-/// 3. Binary search for maximum batch_size that fits in (available / batch_count)
-/// 4. Validate that the result actually fits within budget
-/// 5. If too tight, reduce batch_count and retry
-/// 6. Enforce minimum batch_size of 1000
+/// 2. Binary search for maximum batch_size that fits in available memory
+/// 3. Validate that the result actually fits within budget
+/// 4. Enforce minimum batch_size of 1000
 ///
-/// Note: When using Rayon for parallel batch processing, all batch_count batches may be
-/// in flight simultaneously (worst case). The memory calculation accounts for this by
-/// dividing available memory by batch_count, ensuring peak_memory = batch_count × per_batch_memory
-/// stays within budget.
+/// batch_count is always 1 because the classify main loop processes batches
+/// sequentially (one at a time). Parallelism happens *within* each batch
+/// via Rayon's thread pool.
 ///
-/// I/O buffer memory (prefetch channel) is also accounted for. This is shared across all
-/// parallel batches and scales with batch_size. The prefetch buffer size depends on input
-/// format: FASTX uses 2 slots, Parquet uses 4 slots.
+/// I/O buffer memory (prefetch channel) is also accounted for. This scales
+/// with batch_size. The prefetch buffer size depends on input format:
+/// FASTX uses 2 slots, Parquet uses 4 slots.
 pub fn calculate_batch_config(config: &MemoryConfig) -> BatchConfig {
     // Calculate safety margin
     let safety_margin = (config.max_memory as f64 * SAFETY_MARGIN_PERCENT).round() as usize;
@@ -1009,34 +1006,32 @@ pub fn calculate_batch_config(config: &MemoryConfig) -> BatchConfig {
         return make_min_config();
     }
 
-    // Try decreasing batch counts
-    for batch_count in (1..=config.num_threads).rev() {
-        // Binary search for batch_size that fits within available memory
-        let batch_size = binary_search_batch_size_with_io(available, batch_count, config);
+    // Batches are processed sequentially in the classify main loop (one at a
+    // time), so only 1 batch is ever in memory. Using batch_count > 1 would
+    // reserve N× too much memory and shrink batch sizes needlessly.
+    let batch_count = 1;
 
-        if batch_size >= MIN_BATCH_SIZE {
-            // Validate that the result actually fits within budget
-            // This handles edge cases where binary search returns MIN_BATCH_SIZE
-            // but that still exceeds the budget with the given batch_count
-            let total = estimate_total_batch_memory(batch_size, batch_count, config);
-            if total.is_some_and(|t| t <= available) {
-                let per_batch_memory =
-                    estimate_batch_memory(batch_size, &config.read_profile, config.num_buckets)
-                        .unwrap_or(usize::MAX);
-                let io_buffer_memory =
-                    estimate_io_buffer_memory(batch_size, config).unwrap_or(usize::MAX);
-                let peak_memory = base_reserved
-                    .saturating_add(per_batch_memory.saturating_mul(batch_count))
-                    .saturating_add(io_buffer_memory);
+    // Binary search for batch_size that fits within available memory
+    let batch_size = binary_search_batch_size_with_io(available, batch_count, config);
 
-                return BatchConfig {
-                    batch_size,
-                    batch_count,
-                    per_batch_memory,
-                    peak_memory,
-                };
-            }
-            // If validation failed, continue to try smaller batch_count
+    if batch_size >= MIN_BATCH_SIZE {
+        let total = estimate_total_batch_memory(batch_size, batch_count, config);
+        if total.is_some_and(|t| t <= available) {
+            let per_batch_memory =
+                estimate_batch_memory(batch_size, &config.read_profile, config.num_buckets)
+                    .unwrap_or(usize::MAX);
+            let io_buffer_memory =
+                estimate_io_buffer_memory(batch_size, config).unwrap_or(usize::MAX);
+            let peak_memory = base_reserved
+                .saturating_add(per_batch_memory)
+                .saturating_add(io_buffer_memory);
+
+            return BatchConfig {
+                batch_size,
+                batch_count,
+                per_batch_memory,
+                peak_memory,
+            };
         }
     }
 
@@ -1083,6 +1078,65 @@ fn binary_search_batch_size_with_io(
 
     best
 }
+/// Estimate memory reservation for shard loading during classification.
+///
+/// Shard loading reads row groups individually (not the whole shard at once).
+/// Peak shard memory = concurrent row-group decode buffers + filtered CSR output.
+///
+/// Components:
+/// - **Decode buffers**: `num_threads` concurrent row-group decodes, each holding
+///   up to `DEFAULT_ROW_GROUP_SIZE` entries at 12 bytes/entry (u64 + u32).
+///   Arrow's columnar decode path adds overhead for validity bitmaps,
+///   decompression scratch space, and builder metadata — accounted for by
+///   `DECODE_OVERHEAD_MULTIPLIER`.
+/// - **Filtered CSR**: After filtering to query minimizers, the CSR output is
+///   typically ~10% of the shard (`SHARD_SELECTIVITY_ESTIMATE`). We use
+///   `CSR_CONCAT_MULTIPLIER` for the concat spike during assembly.
+///
+/// Returns 0 if `largest_shard_entries` is 0 (no shards).
+///
+/// Uses saturating arithmetic to prevent overflow for very large shards.
+pub fn estimate_shard_reservation(largest_shard_entries: u64, num_threads: usize) -> usize {
+    /// Assumed fraction of shard entries matching query minimizers.
+    /// Conservative estimate — real selectivity is often lower (~1-5%),
+    /// but we budget for worst-case queries with broad minimizer overlap.
+    const SHARD_SELECTIVITY_ESTIMATE: f64 = 0.10;
+
+    /// Safety multiplier for CSR concatenation spike.
+    /// During assembly, both the per-thread filtered chunks and the final
+    /// concatenated CSR coexist briefly, roughly doubling peak usage.
+    const CSR_CONCAT_MULTIPLIER: f64 = 2.0;
+
+    /// Arrow decode overhead multiplier.
+    /// Each concurrent row-group decode allocates Arrow columnar buffers
+    /// (UInt64Array + UInt32Array with validity bitmaps), decompression
+    /// scratch space, and RecordBatch builder metadata — roughly 3× the
+    /// final (minimizer, bucket_id) pair size.
+    const DECODE_OVERHEAD_MULTIPLIER: usize = 3;
+
+    if largest_shard_entries == 0 {
+        return 0;
+    }
+
+    let bytes_per_entry: usize = 12; // u64 minimizer + u32 bucket_id
+    let rg_size = crate::constants::DEFAULT_ROW_GROUP_SIZE;
+
+    // Parallel decode buffers: num_threads concurrent RG decodes with Arrow overhead
+    let decode_buffers = num_threads
+        .saturating_mul(rg_size)
+        .saturating_mul(bytes_per_entry)
+        .saturating_mul(DECODE_OVERHEAD_MULTIPLIER);
+
+    // Filtered CSR estimate: selectivity × concat spike
+    let filtered_bytes = largest_shard_entries as f64
+        * bytes_per_entry as f64
+        * SHARD_SELECTIVITY_ESTIMATE
+        * CSR_CONCAT_MULTIPLIER;
+    let filtered_csr = filtered_bytes.min(usize::MAX as f64).round() as usize;
+
+    decode_buffers.saturating_add(filtered_csr)
+}
+
 /// Format bytes as human-readable string.
 pub fn format_bytes(bytes: usize) -> String {
     const KB: usize = 1024;
@@ -2158,5 +2212,191 @@ mod tests {
             InputFormat::Fastx { is_paired: false },
         );
         assert!(invalid.is_err());
+    }
+
+    // =========================================================================
+    // estimate_shard_reservation tests
+    // =========================================================================
+
+    #[test]
+    fn test_estimate_shard_reservation_zero_entries() {
+        // No shards -> no reservation
+        assert_eq!(estimate_shard_reservation(0, 8), 0);
+    }
+
+    #[test]
+    fn test_estimate_shard_reservation_realistic() {
+        // Real 8-shard index: largest shard = 62,443,845 entries, 8 threads
+        let reservation = estimate_shard_reservation(62_443_845, 8);
+
+        // decode buffers: 8 * 100_000 * 12 * 3 (Arrow overhead) = 28,800,000 (~27.5MB)
+        // filtered CSR: 62_443_845 * 12 * 0.10 * 2 = 149,865,228 (~142.9MB)
+        // total ≈ 170MB
+        let expected_mb = 170;
+        let actual_mb = reservation / (1024 * 1024);
+        assert!(
+            actual_mb >= expected_mb - 15 && actual_mb <= expected_mb + 15,
+            "Shard reservation should be ~{}MB for 62M entries, got {}MB",
+            expected_mb,
+            actual_mb
+        );
+    }
+
+    #[test]
+    fn test_estimate_shard_reservation_overflow_safety() {
+        // Very large shard entry count should not panic or wrap around
+        let reservation = estimate_shard_reservation(u64::MAX, 64);
+        // Should saturate rather than overflow — exact value doesn't matter,
+        // just must not panic
+        assert!(
+            reservation > 0,
+            "Should return a positive value for large inputs"
+        );
+    }
+
+    #[test]
+    fn test_estimate_shard_reservation_scales_with_entries() {
+        let small = estimate_shard_reservation(1_000_000, 8);
+        let large = estimate_shard_reservation(100_000_000, 8);
+
+        assert!(
+            large > small,
+            "Larger shards should require more reservation: small={}, large={}",
+            small,
+            large
+        );
+    }
+
+    #[test]
+    fn test_estimate_shard_reservation_scales_with_threads() {
+        let few = estimate_shard_reservation(62_000_000, 2);
+        let many = estimate_shard_reservation(62_000_000, 16);
+
+        assert!(
+            many > few,
+            "More threads should increase decode buffer reservation: 2t={}, 16t={}",
+            few,
+            many
+        );
+    }
+
+    // =========================================================================
+    // Regression tests for batch sizing bugs
+    // See: batch_count=num_threads but batches are sequential (wastes memory)
+    //      shard_reservation=0 (shard loading memory unaccounted for)
+    // =========================================================================
+
+    /// Bug 1: batch_count must be 1 because the classify main loop processes
+    /// batches sequentially. Setting batch_count=num_threads reserves N× too
+    /// much memory and shrinks batch sizes needlessly.
+    ///
+    /// Realistic scenario: 64GB machine, 8 threads, 160-bucket sharded index,
+    /// 5000bp long reads. Before fix: batch_count=8, batch_size≈795K.
+    /// After fix: batch_count=1, batch_size≈3.3M (4.2× larger).
+    #[test]
+    fn test_batch_count_is_one_for_sequential_processing() {
+        let profile = ReadMemoryProfile::new(5000, false, 64, 200);
+        let config = MemoryConfig {
+            max_memory: 64 * 1024 * 1024 * 1024, // 64GB
+            num_threads: 8,
+            index_memory: 0,
+            shard_reservation: 0,
+            read_profile: profile,
+            num_buckets: 160,
+            input_format: InputFormat::Fastx { is_paired: false },
+        };
+
+        let result = calculate_batch_config(&config);
+
+        // Batches are processed sequentially in the classify loop, so only
+        // 1 batch is in flight at a time. batch_count must always be 1.
+        assert_eq!(
+            result.batch_count, 1,
+            "batch_count should be 1 (sequential processing), got {}",
+            result.batch_count
+        );
+    }
+
+    /// With batch_count=1, the batch_size should be identical regardless of
+    /// num_threads, since threads only affect parallelism *within* a batch
+    /// (via rayon), not how many batches are in memory simultaneously.
+    #[test]
+    fn test_batch_size_independent_of_thread_count() {
+        let profile = ReadMemoryProfile::new(5000, false, 64, 200);
+        let base = MemoryConfig {
+            max_memory: 64 * 1024 * 1024 * 1024,
+            num_threads: 1,
+            index_memory: 0,
+            shard_reservation: 0,
+            read_profile: profile,
+            num_buckets: 160,
+            input_format: InputFormat::Fastx { is_paired: false },
+        };
+
+        let result_1t = calculate_batch_config(&base);
+        let result_8t = calculate_batch_config(&MemoryConfig {
+            num_threads: 8,
+            ..base.clone()
+        });
+        let result_16t = calculate_batch_config(&MemoryConfig {
+            num_threads: 16,
+            ..base.clone()
+        });
+
+        // All should produce the same batch_size since batch_count=1
+        assert_eq!(
+            result_1t.batch_size, result_8t.batch_size,
+            "1-thread batch_size ({}) != 8-thread batch_size ({}); \
+             thread count should not affect batch_size when batches are sequential",
+            result_1t.batch_size, result_8t.batch_size
+        );
+        assert_eq!(
+            result_1t.batch_size, result_16t.batch_size,
+            "1-thread batch_size ({}) != 16-thread batch_size ({})",
+            result_1t.batch_size, result_16t.batch_size
+        );
+    }
+
+    /// Bug 2: shard_reservation should reduce available memory and therefore
+    /// produce smaller batch sizes. This tests the MemoryConfig plumbing works.
+    ///
+    /// Realistic scenario: largest shard has 62M entries. Parallel row-group
+    /// decoding + filtered CSR output ≈ 152MB shard reservation. With the
+    /// reservation, batch_size should be smaller than without.
+    #[test]
+    fn test_shard_reservation_reduces_batch_size() {
+        let profile = ReadMemoryProfile::new(5000, false, 64, 200);
+
+        let config_no_reservation = MemoryConfig {
+            max_memory: 8 * 1024 * 1024 * 1024, // 8GB (constrained so effect is visible)
+            num_threads: 8,
+            index_memory: 0,
+            shard_reservation: 0,
+            read_profile: profile.clone(),
+            num_buckets: 160,
+            input_format: InputFormat::Fastx { is_paired: false },
+        };
+
+        // Realistic shard reservation for 62M-entry largest shard:
+        // decode buffers: 8 threads * 100K rows * 12 bytes = 9.6MB
+        // filtered CSR: 62M * 12 * 0.10 * 2 = 148.8MB
+        // total ≈ 158MB
+        let shard_reservation = 158 * 1024 * 1024;
+        let config_with_reservation = MemoryConfig {
+            shard_reservation,
+            ..config_no_reservation.clone()
+        };
+
+        let result_no = calculate_batch_config(&config_no_reservation);
+        let result_with = calculate_batch_config(&config_with_reservation);
+
+        assert!(
+            result_with.batch_size < result_no.batch_size,
+            "Shard reservation of {}MB should reduce batch_size: \
+             without={}, with={}",
+            shard_reservation / (1024 * 1024),
+            result_no.batch_size,
+            result_with.batch_size
+        );
     }
 }

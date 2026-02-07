@@ -8,8 +8,8 @@ use std::path::Path;
 use anyhow::Result;
 
 use rype::memory::{
-    calculate_batch_config, detect_available_memory, format_bytes, InputFormat, MemoryConfig,
-    MemorySource, ReadMemoryProfile,
+    calculate_batch_config, detect_available_memory, estimate_shard_reservation, format_bytes,
+    InputFormat, MemoryConfig, MemorySource, ReadMemoryProfile,
 };
 
 use super::load_index_metadata;
@@ -36,12 +36,12 @@ pub struct BatchSizeConfig<'a> {
 pub struct BatchSizeResult {
     /// The computed batch size
     pub batch_size: usize,
-    /// Number of parallel batches (for logging)
-    pub batch_count: usize,
     /// Estimated peak memory (for logging)
     pub peak_memory: usize,
     /// Input format used for estimation
     pub input_format: InputFormat,
+    /// Memory reserved for shard loading (for logging)
+    pub shard_reservation: usize,
 }
 
 /// Compute effective batch size with memory-aware auto-sizing.
@@ -71,9 +71,9 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
         };
         return Ok(BatchSizeResult {
             batch_size: bs,
-            batch_count: rayon::current_num_threads(),
             peak_memory: 0, // Unknown for user-specified
             input_format,
+            shard_reservation: 0, // Unknown for user-specified
         });
     }
 
@@ -147,11 +147,15 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
         InputFormat::Fastx { is_paired }
     };
 
+    // Estimate shard loading memory from largest shard size
+    let shard_reservation =
+        estimate_shard_reservation(metadata.largest_shard_entries, rayon::current_num_threads());
+
     let mem_config = MemoryConfig {
         max_memory: mem_limit,
         num_threads: rayon::current_num_threads(),
         index_memory: estimated_index_mem,
-        shard_reservation: 0, // Will be updated after loading index
+        shard_reservation,
         read_profile,
         num_buckets,
         input_format,
@@ -161,9 +165,9 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
 
     Ok(BatchSizeResult {
         batch_size: batch_config.batch_size,
-        batch_count: batch_config.batch_count,
         peak_memory: batch_config.peak_memory,
         input_format,
+        shard_reservation,
     })
 }
 
@@ -329,7 +333,6 @@ num_entries = 3
             "Batch size {} should be >= 1000",
             result.batch_size
         );
-        assert!(result.batch_count >= 1);
         assert!(result.peak_memory > 0);
     }
 
@@ -381,5 +384,122 @@ num_entries = 3
             result.input_format,
             InputFormat::Parquet { is_paired: false }
         ));
+    }
+
+    // =========================================================================
+    // Regression tests for batch sizing with real sharded indices.
+    //
+    // These tests use the perf-assessment data (real 8-shard index with 160
+    // buckets, ~485M total entries; real long-read Parquet queries).
+    // They are #[ignore]d because the data is local-only (not in git).
+    //
+    // Run with: cargo test batch_config -- --ignored --nocapture
+    // =========================================================================
+
+    /// Regression: with real sharded index and real query data, batch sizing
+    /// should produce a reasonable batch size (not crippled by over-reservation).
+    ///
+    /// Before fix: batch_count=num_threads reserved ~8x too much memory,
+    /// producing batch sizes ~4-8x smaller than necessary.
+    #[test]
+    #[ignore]
+    fn test_real_sharded_index_batch_size_is_reasonable() {
+        let index_path = std::path::Path::new("perf-assessment/parquet-index/n100-w200.ryxdi");
+        let query_path = std::path::Path::new("perf-assessment/query-files/long_read.parquet");
+
+        if !index_path.exists() || !query_path.exists() {
+            eprintln!("Skipping: perf-assessment data not available");
+            return;
+        }
+
+        let config = BatchSizeConfig {
+            batch_size_override: None,
+            max_memory: 64 * 1024 * 1024 * 1024, // 64GB
+            r1_path: query_path,
+            r2_path: None,
+            is_parquet_input: true,
+            index_path,
+            trim_to: None,
+        };
+
+        let result = compute_effective_batch_size(&config).unwrap();
+
+        eprintln!(
+            "Real index: batch_size={}, peak_memory={:.2}GB, shard_reservation={:.2}MB",
+            result.batch_size,
+            result.peak_memory as f64 / (1024.0 * 1024.0 * 1024.0),
+            result.shard_reservation as f64 / (1024.0 * 1024.0)
+        );
+
+        // With batch_count=1 fix, batch_size should be well above 1M for 64GB
+        assert!(
+            result.batch_size > 1_000_000,
+            "batch_size should be > 1M for 64GB with sequential batches, got {}",
+            result.batch_size
+        );
+    }
+
+    /// Regression: shard reservation must be nonzero for a sharded index.
+    ///
+    /// The 8-shard index has largest shard ~62M entries. Loading a shard
+    /// involves concurrent row-group decoding + filtered CSR output.
+    /// This memory must be accounted for.
+    ///
+    /// We verify: load_index_metadata populates largest_shard_entries,
+    /// and estimate_shard_reservation returns a nonzero value that feeds
+    /// into the batch sizing. The shard reservation for the 8-shard index
+    /// (largest shard ≈ 62M entries) should be substantial (>100MB).
+    #[test]
+    #[ignore]
+    fn test_real_index_shard_reservation_affects_batch_size() {
+        let sharded_index = std::path::Path::new("perf-assessment/parquet-index/n100-w200.ryxdi");
+
+        if !sharded_index.exists() {
+            eprintln!("Skipping: perf-assessment data not available");
+            return;
+        }
+
+        let metadata = load_index_metadata(sharded_index).unwrap();
+
+        // The 8-shard index has shards with ~60-62M entries each
+        eprintln!("largest_shard_entries: {}", metadata.largest_shard_entries);
+        assert!(
+            metadata.largest_shard_entries > 50_000_000,
+            "8-shard index should have largest shard > 50M entries, got {}",
+            metadata.largest_shard_entries
+        );
+
+        // Shard reservation should be substantial
+        let reservation = estimate_shard_reservation(metadata.largest_shard_entries, 8);
+        let reservation_mb = reservation / (1024 * 1024);
+        eprintln!("shard_reservation: {}MB", reservation_mb);
+        assert!(
+            reservation_mb > 100,
+            "Shard reservation should be > 100MB for 62M-entry shard, got {}MB",
+            reservation_mb
+        );
+    }
+
+    /// Regression: with the test helper index (has shards with known entries),
+    /// verify that shard info flows through to batch sizing.
+    ///
+    /// The test index has 1 shard with 3 entries. After fix, load_index_metadata
+    /// should populate largest_shard_entries=3, and compute_effective_batch_size
+    /// should use it for shard_reservation.
+    #[test]
+    fn test_shard_info_flows_to_batch_sizing() {
+        let index_dir = create_test_index();
+        let index_path = index_dir.path().join("test.ryxdi");
+
+        // Load metadata and verify shard info is captured
+        let metadata = load_index_metadata(&index_path).unwrap();
+
+        // After fix: largest_shard_entries should be 3 (from manifest)
+        // Before fix: field doesn't exist or is always 0
+        // We use a compile-time check: if the field exists, it must be 3
+        assert_eq!(
+            metadata.largest_shard_entries, 3,
+            "load_index_metadata should populate largest_shard_entries from manifest"
+        );
     }
 }

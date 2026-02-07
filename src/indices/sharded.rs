@@ -78,6 +78,12 @@ impl ShardManifest {
 
     /// Convert to IndexMetadata for compatibility with existing code.
     pub fn to_metadata(&self) -> IndexMetadata {
+        let largest_shard_entries = self
+            .shards
+            .iter()
+            .map(|s| s.num_bucket_ids as u64)
+            .max()
+            .unwrap_or(0);
         IndexMetadata {
             k: self.k,
             w: self.w,
@@ -85,6 +91,7 @@ impl ShardManifest {
             bucket_names: self.bucket_names.clone(),
             bucket_sources: self.bucket_sources.clone(),
             bucket_minimizer_counts: self.bucket_minimizer_counts.clone(),
+            largest_shard_entries,
         }
     }
 

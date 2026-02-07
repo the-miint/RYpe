@@ -105,11 +105,11 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     // Log adaptive batch sizing details (only for auto-computed batch sizes)
     if args.common.batch_size.is_none() {
         log::info!(
-            "Adaptive batch sizing: batch_size={}, parallel_batches={}, threads={}, estimated peak memory={}, format={:?}",
+            "Adaptive batch sizing: batch_size={}, threads={}, estimated peak memory={}, shard_reservation={}, format={:?}",
             batch_result.batch_size,
-            batch_result.batch_count,
             rayon::current_num_threads(),
             format_bytes(batch_result.peak_memory),
+            format_bytes(batch_result.shard_reservation),
             batch_result.input_format
         );
     }
@@ -761,11 +761,11 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
 
     if args.batch_size.is_none() {
         log::info!(
-            "Adaptive batch sizing: batch_size={}, parallel_batches={}, threads={}, estimated peak memory={}, format={:?}",
+            "Adaptive batch sizing: batch_size={}, threads={}, estimated peak memory={}, shard_reservation={}, format={:?}",
             batch_result.batch_size,
-            batch_result.batch_count,
             rayon::current_num_threads(),
             format_bytes(batch_result.peak_memory),
+            format_bytes(batch_result.shard_reservation),
             batch_result.input_format
         );
     }
@@ -1500,6 +1500,7 @@ mod tests {
             bucket_names: HashMap::new(),
             bucket_sources: HashMap::new(),
             bucket_minimizer_counts: HashMap::new(),
+            largest_shard_entries: 0,
         }
     }
 

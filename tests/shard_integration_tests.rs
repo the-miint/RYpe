@@ -181,6 +181,7 @@ fn build_inverted_from_buckets(
         bucket_names,
         bucket_sources,
         bucket_minimizer_counts,
+        largest_shard_entries: 0,
     };
 
     InvertedIndex::build_from_bucket_map(k, w, salt, &bucket_map, &metadata)
