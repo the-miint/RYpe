@@ -986,6 +986,7 @@ fn build_single_bucket_streaming(
     salt: u64,
     max_memory: Option<usize>,
     options: Option<&rype::parquet_index::ParquetWriteOptions>,
+    exclusion_set: Option<&HashSet<u64>>,
 ) -> Result<SingleBucketResult> {
     use rype::memory::detect_available_memory;
     use rype::parquet_index::ShardAccumulator;
@@ -1035,6 +1036,7 @@ fn build_single_bucket_streaming(
     let mut accumulator = ShardAccumulator::with_output_dir(output_dir, shard_size, options);
     let mut all_sources: Vec<String> = Vec::new();
     let mut total_minimizers: u64 = 0;
+    let mut total_excluded: u64 = 0;
 
     let mut chunk_iter =
         SequenceChunkIterator::new(files, config_dir, chunk_config.target_chunk_bytes);
@@ -1073,6 +1075,23 @@ fn build_single_bucket_streaming(
 
         // K-way merge this chunk's results
         let chunk_merged = kway_merge_dedup(chunk_mins);
+
+        // Filter out excluded minimizers if subtraction is active
+        let chunk_merged = if let Some(excl) = exclusion_set {
+            let original_len = chunk_merged.len();
+            let filtered: Vec<u64> = chunk_merged
+                .into_iter()
+                .filter(|m| !excl.contains(m))
+                .collect();
+            let excluded = original_len - filtered.len();
+            if excluded > 0 {
+                total_excluded += excluded as u64;
+            }
+            filtered
+        } else {
+            chunk_merged
+        };
+
         total_minimizers += chunk_merged.len() as u64;
 
         // Stream to accumulator in batches, checking flush threshold between batches
@@ -1091,6 +1110,14 @@ fn build_single_bucket_streaming(
                 }
             }
         }
+    }
+
+    if total_excluded > 0 {
+        log::info!(
+            "Bucket '{}': excluded {} minimizer entries via subtraction",
+            bucket_name,
+            total_excluded
+        );
     }
 
     let shard_infos = accumulator.finish()?;
@@ -1132,6 +1159,7 @@ fn build_single_bucket_streaming_oriented(
     salt: u64,
     max_memory: Option<usize>,
     options: Option<&rype::parquet_index::ParquetWriteOptions>,
+    exclusion_set: Option<&HashSet<u64>>,
 ) -> Result<SingleBucketResult> {
     use rype::memory::detect_available_memory;
     use rype::parquet_index::ShardAccumulator;
@@ -1177,20 +1205,43 @@ fn build_single_bucket_streaming_oriented(
     let add_batch_entries = (shard_size / 16).min(8_000_000);
 
     let mut accumulator = ShardAccumulator::with_output_dir(output_dir, shard_size, options);
+    let mut total_excluded: u64 = 0;
 
-    // Add baseline minimizers to accumulator in batches
-    for batch in baseline_mins.chunks(add_batch_entries) {
+    // Keep unfiltered baseline for orientation decisions, but filter before
+    // writing to accumulator. We don't count baseline exclusions in
+    // total_excluded because the same minimizers may reappear in chunks
+    // (where they'll be counted).
+    let baseline_for_orient = baseline_mins;
+    let baseline_to_write = if let Some(excl) = exclusion_set {
+        let original_len = baseline_for_orient.len();
+        let filtered: Vec<u64> = baseline_for_orient
+            .iter()
+            .copied()
+            .filter(|m| !excl.contains(m))
+            .collect();
+        log::debug!(
+            "Baseline: excluded {} of {} minimizers via subtraction",
+            original_len - filtered.len(),
+            original_len
+        );
+        filtered
+    } else {
+        baseline_for_orient.clone()
+    };
+
+    // Add filtered baseline to accumulator in batches
+    for batch in baseline_to_write.chunks(add_batch_entries) {
         accumulator.add_entries_from_minimizers(batch, BUCKET_ID);
         while accumulator.should_flush() {
             accumulator.flush_shard()?;
         }
     }
-    let mut total_minimizers = baseline_mins.len() as u64;
+    let mut total_minimizers = baseline_to_write.len() as u64;
     let mut all_sources = baseline_sources;
 
-    // Phase 2: Process remaining files with orientation against baseline
+    // Phase 2: Process remaining files with orientation against unfiltered baseline
     if files.len() > 1 {
-        let baseline_ref = &baseline_mins;
+        let baseline_ref = &baseline_for_orient;
 
         let mut chunk_iter =
             SequenceChunkIterator::new(&files[1..], config_dir, chunk_config.target_chunk_bytes);
@@ -1234,6 +1285,23 @@ fn build_single_bucket_streaming_oriented(
 
             // K-way merge this chunk's results
             let chunk_merged = kway_merge_dedup(chunk_mins);
+
+            // Filter out excluded minimizers if subtraction is active
+            let chunk_merged = if let Some(excl) = exclusion_set {
+                let original_len = chunk_merged.len();
+                let filtered: Vec<u64> = chunk_merged
+                    .into_iter()
+                    .filter(|m| !excl.contains(m))
+                    .collect();
+                let excluded = original_len - filtered.len();
+                if excluded > 0 {
+                    total_excluded += excluded as u64;
+                }
+                filtered
+            } else {
+                chunk_merged
+            };
+
             total_minimizers += chunk_merged.len() as u64;
 
             // Stream to accumulator in batches
@@ -1253,6 +1321,14 @@ fn build_single_bucket_streaming_oriented(
         }
 
         log::debug!("Processed {} additional chunks", chunk_count);
+    }
+
+    if total_excluded > 0 {
+        log::info!(
+            "Bucket '{}': excluded {} minimizer entries via subtraction",
+            bucket_name,
+            total_excluded
+        );
     }
 
     let shard_infos = accumulator.finish()?;
@@ -1422,10 +1498,8 @@ pub fn build_parquet_index_from_config(
     // Build buckets - strategy depends on bucket count
     let is_single_bucket = bucket_names.len() == 1;
 
-    // When subtracting, always use streaming path (even for single bucket)
-    // to avoid modifying build_single_bucket_streaming
-    if !is_single_bucket || exclusion_set.is_some() {
-        // Multiple buckets (or subtraction active): use streaming mode
+    if !is_single_bucket {
+        // Multiple buckets: use streaming mode with channel-based parallelism
         use rype::memory::detect_available_memory;
         let available = cli_max_memory.unwrap_or_else(|| detect_available_memory().bytes);
         let shard_size = available / 2;
@@ -1476,6 +1550,7 @@ pub fn build_parquet_index_from_config(
             cfg.index.salt,
             cli_max_memory,
             options,
+            exclusion_set.as_ref(),
         )?
     } else {
         build_single_bucket_streaming(
@@ -1488,6 +1563,7 @@ pub fn build_parquet_index_from_config(
             cfg.index.salt,
             cli_max_memory,
             options,
+            exclusion_set.as_ref(),
         )?
     };
     log_timing(
@@ -3922,6 +3998,7 @@ files = ["short.fa", "long.fa"]
             0x5555555555555555,
             Some(64 * 1024 * 1024), // 64MB max_memory
             None,
+            None,
         )
         .unwrap();
 
@@ -3997,6 +4074,7 @@ files = ["short.fa", "long.fa"]
             0x5555555555555555,
             Some(3 * 1024 * 1024), // 3MB max_memory → ~1.2MB shard size
             None,
+            None,
         )
         .unwrap();
 
@@ -4053,6 +4131,7 @@ files = ["short.fa", "long.fa"]
             0x5555555555555555,
             Some(64 * 1024 * 1024),
             None,
+            None,
         )
         .unwrap();
 
@@ -4082,6 +4161,7 @@ files = ["short.fa", "long.fa"]
             0x5555555555555555,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -4099,6 +4179,7 @@ files = ["short.fa", "long.fa"]
             32,
             10,
             0x5555555555555555,
+            None,
             None,
             None,
         )
@@ -4134,6 +4215,7 @@ files = ["short.fa", "long.fa"]
             32,
             10,
             0x5555555555555555,
+            None,
             None,
             None,
         )
@@ -4194,6 +4276,7 @@ files = ["short.fa", "long.fa"]
             10,
             0x5555555555555555,
             Some(3 * 1024 * 1024), // 3MB max_memory → ~1.2MB shard size
+            None,
             None,
         )
         .unwrap();
@@ -4281,5 +4364,182 @@ files = ["short.fa", "long.fa"]
         manifest.save(output_dir)?;
 
         Ok(())
+    }
+
+    // ============================================================================
+    // Subtraction (exclusion_set) in single-bucket streaming tests
+    // ============================================================================
+
+    #[test]
+    fn test_single_bucket_streaming_with_exclusion_set() {
+        use std::collections::HashSet;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Use real FASTA files with biologically distinct sequences
+        let phix_path = PathBuf::from("examples/phiX174.fasta");
+        let puc19_path = PathBuf::from("examples/pUC19.fasta");
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        // Build exclusion set from phiX174 minimizers
+        let (phix_mins, _) = extract_bucket_minimizers(
+            &[phix_path.clone()],
+            &project_root,
+            32,
+            10,
+            0x5555555555555555,
+            false,
+        )
+        .unwrap();
+        let exclusion_set: HashSet<u64> = phix_mins.into_iter().collect();
+        assert!(
+            !exclusion_set.is_empty(),
+            "Exclusion set should not be empty"
+        );
+
+        // Create a FASTA that contains both phiX174 and pUC19 sequences
+        // (concatenate both files into one)
+        let combined_path = dir.join("combined.fa");
+        {
+            use std::io::Read as _;
+            let mut combined = Vec::new();
+            let mut f1 = std::fs::File::open(project_root.join(&phix_path)).unwrap();
+            f1.read_to_end(&mut combined).unwrap();
+            let mut f2 = std::fs::File::open(project_root.join(&puc19_path)).unwrap();
+            f2.read_to_end(&mut combined).unwrap();
+            std::fs::write(&combined_path, &combined).unwrap();
+        }
+
+        // Create index directories
+        let output_no_excl = dir.join("no_excl.ryxdi");
+        let output_with_excl = dir.join("with_excl.ryxdi");
+        rype::parquet_index::create_index_directory(&output_no_excl).unwrap();
+        rype::parquet_index::create_index_directory(&output_with_excl).unwrap();
+
+        // Build WITHOUT exclusion
+        let result_no_excl = build_single_bucket_streaming(
+            &output_no_excl,
+            "TestBucket",
+            &[combined_path.clone()],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(100 * 1024 * 1024),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Build WITH exclusion (remove phiX174 minimizers)
+        let result_with_excl = build_single_bucket_streaming(
+            &output_with_excl,
+            "TestBucket",
+            &[combined_path],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(100 * 1024 * 1024),
+            None,
+            Some(&exclusion_set),
+        )
+        .unwrap();
+
+        // Subtracted version should have fewer minimizers
+        assert!(
+            result_with_excl.total_minimizers < result_no_excl.total_minimizers,
+            "Exclusion should reduce minimizer count: {} should be < {}",
+            result_with_excl.total_minimizers,
+            result_no_excl.total_minimizers
+        );
+        // But should still have some (pUC19 minimizers should survive)
+        assert!(
+            result_with_excl.total_minimizers > 0,
+            "Should retain pUC19-unique minimizers"
+        );
+    }
+
+    #[test]
+    fn test_single_bucket_streaming_oriented_with_exclusion_set() {
+        use std::collections::HashSet;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let phix_path = PathBuf::from("examples/phiX174.fasta");
+        let puc19_path = PathBuf::from("examples/pUC19.fasta");
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        // Build exclusion set from phiX174 minimizers
+        let (phix_mins, _) = extract_bucket_minimizers(
+            &[phix_path.clone()],
+            &project_root,
+            32,
+            10,
+            0x5555555555555555,
+            false,
+        )
+        .unwrap();
+        let exclusion_set: HashSet<u64> = phix_mins.into_iter().collect();
+
+        // Combined FASTA with both genomes
+        let combined_path = dir.join("combined.fa");
+        {
+            use std::io::Read as _;
+            let mut combined = Vec::new();
+            let mut f1 = std::fs::File::open(project_root.join(&phix_path)).unwrap();
+            f1.read_to_end(&mut combined).unwrap();
+            let mut f2 = std::fs::File::open(project_root.join(&puc19_path)).unwrap();
+            f2.read_to_end(&mut combined).unwrap();
+            std::fs::write(&combined_path, &combined).unwrap();
+        }
+
+        let output_no_excl = dir.join("no_excl.ryxdi");
+        let output_with_excl = dir.join("with_excl.ryxdi");
+        rype::parquet_index::create_index_directory(&output_no_excl).unwrap();
+        rype::parquet_index::create_index_directory(&output_with_excl).unwrap();
+
+        // Build oriented WITHOUT exclusion
+        let result_no_excl = build_single_bucket_streaming_oriented(
+            &output_no_excl,
+            "TestBucket",
+            &[combined_path.clone()],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(100 * 1024 * 1024),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Build oriented WITH exclusion
+        let result_with_excl = build_single_bucket_streaming_oriented(
+            &output_with_excl,
+            "TestBucket",
+            &[combined_path],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(100 * 1024 * 1024),
+            None,
+            Some(&exclusion_set),
+        )
+        .unwrap();
+
+        assert!(
+            result_with_excl.total_minimizers < result_no_excl.total_minimizers,
+            "Exclusion should reduce minimizer count: {} should be < {}",
+            result_with_excl.total_minimizers,
+            result_no_excl.total_minimizers
+        );
+        assert!(
+            result_with_excl.total_minimizers > 0,
+            "Should retain pUC19-unique minimizers"
+        );
     }
 }

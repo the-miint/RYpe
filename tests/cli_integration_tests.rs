@@ -4313,3 +4313,104 @@ files = ["{}"]
 
     Ok(())
 }
+
+/// Test that single-bucket `from-config --subtract-from` uses the parallel
+/// streaming path (not the serial multi-bucket path).
+#[test]
+fn test_cli_from_config_subtract_single_bucket_parallel() -> Result<()> {
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+
+    // Create reference files
+    let shared_seq = "A".repeat(200);
+    let unique_seq = "T".repeat(200);
+
+    let ref_shared = dir.path().join("ref_shared.fasta");
+    fs::write(&ref_shared, format!(">shared\n{}\n", shared_seq))?;
+
+    let ref_main = dir.path().join("ref_main.fasta");
+    fs::write(
+        &ref_main,
+        format!(">shared_copy\n{}\n>unique\n{}\n", shared_seq, unique_seq),
+    )?;
+
+    // Build subtraction index
+    let subtract_path = dir.path().join("subtract.ryxdi");
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            subtract_path.to_str().unwrap(),
+            "-r",
+            ref_shared.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Subtraction index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Build from-config WITH subtraction (single bucket)
+    let config_path = dir.path().join("config.toml");
+    let config_content = format!(
+        r#"
+[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "output.ryxdi"
+
+[buckets.SingleBucket]
+files = ["{}"]
+"#,
+        ref_main.to_str().unwrap()
+    );
+    fs::write(&config_path, &config_content)?;
+
+    let output = Command::new(&binary)
+        .args([
+            "-v",
+            "index",
+            "from-config",
+            "-c",
+            config_path.to_str().unwrap(),
+            "--subtract-from",
+            subtract_path.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The single-bucket streaming path logs "(streaming," while the
+    // multi-bucket path logs "(N/M)". Assert we hit the parallel path.
+    assert!(
+        stderr.contains("(streaming,"),
+        "Single-bucket subtract should use parallel streaming path.\n\
+         Expected '(streaming,' in stderr but got:\n{}",
+        stderr
+    );
+
+    // Verify the index is valid
+    let stats = Command::new(&binary)
+        .args([
+            "index",
+            "stats",
+            "-i",
+            dir.path().join("output.ryxdi").to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(stats.status.success());
+
+    Ok(())
+}
