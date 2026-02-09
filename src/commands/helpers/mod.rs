@@ -13,6 +13,7 @@
 
 mod arg_parsing;
 mod batch_config;
+pub(crate) mod deferred_denom;
 mod fastx_io;
 mod formatting;
 mod index_loading;
@@ -30,6 +31,8 @@ pub use arg_parsing::{
     parse_bloom_fpp, parse_max_memory_arg, parse_shard_size_arg, validate_trim_to,
 };
 pub use batch_config::{compute_effective_batch_size, BatchSizeConfig};
+#[allow(unused_imports)]
+pub use deferred_denom::{DeferredDenomBuffer, DeferredRead};
 #[allow(unused_imports)]
 pub use fastx_io::OwnedFastxRecord;
 #[allow(unused_imports)]

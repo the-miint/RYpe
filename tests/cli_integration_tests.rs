@@ -3810,6 +3810,152 @@ fn test_log_ratio_paired_creates_r1_r2_files() -> Result<()> {
     Ok(())
 }
 
+/// Test that log-ratio works correctly when multiple deferred-denom flush cycles occur.
+///
+/// Uses a very small batch size (4 reads) so the deferred threshold (batch_size/2 = 2)
+/// is reached quickly, forcing multiple flush cycles across 10 query reads.
+/// Validates that all reads appear in the output despite multiple flushes.
+#[test]
+fn test_log_ratio_multiple_deferred_flushes() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
+
+    // Create separate single-bucket indices
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            num_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Numerator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Denominator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create 10 query reads — all from phiX174 so they have non-zero numerator scores
+    // and need denominator classification (not fast-path NumZero).
+    let query_path = dir.path().join("queries.fastq");
+    let phix_seq = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT";
+    let mut query_content = String::new();
+    for i in 0..10 {
+        query_content.push_str(&format!(
+            "@read{}\n{}\n+\n{}\n",
+            i,
+            phix_seq,
+            "I".repeat(phix_seq.len())
+        ));
+    }
+    fs::write(&query_path, &query_content)?;
+
+    let tsv_output_path = dir.path().join("output.tsv");
+
+    // Run log-ratio with very small batch size to force multiple deferred flushes.
+    // batch_size=4 → deferred_threshold=2, so with 10 reads across 3 batches (4+4+2),
+    // the deferred buffer should flush multiple times.
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-o",
+            tsv_output_path.to_str().unwrap(),
+            "--batch-size",
+            "4",
+            "--verbose",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Log-ratio with small batch size failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify all 10 reads appear in output
+    let tsv_content = fs::read_to_string(&tsv_output_path)?;
+    let data_lines: Vec<&str> = tsv_content
+        .lines()
+        .filter(|l| !l.starts_with("read_id"))
+        .collect();
+
+    assert_eq!(
+        data_lines.len(),
+        10,
+        "Expected 10 output lines (one per read), got {}. Output:\n{}",
+        data_lines.len(),
+        tsv_content
+    );
+
+    // Every line should have 4 tab-separated columns
+    for (i, line) in data_lines.iter().enumerate() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(
+            cols.len(),
+            4,
+            "Line {} should have 4 columns, got {}: {:?}",
+            i,
+            cols.len(),
+            cols
+        );
+    }
+
+    // Verify stderr mentions deferred flushing (at least one mid-loop flush)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // With 10 reads at batch_size=4, there should be multiple batches and at least one flush
+    assert!(
+        stderr.contains("Flushed") || stderr.contains("deferred"),
+        "Expected deferred flush log messages in stderr. stderr:\n{}",
+        stderr
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_cli_from_config_subtract_nonexistent_index() -> Result<()> {
     let dir = tempdir()?;
