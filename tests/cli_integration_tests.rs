@@ -1670,10 +1670,10 @@ fn test_cli_log_ratio_end_to_end() -> Result<()> {
 
     // Score should be parseable
     let score_str = cols[2];
-    if score_str != "inf" && score_str != "-inf" {
+    if score_str != "inf" && score_str != "-inf" && score_str != "NaN" {
         let _score: f64 = score_str.parse().unwrap_or_else(|_| {
             panic!(
-                "Score should be a valid float or 'inf'. Got: '{}'",
+                "Score should be a valid float, 'inf', '-inf', or 'NaN'. Got: '{}'",
                 score_str
             )
         });
@@ -1682,8 +1682,8 @@ fn test_cli_log_ratio_end_to_end() -> Result<()> {
     // fast_path should be a valid value
     let fast_path = cols[3];
     assert!(
-        fast_path == "none" || fast_path == "num_zero" || fast_path == "num_high",
-        "fast_path should be none/num_zero/num_high. Got: {}",
+        fast_path == "none" || fast_path == "num_high",
+        "fast_path should be none/num_high. Got: {}",
         fast_path
     );
 
@@ -2095,9 +2095,9 @@ fn test_cli_log_ratio_numerator_skip_threshold() -> Result<()> {
     Ok(())
 }
 
-/// Test fast-path num_zero: query matching only denominator -> -inf + num_zero
+/// Test exact computation for num=0: query matching only denominator -> -inf + none
 #[test]
-fn test_cli_log_ratio_fast_path_num_zero() -> Result<()> {
+fn test_cli_log_ratio_num_zero_denom_positive() -> Result<()> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let dir = tempdir()?;
 
@@ -2153,7 +2153,7 @@ fn test_cli_log_ratio_fast_path_num_zero() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Query matching ONLY pUC19 (denominator) -> numerator score = 0 -> num_zero fast path
+    // Query matching ONLY pUC19 (denominator) -> numerator score = 0, denom > 0 -> -inf via exact computation
     let query_path = dir.path().join("query.fastq");
     let puc19_seq = "TCGCGCGTTTCGGTGATGACGGTGAAAACCTCTGACACATGCAGCTCCCGGAGACGGTCACAGCTTGTCT";
     fs::write(
@@ -2185,24 +2185,138 @@ fn test_cli_log_ratio_fast_path_num_zero() -> Result<()> {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("num_zero fast path output:\n{}", stdout);
+    println!("num=0 exact computation output:\n{}", stdout);
 
     // Should have header + at least 1 data row
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines.len() >= 2, "Should have at least header + 1 data row");
 
-    // Data row should show -inf with num_zero fast path
+    // Data row should show -inf with none fast path (exact computation, not fast-pathed)
     let data_row = lines[1];
     let cols: Vec<&str> = data_row.split('\t').collect();
     assert_eq!(cols.len(), 4, "Should have 4 columns: {:?}", cols);
     assert_eq!(
         cols[2], "-inf",
-        "Score should be -inf for num_zero. Got: {}",
+        "Score should be -inf for num=0, denom>0. Got: {}",
         cols[2]
     );
     assert_eq!(
-        cols[3], "num_zero",
-        "Fast path should be num_zero. Got: {}",
+        cols[3], "none",
+        "Fast path should be none (exact computation). Got: {}",
+        cols[3]
+    );
+
+    Ok(())
+}
+
+/// Test NaN output when query matches neither numerator nor denominator (both scores = 0).
+#[test]
+fn test_cli_log_ratio_both_zero_gives_nan() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
+
+    // phiX is numerator, pUC19 is denominator
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            num_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Numerator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Denominator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Synthetic query that matches neither phiX nor pUC19.
+    // Alternating ACAC... produces k-mers unlike either genome.
+    let query_path = dir.path().join("query.fastq");
+    let no_match_seq = "ACACACACACACACACACACACACACACACACACACACACACACACACACACACACACACACACACACACAC";
+    fs::write(
+        &query_path,
+        format!(
+            "@no_match_read\n{}\n+\n{}\n",
+            no_match_seq,
+            "I".repeat(no_match_seq.len())
+        ),
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Log-ratio failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("both-zero NaN output:\n{}", stdout);
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines.len() >= 2, "Should have at least header + 1 data row");
+
+    // Data row should show NaN with fast_path=none (exact computation, both scores = 0)
+    let data_row = lines[1];
+    let cols: Vec<&str> = data_row.split('\t').collect();
+    assert_eq!(cols.len(), 4, "Should have 4 columns: {:?}", cols);
+    assert_eq!(
+        cols[2], "NaN",
+        "Score should be NaN when both num and denom are 0. Got: {}",
+        cols[2]
+    );
+    assert_eq!(
+        cols[3], "none",
+        "Fast path should be none (exact computation). Got: {}",
         cols[3]
     );
 
@@ -3660,6 +3774,163 @@ fn test_log_ratio_output_sequences_positive_flag() -> Result<()> {
     Ok(())
 }
 
+/// Test that NaN reads (matching neither index) are always emitted in --output-sequences,
+/// regardless of --passing-is-positive flag.
+///
+/// NaN means "no evidence for or against", so the conservative choice is to always emit.
+#[test]
+fn test_log_ratio_output_sequences_nan_always_emitted() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
+
+    // Create separate single-bucket indices
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            num_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Numerator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Denominator index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Synthetic query matching neither index → NaN
+    let no_match_seq = "ACACACACACACACACACACACACACACACACACACACACACACACACACACACACACACACACACACACAC";
+
+    let query_path = dir.path().join("reads.fastq");
+    fs::write(
+        &query_path,
+        format!(
+            "@no_match_read\n{}\n+\n{}\n",
+            no_match_seq,
+            "I".repeat(no_match_seq.len()),
+        ),
+    )?;
+
+    // Test 1: default (passing-is-negative) — NaN read should be emitted
+    let out_seq_neg = dir.path().join("filtered_neg.fastq.gz");
+    let tsv_neg = dir.path().join("results_neg.tsv");
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-o",
+            tsv_neg.to_str().unwrap(),
+            "--output-sequences",
+            out_seq_neg.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Log-ratio (default) failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify TSV shows NaN
+    let tsv_content = fs::read_to_string(&tsv_neg)?;
+    println!("TSV (default):\n{}", tsv_content);
+    let data_lines: Vec<&str> = tsv_content.lines().skip(1).collect();
+    assert!(!data_lines.is_empty(), "Should have data rows");
+    let cols: Vec<&str> = data_lines[0].split('\t').collect();
+    assert_eq!(cols[2], "NaN", "Score should be NaN. Got: {}", cols[2]);
+
+    // NaN read should be in output sequences (default = passing-is-negative)
+    assert!(
+        out_seq_neg.exists(),
+        "Output sequences file should exist (default)"
+    );
+    let content_neg = read_gzipped(&out_seq_neg);
+    assert!(
+        content_neg.contains("@no_match_read"),
+        "NaN read should be emitted with default (passing-is-negative) setting"
+    );
+
+    // Test 2: --passing-is-positive — NaN read should ALSO be emitted
+    let out_seq_pos = dir.path().join("filtered_pos.fastq.gz");
+    let tsv_pos = dir.path().join("results_pos.tsv");
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-o",
+            tsv_pos.to_str().unwrap(),
+            "--output-sequences",
+            out_seq_pos.to_str().unwrap(),
+            "--passing-is-positive",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Log-ratio (passing-is-positive) failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        out_seq_pos.exists(),
+        "Output sequences file should exist (passing-is-positive)"
+    );
+    let content_pos = read_gzipped(&out_seq_pos);
+    assert!(
+        content_pos.contains("@no_match_read"),
+        "NaN read should be emitted with --passing-is-positive setting"
+    );
+
+    Ok(())
+}
+
 /// Test that paired-end output creates foo.R1.fastq.gz and foo.R2.fastq.gz files.
 ///
 /// Uses a pUC19-matching read (log-ratio = -inf) which passes with default settings.
@@ -3873,7 +4144,7 @@ fn test_log_ratio_multiple_deferred_flushes() -> Result<()> {
     );
 
     // Create 10 query reads — all from phiX174 so they have non-zero numerator scores
-    // and need denominator classification (not fast-path NumZero).
+    // and need denominator classification.
     let query_path = dir.path().join("queries.fastq");
     let phix_seq = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT";
     let mut query_content = String::new();

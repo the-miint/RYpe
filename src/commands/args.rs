@@ -545,20 +545,20 @@ THRESHOLD:
   Computes log10(numerator_score / denominator_score) for each read using
   two separate single-bucket indices.
 
-  Reads are first classified against the numerator index. Reads with zero
-  numerator score are assigned -inf (fast path). If --numerator-skip-threshold
+  Reads are first classified against the numerator index. If --numerator-skip-threshold
   is set, reads exceeding that threshold are assigned +inf (fast path).
-  Only remaining reads are classified against the denominator index.
+  All other reads (including zero numerator score) are classified against the
+  denominator index to compute the exact log-ratio.
 
 OUTPUT FORMAT:
   Tab-separated: read_id<TAB>log10([Num] / [Denom])<TAB>score<TAB>fast_path
 
-  fast_path column: 'none' (exact), 'num_zero' (-inf), 'num_high' (+inf)
+  fast_path column: 'none' (exact), 'num_high' (+inf)
 
 EDGE CASES:
-  - numerator = 0 → -inf (fast path: num_zero)
-  - denominator = 0, numerator > 0 → +inf
-  - both = 0 → -inf (fast path: num_zero)
+  - numerator = 0, denominator > 0 → -inf (no numerator signal)
+  - numerator > 0, denominator = 0 → +inf
+  - both = 0 → NaN (no evidence for or against)
 
 EXAMPLES:
   # Basic log-ratio with two indices

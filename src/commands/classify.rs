@@ -582,11 +582,11 @@ fn validate_seq_output(
 
 /// Result of partitioning reads by numerator score into fast-path and needs-denominator groups.
 pub struct PartitionResult {
-    /// Reads resolved via fast path (num_zero or num_high) — no denominator needed.
+    /// Reads resolved via fast path (NumHigh only) — no denominator needed.
     pub fast_path_results: Vec<super::helpers::LogRatioResult>,
     /// Query IDs of reads that need denominator classification.
     pub needs_denom_query_ids: Vec<i64>,
-    /// Numerator scores indexed by query_id (0.0 for fast-path reads).
+    /// Numerator scores indexed by query_id (0.0 for zero-score reads).
     /// Only entries for needs-denom reads are meaningful.
     pub num_scores: Vec<f64>,
 }
@@ -594,10 +594,10 @@ pub struct PartitionResult {
 /// Partition reads by numerator classification results into fast-path and needs-denominator groups.
 ///
 /// For each read in 0..total_reads:
-/// - If the read has no numerator hit (score = 0), it gets fast-path `-inf` (NumZero).
 /// - If `skip_threshold` is set and the read's numerator score >= threshold, it gets
 ///   fast-path `+inf` (NumHigh).
-/// - Otherwise, the read needs denominator classification.
+/// - Otherwise (including score=0), the read needs denominator classification.
+///   Score=0 reads need the denominator to distinguish -inf (denom>0) from NaN (denom=0).
 ///
 /// `num_results` are the HitResults from classifying against the numerator index
 /// (single bucket, threshold=0.0).
@@ -620,14 +620,7 @@ pub fn partition_by_numerator_score(
     for query_id in 0..total_reads as i64 {
         let score = num_scores[query_id as usize];
 
-        if score == 0.0 {
-            // No numerator signal → -inf
-            fast_path_results.push(LogRatioResult {
-                query_id,
-                log_ratio: f64::NEG_INFINITY,
-                fast_path: FastPath::NumZero,
-            });
-        } else if let Some(thresh) = skip_threshold {
+        if let Some(thresh) = skip_threshold {
             if score >= thresh {
                 // Strong numerator signal → +inf
                 fast_path_results.push(LogRatioResult {
@@ -657,7 +650,7 @@ pub fn partition_by_numerator_score(
 ///
 /// Flow per batch:
 /// 1. Classify all reads against numerator (threshold=0.0)
-/// 2. Partition: num_score=0 → -inf (NumZero), num_score >= skip_threshold → +inf (NumHigh)
+/// 2. Partition: num_score >= skip_threshold → +inf (NumHigh); all others need denominator
 /// 3. Classify remaining reads against denominator
 /// 4. Merge fast-path + exact results, format and write
 pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
@@ -1036,9 +1029,9 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
                 if let Some(ref mut writer) = seq_writer {
                     for lr in &partition.fast_path_results {
                         let passes = if passing_is_positive {
-                            lr.log_ratio > 0.0
+                            lr.log_ratio > 0.0 || lr.log_ratio.is_nan()
                         } else {
-                            lr.log_ratio <= 0.0
+                            lr.log_ratio <= 0.0 || lr.log_ratio.is_nan()
                         };
                         if passes {
                             let rec = &owned_records[lr.query_id as usize];
@@ -1142,7 +1135,7 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
 ///
 /// This is the first half of log-ratio classification: classify all reads against the
 /// numerator (threshold=0.0), then call `partition_by_numerator_score` to split reads
-/// into fast-path (NumZero/NumHigh) vs needs-denominator groups.
+/// into fast-path (NumHigh) vs needs-denominator groups.
 ///
 /// Returns a `PartitionResult` with fast-path results, needs-denom query IDs, and dense
 /// numerator scores.
@@ -1265,12 +1258,13 @@ pub fn flush_deferred_denom(
     let headers: Vec<&str> = deferred_reads.iter().map(|dr| dr.header.as_str()).collect();
 
     // Write sequences if seq_writer provided
+    // NaN reads (num=0, denom=0) are always emitted — no evidence against them.
     if let Some(writer) = seq_writer {
         for (i, lr) in results.iter().enumerate() {
             let passes = if passing_is_positive {
-                lr.log_ratio > 0.0
+                lr.log_ratio > 0.0 || lr.log_ratio.is_nan()
             } else {
-                lr.log_ratio <= 0.0
+                lr.log_ratio <= 0.0 || lr.log_ratio.is_nan()
             };
             if passes {
                 let rec = &deferred_reads[i].record;
@@ -1778,27 +1772,20 @@ mod tests {
     // Phase 7: partition_by_numerator_score tests
 
     #[test]
-    fn test_partition_all_zeros_gives_all_num_zero() {
-        // No HitResults means all reads have score=0 → all NumZero
-        use crate::commands::helpers::FastPath;
-
+    fn test_partition_all_zeros_goes_to_needs_denom() {
+        // No HitResults means all reads have score=0 → all need denominator
         let num_results: Vec<rype::HitResult> = vec![];
         let result = partition_by_numerator_score(&num_results, 3, None);
 
-        assert_eq!(result.fast_path_results.len(), 3);
-        assert!(result.needs_denom_query_ids.is_empty());
+        assert!(result.fast_path_results.is_empty());
+        assert_eq!(result.needs_denom_query_ids.len(), 3);
+        assert_eq!(result.needs_denom_query_ids, vec![0, 1, 2]);
         // All scores are 0.0 (no hits)
         assert!(result.num_scores.iter().all(|&s| s == 0.0));
-
-        for (i, lr) in result.fast_path_results.iter().enumerate() {
-            assert_eq!(lr.query_id, i as i64);
-            assert!(lr.log_ratio.is_infinite() && lr.log_ratio.is_sign_negative());
-            assert_eq!(lr.fast_path, FastPath::NumZero);
-        }
     }
 
     #[test]
-    fn test_partition_with_skip_threshold_creates_three_groups() {
+    fn test_partition_with_skip_threshold_creates_two_groups() {
         use crate::commands::helpers::FastPath;
 
         // 4 reads: query 0 has no hit (score=0), query 1 has score=0.05 (below thresh),
@@ -1823,29 +1810,15 @@ mod tests {
 
         let result = partition_by_numerator_score(&num_results, 4, Some(0.1));
 
-        // Fast path: query 0 (NumZero) and query 2 (NumHigh)
-        assert_eq!(result.fast_path_results.len(), 2);
+        // Fast path: only query 2 (NumHigh); query 0 (score=0) goes to needs-denom
+        assert_eq!(result.fast_path_results.len(), 1);
+        assert_eq!(result.fast_path_results[0].query_id, 2);
+        assert_eq!(result.fast_path_results[0].fast_path, FastPath::NumHigh);
+        assert!(result.fast_path_results[0].log_ratio == f64::INFINITY);
 
-        let num_zero: Vec<_> = result
-            .fast_path_results
-            .iter()
-            .filter(|r| r.fast_path == FastPath::NumZero)
-            .collect();
-        assert_eq!(num_zero.len(), 1);
-        assert_eq!(num_zero[0].query_id, 0);
-        assert!(num_zero[0].log_ratio == f64::NEG_INFINITY);
-
-        let num_high: Vec<_> = result
-            .fast_path_results
-            .iter()
-            .filter(|r| r.fast_path == FastPath::NumHigh)
-            .collect();
-        assert_eq!(num_high.len(), 1);
-        assert_eq!(num_high[0].query_id, 2);
-        assert!(num_high[0].log_ratio == f64::INFINITY);
-
-        // Needs denom: query 1 (score=0.05) and query 3 (score=0.01)
-        assert_eq!(result.needs_denom_query_ids.len(), 2);
+        // Needs denom: query 0 (score=0), query 1 (score=0.05), query 3 (score=0.01)
+        assert_eq!(result.needs_denom_query_ids.len(), 3);
+        assert!(result.needs_denom_query_ids.contains(&0));
         assert!(result.needs_denom_query_ids.contains(&1));
         assert!(result.needs_denom_query_ids.contains(&3));
 
@@ -1856,8 +1829,6 @@ mod tests {
 
     #[test]
     fn test_partition_without_skip_threshold_no_num_high() {
-        use crate::commands::helpers::FastPath;
-
         // 3 reads: query 0 has no hit, query 1 has score=0.5, query 2 has score=0.9
         let num_results = vec![
             rype::HitResult {
@@ -1874,21 +1845,12 @@ mod tests {
 
         let result = partition_by_numerator_score(&num_results, 3, None);
 
-        // Only query 0 is fast path (NumZero)
-        assert_eq!(result.fast_path_results.len(), 1);
-        assert_eq!(result.fast_path_results[0].query_id, 0);
-        assert_eq!(result.fast_path_results[0].fast_path, FastPath::NumZero);
+        // No fast path at all without skip threshold
+        assert!(result.fast_path_results.is_empty());
 
-        // No NumHigh without skip threshold
-        let num_high: Vec<_> = result
-            .fast_path_results
-            .iter()
-            .filter(|r| r.fast_path == FastPath::NumHigh)
-            .collect();
-        assert!(num_high.is_empty());
-
-        // Queries 1 and 2 need denom
-        assert_eq!(result.needs_denom_query_ids.len(), 2);
+        // All 3 reads need denom (including query 0 with score=0)
+        assert_eq!(result.needs_denom_query_ids.len(), 3);
+        assert!(result.needs_denom_query_ids.contains(&0));
         assert!(result.needs_denom_query_ids.contains(&1));
         assert!(result.needs_denom_query_ids.contains(&2));
 
@@ -1917,7 +1879,7 @@ mod tests {
 
     #[test]
     fn test_partition_all_reads_have_hits() {
-        // No reads should be NumZero when all have hits
+        // All reads have hits, so all go to needs_denom (no skip threshold)
         let num_results = vec![
             rype::HitResult {
                 query_id: 0,

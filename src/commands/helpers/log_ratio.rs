@@ -11,8 +11,6 @@ use std::io::Write;
 pub enum FastPath {
     /// Result was computed exactly (both numerator and denominator classified).
     None,
-    /// Numerator score was zero, so log-ratio is -inf without needing denominator.
-    NumZero,
     /// Numerator score exceeded the skip threshold, so log-ratio is +inf without needing denominator.
     NumHigh,
 }
@@ -22,7 +20,6 @@ impl FastPath {
     pub fn as_str(&self) -> &'static str {
         match self {
             FastPath::None => "none",
-            FastPath::NumZero => "num_zero",
             FastPath::NumHigh => "num_high",
         }
     }
@@ -39,14 +36,15 @@ pub struct LogRatioResult {
 /// Compute log10(numerator / denominator) with special handling for edge cases.
 ///
 /// Edge cases:
-/// - numerator = 0 → -infinity (no numerator signal)
-/// - denominator = 0 and numerator > 0 → +infinity
-/// - both = 0 → -infinity (no numerator signal)
+/// - numerator = 0, denominator > 0 → -infinity (read matches denom but not num)
+/// - numerator > 0, denominator = 0 → +infinity (read matches num but not denom)
+/// - both = 0 → NaN (no evidence for or against)
 pub fn compute_log_ratio(numerator: f64, denominator: f64) -> f64 {
-    if numerator == 0.0 {
+    if numerator == 0.0 && denominator == 0.0 {
+        f64::NAN
+    } else if numerator == 0.0 {
         f64::NEG_INFINITY
     } else if denominator == 0.0 {
-        // Numerator > 0, denominator = 0 → +infinity
         f64::INFINITY
     } else {
         (numerator / denominator).log10()
@@ -81,7 +79,14 @@ pub fn format_log_ratio_output<S: AsRef<str>>(
     for lr in log_ratios {
         let header = headers[lr.query_id as usize].as_ref();
         let fast_path = lr.fast_path.as_str();
-        if lr.log_ratio == f64::NEG_INFINITY {
+        if lr.log_ratio.is_nan() {
+            writeln!(
+                output,
+                "{}\t{}\tNaN\t{}",
+                header, ratio_bucket_name, fast_path
+            )
+            .unwrap();
+        } else if lr.log_ratio == f64::NEG_INFINITY {
             writeln!(
                 output,
                 "{}\t{}\t-inf\t{}",
@@ -114,21 +119,11 @@ mod tests {
     #[test]
     fn test_fast_path_as_str() {
         assert_eq!(FastPath::None.as_str(), "none");
-        assert_eq!(FastPath::NumZero.as_str(), "num_zero");
         assert_eq!(FastPath::NumHigh.as_str(), "num_high");
     }
 
     #[test]
     fn test_log_ratio_result_with_fast_path() {
-        let result = LogRatioResult {
-            query_id: 42,
-            log_ratio: f64::NEG_INFINITY,
-            fast_path: FastPath::NumZero,
-        };
-        assert_eq!(result.query_id, 42);
-        assert!(result.log_ratio.is_infinite() && result.log_ratio.is_sign_negative());
-        assert_eq!(result.fast_path, FastPath::NumZero);
-
         let result = LogRatioResult {
             query_id: 7,
             log_ratio: f64::INFINITY,
@@ -178,9 +173,9 @@ mod tests {
 
     #[test]
     fn test_compute_log_ratio_both_zero() {
-        // both = 0 → -inf (numerator is zero)
+        // both = 0 → NaN (no evidence for or against)
         let result = compute_log_ratio(0.0, 0.0);
-        assert!(result.is_infinite() && result.is_sign_negative());
+        assert!(result.is_nan());
     }
 
     #[test]
@@ -252,7 +247,7 @@ mod tests {
         let log_ratios = vec![LogRatioResult {
             query_id: 0,
             log_ratio: f64::NEG_INFINITY,
-            fast_path: FastPath::NumZero,
+            fast_path: FastPath::None,
         }];
         let headers: Vec<&str> = vec!["read_neginf"];
         let ratio_name = "ratio";
@@ -260,7 +255,7 @@ mod tests {
         let output = format_log_ratio_output(&log_ratios, &headers, ratio_name);
         let output_str = String::from_utf8(output).unwrap();
 
-        assert_eq!(output_str, "read_neginf\tratio\t-inf\tnum_zero\n");
+        assert_eq!(output_str, "read_neginf\tratio\t-inf\tnone\n");
     }
 
     #[test]
@@ -268,8 +263,8 @@ mod tests {
         let log_ratios = vec![
             LogRatioResult {
                 query_id: 0,
-                log_ratio: f64::NEG_INFINITY,
-                fast_path: FastPath::NumZero,
+                log_ratio: f64::NAN,
+                fast_path: FastPath::None,
             },
             LogRatioResult {
                 query_id: 1,
@@ -290,8 +285,24 @@ mod tests {
 
         assert_eq!(
             output_str,
-            "read_0\tratio\t-inf\tnum_zero\nread_1\tratio\tinf\tnum_high\nread_2\tratio\t0.3010\tnone\n"
+            "read_0\tratio\tNaN\tnone\nread_1\tratio\tinf\tnum_high\nread_2\tratio\t0.3010\tnone\n"
         );
+    }
+
+    #[test]
+    fn test_format_log_ratio_output_nan() {
+        let log_ratios = vec![LogRatioResult {
+            query_id: 0,
+            log_ratio: f64::NAN,
+            fast_path: FastPath::None,
+        }];
+        let headers: Vec<&str> = vec!["read_nan"];
+        let ratio_name = "ratio";
+
+        let output = format_log_ratio_output(&log_ratios, &headers, ratio_name);
+        let output_str = String::from_utf8(output).unwrap();
+
+        assert_eq!(output_str, "read_nan\tratio\tNaN\tnone\n");
     }
 
     #[test]
