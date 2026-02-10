@@ -337,6 +337,8 @@ pub struct ReadMemoryProfile {
     pub avg_query_length: usize,
     /// Estimated minimizers per query
     pub minimizers_per_query: usize,
+    /// Whether the input is paired-end
+    pub is_paired: bool,
 }
 
 impl ReadMemoryProfile {
@@ -366,6 +368,7 @@ impl ReadMemoryProfile {
             avg_read_length,
             avg_query_length,
             minimizers_per_query,
+            is_paired,
         }
     }
 
@@ -429,6 +432,7 @@ impl ReadMemoryProfile {
                 avg_read_length,
                 avg_query_length,
                 minimizers_per_query,
+                is_paired,
             });
         }
 
@@ -470,6 +474,7 @@ impl ReadMemoryProfile {
             avg_read_length,
             avg_query_length,
             minimizers_per_query,
+            is_paired,
         })
     }
 
@@ -1318,6 +1323,7 @@ mod tests {
             avg_read_length: 150,
             avg_query_length: 150,
             minimizers_per_query: usize::MAX / 2,
+            is_paired: false,
         };
         let result = estimate_batch_memory(1000000, &large_profile, 100);
         assert!(result.is_none(), "Should return None on overflow");

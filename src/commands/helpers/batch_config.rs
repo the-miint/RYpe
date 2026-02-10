@@ -59,15 +59,22 @@ pub struct BatchSizeResult {
 /// # Returns
 /// A `BatchSizeResult` containing the computed batch size and metadata for logging.
 pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSizeResult> {
-    let is_paired = config.r2_path.is_some();
+    // For FASTX, paired-end is determined by having an R2 file.
+    // For Parquet, paired-end data lives in the sequence2 column of the same file,
+    // so r2_path is always None. We detect pairing from the file itself later.
+    let is_paired_hint = config.r2_path.is_some();
 
     if let Some(bs) = config.batch_size_override {
         log::info!("Using user-specified batch size: {}", bs);
         // For user-specified batch, return minimal metadata
         let input_format = if config.is_parquet_input {
-            InputFormat::Parquet { is_paired }
+            InputFormat::Parquet {
+                is_paired: is_paired_hint,
+            }
         } else {
-            InputFormat::Fastx { is_paired }
+            InputFormat::Fastx {
+                is_paired: is_paired_hint,
+            }
         };
         return Ok(BatchSizeResult {
             batch_size: bs,
@@ -125,14 +132,19 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
     )
     .unwrap_or_else(|| {
         log::warn!("Could not sample read lengths, using default profile");
-        ReadMemoryProfile::default_profile(is_paired, metadata.k, metadata.w)
+        ReadMemoryProfile::default_profile(is_paired_hint, metadata.k, metadata.w)
     });
 
+    // Use is_paired from the read profile, which correctly detects pairing
+    // from the Parquet sequence2 column (not just from r2_path).
+    let is_paired = read_profile.is_paired;
+
     log::debug!(
-        "Read profile: avg_read_length={}, avg_query_length={}, minimizers_per_query={}",
+        "Read profile: avg_read_length={}, avg_query_length={}, minimizers_per_query={}, is_paired={}",
         read_profile.avg_read_length,
         read_profile.avg_query_length,
-        read_profile.minimizers_per_query
+        read_profile.minimizers_per_query,
+        is_paired
     );
 
     // Estimate index memory from metadata
