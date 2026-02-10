@@ -4,26 +4,29 @@
 //! flushing only when the buffer reaches a threshold. This avoids paying
 //! the full shard I/O cost for every batch when most reads fast-path.
 
-use super::fastx_io::OwnedFastxRecord;
-
 /// A read deferred for later denominator classification.
 ///
-/// Stores the header, numerator score, and owned sequence data needed to
-/// re-classify the read against the denominator index at flush time.
+/// Stores the header, numerator score, and pre-extracted minimizers.
+/// The minimizers were extracted during numerator classification and are
+/// cached here to avoid redundant re-extraction against the denominator.
 pub struct DeferredRead {
     pub header: String,
     pub num_score: f64,
-    pub record: OwnedFastxRecord,
+    /// Cached (forward, reverse-complement) minimizers from numerator extraction.
+    pub minimizers: (Vec<u64>, Vec<u64>),
+    /// Global read index (position in the input file) for bitset tracking.
+    pub global_index: usize,
 }
 
 impl DeferredRead {
     /// Approximate heap bytes owned by this deferred read.
+    ///
+    /// Counts String/Vec capacity (not len) plus Vec struct overhead (24 bytes each).
     pub fn approx_heap_bytes(&self) -> usize {
-        self.header.len()
-            + self.record.seq1.len()
-            + self.record.qual1.as_ref().map_or(0, |v| v.len())
-            + self.record.seq2.as_ref().map_or(0, |v| v.len())
-            + self.record.qual2.as_ref().map_or(0, |v| v.len())
+        self.header.capacity()
+            + self.minimizers.0.capacity() * 8
+            + self.minimizers.1.capacity() * 8
+            + 24 * 3 // Vec overhead for header String + 2 minimizer Vecs
     }
 }
 
@@ -89,7 +92,8 @@ mod tests {
         DeferredRead {
             header: header.to_string(),
             num_score,
-            record: OwnedFastxRecord::new(0, b"ACGT".to_vec(), None, None, None),
+            minimizers: (vec![100, 200], vec![300, 400]),
+            global_index: 0,
         }
     }
 
@@ -199,56 +203,46 @@ mod tests {
         let mut buf = DeferredDenomBuffer::new(10);
         assert_eq!(buf.approx_bytes(), 0);
 
-        // "r0" = 2 bytes header, "ACGT" = 4 bytes seq1, no qual/seq2
+        // "r0": cap=2 header + 2*8 fwd + 2*8 rc + 72 overhead = 106
         buf.push(make_deferred("r0", 0.1));
-        assert_eq!(buf.approx_bytes(), 2 + 4);
+        let per_entry = buf.approx_bytes();
+        assert!(per_entry > 0);
 
         buf.push(make_deferred("r1", 0.2));
-        assert_eq!(buf.approx_bytes(), (2 + 4) * 2);
+        assert_eq!(buf.approx_bytes(), per_entry * 2);
 
         buf.drain();
         assert_eq!(buf.approx_bytes(), 0);
     }
 
     #[test]
-    fn test_approx_heap_bytes_with_qual_and_paired() {
-        let record = OwnedFastxRecord::new(
-            0,
-            b"GATTACA".to_vec(),
-            Some(b"IIIIIII".to_vec()),
-            Some(b"TTTT".to_vec()),
-            Some(b"JJJJ".to_vec()),
-        );
+    fn test_approx_heap_bytes_varied_minimizers() {
         let dr = DeferredRead {
             header: "hdr".to_string(),
             num_score: 0.5,
-            record,
+            minimizers: (vec![1, 2, 3], vec![4, 5]),
+            global_index: 42,
         };
-        // "hdr"=3 + "GATTACA"=7 + "IIIIIII"=7 + "TTTT"=4 + "JJJJ"=4 = 25
-        assert_eq!(dr.approx_heap_bytes(), 25);
+        // "hdr" cap=3 + fwd=3*8=24 + rc=2*8=16 + 72 overhead = 115
+        let bytes = dr.approx_heap_bytes();
+        // Must include header + both minimizer vecs + overhead
+        assert!(bytes >= 3 + 24 + 16 + 72, "got {}", bytes);
     }
 
     #[test]
-    fn test_deferred_read_preserves_record() {
-        let record = OwnedFastxRecord::new(
-            5,
-            b"GATTACA".to_vec(),
-            Some(b"IIIIIII".to_vec()),
-            Some(b"TTTT".to_vec()),
-            Some(b"JJJJ".to_vec()),
-        );
+    fn test_deferred_read_preserves_minimizers() {
         let mut buf = DeferredDenomBuffer::new(10);
         buf.push(DeferredRead {
-            header: "paired_read".to_string(),
+            header: "read1".to_string(),
             num_score: 0.75,
-            record,
+            minimizers: (vec![10, 20, 30], vec![40, 50]),
+            global_index: 99,
         });
 
         let drained = buf.drain();
-        let rec = &drained[0].record;
-        assert_eq!(rec.seq1, b"GATTACA");
-        assert_eq!(rec.qual1.as_deref(), Some(b"IIIIIII".as_slice()));
-        assert_eq!(rec.seq2.as_deref(), Some(b"TTTT".as_slice()));
-        assert_eq!(rec.qual2.as_deref(), Some(b"JJJJ".as_slice()));
+        let dr = &drained[0];
+        assert_eq!(dr.minimizers.0, vec![10, 20, 30]);
+        assert_eq!(dr.minimizers.1, vec![40, 50]);
+        assert_eq!(dr.global_index, 99);
     }
 }

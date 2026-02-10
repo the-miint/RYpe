@@ -209,6 +209,194 @@ impl SequenceWriter {
 }
 
 // ============================================================================
+// Post-classification re-walk
+// ============================================================================
+
+/// Re-walk the input file and write sequences that are marked as passing in the tracker.
+///
+/// This is used after classification completes: during classification, only a compact
+/// bitset tracks which reads pass the filter. After classification, this function
+/// re-reads the input file and writes passing sequences to gzipped output.
+///
+/// Supports both FASTX (FASTA/FASTQ) and Parquet input. For Parquet input, sequences
+/// are read from `read_id`, `sequence1`, and optionally `sequence2` columns.
+pub fn rewalk_and_write_passing(
+    r1_path: &Path,
+    r2_path: Option<&Path>,
+    is_parquet: bool,
+    tracker: &super::passing_tracker::PassingReadTracker,
+    output_path: &Path,
+    paired: bool,
+    expected_total_reads: usize,
+) -> Result<usize> {
+    if is_parquet {
+        rewalk_parquet(r1_path, tracker, output_path, paired, expected_total_reads)
+    } else {
+        rewalk_fastx(
+            r1_path,
+            r2_path,
+            tracker,
+            output_path,
+            paired,
+            expected_total_reads,
+        )
+    }
+}
+
+/// Re-walk a FASTX input file, writing passing sequences.
+fn rewalk_fastx(
+    r1_path: &Path,
+    r2_path: Option<&Path>,
+    tracker: &super::passing_tracker::PassingReadTracker,
+    output_path: &Path,
+    paired: bool,
+    expected_total_reads: usize,
+) -> Result<usize> {
+    use super::fastx_io::PrefetchingIoHandler;
+
+    let mut reader1 = needletail::parse_fastx_file(r1_path)
+        .map_err(|e| anyhow!("Failed to open R1 for re-walk: {}", e))?;
+    let mut reader2 = r2_path
+        .map(|p| {
+            needletail::parse_fastx_file(p)
+                .map_err(|e| anyhow!("Failed to open R2 for re-walk: {}", e))
+        })
+        .transpose()?;
+
+    let mut writer = SequenceWriter::new(output_path, paired)?;
+    let mut global_index = 0usize;
+    let mut written = 0usize;
+
+    loop {
+        let Some(rec1_result) = reader1.next() else {
+            break;
+        };
+        let rec1 = rec1_result.map_err(|e| anyhow!("Error reading R1 record: {}", e))?;
+
+        let rec2 = if let Some(ref mut r2) = reader2 {
+            let r2_result = r2
+                .next()
+                .ok_or_else(|| anyhow!("R2 has fewer records than R1"))?;
+            Some(r2_result.map_err(|e| anyhow!("Error reading R2 record: {}", e))?)
+        } else {
+            None
+        };
+
+        if tracker.is_passing(global_index) {
+            let header = PrefetchingIoHandler::base_read_id(rec1.id());
+            let owned = OwnedFastxRecord::new(
+                0,
+                rec1.seq().to_vec(),
+                rec1.qual().map(|q| q.to_vec()),
+                rec2.as_ref().map(|r| r.seq().to_vec()),
+                rec2.as_ref().and_then(|r| r.qual().map(|q| q.to_vec())),
+            );
+            writer.write_record(&owned, header)?;
+            written += 1;
+        }
+
+        global_index += 1;
+    }
+
+    if global_index != expected_total_reads {
+        return Err(anyhow!(
+            "Input file changed between classification and re-walk: \
+             expected {} reads, found {}",
+            expected_total_reads,
+            global_index
+        ));
+    }
+
+    writer.finish()?;
+    Ok(written)
+}
+
+/// Re-walk a Parquet input file, writing passing sequences.
+fn rewalk_parquet(
+    parquet_path: &Path,
+    tracker: &super::passing_tracker::PassingReadTracker,
+    output_path: &Path,
+    paired: bool,
+    expected_total_reads: usize,
+) -> Result<usize> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = File::open(parquet_path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut writer = SequenceWriter::new(output_path, paired)?;
+    let mut global_index = 0usize;
+    let mut written = 0usize;
+
+    for batch_result in reader {
+        let batch = batch_result?;
+        let num_rows = batch.num_rows();
+
+        let read_id_col = batch
+            .column_by_name("read_id")
+            .ok_or_else(|| anyhow!("Missing read_id column in Parquet"))?;
+        let seq1_col = batch
+            .column_by_name("sequence1")
+            .ok_or_else(|| anyhow!("Missing sequence1 column in Parquet"))?;
+        let seq2_col = if paired {
+            batch.column_by_name("sequence2")
+        } else {
+            None
+        };
+
+        for row in 0..num_rows {
+            if tracker.is_passing(global_index) {
+                let header = get_string_value(read_id_col, row)?;
+                let seq1 = get_string_value(seq1_col, row)?;
+                let seq2 = seq2_col.map(|col| get_string_value(col, row)).transpose()?;
+
+                let owned = OwnedFastxRecord::new(
+                    0,
+                    seq1.as_bytes().to_vec(),
+                    None, // no quality in Parquet
+                    seq2.map(|s| s.as_bytes().to_vec()),
+                    None,
+                );
+                writer.write_record(&owned, header.as_bytes())?;
+                written += 1;
+            }
+            global_index += 1;
+        }
+    }
+
+    if global_index != expected_total_reads {
+        return Err(anyhow!(
+            "Parquet input changed between classification and re-walk: \
+             expected {} reads, found {}",
+            expected_total_reads,
+            global_index
+        ));
+    }
+
+    writer.finish()?;
+    Ok(written)
+}
+
+/// Extract a string value from an Arrow column (supports both Utf8 and LargeUtf8).
+///
+/// Returns a borrowed `&str` to avoid allocating per-row.
+fn get_string_value(col: &dyn arrow::array::Array, row: usize) -> Result<&str> {
+    use arrow::array::{LargeStringArray, StringArray};
+
+    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+        return Ok(arr.value(row));
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(arr.value(row));
+    }
+    Err(anyhow!(
+        "Column is not a string type: {:?}",
+        col.data_type()
+    ))
+}
+
+// ============================================================================
 // Unit Tests
 // ============================================================================
 

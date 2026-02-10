@@ -14,13 +14,13 @@ use rype::{
     ShardedInvertedIndex,
 };
 
+use super::helpers::seq_writer::rewalk_and_write_passing;
 use super::helpers::{
     compute_effective_batch_size, create_input_reader, format_classification_results,
     format_log_ratio_bucket_name, format_log_ratio_output, is_parquet_input,
     load_index_for_classification, read_parquet_batch_trimmed, stacked_batches_to_records,
     validate_input_config, BatchSizeConfig, ClassificationInput, DeferredDenomBuffer, DeferredRead,
-    IndexLoadOptions, InputReaderConfig, OutputFormat, OutputWriter, OwnedFastxRecord,
-    SequenceWriter,
+    IndexLoadOptions, InputReaderConfig, OutputFormat, OutputWriter, PassingReadTracker,
 };
 
 /// Common arguments shared between classify run and log-ratio commands.
@@ -552,23 +552,15 @@ fn validate_compatible_indices(a: &IndexMetadata, b: &IndexMetadata) -> Result<(
 ///
 /// # Errors
 /// Returns an error if:
-/// - Parquet input is used with `--output-sequences` (not supported)
 /// - `--trim-to` is used with `--output-sequences` (would output incomplete sequences)
 fn validate_seq_output(
-    is_parquet: bool,
+    _is_parquet: bool,
     has_trim_to: bool,
     output_sequences: Option<&std::path::Path>,
 ) -> Result<()> {
     let Some(_path) = output_sequences else {
         return Ok(());
     };
-
-    if is_parquet {
-        return Err(anyhow!(
-            "--output-sequences is not supported with Parquet input.\n\
-             Use FASTX (FASTA/FASTQ) input files for sequence output."
-        ));
-    }
 
     if has_trim_to {
         return Err(anyhow!(
@@ -723,16 +715,19 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
     let mut out_writer = OutputWriter::new_long(output_format, args.output.as_ref(), None, true)?;
     out_writer.write_header(b"read_id\tbucket_name\tscore\tfast_path\n")?;
 
-    // Set up sequence writer if --output-sequences
-    let mut seq_writer = if let Some(ref path) = args.output_sequences {
-        Some(SequenceWriter::new(path, args.r2.is_some())?)
+    // Set up passing read tracker if --output-sequences
+    // Sequences are written post-classification by re-walking the input file,
+    // so we only need a compact bitset during classification.
+    let mut passing_tracker = if args.output_sequences.is_some() {
+        // Initial capacity is zero; the bitset grows as reads are marked.
+        // 100M reads = ~12.5MB, so growth overhead is negligible.
+        Some(PassingReadTracker::with_capacity(0))
     } else {
         None
     };
 
     // Create input reader
-    // preserve_for_output captures quality scores for --output-sequences
-    let preserve_for_output = args.output_sequences.is_some();
+    // No quality capture needed — sequences are written via post-classification re-walk
     let mut input_reader = create_input_reader(
         &InputReaderConfig {
             r1_path: &args.r1,
@@ -742,7 +737,7 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
             is_parquet: input_is_parquet,
             trim_to: if input_is_parquet { None } else { args.trim_to },
         },
-        preserve_for_output,
+        false,
     )?;
 
     let num_sharded = &num_loaded.sharded;
@@ -759,16 +754,12 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
     // Deferred denominator buffer: accumulate needs-denom reads across batches
     // and only classify against denom when buffer is large enough to amortize I/O cost.
     //
-    // Memory overhead: the buffer can hold up to `threshold` OwnedFastxRecords
-    // (each ~read_length bytes for seq + qual). At threshold = batch_size/2, this
-    // adds up to ~0.5x the per-batch sequence memory. This is NOT currently
-    // accounted for in adaptive batch sizing — acceptable because our memory
-    // estimates already leave significant headroom over actual usage.
-    //
-    // Threshold is an initial guess (batch_size/2). May tune later based on
-    // real-world fast-path ratios; see docs/PLAN-fastpath.md.
+    // Memory overhead: the buffer stores cached minimizers (not sequences), so memory
+    // is proportional to minimizer count (~8 bytes × ~6 minimizers/read for short reads)
+    // rather than sequence length. Much smaller than the previous OwnedFastxRecord approach.
     let deferred_threshold = effective_batch_size / 2;
     let mut deferred_buffer = DeferredDenomBuffer::new(deferred_threshold.max(1));
+    let mut global_read_offset: usize = 0;
 
     log::info!(
         "Starting log-ratio classification: numerator={}, denominator={} (batch_size={}, deferred_threshold={})",
@@ -777,6 +768,18 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
         effective_batch_size,
         deferred_threshold.max(1)
     );
+
+    // Context for log-ratio batch processing (immutable configuration)
+    let ctx = LogRatioContext {
+        num_sharded,
+        num_read_options,
+        denom_sharded,
+        denom_read_options,
+        parallel_rg,
+        numerator_skip_threshold,
+        passing_is_positive,
+        ratio_bucket_name: &ratio_bucket_name,
+    };
 
     loop {
         let t_io_read = std::time::Instant::now();
@@ -805,71 +808,22 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
                         .map(|rec| (rec.query_id, rec.seq1.as_slice(), rec.seq2.as_deref()))
                         .collect();
 
-                    // Classify against numerator and partition
-                    let partition = classify_numerator_and_partition(
-                        num_sharded,
+                    let (fast_path_count, needs_denom_count) = process_log_ratio_batch(
+                        &ctx,
                         &batch_refs,
+                        &result.headers,
                         batch_read_count,
-                        num_read_options,
-                        parallel_rg,
-                        numerator_skip_threshold,
+                        &mut deferred_buffer,
+                        &mut out_writer,
+                        &mut passing_tracker,
+                        &mut global_read_offset,
+                        batch_num,
                     )?;
-
-                    let fast_path_count = partition.fast_path_results.len();
-                    let needs_denom_count = partition.needs_denom_query_ids.len();
-
-                    // Write fast-path results immediately
-                    if !partition.fast_path_results.is_empty() {
-                        let t_format = std::time::Instant::now();
-                        let chunk = format_log_ratio_output(
-                            &partition.fast_path_results,
-                            &result.headers,
-                            &ratio_bucket_name,
-                        );
-                        log_timing("batch: format_fast_path", t_format.elapsed().as_millis());
-
-                        let t_write = std::time::Instant::now();
-                        out_writer.write_chunk(chunk)?;
-                        log_timing("batch: io_write_fast_path", t_write.elapsed().as_millis());
-                    }
-
-                    // Push needs-denom reads into deferred buffer (clone OwnedFastxRecord)
-                    for &qid in &partition.needs_denom_query_ids {
-                        let idx = qid as usize;
-                        deferred_buffer.push(DeferredRead {
-                            header: result.headers[idx].clone(),
-                            num_score: partition.num_scores[idx],
-                            record: result.records[idx].clone(),
-                        });
-                    }
-
-                    // Flush deferred buffer if threshold reached
-                    if deferred_buffer.should_flush() {
-                        log::info!(
-                            "Deferred buffer reached threshold ({} reads, ~{}), flushing (triggered by batch {})",
-                            deferred_buffer.len(), format_bytes(deferred_buffer.approx_bytes()), batch_num
-                        );
-                        let drained = deferred_buffer.drain();
-                        flush_deferred_denom(
-                            drained,
-                            denom_sharded,
-                            denom_read_options,
-                            parallel_rg,
-                            &ratio_bucket_name,
-                            &mut out_writer,
-                            seq_writer.as_mut(),
-                            passing_is_positive,
-                        )?;
-                    }
 
                     log::info!(
                         "Processed batch {} ({} row groups): {} reads ({} fast-path, {} deferred, {} total)",
-                        batch_num,
-                        result.rg_count,
-                        batch_read_count,
-                        fast_path_count,
-                        needs_denom_count,
-                        total_reads
+                        batch_num, result.rg_count, batch_read_count,
+                        fast_path_count, needs_denom_count, total_reads
                     );
 
                     if is_final_batch {
@@ -912,80 +866,22 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
                     let (batch_refs, headers) = stacked_batches_to_records(&stacked_batches)?;
                     log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
 
-                    // Classify against numerator and partition
-                    let partition = classify_numerator_and_partition(
-                        num_sharded,
+                    let (fast_path_count, needs_denom_count) = process_log_ratio_batch(
+                        &ctx,
                         &batch_refs,
-                        batch_refs.len(),
-                        num_read_options,
-                        parallel_rg,
-                        numerator_skip_threshold,
+                        &headers,
+                        stacked_rows,
+                        &mut deferred_buffer,
+                        &mut out_writer,
+                        &mut passing_tracker,
+                        &mut global_read_offset,
+                        batch_num,
                     )?;
-
-                    let fast_path_count = partition.fast_path_results.len();
-                    let needs_denom_count = partition.needs_denom_query_ids.len();
-
-                    // Write fast-path results immediately
-                    if !partition.fast_path_results.is_empty() {
-                        let t_format = std::time::Instant::now();
-                        let chunk = format_log_ratio_output(
-                            &partition.fast_path_results,
-                            &headers,
-                            &ratio_bucket_name,
-                        );
-                        log_timing("batch: format_fast_path", t_format.elapsed().as_millis());
-
-                        let t_write = std::time::Instant::now();
-                        out_writer.write_chunk(chunk)?;
-                        log_timing("batch: io_write_fast_path", t_write.elapsed().as_millis());
-                    }
-
-                    // Push needs-denom reads into deferred buffer.
-                    // Zero-copy path: must copy borrowed slices into owned vecs
-                    // since the RecordBatch will be dropped after this iteration.
-                    for &qid in &partition.needs_denom_query_ids {
-                        let idx = qid as usize;
-                        let (_, seq1, seq2) = batch_refs[idx];
-                        deferred_buffer.push(DeferredRead {
-                            header: headers[idx].to_string(),
-                            num_score: partition.num_scores[idx],
-                            record: OwnedFastxRecord::new(
-                                0, // reassigned to 0-based index during flush
-                                seq1.to_vec(),
-                                None, // no qual for Parquet
-                                seq2.map(|s| s.to_vec()),
-                                None,
-                            ),
-                        });
-                    }
-
-                    // Flush deferred buffer if threshold reached
-                    if deferred_buffer.should_flush() {
-                        log::info!(
-                            "Deferred buffer reached threshold ({} reads, ~{}), flushing (triggered by batch {})",
-                            deferred_buffer.len(), format_bytes(deferred_buffer.approx_bytes()), batch_num
-                        );
-                        let drained = deferred_buffer.drain();
-                        flush_deferred_denom(
-                            drained,
-                            denom_sharded,
-                            denom_read_options,
-                            parallel_rg,
-                            &ratio_bucket_name,
-                            &mut out_writer,
-                            seq_writer.as_mut(),
-                            passing_is_positive,
-                        )?;
-                    }
 
                     log::info!(
                         "Processed batch {} ({} batches stacked): {} reads ({} fast-path, {} deferred, {} total)",
-                        batch_num,
-                        num_stacked,
-                        stacked_rows,
-                        fast_path_count,
-                        needs_denom_count,
-                        total_reads
+                        batch_num, num_stacked, stacked_rows,
+                        fast_path_count, needs_denom_count, total_reads
                     );
 
                     if is_final_batch {
@@ -1012,78 +908,17 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
                     .collect();
                 log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
 
-                // Classify against numerator and partition
-                let partition = classify_numerator_and_partition(
-                    num_sharded,
+                let (fast_path_count, needs_denom_count) = process_log_ratio_batch(
+                    &ctx,
                     &batch_refs,
+                    &headers,
                     batch_read_count,
-                    num_read_options,
-                    parallel_rg,
-                    numerator_skip_threshold,
+                    &mut deferred_buffer,
+                    &mut out_writer,
+                    &mut passing_tracker,
+                    &mut global_read_offset,
+                    batch_num,
                 )?;
-
-                let fast_path_count = partition.fast_path_results.len();
-                let needs_denom_count = partition.needs_denom_query_ids.len();
-
-                // Write fast-path sequences immediately if --output-sequences
-                if let Some(ref mut writer) = seq_writer {
-                    for lr in &partition.fast_path_results {
-                        let passes = if passing_is_positive {
-                            lr.log_ratio > 0.0 || lr.log_ratio.is_nan()
-                        } else {
-                            lr.log_ratio <= 0.0 || lr.log_ratio.is_nan()
-                        };
-                        if passes {
-                            let rec = &owned_records[lr.query_id as usize];
-                            let header = headers[lr.query_id as usize].as_bytes();
-                            writer.write_record(rec, header)?;
-                        }
-                    }
-                }
-
-                // Write fast-path results immediately
-                if !partition.fast_path_results.is_empty() {
-                    let t_format = std::time::Instant::now();
-                    let chunk = format_log_ratio_output(
-                        &partition.fast_path_results,
-                        &headers,
-                        &ratio_bucket_name,
-                    );
-                    log_timing("batch: format_fast_path", t_format.elapsed().as_millis());
-
-                    let t_write = std::time::Instant::now();
-                    out_writer.write_chunk(chunk)?;
-                    log_timing("batch: io_write_fast_path", t_write.elapsed().as_millis());
-                }
-
-                // Push needs-denom reads into deferred buffer
-                for &qid in &partition.needs_denom_query_ids {
-                    let idx = qid as usize;
-                    deferred_buffer.push(DeferredRead {
-                        header: headers[idx].clone(),
-                        num_score: partition.num_scores[idx],
-                        record: owned_records[idx].clone(),
-                    });
-                }
-
-                // Flush deferred buffer if threshold reached
-                if deferred_buffer.should_flush() {
-                    log::info!(
-                        "Deferred buffer reached threshold ({} reads, ~{}), flushing (triggered by batch {})",
-                        deferred_buffer.len(), format_bytes(deferred_buffer.approx_bytes()), batch_num
-                    );
-                    let drained = deferred_buffer.drain();
-                    flush_deferred_denom(
-                        drained,
-                        denom_sharded,
-                        denom_read_options,
-                        parallel_rg,
-                        &ratio_bucket_name,
-                        &mut out_writer,
-                        seq_writer.as_mut(),
-                        passing_is_positive,
-                    )?;
-                }
 
                 log::info!(
                     "Processed batch {}: {} reads ({} fast-path, {} deferred, {} total)",
@@ -1108,13 +943,13 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
         let drained = deferred_buffer.drain();
         flush_deferred_denom(
             drained,
-            denom_sharded,
-            denom_read_options,
-            parallel_rg,
-            &ratio_bucket_name,
+            ctx.denom_sharded,
+            ctx.denom_read_options,
+            ctx.parallel_rg,
+            ctx.ratio_bucket_name,
             &mut out_writer,
-            seq_writer.as_mut(),
-            passing_is_positive,
+            passing_tracker.as_mut(),
+            ctx.passing_is_positive,
         )?;
     }
 
@@ -1123,22 +958,45 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
         total_reads
     );
     out_writer.finish()?;
-    if let Some(writer) = seq_writer {
-        writer.finish()?;
+
+    // Post-classification: re-walk input file and write passing sequences
+    if let (Some(tracker), Some(ref output_seq_path)) = (passing_tracker, &args.output_sequences) {
+        let paired = args.r2.is_some();
+        log::info!(
+            "Writing {} passing sequences to {:?}",
+            tracker.count(),
+            output_seq_path
+        );
+        let written = rewalk_and_write_passing(
+            &args.r1,
+            args.r2.as_deref(),
+            input_is_parquet,
+            &tracker,
+            output_seq_path,
+            paired,
+            total_reads,
+        )?;
+        log::info!("Wrote {} passing sequences", written);
     }
+
     input_reader.finish()?;
 
     Ok(())
 }
 
+/// Result of `classify_numerator_and_partition`, including cached minimizers.
+pub struct NumeratorResult {
+    pub partition: PartitionResult,
+    /// Extracted minimizers for all reads in the batch, indexed by query_id.
+    /// Minimizers for needs-denom reads can be moved out via `std::mem::take`.
+    pub extracted: Vec<(Vec<u64>, Vec<u64>)>,
+}
+
 /// Classify all reads against the numerator index and partition into fast-path vs needs-denom.
 ///
-/// This is the first half of log-ratio classification: classify all reads against the
-/// numerator (threshold=0.0), then call `partition_by_numerator_score` to split reads
-/// into fast-path (NumHigh) vs needs-denominator groups.
-///
-/// Returns a `PartitionResult` with fast-path results, needs-denom query IDs, and dense
-/// numerator scores.
+/// Extracts minimizers once and caches them in the returned `NumeratorResult`.
+/// Needs-denom reads can reuse these cached minimizers for denominator classification,
+/// avoiding redundant re-extraction.
 pub fn classify_numerator_and_partition(
     num_sharded: &ShardedInvertedIndex,
     batch_refs: &[rype::QueryRecord],
@@ -1146,12 +1004,35 @@ pub fn classify_numerator_and_partition(
     num_read_options: Option<&rype::ParquetReadOptions>,
     parallel_rg: bool,
     numerator_skip_threshold: Option<f64>,
-) -> Result<PartitionResult> {
+) -> Result<NumeratorResult> {
+    let manifest = num_sharded.manifest();
+
+    // Extract minimizers once — cached for reuse
+    let t_extract = std::time::Instant::now();
+    let extracted =
+        rype::extract_batch_minimizers(manifest.k, manifest.w, manifest.salt, None, batch_refs);
+    log_timing("batch: extraction", t_extract.elapsed().as_millis());
+
+    let query_ids: Vec<i64> = batch_refs.iter().map(|(id, _, _)| *id).collect();
+
+    // Classify from extracted minimizers
     let t_num = std::time::Instant::now();
     let num_results = if parallel_rg {
-        classify_batch_sharded_parallel_rg(num_sharded, None, batch_refs, 0.0, num_read_options)?
+        rype::classify_from_extracted_minimizers_parallel_rg(
+            num_sharded,
+            &extracted,
+            &query_ids,
+            0.0,
+            num_read_options,
+        )?
     } else {
-        classify_batch_sharded_merge_join(num_sharded, None, batch_refs, 0.0, num_read_options)?
+        rype::classify_from_extracted_minimizers(
+            num_sharded,
+            &extracted,
+            &query_ids,
+            0.0,
+            num_read_options,
+        )?
     };
     log_timing("batch: classify_numerator", t_num.elapsed().as_millis());
 
@@ -1165,18 +1046,23 @@ pub fn classify_numerator_and_partition(
         partition.needs_denom_query_ids.len()
     );
 
-    Ok(partition)
+    Ok(NumeratorResult {
+        partition,
+        extracted,
+    })
 }
 
-/// Flush a batch of deferred-denom reads: classify against denominator, merge results,
-/// format output, and write. Optionally writes passing sequences.
+/// Flush a batch of deferred-denom reads: classify against denominator using cached
+/// minimizers, merge results, format output, and write. Optionally marks passing reads
+/// in the `PassingReadTracker` for post-classification sequence output.
 ///
-/// Each deferred read already has its numerator score stored. This function:
+/// Each deferred read has its numerator score and pre-extracted minimizers stored.
+/// This function:
 /// 1. Assigns fresh 0-based query IDs to the buffered reads
-/// 2. Classifies them against the denominator index
-/// 3. Merges results (all reads need exact computation — no fast-path results here)
+/// 2. Classifies them against the denominator index using cached minimizers (no re-extraction)
+/// 3. Computes log-ratios from numerator + denominator scores
 /// 4. Formats and writes log-ratio output
-/// 5. If `seq_writer` is provided, writes passing sequences
+/// 5. If `passing_tracker` is provided, marks passing reads in the bitset
 ///
 /// Returns the number of reads flushed.
 #[allow(clippy::too_many_arguments)]
@@ -1187,7 +1073,7 @@ pub fn flush_deferred_denom(
     parallel_rg: bool,
     ratio_bucket_name: &str,
     out_writer: &mut super::helpers::OutputWriter,
-    seq_writer: Option<&mut super::helpers::SequenceWriter>,
+    passing_tracker: Option<&mut super::helpers::PassingReadTracker>,
     passing_is_positive: bool,
 ) -> Result<usize> {
     use super::helpers::{compute_log_ratio, format_log_ratio_output, FastPath, LogRatioResult};
@@ -1199,34 +1085,36 @@ pub fn flush_deferred_denom(
     let t_flush_total = std::time::Instant::now();
     let count = deferred_reads.len();
 
-    // Build QueryRecords with fresh 0-based IDs (reassigned from buffer order)
-    let batch_refs: Vec<rype::QueryRecord> = deferred_reads
-        .iter()
-        .enumerate()
-        .map(|(i, dr)| {
-            (
-                i as i64,
-                dr.record.seq1.as_slice(),
-                dr.record.seq2.as_deref(),
-            )
-        })
-        .collect();
+    // Separate minimizers, headers, scores, and global indices from deferred reads
+    let mut extracted: Vec<(Vec<u64>, Vec<u64>)> = Vec::with_capacity(count);
+    let mut headers: Vec<String> = Vec::with_capacity(count);
+    let mut num_scores: Vec<f64> = Vec::with_capacity(count);
+    let mut global_indices: Vec<usize> = Vec::with_capacity(count);
 
-    // Classify against denominator
+    for dr in deferred_reads {
+        extracted.push(dr.minimizers);
+        headers.push(dr.header);
+        num_scores.push(dr.num_score);
+        global_indices.push(dr.global_index);
+    }
+
+    let query_ids: Vec<i64> = (0..count as i64).collect();
+
+    // Classify against denominator using cached minimizers (no re-extraction!)
     let t_denom = std::time::Instant::now();
     let denom_results = if parallel_rg {
-        classify_batch_sharded_parallel_rg(
+        rype::classify_from_extracted_minimizers_parallel_rg(
             denom_sharded,
-            None,
-            &batch_refs,
+            &extracted,
+            &query_ids,
             0.0,
             denom_read_options,
         )?
     } else {
-        classify_batch_sharded_merge_join(
+        rype::classify_from_extracted_minimizers(
             denom_sharded,
-            None,
-            &batch_refs,
+            &extracted,
+            &query_ids,
             0.0,
             denom_read_options,
         )?
@@ -1244,9 +1132,9 @@ pub fn flush_deferred_denom(
 
     // Compute log-ratio for each deferred read
     let mut results: Vec<LogRatioResult> = Vec::with_capacity(count);
-    for (i, dr) in deferred_reads.iter().enumerate() {
+    for (i, num_score) in num_scores.iter().enumerate() {
         let denom_score = denom_score_map.get(&(i as i64)).copied().unwrap_or(0.0);
-        let log_ratio = compute_log_ratio(dr.num_score, denom_score);
+        let log_ratio = compute_log_ratio(*num_score, denom_score);
         results.push(LogRatioResult {
             query_id: i as i64,
             log_ratio,
@@ -1254,12 +1142,8 @@ pub fn flush_deferred_denom(
         });
     }
 
-    // Build headers for formatting (fresh 0-based IDs index into this)
-    let headers: Vec<&str> = deferred_reads.iter().map(|dr| dr.header.as_str()).collect();
-
-    // Write sequences if seq_writer provided
-    // NaN reads (num=0, denom=0) are always emitted — no evidence against them.
-    if let Some(writer) = seq_writer {
+    // Mark passing reads in tracker for post-classification sequence output
+    if let Some(tracker) = passing_tracker {
         for (i, lr) in results.iter().enumerate() {
             let passes = if passing_is_positive {
                 lr.log_ratio > 0.0 || lr.log_ratio.is_nan()
@@ -1267,16 +1151,17 @@ pub fn flush_deferred_denom(
                 lr.log_ratio <= 0.0 || lr.log_ratio.is_nan()
             };
             if passes {
-                let rec = &deferred_reads[i].record;
-                let header = deferred_reads[i].header.as_bytes();
-                writer.write_record(rec, header)?;
+                tracker.mark(global_indices[i]);
             }
         }
     }
 
+    // Build header refs for formatting
+    let header_refs: Vec<&str> = headers.iter().map(|s| s.as_str()).collect();
+
     // Format and write output
     let t_format = std::time::Instant::now();
-    let chunk = format_log_ratio_output(&results, &headers, ratio_bucket_name);
+    let chunk = format_log_ratio_output(&results, &header_refs, ratio_bucket_name);
     log_timing("deferred: format_output", t_format.elapsed().as_millis());
 
     let t_write = std::time::Instant::now();
@@ -1287,6 +1172,126 @@ pub fn flush_deferred_denom(
     log::info!("Flushed {} deferred-denom reads", count);
 
     Ok(count)
+}
+
+/// Immutable configuration for log-ratio batch processing.
+///
+/// Groups the many parameters that stay constant across batches into a single
+/// struct, reducing argument count in `process_log_ratio_batch`.
+struct LogRatioContext<'a> {
+    num_sharded: &'a ShardedInvertedIndex,
+    num_read_options: Option<&'a rype::ParquetReadOptions>,
+    denom_sharded: &'a ShardedInvertedIndex,
+    denom_read_options: Option<&'a rype::ParquetReadOptions>,
+    parallel_rg: bool,
+    numerator_skip_threshold: Option<f64>,
+    passing_is_positive: bool,
+    ratio_bucket_name: &'a str,
+}
+
+/// Process a single batch for log-ratio classification.
+///
+/// Classifies against numerator, partitions into fast-path/needs-denom,
+/// marks passing reads in tracker, writes fast-path results immediately,
+/// and buffers needs-denom reads for later denominator classification.
+///
+/// Returns (fast_path_count, needs_denom_count).
+#[allow(clippy::too_many_arguments)]
+fn process_log_ratio_batch<S: AsRef<str>>(
+    ctx: &LogRatioContext,
+    batch_refs: &[rype::QueryRecord],
+    headers: &[S],
+    batch_read_count: usize,
+    deferred_buffer: &mut DeferredDenomBuffer,
+    out_writer: &mut super::helpers::OutputWriter,
+    passing_tracker: &mut Option<super::helpers::PassingReadTracker>,
+    global_read_offset: &mut usize,
+    batch_num: usize,
+) -> Result<(usize, usize)> {
+    let NumeratorResult {
+        partition,
+        mut extracted,
+    } = classify_numerator_and_partition(
+        ctx.num_sharded,
+        batch_refs,
+        batch_read_count,
+        ctx.num_read_options,
+        ctx.parallel_rg,
+        ctx.numerator_skip_threshold,
+    )?;
+
+    let fast_path_count = partition.fast_path_results.len();
+    let needs_denom_count = partition.needs_denom_query_ids.len();
+
+    // Mark passing fast-path reads in tracker
+    if let Some(ref mut tracker) = passing_tracker {
+        for lr in &partition.fast_path_results {
+            let passes = if ctx.passing_is_positive {
+                lr.log_ratio > 0.0 || lr.log_ratio.is_nan()
+            } else {
+                lr.log_ratio <= 0.0 || lr.log_ratio.is_nan()
+            };
+            if passes {
+                tracker.mark(*global_read_offset + lr.query_id as usize);
+            }
+        }
+    }
+
+    // Write fast-path results immediately
+    if !partition.fast_path_results.is_empty() {
+        let t_format = std::time::Instant::now();
+        let chunk =
+            format_log_ratio_output(&partition.fast_path_results, headers, ctx.ratio_bucket_name);
+        log_timing("batch: format_fast_path", t_format.elapsed().as_millis());
+
+        let t_write = std::time::Instant::now();
+        out_writer.write_chunk(chunk)?;
+        log_timing("batch: io_write_fast_path", t_write.elapsed().as_millis());
+    }
+
+    // Push needs-denom reads into deferred buffer (cache minimizers, not sequences)
+    for &qid in &partition.needs_denom_query_ids {
+        let idx = qid as usize;
+        debug_assert!(
+            idx < headers.len() && idx < partition.num_scores.len() && idx < extracted.len(),
+            "query_id {} out of bounds (headers={}, scores={}, extracted={})",
+            idx,
+            headers.len(),
+            partition.num_scores.len(),
+            extracted.len()
+        );
+        deferred_buffer.push(DeferredRead {
+            header: headers[idx].as_ref().to_string(),
+            num_score: partition.num_scores[idx],
+            minimizers: std::mem::take(&mut extracted[idx]),
+            global_index: *global_read_offset + idx,
+        });
+    }
+
+    *global_read_offset += batch_read_count;
+
+    // Flush deferred buffer if threshold reached
+    if deferred_buffer.should_flush() {
+        log::info!(
+            "Deferred buffer reached threshold ({} reads, ~{}), flushing (triggered by batch {})",
+            deferred_buffer.len(),
+            format_bytes(deferred_buffer.approx_bytes()),
+            batch_num
+        );
+        let drained = deferred_buffer.drain();
+        flush_deferred_denom(
+            drained,
+            ctx.denom_sharded,
+            ctx.denom_read_options,
+            ctx.parallel_rg,
+            ctx.ratio_bucket_name,
+            out_writer,
+            passing_tracker.as_mut(),
+            ctx.passing_is_positive,
+        )?;
+    }
+
+    Ok((fast_path_count, needs_denom_count))
 }
 
 /// Build the header line and sorted bucket IDs for wide-format output.
@@ -1735,13 +1740,12 @@ mod tests {
     // validate_seq_output tests
 
     #[test]
-    fn test_validate_seq_output_rejects_parquet_input() {
+    fn test_validate_seq_output_accepts_parquet_input() {
         use std::path::Path;
 
+        // Parquet input is now supported via post-classification re-walk
         let result = validate_seq_output(true, false, Some(Path::new("out.fastq.gz")));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("Parquet input"));
+        assert!(result.is_ok());
     }
 
     #[test]

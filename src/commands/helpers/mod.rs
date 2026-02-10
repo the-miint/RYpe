@@ -22,7 +22,8 @@ mod log_ratio;
 mod metadata;
 mod output;
 mod parquet_io;
-mod seq_writer;
+mod passing_tracker;
+pub(crate) mod seq_writer;
 
 // Re-export everything for backward compatibility.
 // Some items are marked #[allow(dead_code)] in their modules as they provide
@@ -58,5 +59,6 @@ pub use parquet_io::{
     is_parquet_input, read_parquet_batch_trimmed, stacked_batches_to_records, ParquetInputReader,
     PrefetchingParquetReader, TrimmedBatchResult,
 };
+pub use passing_tracker::PassingReadTracker;
 #[allow(unused_imports)]
 pub use seq_writer::{SeqFormat, SequenceWriter};

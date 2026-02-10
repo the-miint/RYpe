@@ -14,7 +14,8 @@ pub use common::collect_negative_minimizers_sharded;
 pub use merge_join::classify_batch_merge_join;
 pub use sharded::{
     classify_batch_sharded_merge_join, classify_batch_sharded_parallel_rg,
-    classify_with_sharded_negative,
+    classify_from_extracted_minimizers, classify_from_extracted_minimizers_parallel_rg,
+    classify_with_sharded_negative, extract_batch_minimizers,
 };
 
 // Re-export best-hit filtering

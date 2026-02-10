@@ -45,60 +45,80 @@ fn estimate_minimizers_from_records(records: &[QueryRecord], k: usize, w: usize)
     estimate.max(ESTIMATED_MINIMIZERS_PER_SEQUENCE)
 }
 
-/// Classify a batch of records against a sharded inverted index using merge-join.
+/// Extract minimizers from a batch of query records in parallel.
+///
+/// This is the extraction step factored out from classification functions,
+/// allowing callers to cache extracted minimizers for reuse (e.g., log-ratio
+/// deferred buffer avoids re-extracting when classifying against the denominator).
+///
+/// # Arguments
+/// * `k` - K-mer size
+/// * `w` - Window size
+/// * `salt` - Hash salt
+/// * `negative_mins` - Optional set of minimizers to exclude before returning
+/// * `records` - Batch of query records
+///
+/// # Returns
+/// Vec of (forward_minimizers, rc_minimizers) per query, in the same order as `records`.
+pub fn extract_batch_minimizers(
+    k: usize,
+    w: usize,
+    salt: u64,
+    negative_mins: Option<&HashSet<u64>>,
+    records: &[QueryRecord],
+) -> Vec<(Vec<u64>, Vec<u64>)> {
+    if records.is_empty() {
+        return Vec::new();
+    }
+    let estimated_mins = estimate_minimizers_from_records(records, k, w);
+    records
+        .par_iter()
+        .map_init(
+            || MinimizerWorkspace::with_estimate(estimated_mins),
+            |ws, (_, s1, s2)| {
+                let (ha, hb) = get_paired_minimizers_into(s1, *s2, k, w, salt, ws);
+                filter_negative_mins(ha, hb, negative_mins)
+            },
+        )
+        .collect()
+}
+
+/// Classify from pre-extracted minimizers against a sharded inverted index using merge-join.
+///
+/// This is the classification step factored out from `classify_batch_sharded_merge_join`,
+/// accepting pre-extracted minimizers instead of raw sequences. Use this when minimizers
+/// have already been extracted (e.g., cached from a prior classification pass).
 ///
 /// Builds a QueryInvertedIndex once, then processes each shard sequentially
-/// using merge-join. This is efficient when there is high minimizer overlap
-/// across reads.
-///
-/// Memory complexity: O(batch_size * minimizers_per_read) + O(single_shard_size)
+/// using merge-join.
 ///
 /// # Arguments
 /// * `sharded` - The sharded inverted index
-/// * `negative_mins` - Optional set of minimizers to exclude from queries before scoring
-/// * `records` - Batch of query records (should be pre-trimmed if trimming is desired)
+/// * `extracted` - Pre-extracted minimizers: (fwd_mins, rc_mins) per query
+/// * `query_ids` - Query IDs corresponding to each entry in `extracted`
 /// * `threshold` - Minimum score threshold
 /// * `read_options` - Parquet read options (None = default behavior without bloom filters)
 ///
 /// # Returns
 /// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
-pub fn classify_batch_sharded_merge_join(
+pub fn classify_from_extracted_minimizers(
     sharded: &ShardedInvertedIndex,
-    negative_mins: Option<&HashSet<u64>>,
-    records: &[QueryRecord],
+    extracted: &[(Vec<u64>, Vec<u64>)],
+    query_ids: &[i64],
     threshold: f64,
     read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
 ) -> Result<Vec<HitResult>> {
     let t_start = Instant::now();
 
-    if records.is_empty() {
+    if extracted.is_empty() {
         return Ok(Vec::new());
     }
 
     let manifest = sharded.manifest();
 
-    // Extract minimizers in parallel, filtering negatives if provided
-    let t_extract = Instant::now();
-    let estimated_mins = estimate_minimizers_from_records(records, manifest.k, manifest.w);
-    let extracted: Vec<_> = records
-        .par_iter()
-        .map_init(
-            || MinimizerWorkspace::with_estimate(estimated_mins),
-            |ws, (_, s1, s2)| {
-                let (ha, hb) =
-                    get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
-                filter_negative_mins(ha, hb, negative_mins)
-            },
-        )
-        .collect();
-    log_timing("merge_join: extraction", t_extract.elapsed().as_millis());
-
-    // Collect query IDs
-    let query_ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
-
     // Build query inverted index
     let t_build_idx = Instant::now();
-    let query_idx = QueryInvertedIndex::build(&extracted);
+    let query_idx = QueryInvertedIndex::build(extracted);
     log_timing(
         "merge_join: build_query_index",
         t_build_idx.elapsed().as_millis(),
@@ -133,18 +153,13 @@ pub fn classify_batch_sharded_merge_join(
     // Process each shard sequentially
     for shard_info in &manifest.shards {
         let t_load = Instant::now();
-        // Use filtered loading for Parquet shards - only loads row groups
-        // that contain query minimizers, potentially skipping 90%+ of data
-        // (with optional bloom filter support)
         let shard =
             sharded.load_shard_for_query(shard_info.shard_id, query_minimizers, read_options)?;
         total_shard_load_ms += t_load.elapsed().as_millis();
 
         let t_merge = Instant::now();
-        // Accumulate hits from this shard
         accumulate_merge_join(&query_idx, &shard, &mut accumulators);
         total_merge_join_ms += t_merge.elapsed().as_millis();
-        // shard dropped here, freeing memory before loading next
     }
     log_timing("merge_join: shard_load_total", total_shard_load_ms);
     log_timing("merge_join: merge_join_total", total_merge_join_ms);
@@ -174,7 +189,53 @@ pub fn classify_batch_sharded_merge_join(
     Ok(results)
 }
 
-/// Classify using parallel row group processing.
+/// Classify a batch of records against a sharded inverted index using merge-join.
+///
+/// Extracts minimizers from sequences, then delegates to
+/// `classify_from_extracted_minimizers`. This is the standard entry point when
+/// you have raw sequences and don't need to cache the extracted minimizers.
+///
+/// # Arguments
+/// * `sharded` - The sharded inverted index
+/// * `negative_mins` - Optional set of minimizers to exclude from queries before scoring
+/// * `records` - Batch of query records (should be pre-trimmed if trimming is desired)
+/// * `threshold` - Minimum score threshold
+/// * `read_options` - Parquet read options (None = default behavior without bloom filters)
+///
+/// # Returns
+/// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
+pub fn classify_batch_sharded_merge_join(
+    sharded: &ShardedInvertedIndex,
+    negative_mins: Option<&HashSet<u64>>,
+    records: &[QueryRecord],
+    threshold: f64,
+    read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
+) -> Result<Vec<HitResult>> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let manifest = sharded.manifest();
+
+    let t_extract = Instant::now();
+    let extracted = extract_batch_minimizers(
+        manifest.k,
+        manifest.w,
+        manifest.salt,
+        negative_mins,
+        records,
+    );
+    log_timing("merge_join: extraction", t_extract.elapsed().as_millis());
+
+    let query_ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
+
+    classify_from_extracted_minimizers(sharded, &extracted, &query_ids, threshold, read_options)
+}
+
+/// Classify from pre-extracted minimizers using parallel row group processing.
+///
+/// This is the classification step factored out from `classify_batch_sharded_parallel_rg`,
+/// accepting pre-extracted minimizers instead of raw sequences.
 ///
 /// Each row group is processed independently in parallel:
 /// 1. Pre-filter RGs by query minimizer range (using column statistics)
@@ -182,46 +243,19 @@ pub fn classify_batch_sharded_merge_join(
 /// 3. Merge-join pairs with query index, emitting sparse hits
 /// 4. Merge all sparse hits into final accumulators
 ///
-/// This maximizes CPU utilization by processing only RGs that overlap with
-/// the query minimizer range, and by using sparse hit representation to
-/// minimize memory allocation.
-///
-/// # Memory Model
-///
-/// Peak memory is approximately:
-/// - Query index: O(total_query_minimizers)
-/// - Sparse hits: O(total_hits_across_all_RGs) - typically much smaller than reads × buckets
-/// - Final accumulators: O(num_reads × avg_buckets_per_read)
-///
-/// Unlike the merge-join approach which loads entire shards, this processes
-/// one RG at a time per thread, keeping per-thread memory bounded.
-///
-/// # Why read_options is Unused
-///
-/// The `read_options` parameter (bloom filter settings) is accepted for API
-/// consistency with other sharded classification functions but is intentionally
-/// unused. This function uses range-bounded filtering via Parquet column
-/// statistics instead of bloom filters - each row group's min/max is compared
-/// against the query minimizer range to skip non-overlapping RGs entirely.
-/// This is more effective than bloom filters for the per-RG access pattern.
-///
-/// # Requirements
-/// - Parquet shards only (Legacy format not supported)
-/// - Row groups must have column statistics
-///
 /// # Arguments
 /// * `sharded` - The sharded inverted index (must be Parquet format)
-/// * `negative_mins` - Optional set of minimizers to exclude from queries before scoring
-/// * `records` - Batch of query records (should be pre-trimmed if trimming is desired)
+/// * `extracted` - Pre-extracted minimizers: (fwd_mins, rc_mins) per query
+/// * `query_ids` - Query IDs corresponding to each entry in `extracted`
 /// * `threshold` - Minimum score threshold
-/// * `_read_options` - Unused; see "Why read_options is Unused" above
+/// * `_read_options` - Unused; accepted for API consistency
 ///
 /// # Returns
 /// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
-pub fn classify_batch_sharded_parallel_rg(
+pub fn classify_from_extracted_minimizers_parallel_rg(
     sharded: &ShardedInvertedIndex,
-    negative_mins: Option<&HashSet<u64>>,
-    records: &[QueryRecord],
+    extracted: &[(Vec<u64>, Vec<u64>)],
+    query_ids: &[i64],
     threshold: f64,
     _read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
 ) -> Result<Vec<HitResult>> {
@@ -229,34 +263,15 @@ pub fn classify_batch_sharded_parallel_rg(
 
     let t_start = Instant::now();
 
-    if records.is_empty() {
+    if extracted.is_empty() {
         return Ok(Vec::new());
     }
 
     let manifest = sharded.manifest();
 
-    // Extract minimizers in parallel, filtering negatives if provided
-    let t_extract = Instant::now();
-    let estimated_mins = estimate_minimizers_from_records(records, manifest.k, manifest.w);
-    let extracted: Vec<_> = records
-        .par_iter()
-        .map_init(
-            || MinimizerWorkspace::with_estimate(estimated_mins),
-            |ws, (_, s1, s2)| {
-                let (ha, hb) =
-                    get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
-                filter_negative_mins(ha, hb, negative_mins)
-            },
-        )
-        .collect();
-    log_timing("parallel_rg: extraction", t_extract.elapsed().as_millis());
-
-    // Collect query IDs
-    let query_ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
-
     // Build query inverted index (CSR format, built once, reused across all RGs)
     let t_build_idx = Instant::now();
-    let query_idx = QueryInvertedIndex::build(&extracted);
+    let query_idx = QueryInvertedIndex::build(extracted);
     log_timing(
         "parallel_rg: build_query_index",
         t_build_idx.elapsed().as_millis(),
@@ -370,6 +385,55 @@ pub fn classify_batch_sharded_parallel_rg(
     Ok(results)
 }
 
+/// Classify using parallel row group processing.
+///
+/// Extracts minimizers from sequences, then delegates to
+/// `classify_from_extracted_minimizers_parallel_rg`. This is the standard entry
+/// point when you have raw sequences and don't need to cache the extracted minimizers.
+///
+/// # Arguments
+/// * `sharded` - The sharded inverted index (must be Parquet format)
+/// * `negative_mins` - Optional set of minimizers to exclude from queries before scoring
+/// * `records` - Batch of query records (should be pre-trimmed if trimming is desired)
+/// * `threshold` - Minimum score threshold
+/// * `_read_options` - Unused; accepted for API consistency
+///
+/// # Returns
+/// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
+pub fn classify_batch_sharded_parallel_rg(
+    sharded: &ShardedInvertedIndex,
+    negative_mins: Option<&HashSet<u64>>,
+    records: &[QueryRecord],
+    threshold: f64,
+    _read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
+) -> Result<Vec<HitResult>> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let manifest = sharded.manifest();
+
+    let t_extract = Instant::now();
+    let extracted = extract_batch_minimizers(
+        manifest.k,
+        manifest.w,
+        manifest.salt,
+        negative_mins,
+        records,
+    );
+    log_timing("parallel_rg: extraction", t_extract.elapsed().as_millis());
+
+    let query_ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
+
+    classify_from_extracted_minimizers_parallel_rg(
+        sharded,
+        &extracted,
+        &query_ids,
+        threshold,
+        _read_options,
+    )
+}
+
 /// Classify with memory-efficient negative filtering using sharded index.
 ///
 /// Instead of requiring a pre-loaded `HashSet<u64>` containing all minimizers from
@@ -409,22 +473,11 @@ pub fn classify_with_sharded_negative(
     let negative = negative_index.unwrap();
     let manifest = positive_index.manifest();
 
-    // Step 1: Extract minimizers from all records
-    let estimated_mins = estimate_minimizers_from_records(records, manifest.k, manifest.w);
-    let processed: Vec<_> = records
-        .par_iter()
-        .map_init(
-            || MinimizerWorkspace::with_estimate(estimated_mins),
-            |ws, (_, s1, s2)| {
-                let (fwd, rc) =
-                    get_paired_minimizers_into(s1, *s2, manifest.k, manifest.w, manifest.salt, ws);
-                (fwd, rc)
-            },
-        )
-        .collect();
+    // Step 1: Extract minimizers once (no negative filtering yet)
+    let extracted = extract_batch_minimizers(manifest.k, manifest.w, manifest.salt, None, records);
 
     // Step 2: Build sorted unique minimizers for querying negative index
-    let mut all_minimizers: Vec<u64> = processed
+    let mut all_minimizers: Vec<u64> = extracted
         .iter()
         .flat_map(|(fwd, rc)| fwd.iter().chain(rc.iter()).copied())
         .collect();
@@ -435,13 +488,18 @@ pub fn classify_with_sharded_negative(
     let negative_set =
         collect_negative_minimizers_sharded(negative, &all_minimizers, read_options)?;
 
-    // Step 4: Classify using the collected negative set
-    // Note: This will re-extract minimizers, but the memory savings from sharded
-    // negative filtering (24GB -> 1-2GB) far outweigh the extraction overhead.
-    classify_batch_sharded_merge_join(
+    // Step 4: Filter extracted minimizers by negative set, then classify
+    let filtered: Vec<(Vec<u64>, Vec<u64>)> = extracted
+        .into_iter()
+        .map(|(fwd, rc)| filter_negative_mins(fwd, rc, Some(&negative_set)))
+        .collect();
+
+    let query_ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
+
+    classify_from_extracted_minimizers(
         positive_index,
-        Some(&negative_set),
-        records,
+        &filtered,
+        &query_ids,
         threshold,
         read_options,
     )
