@@ -1,34 +1,24 @@
 //! Query inverted index for merge-join classification.
 
-use std::collections::HashMap;
-
 use crate::constants::{MAX_READS, RC_FLAG_BIT, READ_INDEX_MASK};
 
-use super::InvertedIndex;
-
 /// Query inverted index for merge-join classification.
-/// Maps minimizer -> list of (read_index, strand) pairs using CSR format.
+/// Stores sorted COO (coordinate) entries: (minimizer, packed_read_id).
 ///
 /// # Invariants
-/// - `minimizers` is sorted in ascending order with no duplicates
-/// - `offsets.len() == minimizers.len() + 1`
-/// - `offsets[0] == 0`
-/// - `offsets` is monotonically increasing
-/// - `offsets[minimizers.len()] == read_ids.len()`
-/// - For each minimizer at index i, the associated read IDs are `read_ids[offsets[i]..offsets[i+1]]`
+/// - `entries` is sorted by minimizer (ascending). NOT deduplicated: if 2 reads
+///   share minimizer 100, `entries` has 2 entries with minimizer 100.
 /// - `fwd_counts.len() == rc_counts.len()` == number of query reads
 #[derive(Debug)]
 pub struct QueryInvertedIndex {
-    /// Sorted unique minimizers from all queries
-    pub(crate) minimizers: Vec<u64>,
-    /// CSR offsets: read_ids[offsets[i]..offsets[i+1]] are reads containing minimizers[i]
-    pub(crate) offsets: Vec<u32>,
-    /// Packed (read_index, strand): bit 31 = strand (0=fwd, 1=rc), bits 0-30 = read index
-    pub(crate) read_ids: Vec<u32>,
+    /// Sorted (minimizer, packed_read_id) entries. NOT deduplicated.
+    pub(crate) entries: Vec<(u64, u32)>,
     /// Number of forward minimizers per read (for scoring)
     pub(crate) fwd_counts: Vec<u32>,
     /// Number of RC minimizers per read (for scoring)
     pub(crate) rc_counts: Vec<u32>,
+    /// Cached count of unique minimizers. Computed once at build time.
+    unique_count: usize,
 }
 
 impl QueryInvertedIndex {
@@ -52,14 +42,9 @@ impl QueryInvertedIndex {
         (read_idx, is_rc)
     }
 
-    /// Get the number of unique minimizers.
-    pub fn num_minimizers(&self) -> usize {
-        self.minimizers.len()
-    }
-
-    /// Get the total number of read ID entries.
-    pub fn num_read_entries(&self) -> usize {
-        self.read_ids.len()
+    /// Get the total number of COO entries (total minimizers across all reads, NOT unique).
+    pub fn num_entries(&self) -> usize {
+        self.entries.len()
     }
 
     /// Get the number of query reads.
@@ -77,9 +62,36 @@ impl QueryInvertedIndex {
         self.rc_counts[read_idx]
     }
 
-    /// Get a reference to the sorted minimizer array.
-    pub fn minimizers(&self) -> &[u64] {
-        &self.minimizers
+    /// Count of unique minimizers. O(1) — cached at build time.
+    pub fn num_unique_minimizers(&self) -> usize {
+        self.unique_count
+    }
+
+    /// Compute sorted, deduplicated minimizers from COO entries.
+    /// Used for shard filtering and bloom filter hints. Allocates a new Vec on each call;
+    /// prefer `num_unique_minimizers()` when only the count is needed.
+    pub fn unique_minimizers(&self) -> Vec<u64> {
+        let mut mins: Vec<u64> = self.entries.iter().map(|(m, _)| *m).collect();
+        mins.dedup();
+        mins
+    }
+
+    /// Get (min, max) minimizer range, or None if empty.
+    pub fn minimizer_range(&self) -> Option<(u64, u64)> {
+        if self.entries.is_empty() {
+            None
+        } else {
+            Some((self.entries[0].0, self.entries[self.entries.len() - 1].0))
+        }
+    }
+
+    /// Compute unique minimizer count from sorted entries.
+    fn compute_unique_count(entries: &[(u64, u32)]) -> usize {
+        if entries.is_empty() {
+            0
+        } else {
+            entries.windows(2).filter(|w| w[0].0 != w[1].0).count() + 1
+        }
     }
 
     /// Maximum number of reads supported (31 bits, bit 31 reserved for strand flag).
@@ -92,17 +104,11 @@ impl QueryInvertedIndex {
     ///   Each vector should be sorted and deduplicated (as returned by `get_paired_minimizers_into`).
     ///
     /// # Returns
-    /// A QueryInvertedIndex mapping minimizers to read IDs.
+    /// A QueryInvertedIndex with sorted COO entries.
     ///
     /// # Panics
     /// - If `queries.len()` exceeds `MAX_READS` (2^31 - 1)
     /// - If total minimizer count overflows `usize`
-    ///
-    /// # Implementation Note
-    /// Currently uses global sort O(N log N). Since input vectors are already sorted,
-    /// a k-way merge (like `InvertedIndex::build_from_index`) could achieve O(N log K)
-    /// where K = number of reads. This optimization is deferred as the current approach
-    /// is simpler and the sort is parallelizable.
     pub fn build(queries: &[(Vec<u64>, Vec<u64>)]) -> Self {
         assert!(
             queries.len() <= Self::MAX_READS,
@@ -113,11 +119,10 @@ impl QueryInvertedIndex {
 
         if queries.is_empty() {
             return QueryInvertedIndex {
-                minimizers: Vec::new(),
-                offsets: vec![0],
-                read_ids: Vec::new(),
+                entries: Vec::new(),
                 fwd_counts: Vec::new(),
                 rc_counts: Vec::new(),
+                unique_count: 0,
             };
         }
 
@@ -137,11 +142,10 @@ impl QueryInvertedIndex {
 
         if total_entries == 0 {
             return QueryInvertedIndex {
-                minimizers: Vec::new(),
-                offsets: vec![0],
-                read_ids: Vec::new(),
+                entries: Vec::new(),
                 fwd_counts,
                 rc_counts,
+                unique_count: 0,
             };
         }
 
@@ -157,75 +161,42 @@ impl QueryInvertedIndex {
             }
         }
 
-        // Sort by minimizer (stable sort preserves read order for same minimizer)
+        // Sort by minimizer
         entries.sort_unstable_by_key(|(m, _)| *m);
 
-        // Build CSR structure via linear scan
-        let mut minimizers = Vec::with_capacity(entries.len() / 2); // estimate unique
-        let mut offsets = Vec::with_capacity(entries.len() / 2 + 1);
-        let mut read_ids = Vec::with_capacity(entries.len());
-
-        offsets.push(0);
-        let mut current_min = entries[0].0;
-        minimizers.push(current_min);
-
-        for (m, packed) in entries {
-            if m != current_min {
-                offsets.push(read_ids.len() as u32);
-                minimizers.push(m);
-                current_min = m;
-            }
-            read_ids.push(packed);
-        }
-        offsets.push(read_ids.len() as u32);
-
+        let unique_count = Self::compute_unique_count(&entries);
         QueryInvertedIndex {
-            minimizers,
-            offsets,
-            read_ids,
+            entries,
             fwd_counts,
             rc_counts,
+            unique_count,
         }
     }
-}
 
-impl InvertedIndex {
-    /// Accumulate hits for a single matching minimizer pair.
+    /// Build from pre-sorted COO entries and per-read counts.
     ///
-    /// This method encapsulates access to internal CSR arrays, allowing callers
-    /// to accumulate hits without directly accessing the internal representation.
+    /// # Preconditions
+    /// - `entries` must be sorted by minimizer (ascending).
+    ///   Use `DeferredDenomBuffer::drain()` which sorts before returning.
     ///
-    /// # Arguments
-    /// * `query_idx` - The query inverted index
-    /// * `qi` - Index into query_idx.minimizers for the matching minimizer
-    /// * `ri` - Index into self.minimizers for the matching minimizer
-    /// * `accumulators` - Per-read accumulators mapping bucket_id -> (fwd_hits, rc_hits)
-    #[inline]
-    pub fn accumulate_hits_for_match(
-        &self,
-        query_idx: &QueryInvertedIndex,
-        qi: usize,
-        ri: usize,
-        accumulators: &mut [HashMap<u32, (u32, u32)>],
-    ) {
-        let q_start = query_idx.offsets[qi] as usize;
-        let q_end = query_idx.offsets[qi + 1] as usize;
-        let r_start = self.offsets[ri] as usize;
-        let r_end = self.offsets[ri + 1] as usize;
+    /// # Panics (debug only)
+    /// If entries are not sorted by minimizer.
+    pub fn from_sorted_coo(
+        entries: Vec<(u64, u32)>,
+        fwd_counts: Vec<u32>,
+        rc_counts: Vec<u32>,
+    ) -> Self {
+        debug_assert!(
+            entries.windows(2).all(|w| w[0].0 <= w[1].0),
+            "from_sorted_coo: entries must be sorted by minimizer"
+        );
 
-        for &packed in &query_idx.read_ids[q_start..q_end] {
-            let (read_idx, is_rc) = QueryInvertedIndex::unpack_read_id(packed);
-            for &bucket_id in &self.bucket_ids[r_start..r_end] {
-                let entry = accumulators[read_idx as usize]
-                    .entry(bucket_id)
-                    .or_insert((0, 0));
-                // Use saturating_add to prevent overflow (defensive, unlikely in practice)
-                if is_rc {
-                    entry.1 = entry.1.saturating_add(1);
-                } else {
-                    entry.0 = entry.0.saturating_add(1);
-                }
-            }
+        let unique_count = Self::compute_unique_count(&entries);
+        QueryInvertedIndex {
+            entries,
+            fwd_counts,
+            rc_counts,
+            unique_count,
         }
     }
 }
@@ -272,11 +243,9 @@ mod tests {
         let queries: Vec<(Vec<u64>, Vec<u64>)> = vec![];
         let qidx = QueryInvertedIndex::build(&queries);
 
-        assert_eq!(qidx.num_minimizers(), 0);
-        assert_eq!(qidx.num_read_entries(), 0);
+        assert_eq!(qidx.num_entries(), 0);
+        assert_eq!(qidx.unique_minimizers().len(), 0);
         assert_eq!(qidx.num_reads(), 0);
-        assert_eq!(qidx.offsets.len(), 1);
-        assert_eq!(qidx.offsets[0], 0);
     }
 
     #[test]
@@ -286,13 +255,13 @@ mod tests {
         let qidx = QueryInvertedIndex::build(&queries);
 
         // 5 unique minimizers: 100, 150, 200, 250, 300
-        assert_eq!(qidx.num_minimizers(), 5);
-        // 5 entries (each minimizer maps to read 0)
-        assert_eq!(qidx.num_read_entries(), 5);
+        assert_eq!(qidx.unique_minimizers().len(), 5);
+        // 5 total entries (each minimizer maps to read 0)
+        assert_eq!(qidx.num_entries(), 5);
         assert_eq!(qidx.num_reads(), 1);
 
-        // Verify minimizers are sorted
-        assert_eq!(qidx.minimizers, vec![100, 150, 200, 250, 300]);
+        // Verify unique_mins are sorted
+        assert_eq!(qidx.unique_minimizers(), &[100, 150, 200, 250, 300]);
 
         // Verify counts
         assert_eq!(qidx.fwd_counts[0], 3);
@@ -309,38 +278,34 @@ mod tests {
         let qidx = QueryInvertedIndex::build(&queries);
 
         // Unique minimizers: 100, 150, 200, 300
-        assert_eq!(qidx.num_minimizers(), 4);
-        // Total entries: 100->[0,1], 150->[0,1], 200->[0], 300->[1] = 6 entries
-        assert_eq!(qidx.num_read_entries(), 6);
+        assert_eq!(qidx.unique_minimizers().len(), 4);
+        // Total entries: 100(r0), 100(r1), 150(r0), 150(r1), 200(r0), 300(r1) = 6
+        assert_eq!(qidx.num_entries(), 6);
         assert_eq!(qidx.num_reads(), 2);
 
-        // Verify minimizers are sorted
-        assert_eq!(qidx.minimizers, vec![100, 150, 200, 300]);
+        // Verify unique_mins are sorted
+        assert_eq!(qidx.unique_minimizers(), &[100, 150, 200, 300]);
 
-        // Verify CSR structure for minimizer 100 (index 0)
-        let start = qidx.offsets[0] as usize;
-        let end = qidx.offsets[1] as usize;
-        assert_eq!(end - start, 2); // 100 appears in 2 reads
-
-        // Verify CSR structure for minimizer 150 (index 1)
-        let start = qidx.offsets[1] as usize;
-        let end = qidx.offsets[2] as usize;
-        assert_eq!(end - start, 2); // 150 appears in 2 reads
+        // Verify COO entries for minimizer 100 (should have 2 entries)
+        let count_100 = qidx.entries.iter().filter(|(m, _)| *m == 100).count();
+        assert_eq!(count_100, 2);
 
         // Verify the read IDs for minimizer 100 are reads 0 and 1 (forward)
-        let reads_for_100: Vec<(u32, bool)> = qidx.read_ids
-            [qidx.offsets[0] as usize..qidx.offsets[1] as usize]
+        let reads_for_100: Vec<(u32, bool)> = qidx
+            .entries
             .iter()
-            .map(|&p| QueryInvertedIndex::unpack_read_id(p))
+            .filter(|(m, _)| *m == 100)
+            .map(|(_, p)| QueryInvertedIndex::unpack_read_id(*p))
             .collect();
         assert!(reads_for_100.contains(&(0, false)));
         assert!(reads_for_100.contains(&(1, false)));
 
         // Verify the read IDs for minimizer 150 are reads 0 and 1 (RC)
-        let reads_for_150: Vec<(u32, bool)> = qidx.read_ids
-            [qidx.offsets[1] as usize..qidx.offsets[2] as usize]
+        let reads_for_150: Vec<(u32, bool)> = qidx
+            .entries
             .iter()
-            .map(|&p| QueryInvertedIndex::unpack_read_id(p))
+            .filter(|(m, _)| *m == 150)
+            .map(|(_, p)| QueryInvertedIndex::unpack_read_id(*p))
             .collect();
         assert!(reads_for_150.contains(&(0, true)));
         assert!(reads_for_150.contains(&(1, true)));
@@ -372,8 +337,8 @@ mod tests {
         let queries = vec![(vec![], vec![]), (vec![], vec![])];
         let qidx = QueryInvertedIndex::build(&queries);
 
-        assert_eq!(qidx.num_minimizers(), 0);
-        assert_eq!(qidx.num_read_entries(), 0);
+        assert_eq!(qidx.num_entries(), 0);
+        assert_eq!(qidx.unique_minimizers().len(), 0);
         assert_eq!(qidx.num_reads(), 2);
         assert_eq!(qidx.fwd_counts, vec![0, 0]);
         assert_eq!(qidx.rc_counts, vec![0, 0]);
@@ -389,16 +354,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "31-bit limit")]
     fn test_query_inverted_overflow_too_many_reads() {
-        // This test verifies the overflow check works, but we can't actually
-        // allocate 2^31 reads. Instead, we create a mock scenario by checking
-        // the assertion logic directly. Since we can't easily trigger this
-        // without massive memory, we test the boundary check indirectly.
-        //
-        // In practice, the assertion at the start of build() will catch this:
-        // assert!(queries.len() <= Self::MAX_READS, ...)
-        //
-        // For a real test, we'd need to mock or use a smaller limit.
-        // This test documents the expected behavior.
         let queries: Vec<(Vec<u64>, Vec<u64>)> = Vec::new();
 
         // Simulate the check that would fail with too many reads
@@ -410,7 +365,6 @@ mod tests {
             QueryInvertedIndex::MAX_READS
         );
 
-        // This line won't be reached due to the panic above
         let _ = QueryInvertedIndex::build(&queries);
     }
 
@@ -430,9 +384,74 @@ mod tests {
         assert_eq!(qidx.rc_count(0), 2);
         assert_eq!(qidx.rc_count(1), 3);
 
-        // Test minimizers accessor
-        let mins = qidx.minimizers();
+        // Test unique_minimizers accessor
+        let mins = qidx.unique_minimizers();
         assert!(mins.is_sorted());
-        assert_eq!(mins.len(), qidx.num_minimizers());
+        assert_eq!(mins.len(), qidx.unique_minimizers().len());
+    }
+
+    // === COO-specific tests ===
+
+    #[test]
+    fn test_coo_entry_count_equals_total_minimizers() {
+        let queries = vec![
+            (vec![100, 200, 300], vec![150, 250]), // 5 total
+            (vec![100], vec![150, 250, 350]),      // 4 total
+        ];
+        let qidx = QueryInvertedIndex::build(&queries);
+
+        assert_eq!(qidx.entries.len(), 9); // 5 + 4 = 9
+    }
+
+    #[test]
+    fn test_coo_entries_sorted_by_minimizer() {
+        let queries = vec![(vec![300, 100, 200], vec![250, 150]), (vec![50], vec![400])];
+        let qidx = QueryInvertedIndex::build(&queries);
+
+        assert!(qidx.entries.windows(2).all(|w| w[0].0 <= w[1].0));
+    }
+
+    #[test]
+    fn test_coo_no_deduplication() {
+        // 2 reads share minimizer 100
+        let queries = vec![(vec![100, 200], vec![]), (vec![100, 300], vec![])];
+        let qidx = QueryInvertedIndex::build(&queries);
+
+        let count_100 = qidx.entries.iter().filter(|(m, _)| *m == 100).count();
+        assert_eq!(
+            count_100, 2,
+            "COO should NOT deduplicate: 2 reads share minimizer 100"
+        );
+    }
+
+    #[test]
+    fn test_minimizer_range() {
+        let queries = vec![(vec![300, 100], vec![500])];
+        let qidx = QueryInvertedIndex::build(&queries);
+        assert_eq!(qidx.minimizer_range(), Some((100, 500)));
+
+        let empty_queries: Vec<(Vec<u64>, Vec<u64>)> = vec![];
+        let empty_qidx = QueryInvertedIndex::build(&empty_queries);
+        assert_eq!(empty_qidx.minimizer_range(), None);
+    }
+
+    #[test]
+    fn test_from_sorted_coo() {
+        let entries = vec![(100, 0u32), (100, 1), (200, 0), (300, 1)];
+        let fwd_counts = vec![2, 1];
+        let rc_counts = vec![0, 1];
+        let qidx = QueryInvertedIndex::from_sorted_coo(entries, fwd_counts, rc_counts);
+
+        assert_eq!(qidx.num_entries(), 4);
+        assert_eq!(qidx.unique_minimizers(), vec![100u64, 200, 300]);
+        assert_eq!(qidx.num_reads(), 2);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "entries must be sorted")]
+    fn test_from_sorted_coo_rejects_unsorted() {
+        let entries = vec![(200, 0u32), (100, 1)]; // NOT sorted
+        QueryInvertedIndex::from_sorted_coo(entries, vec![1], vec![1]);
     }
 }

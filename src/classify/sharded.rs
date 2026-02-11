@@ -23,6 +23,35 @@ use super::merge_join::{
 };
 use super::scoring::compute_score;
 
+/// Score accumulated hits and filter by threshold.
+///
+/// Shared scoring logic used by both sequential and parallel-RG classification.
+fn score_and_filter(
+    accumulators: Vec<HashMap<u32, (u32, u32)>>,
+    query_idx: &QueryInvertedIndex,
+    query_ids: &[i64],
+    threshold: f64,
+) -> Vec<HitResult> {
+    let mut results = Vec::new();
+    for (read_idx, buckets) in accumulators.into_iter().enumerate() {
+        let fwd_total = query_idx.fwd_counts[read_idx] as usize;
+        let rc_total = query_idx.rc_counts[read_idx] as usize;
+        let query_id = query_ids[read_idx];
+
+        for (bucket_id, (fwd_hits, rc_hits)) in buckets {
+            let score = compute_score(fwd_hits as usize, fwd_total, rc_hits as usize, rc_total);
+            if score >= threshold {
+                results.push(HitResult {
+                    query_id,
+                    bucket_id,
+                    score,
+                });
+            }
+        }
+    }
+    results
+}
+
 /// Estimate minimizers per query from the first record in a batch.
 ///
 /// Uses the formula: ((query_length - k) / w + 1) * 2 (for both strands).
@@ -83,14 +112,84 @@ pub fn extract_batch_minimizers(
         .collect()
 }
 
+/// Classify using a pre-built QueryInvertedIndex against a sharded inverted index.
+///
+/// This is the core classification step that processes each shard sequentially
+/// using merge-join. Use this when you have a pre-built `QueryInvertedIndex`
+/// (e.g., from a deferred buffer's flat COO entries).
+///
+/// # Arguments
+/// * `sharded` - The sharded inverted index
+/// * `query_idx` - Pre-built query inverted index
+/// * `query_ids` - Query IDs corresponding to each read in the query index
+/// * `threshold` - Minimum score threshold
+/// * `read_options` - Parquet read options (None = default behavior without bloom filters)
+///
+/// # Returns
+/// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
+pub fn classify_from_query_index(
+    sharded: &ShardedInvertedIndex,
+    query_idx: &QueryInvertedIndex,
+    query_ids: &[i64],
+    threshold: f64,
+    read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
+) -> Result<Vec<HitResult>> {
+    let t_start = Instant::now();
+
+    let num_reads = query_idx.num_reads();
+    if num_reads == 0 {
+        return Ok(Vec::new());
+    }
+
+    let manifest = sharded.manifest();
+
+    // Per-read accumulator: bucket_id -> (fwd_hits, rc_hits)
+    let mut accumulators: Vec<HashMap<u32, (u32, u32)>> = (0..num_reads)
+        .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
+        .collect();
+
+    let mut total_shard_load_ms = 0u128;
+    let mut total_merge_join_ms = 0u128;
+
+    // Compute unique query minimizers once for filtered shard loading
+    let query_minimizers = query_idx.unique_minimizers();
+
+    // Debug: show query minimizer statistics
+    if std::env::var("RYPE_DEBUG").is_ok() && !query_minimizers.is_empty() {
+        eprintln!(
+            "[DEBUG] Query minimizers: {} unique, range: {} to {}",
+            query_minimizers.len(),
+            query_minimizers[0],
+            query_minimizers[query_minimizers.len() - 1]
+        );
+    }
+
+    // Process each shard sequentially
+    for shard_info in &manifest.shards {
+        let t_load = Instant::now();
+        let shard =
+            sharded.load_shard_for_query(shard_info.shard_id, &query_minimizers, read_options)?;
+        total_shard_load_ms += t_load.elapsed().as_millis();
+
+        let t_merge = Instant::now();
+        accumulate_merge_join(query_idx, &shard, &mut accumulators, &query_minimizers);
+        total_merge_join_ms += t_merge.elapsed().as_millis();
+    }
+    log_timing("merge_join: shard_load_total", total_shard_load_ms);
+    log_timing("merge_join: merge_join_total", total_merge_join_ms);
+
+    let t_score = Instant::now();
+    let results = score_and_filter(accumulators, query_idx, query_ids, threshold);
+    log_timing("merge_join: scoring", t_score.elapsed().as_millis());
+    log_timing("merge_join: total", t_start.elapsed().as_millis());
+
+    Ok(results)
+}
+
 /// Classify from pre-extracted minimizers against a sharded inverted index using merge-join.
 ///
-/// This is the classification step factored out from `classify_batch_sharded_merge_join`,
-/// accepting pre-extracted minimizers instead of raw sequences. Use this when minimizers
-/// have already been extracted (e.g., cached from a prior classification pass).
-///
-/// Builds a QueryInvertedIndex once, then processes each shard sequentially
-/// using merge-join.
+/// Builds a QueryInvertedIndex, then delegates to [`classify_from_query_index`].
+/// Use this when you have pre-extracted minimizers but not a pre-built query index.
 ///
 /// # Arguments
 /// * `sharded` - The sharded inverted index
@@ -108,13 +207,9 @@ pub fn classify_from_extracted_minimizers(
     threshold: f64,
     read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
 ) -> Result<Vec<HitResult>> {
-    let t_start = Instant::now();
-
     if extracted.is_empty() {
         return Ok(Vec::new());
     }
-
-    let manifest = sharded.manifest();
 
     // Build query inverted index
     let t_build_idx = Instant::now();
@@ -124,69 +219,7 @@ pub fn classify_from_extracted_minimizers(
         t_build_idx.elapsed().as_millis(),
     );
 
-    let num_reads = query_idx.num_reads();
-    if num_reads == 0 {
-        return Ok(Vec::new());
-    }
-
-    // Per-read accumulator: bucket_id -> (fwd_hits, rc_hits)
-    let mut accumulators: Vec<HashMap<u32, (u32, u32)>> = (0..num_reads)
-        .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
-        .collect();
-
-    let mut total_shard_load_ms = 0u128;
-    let mut total_merge_join_ms = 0u128;
-
-    // Get query minimizers for filtered loading (Parquet only)
-    let query_minimizers = query_idx.minimizers();
-
-    // Debug: show query minimizer statistics
-    if std::env::var("RYPE_DEBUG").is_ok() && !query_minimizers.is_empty() {
-        eprintln!(
-            "[DEBUG] Query minimizers: {} unique, range: {} to {}",
-            query_minimizers.len(),
-            query_minimizers[0],
-            query_minimizers[query_minimizers.len() - 1]
-        );
-    }
-
-    // Process each shard sequentially
-    for shard_info in &manifest.shards {
-        let t_load = Instant::now();
-        let shard =
-            sharded.load_shard_for_query(shard_info.shard_id, query_minimizers, read_options)?;
-        total_shard_load_ms += t_load.elapsed().as_millis();
-
-        let t_merge = Instant::now();
-        accumulate_merge_join(&query_idx, &shard, &mut accumulators);
-        total_merge_join_ms += t_merge.elapsed().as_millis();
-    }
-    log_timing("merge_join: shard_load_total", total_shard_load_ms);
-    log_timing("merge_join: merge_join_total", total_merge_join_ms);
-
-    // Score and filter
-    let t_score = Instant::now();
-    let mut results = Vec::new();
-    for (read_idx, buckets) in accumulators.into_iter().enumerate() {
-        let fwd_total = query_idx.fwd_counts[read_idx] as usize;
-        let rc_total = query_idx.rc_counts[read_idx] as usize;
-        let query_id = query_ids[read_idx];
-
-        for (bucket_id, (fwd_hits, rc_hits)) in buckets {
-            let score = compute_score(fwd_hits as usize, fwd_total, rc_hits as usize, rc_total);
-            if score >= threshold {
-                results.push(HitResult {
-                    query_id,
-                    bucket_id,
-                    score,
-                });
-            }
-        }
-    }
-    log_timing("merge_join: scoring", t_score.elapsed().as_millis());
-    log_timing("merge_join: total", t_start.elapsed().as_millis());
-
-    Ok(results)
+    classify_from_query_index(sharded, &query_idx, query_ids, threshold, read_options)
 }
 
 /// Classify a batch of records against a sharded inverted index using merge-join.
@@ -232,10 +265,10 @@ pub fn classify_batch_sharded_merge_join(
     classify_from_extracted_minimizers(sharded, &extracted, &query_ids, threshold, read_options)
 }
 
-/// Classify from pre-extracted minimizers using parallel row group processing.
+/// Classify using a pre-built QueryInvertedIndex with parallel row group processing.
 ///
-/// This is the classification step factored out from `classify_batch_sharded_parallel_rg`,
-/// accepting pre-extracted minimizers instead of raw sequences.
+/// This is the core parallel-RG classification step. Use this when you have a
+/// pre-built `QueryInvertedIndex` (e.g., from a deferred buffer's flat COO entries).
 ///
 /// Each row group is processed independently in parallel:
 /// 1. Pre-filter RGs by query minimizer range (using column statistics)
@@ -245,16 +278,16 @@ pub fn classify_batch_sharded_merge_join(
 ///
 /// # Arguments
 /// * `sharded` - The sharded inverted index (must be Parquet format)
-/// * `extracted` - Pre-extracted minimizers: (fwd_mins, rc_mins) per query
-/// * `query_ids` - Query IDs corresponding to each entry in `extracted`
+/// * `query_idx` - Pre-built query inverted index
+/// * `query_ids` - Query IDs corresponding to each read in the query index
 /// * `threshold` - Minimum score threshold
 /// * `_read_options` - Unused; accepted for API consistency
 ///
 /// # Returns
 /// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
-pub fn classify_from_extracted_minimizers_parallel_rg(
+pub fn classify_from_query_index_parallel_rg(
     sharded: &ShardedInvertedIndex,
-    extracted: &[(Vec<u64>, Vec<u64>)],
+    query_idx: &QueryInvertedIndex,
     query_ids: &[i64],
     threshold: f64,
     _read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
@@ -263,34 +296,18 @@ pub fn classify_from_extracted_minimizers_parallel_rg(
 
     let t_start = Instant::now();
 
-    if extracted.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let manifest = sharded.manifest();
-
-    // Build query inverted index (CSR format, built once, reused across all RGs)
-    let t_build_idx = Instant::now();
-    let query_idx = QueryInvertedIndex::build(extracted);
-    log_timing(
-        "parallel_rg: build_query_index",
-        t_build_idx.elapsed().as_millis(),
-    );
-
     let num_reads = query_idx.num_reads();
     if num_reads == 0 {
         return Ok(Vec::new());
     }
 
-    // Get sorted query minimizers and their range for pre-filtering
-    let query_minimizers = query_idx.minimizers();
-    let (query_min, query_max) = if query_minimizers.is_empty() {
-        return Ok(Vec::new());
-    } else {
-        (
-            query_minimizers[0],
-            query_minimizers[query_minimizers.len() - 1],
-        )
+    let manifest = sharded.manifest();
+
+    // Compute unique query minimizers once for shard/RG filtering and bloom filter hints
+    let query_minimizers = query_idx.unique_minimizers();
+    let (query_min, query_max) = match query_idx.minimizer_range() {
+        Some(range) => range,
+        None => return Ok(Vec::new()),
     };
 
     let mut total_rg_count = 0usize;
@@ -333,11 +350,11 @@ pub fn classify_from_extracted_minimizers_parallel_rg(
     let results: Result<Vec<Vec<SparseHit>>> = work_items
         .into_par_iter()
         .map(|(shard_path, rg_idx)| {
-            let pairs = load_row_group_pairs(&shard_path, rg_idx, query_minimizers)?;
+            let pairs = load_row_group_pairs(&shard_path, rg_idx, &query_minimizers)?;
             if pairs.is_empty() {
                 Ok(Vec::new())
             } else {
-                Ok(merge_join_pairs_sparse(&query_idx, &pairs))
+                Ok(merge_join_pairs_sparse(query_idx, &pairs))
             }
         })
         .filter_map(|result: Result<Vec<SparseHit>>| match result {
@@ -360,29 +377,48 @@ pub fn classify_from_extracted_minimizers_parallel_rg(
     log_timing("parallel_rg: total_rg_count", total_rg_count as u128);
     log_timing("parallel_rg: filtered_rg_count", filtered_rg_count as u128);
 
-    // Score and filter
     let t_score = Instant::now();
-    let mut results = Vec::new();
-    for (read_idx, buckets) in final_accumulators.into_iter().enumerate() {
-        let fwd_total = query_idx.fwd_counts[read_idx] as usize;
-        let rc_total = query_idx.rc_counts[read_idx] as usize;
-        let query_id = query_ids[read_idx];
-
-        for (bucket_id, (fwd_hits, rc_hits)) in buckets {
-            let score = compute_score(fwd_hits as usize, fwd_total, rc_hits as usize, rc_total);
-            if score >= threshold {
-                results.push(HitResult {
-                    query_id,
-                    bucket_id,
-                    score,
-                });
-            }
-        }
-    }
+    let results = score_and_filter(final_accumulators, query_idx, query_ids, threshold);
     log_timing("parallel_rg: scoring", t_score.elapsed().as_millis());
     log_timing("parallel_rg: total", t_start.elapsed().as_millis());
 
     Ok(results)
+}
+
+/// Classify from pre-extracted minimizers using parallel row group processing.
+///
+/// Builds a QueryInvertedIndex, then delegates to [`classify_from_query_index_parallel_rg`].
+/// Use this when you have pre-extracted minimizers but not a pre-built query index.
+///
+/// # Arguments
+/// * `sharded` - The sharded inverted index (must be Parquet format)
+/// * `extracted` - Pre-extracted minimizers: (fwd_mins, rc_mins) per query
+/// * `query_ids` - Query IDs corresponding to each entry in `extracted`
+/// * `threshold` - Minimum score threshold
+/// * `_read_options` - Unused; accepted for API consistency
+///
+/// # Returns
+/// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
+pub fn classify_from_extracted_minimizers_parallel_rg(
+    sharded: &ShardedInvertedIndex,
+    extracted: &[(Vec<u64>, Vec<u64>)],
+    query_ids: &[i64],
+    threshold: f64,
+    _read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
+) -> Result<Vec<HitResult>> {
+    if extracted.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build query inverted index (built once, reused across all RGs)
+    let t_build_idx = Instant::now();
+    let query_idx = QueryInvertedIndex::build(extracted);
+    log_timing(
+        "parallel_rg: build_query_index",
+        t_build_idx.elapsed().as_millis(),
+    );
+
+    classify_from_query_index_parallel_rg(sharded, &query_idx, query_ids, threshold, _read_options)
 }
 
 /// Classify using parallel row group processing.
@@ -908,6 +944,140 @@ mod tests {
             results.is_empty(),
             "Empty records should produce empty results"
         );
+    }
+
+    // =========================================================================
+    // classify_from_query_index tests (Cycle 3)
+    // =========================================================================
+
+    #[test]
+    fn test_classify_from_query_index_matches_extracted() {
+        let (_dir, index, seqs) = create_test_index();
+
+        // Build extracted minimizers from both sequences
+        let manifest = index.manifest();
+        let extracted = extract_batch_minimizers(
+            manifest.k,
+            manifest.w,
+            manifest.salt,
+            None,
+            &[
+                (1i64, seqs[0].as_slice(), None),
+                (2i64, seqs[1].as_slice(), None),
+            ],
+        );
+        let query_ids = vec![1i64, 2];
+
+        // Get results via the existing classify_from_extracted_minimizers
+        let results_existing =
+            classify_from_extracted_minimizers(&index, &extracted, &query_ids, 0.1, None).unwrap();
+
+        // Build QueryInvertedIndex manually, then call classify_from_query_index
+        let query_idx = QueryInvertedIndex::build(&extracted);
+        let results_new =
+            classify_from_query_index(&index, &query_idx, &query_ids, 0.1, None).unwrap();
+
+        // Results should be identical
+        assert_eq!(
+            results_existing.len(),
+            results_new.len(),
+            "classify_from_query_index should produce same number of results"
+        );
+
+        // Sort both by (query_id, bucket_id) for comparison
+        let mut existing_sorted = results_existing.clone();
+        existing_sorted.sort_by(|a, b| {
+            a.query_id
+                .cmp(&b.query_id)
+                .then(a.bucket_id.cmp(&b.bucket_id))
+        });
+        let mut new_sorted = results_new.clone();
+        new_sorted.sort_by(|a, b| {
+            a.query_id
+                .cmp(&b.query_id)
+                .then(a.bucket_id.cmp(&b.bucket_id))
+        });
+
+        for (e, n) in existing_sorted.iter().zip(new_sorted.iter()) {
+            assert_eq!(e.query_id, n.query_id);
+            assert_eq!(e.bucket_id, n.bucket_id);
+            assert!(
+                (e.score - n.score).abs() < 1e-10,
+                "Scores should match: {} vs {}",
+                e.score,
+                n.score
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_from_query_index_parallel_rg_matches_extracted() {
+        let (_dir, index, seqs) = create_test_index();
+
+        let manifest = index.manifest();
+        let extracted = extract_batch_minimizers(
+            manifest.k,
+            manifest.w,
+            manifest.salt,
+            None,
+            &[
+                (1i64, seqs[0].as_slice(), None),
+                (2i64, seqs[1].as_slice(), None),
+            ],
+        );
+        let query_ids = vec![1i64, 2];
+
+        // Get results via the existing classify_from_extracted_minimizers_parallel_rg
+        let results_existing = classify_from_extracted_minimizers_parallel_rg(
+            &index, &extracted, &query_ids, 0.1, None,
+        )
+        .unwrap();
+
+        // Build QueryInvertedIndex manually, then call classify_from_query_index_parallel_rg
+        let query_idx = QueryInvertedIndex::build(&extracted);
+        let results_new =
+            classify_from_query_index_parallel_rg(&index, &query_idx, &query_ids, 0.1, None)
+                .unwrap();
+
+        assert_eq!(
+            results_existing.len(),
+            results_new.len(),
+            "classify_from_query_index_parallel_rg should produce same number of results"
+        );
+
+        let mut existing_sorted = results_existing.clone();
+        existing_sorted.sort_by(|a, b| {
+            a.query_id
+                .cmp(&b.query_id)
+                .then(a.bucket_id.cmp(&b.bucket_id))
+        });
+        let mut new_sorted = results_new.clone();
+        new_sorted.sort_by(|a, b| {
+            a.query_id
+                .cmp(&b.query_id)
+                .then(a.bucket_id.cmp(&b.bucket_id))
+        });
+
+        for (e, n) in existing_sorted.iter().zip(new_sorted.iter()) {
+            assert_eq!(e.query_id, n.query_id);
+            assert_eq!(e.bucket_id, n.bucket_id);
+            assert!(
+                (e.score - n.score).abs() < 1e-10,
+                "Scores should match: {} vs {}",
+                e.score,
+                n.score
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_from_query_index_empty() {
+        let (_dir, index, _seqs) = create_test_index();
+
+        // Empty query index
+        let query_idx = QueryInvertedIndex::build(&[]);
+        let results = classify_from_query_index(&index, &query_idx, &[], 0.1, None).unwrap();
+        assert!(results.is_empty());
     }
 
     #[test]

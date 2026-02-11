@@ -19,7 +19,7 @@ use super::helpers::{
     accumulate_owned_batches, compute_effective_batch_size, create_input_reader,
     format_classification_results, format_log_ratio_bucket_name, format_log_ratio_output,
     is_parquet_input, load_index_for_classification, stacked_batches_to_records,
-    validate_input_config, BatchSizeConfig, ClassificationInput, DeferredDenomBuffer, DeferredRead,
+    validate_input_config, BatchSizeConfig, ClassificationInput, DeferredDenomBuffer,
     IndexLoadOptions, InputReaderConfig, OutputFormat, OutputWriter, PassingReadTracker,
 };
 
@@ -102,6 +102,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         index_path: &args.common.index,
         trim_to: args.common.trim_to,
         minimum_length: args.common.minimum_length,
+        is_log_ratio: false,
     })?;
     let effective_batch_size = batch_result.batch_size;
 
@@ -693,6 +694,7 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
         index_path: &args.numerator,
         trim_to: args.trim_to,
         minimum_length: args.minimum_length,
+        is_log_ratio: true,
     })?;
     let effective_batch_size = batch_result.batch_size;
 
@@ -942,9 +944,12 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
             format_bytes(deferred_buffer.approx_bytes()),
             batch_num
         );
-        let drained = deferred_buffer.drain();
+        let t_drain = std::time::Instant::now();
+        let (entries, metadata) = deferred_buffer.drain();
+        log_timing("deferred: drain_sort", t_drain.elapsed().as_millis());
         flush_deferred_denom(
-            drained,
+            entries,
+            metadata,
             ctx.denom_sharded,
             ctx.denom_read_options,
             ctx.parallel_rg,
@@ -1069,7 +1074,8 @@ pub fn classify_numerator_and_partition(
 /// Returns the number of reads flushed.
 #[allow(clippy::too_many_arguments)]
 pub fn flush_deferred_denom(
-    deferred_reads: Vec<super::helpers::DeferredRead>,
+    entries: Vec<(u64, u32)>,
+    metadata: Vec<super::helpers::DeferredMeta>,
     denom_sharded: &ShardedInvertedIndex,
     denom_read_options: Option<&rype::ParquetReadOptions>,
     parallel_rg: bool,
@@ -1080,42 +1086,37 @@ pub fn flush_deferred_denom(
 ) -> Result<usize> {
     use super::helpers::{compute_log_ratio, format_log_ratio_output, FastPath, LogRatioResult};
 
-    if deferred_reads.is_empty() {
+    if metadata.is_empty() {
         return Ok(0);
     }
 
     let t_flush_total = std::time::Instant::now();
-    let count = deferred_reads.len();
+    let count = metadata.len();
 
-    // Separate minimizers, headers, scores, and global indices from deferred reads
-    let mut extracted: Vec<(Vec<u64>, Vec<u64>)> = Vec::with_capacity(count);
-    let mut headers: Vec<String> = Vec::with_capacity(count);
-    let mut num_scores: Vec<f64> = Vec::with_capacity(count);
-    let mut global_indices: Vec<usize> = Vec::with_capacity(count);
+    // Build QueryInvertedIndex directly from sorted COO entries
+    let fwd_counts: Vec<u32> = metadata.iter().map(|m| m.fwd_count).collect();
+    let rc_counts: Vec<u32> = metadata.iter().map(|m| m.rc_count).collect();
 
-    for dr in deferred_reads {
-        extracted.push(dr.minimizers);
-        headers.push(dr.header);
-        num_scores.push(dr.num_score);
-        global_indices.push(dr.global_index);
-    }
+    let t_build = std::time::Instant::now();
+    let query_idx = rype::QueryInvertedIndex::from_sorted_coo(entries, fwd_counts, rc_counts);
+    log_timing("deferred: build_query_index", t_build.elapsed().as_millis());
 
     let query_ids: Vec<i64> = (0..count as i64).collect();
 
-    // Classify against denominator using cached minimizers (no re-extraction!)
+    // Classify against denominator using pre-built query index (no re-extraction!)
     let t_denom = std::time::Instant::now();
     let denom_results = if parallel_rg {
-        rype::classify_from_extracted_minimizers_parallel_rg(
+        rype::classify_from_query_index_parallel_rg(
             denom_sharded,
-            &extracted,
+            &query_idx,
             &query_ids,
             0.0,
             denom_read_options,
         )?
     } else {
-        rype::classify_from_extracted_minimizers(
+        rype::classify_from_query_index(
             denom_sharded,
-            &extracted,
+            &query_idx,
             &query_ids,
             0.0,
             denom_read_options,
@@ -1134,9 +1135,9 @@ pub fn flush_deferred_denom(
 
     // Compute log-ratio for each deferred read
     let mut results: Vec<LogRatioResult> = Vec::with_capacity(count);
-    for (i, num_score) in num_scores.iter().enumerate() {
+    for (i, meta) in metadata.iter().enumerate() {
         let denom_score = denom_score_map.get(&(i as i64)).copied().unwrap_or(0.0);
-        let log_ratio = compute_log_ratio(*num_score, denom_score);
+        let log_ratio = compute_log_ratio(meta.num_score, denom_score);
         results.push(LogRatioResult {
             query_id: i as i64,
             log_ratio,
@@ -1153,13 +1154,13 @@ pub fn flush_deferred_denom(
                 lr.log_ratio <= 0.0 || lr.log_ratio.is_nan()
             };
             if passes {
-                tracker.mark(global_indices[i]);
+                tracker.mark(metadata[i].global_index);
             }
         }
     }
 
     // Build header refs for formatting
-    let header_refs: Vec<&str> = headers.iter().map(|s| s.as_str()).collect();
+    let header_refs: Vec<&str> = metadata.iter().map(|m| m.header.as_str()).collect();
 
     // Format and write output
     let t_format = std::time::Instant::now();
@@ -1262,12 +1263,14 @@ fn process_log_ratio_batch<S: AsRef<str>>(
             partition.num_scores.len(),
             extracted.len()
         );
-        deferred_buffer.push(DeferredRead {
-            header: headers[idx].as_ref().to_string(),
-            num_score: partition.num_scores[idx],
-            minimizers: std::mem::take(&mut extracted[idx]),
-            global_index: *global_read_offset + idx,
-        });
+        let (fwd, rc) = std::mem::take(&mut extracted[idx]);
+        deferred_buffer.push(
+            headers[idx].as_ref().to_string(),
+            partition.num_scores[idx],
+            *global_read_offset + idx,
+            fwd,
+            rc,
+        );
     }
 
     *global_read_offset += batch_read_count;
@@ -1280,9 +1283,12 @@ fn process_log_ratio_batch<S: AsRef<str>>(
             format_bytes(deferred_buffer.approx_bytes()),
             batch_num
         );
-        let drained = deferred_buffer.drain();
+        let t_drain = std::time::Instant::now();
+        let (entries, metadata) = deferred_buffer.drain();
+        log_timing("deferred: drain_sort", t_drain.elapsed().as_millis());
         flush_deferred_denom(
-            drained,
+            entries,
+            metadata,
             ctx.denom_sharded,
             ctx.denom_read_options,
             ctx.parallel_rg,

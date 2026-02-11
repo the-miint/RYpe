@@ -796,12 +796,15 @@ pub struct MemoryConfig {
     pub num_buckets: usize,
     /// Input format (determines prefetch buffer size and per-row memory)
     pub input_format: InputFormat,
+    /// Whether this is a log-ratio classification (adds deferred buffer memory)
+    pub is_log_ratio: bool,
 }
 
 impl MemoryConfig {
     /// Create a new MemoryConfig with validation.
     ///
     /// Returns an error if configuration values are invalid.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         max_memory: usize,
         num_threads: usize,
@@ -810,6 +813,7 @@ impl MemoryConfig {
         read_profile: ReadMemoryProfile,
         num_buckets: usize,
         input_format: InputFormat,
+        is_log_ratio: bool,
     ) -> Result<Self> {
         // Validate configuration
         if max_memory == 0 {
@@ -830,6 +834,7 @@ impl MemoryConfig {
             read_profile,
             num_buckets,
             input_format,
+            is_log_ratio,
         })
     }
 
@@ -902,6 +907,7 @@ pub fn estimate_batch_memory(
     batch_size: usize,
     profile: &ReadMemoryProfile,
     num_buckets: usize,
+    is_log_ratio: bool,
 ) -> Option<usize> {
     // OwnedFastxRecord overhead ≈ 72 bytes + sequence data
     let record_overhead: usize = 72;
@@ -927,10 +933,26 @@ pub fn estimate_batch_memory(
         .checked_mul(24)?; // HashMap entry overhead
 
     // Sum components with overflow checking
-    let base_estimate = input_records
+    let mut base_estimate = input_records
         .checked_add(minimizer_vecs)?
         .checked_add(query_index)?
         .checked_add(accumulators)?;
+
+    // Deferred denominator buffer: log-ratio holds up to batch_size/2 reads
+    // across batches, each retaining their minimizer Vecs plus metadata.
+    if is_log_ratio {
+        let deferred_reads = batch_size / 2;
+        // DeferredMeta: header String + f64 + usize + u32 + u32 ≈ 48 bytes stack
+        let meta_bytes: usize = 48;
+        let estimated_header_bytes: usize = 60;
+        let per_read_overhead = meta_bytes.checked_add(estimated_header_bytes)?;
+        // minimizers_per_query already includes both strands.
+        // Each minimizer stored as (u64, u32) = 12 bytes in COO entries.
+        let minimizer_cost = profile.minimizers_per_query.checked_mul(12)?;
+        let deferred_memory =
+            deferred_reads.checked_mul(per_read_overhead.checked_add(minimizer_cost)?)?;
+        base_estimate = base_estimate.checked_add(deferred_memory)?;
+    }
 
     // Apply fudge factor (safe since we're multiplying by a small factor)
     let result = (base_estimate as f64 * MEMORY_FUDGE_FACTOR).round() as usize;
@@ -980,7 +1002,12 @@ fn estimate_total_batch_memory(
     batch_count: usize,
     config: &MemoryConfig,
 ) -> Option<usize> {
-    let per_batch = estimate_batch_memory(batch_size, &config.read_profile, config.num_buckets)?;
+    let per_batch = estimate_batch_memory(
+        batch_size,
+        &config.read_profile,
+        config.num_buckets,
+        config.is_log_ratio,
+    )?;
     let io_buffers = estimate_io_buffer_memory(batch_size, config)?;
     // I/O buffers are shared, per-batch memory scales with batch_count
     per_batch.checked_mul(batch_count)?.checked_add(io_buffers)
@@ -1015,9 +1042,13 @@ pub fn calculate_batch_config(config: &MemoryConfig) -> BatchConfig {
 
     // Helper to create minimum config
     let make_min_config = || {
-        let per_batch_memory =
-            estimate_batch_memory(MIN_BATCH_SIZE, &config.read_profile, config.num_buckets)
-                .unwrap_or(usize::MAX);
+        let per_batch_memory = estimate_batch_memory(
+            MIN_BATCH_SIZE,
+            &config.read_profile,
+            config.num_buckets,
+            config.is_log_ratio,
+        )
+        .unwrap_or(usize::MAX);
         let io_buffer_memory =
             estimate_io_buffer_memory(MIN_BATCH_SIZE, config).unwrap_or(usize::MAX);
         BatchConfig {
@@ -1047,9 +1078,13 @@ pub fn calculate_batch_config(config: &MemoryConfig) -> BatchConfig {
     if batch_size >= MIN_BATCH_SIZE {
         let total = estimate_total_batch_memory(batch_size, batch_count, config);
         if total.is_some_and(|t| t <= available) {
-            let per_batch_memory =
-                estimate_batch_memory(batch_size, &config.read_profile, config.num_buckets)
-                    .unwrap_or(usize::MAX);
+            let per_batch_memory = estimate_batch_memory(
+                batch_size,
+                &config.read_profile,
+                config.num_buckets,
+                config.is_log_ratio,
+            )
+            .unwrap_or(usize::MAX);
             let io_buffer_memory =
                 estimate_io_buffer_memory(batch_size, config).unwrap_or(usize::MAX);
             let peak_memory = base_reserved
@@ -1312,8 +1347,8 @@ mod tests {
     fn test_estimate_batch_memory_scales_linearly() {
         let profile = ReadMemoryProfile::new(150, false, 64, 50);
 
-        let mem_1k = estimate_batch_memory(1000, &profile, 100).unwrap();
-        let mem_2k = estimate_batch_memory(2000, &profile, 100).unwrap();
+        let mem_1k = estimate_batch_memory(1000, &profile, 100, false).unwrap();
+        let mem_2k = estimate_batch_memory(2000, &profile, 100, false).unwrap();
 
         // Should roughly double (within 10% tolerance for fixed overheads)
         let ratio = mem_2k as f64 / mem_1k as f64;
@@ -1329,8 +1364,8 @@ mod tests {
         let profile_short = ReadMemoryProfile::new(150, false, 64, 50);
         let profile_long = ReadMemoryProfile::new(10000, false, 64, 50);
 
-        let mem_short = estimate_batch_memory(10000, &profile_short, 100).unwrap();
-        let mem_long = estimate_batch_memory(10000, &profile_long, 100).unwrap();
+        let mem_short = estimate_batch_memory(10000, &profile_short, 100, false).unwrap();
+        let mem_long = estimate_batch_memory(10000, &profile_long, 100, false).unwrap();
 
         assert!(mem_long > mem_short);
     }
@@ -1340,7 +1375,7 @@ mod tests {
         let profile = ReadMemoryProfile::new(150, false, 64, 50);
 
         // Very large batch size that would overflow
-        let result = estimate_batch_memory(usize::MAX, &profile, 100);
+        let result = estimate_batch_memory(usize::MAX, &profile, 100, false);
         assert!(result.is_none(), "Should return None on overflow");
 
         // Also test with large minimizers_per_query
@@ -1350,8 +1385,73 @@ mod tests {
             minimizers_per_query: usize::MAX / 2,
             is_paired: false,
         };
-        let result = estimate_batch_memory(1000000, &large_profile, 100);
+        let result = estimate_batch_memory(1000000, &large_profile, 100, false);
         assert!(result.is_none(), "Should return None on overflow");
+    }
+
+    // === Log-ratio deferred buffer memory tests ===
+
+    #[test]
+    fn test_estimate_batch_memory_with_log_ratio_larger() {
+        let profile = ReadMemoryProfile::new(1000, false, 64, 50);
+
+        let mem_normal = estimate_batch_memory(10000, &profile, 100, false).unwrap();
+        let mem_log_ratio = estimate_batch_memory(10000, &profile, 100, true).unwrap();
+
+        assert!(
+            mem_log_ratio > mem_normal,
+            "Log-ratio memory {} should exceed normal memory {}",
+            mem_log_ratio,
+            mem_normal
+        );
+    }
+
+    #[test]
+    fn test_estimate_batch_memory_log_ratio_scales() {
+        let profile = ReadMemoryProfile::new(1000, false, 64, 50);
+
+        let mem_10k = estimate_batch_memory(10000, &profile, 100, true).unwrap();
+        let mem_20k = estimate_batch_memory(20000, &profile, 100, true).unwrap();
+
+        // The deferred component scales with batch_size, so doubling batch_size
+        // should roughly double the total (within tolerance for fixed overhead).
+        let ratio = mem_20k as f64 / mem_10k as f64;
+        assert!(
+            ratio > 1.8 && ratio < 2.2,
+            "Expected ~2x scaling for log-ratio memory, got {}",
+            ratio
+        );
+    }
+
+    #[test]
+    fn test_calculate_batch_config_shrinks_for_log_ratio() {
+        let profile = ReadMemoryProfile::new(1000, false, 64, 50);
+
+        let config_normal = MemoryConfig {
+            max_memory: 4 * 1024 * 1024 * 1024, // 4GB
+            num_threads: 4,
+            index_memory: 100 * 1024 * 1024,
+            shard_reservation: 50 * 1024 * 1024,
+            read_profile: profile.clone(),
+            num_buckets: 100,
+            input_format: InputFormat::Fastx { is_paired: false },
+            is_log_ratio: false,
+        };
+
+        let config_log_ratio = MemoryConfig {
+            is_log_ratio: true,
+            ..config_normal.clone()
+        };
+
+        let batch_normal = calculate_batch_config(&config_normal);
+        let batch_log_ratio = calculate_batch_config(&config_log_ratio);
+
+        assert!(
+            batch_log_ratio.batch_size < batch_normal.batch_size,
+            "Log-ratio batch_size {} should be < normal batch_size {}",
+            batch_log_ratio.batch_size,
+            batch_normal.batch_size
+        );
     }
 
     // === Batch calculation tests ===
@@ -1367,6 +1467,7 @@ mod tests {
             read_profile: profile,
             num_buckets: 100,
             input_format: InputFormat::Fastx { is_paired: false },
+            is_log_ratio: false,
         };
 
         let batch_config = calculate_batch_config(&config);
@@ -1393,6 +1494,7 @@ mod tests {
             read_profile: profile.clone(),
             num_buckets: 100,
             input_format: InputFormat::Fastx { is_paired: false },
+            is_log_ratio: false,
         };
 
         let config_large_index = MemoryConfig {
@@ -1403,6 +1505,7 @@ mod tests {
             read_profile: profile,
             num_buckets: 100,
             input_format: InputFormat::Fastx { is_paired: false },
+            is_log_ratio: false,
         };
 
         let batch_small = calculate_batch_config(&config_small_index);
@@ -1430,6 +1533,7 @@ mod tests {
             read_profile: profile,
             num_buckets: 100,
             input_format: InputFormat::Fastx { is_paired: false },
+            is_log_ratio: false,
         };
 
         let batch_config = calculate_batch_config(&config);
@@ -1452,6 +1556,7 @@ mod tests {
             read_profile: profile,
             num_buckets: 100,
             input_format: InputFormat::Fastx { is_paired: false },
+            is_log_ratio: false,
         };
 
         let batch_config = calculate_batch_config(&config);
@@ -1989,6 +2094,7 @@ mod tests {
                 is_paired: false,
                 trimmed_in_reader: false,
             },
+            is_log_ratio: false,
         };
 
         let batch_config = calculate_batch_config(&config);
@@ -2021,6 +2127,7 @@ mod tests {
             read_profile: profile.clone(),
             num_buckets: 100,
             input_format: InputFormat::Fastx { is_paired: false },
+            is_log_ratio: false,
         };
 
         // Parquet uses 4 slots
@@ -2035,6 +2142,7 @@ mod tests {
                 is_paired: false,
                 trimmed_in_reader: false,
             },
+            is_log_ratio: false,
         };
 
         assert_eq!(
@@ -2120,6 +2228,7 @@ mod tests {
                 is_paired: true,
                 trimmed_in_reader: false,
             },
+            is_log_ratio: false,
         };
 
         let batch_config = calculate_batch_config(&config);
@@ -2181,6 +2290,7 @@ mod tests {
             read_profile: profile,
             num_buckets: 100,
             input_format: InputFormat::Fastx { is_paired: false },
+            is_log_ratio: false,
         };
 
         let batch_config = calculate_batch_config(&config);
@@ -2214,6 +2324,7 @@ mod tests {
             profile.clone(),
             100,
             InputFormat::Fastx { is_paired: false },
+            false,
         );
         assert!(valid.is_ok());
 
@@ -2226,6 +2337,7 @@ mod tests {
             profile.clone(),
             100,
             InputFormat::Fastx { is_paired: false },
+            false,
         );
         assert!(invalid.is_err());
 
@@ -2238,6 +2350,7 @@ mod tests {
             profile.clone(),
             100,
             InputFormat::Fastx { is_paired: false },
+            false,
         );
         assert!(invalid.is_err());
 
@@ -2250,6 +2363,7 @@ mod tests {
             profile,
             0,
             InputFormat::Fastx { is_paired: false },
+            false,
         );
         assert!(invalid.is_err());
     }
@@ -2344,6 +2458,7 @@ mod tests {
             read_profile: profile,
             num_buckets: 160,
             input_format: InputFormat::Fastx { is_paired: false },
+            is_log_ratio: false,
         };
 
         let result = calculate_batch_config(&config);
@@ -2371,6 +2486,7 @@ mod tests {
             read_profile: profile,
             num_buckets: 160,
             input_format: InputFormat::Fastx { is_paired: false },
+            is_log_ratio: false,
         };
 
         let result_1t = calculate_batch_config(&base);
@@ -2415,6 +2531,7 @@ mod tests {
             read_profile: profile.clone(),
             num_buckets: 160,
             input_format: InputFormat::Fastx { is_paired: false },
+            is_log_ratio: false,
         };
 
         // Realistic shard reservation for 62M-entry largest shard:
@@ -2529,6 +2646,7 @@ mod tests {
                 is_paired: false,
                 trimmed_in_reader: false,
             },
+            is_log_ratio: false,
         };
         let io_untrimmed = estimate_io_buffer_memory(batch_size, &config_untrimmed).unwrap();
 
@@ -2544,6 +2662,7 @@ mod tests {
                 is_paired: false,
                 trimmed_in_reader: true,
             },
+            is_log_ratio: false,
         };
         let io_trimmed = estimate_io_buffer_memory(batch_size, &config_trimmed).unwrap();
 

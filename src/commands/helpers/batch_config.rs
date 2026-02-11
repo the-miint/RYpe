@@ -32,6 +32,8 @@ pub struct BatchSizeConfig<'a> {
     pub trim_to: Option<usize>,
     /// Optional minimum read length filter
     pub minimum_length: Option<usize>,
+    /// Whether this is a log-ratio classification (adds deferred buffer memory)
+    pub is_log_ratio: bool,
 }
 
 /// Result of batch size computation with logging metadata.
@@ -176,6 +178,7 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
         read_profile,
         num_buckets,
         input_format,
+        is_log_ratio: config.is_log_ratio,
     };
 
     let batch_config = calculate_batch_config(&mem_config);
@@ -321,6 +324,7 @@ num_entries = 3
             index_path: &index_path,
             trim_to: None,
             minimum_length: None,
+            is_log_ratio: false,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -342,6 +346,7 @@ num_entries = 3
             index_path: &index_path,
             trim_to: None,
             minimum_length: None,
+            is_log_ratio: false,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -371,6 +376,7 @@ num_entries = 3
             index_path: &index_path,
             trim_to: None,
             minimum_length: None,
+            is_log_ratio: false,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -397,6 +403,7 @@ num_entries = 3
             index_path: &index_path,
             trim_to: None,
             minimum_length: None,
+            is_log_ratio: false,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -445,6 +452,7 @@ num_entries = 3
             index_path,
             trim_to: None,
             minimum_length: None,
+            is_log_ratio: false,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();

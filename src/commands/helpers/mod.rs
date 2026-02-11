@@ -34,7 +34,7 @@ pub use arg_parsing::{
 };
 pub use batch_config::{compute_effective_batch_size, BatchSizeConfig};
 #[allow(unused_imports)]
-pub use deferred_denom::{DeferredDenomBuffer, DeferredRead};
+pub use deferred_denom::{DeferredDenomBuffer, DeferredMeta};
 #[allow(unused_imports)]
 pub use fastx_io::OwnedFastxRecord;
 #[allow(unused_imports)]

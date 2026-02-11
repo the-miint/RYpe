@@ -307,6 +307,71 @@ When adding features:
 3. **Index compatibility**: Indices with different k, w, or salt cannot be used together for negative filtering
 4. **Short sequences**: Sequences < K bases produce no minimizers
 
+## Performance Test Data (Local Only)
+
+The `perf-assessment/` and `perf-data/` directories contain real-world test data for benchmarking (not checked into git):
+
+- **Genomes**: `perf-data/wol2-genomes/` — ~16,000 compressed FASTA genomes (WoL2 database)
+- **Query files** (symlinks in `perf-assessment/query-files/`):
+  - `short_read_R1.fastq.gz` / `short_read_R2.fastq.gz` — paired-end short reads (~108MB/113MB)
+  - `long_read.fastq.gz` — long reads (~2.2GB)
+  - `short_read.parquet` / `long_read.parquet` — Parquet-converted versions
+- **Pre-built indices**:
+  - `perf-assessment/parquet-index/n100-w200.ryxdi/` — 160-bucket index (k=64, w=200, 8 shards, ~486M minimizers)
+  - `perf-assessment/config/numerator-w200.ryxdi/` — single-bucket index (8000 genomes from buckets 1-80, 267M minimizers)
+  - `perf-assessment/config/denominator-w200.ryxdi/` — single-bucket index (7952 genomes from buckets 81-160, 216M minimizers)
+- **Index configs**: `perf-assessment/config/n100-w200.toml` etc. — TOML configs for rebuilding indices
+
+Tests using this data should be `#[ignore]` since it's local-only.
+
+### Building Single-Bucket Indices for Log-Ratio Testing
+
+Log-ratio mode (`classify log-ratio`) requires single-bucket indices (exactly 1 bucket each). The multi-bucket `n100-w200.ryxdi` cannot be used. To build single-bucket indices:
+
+1. **Config format** — each config has `[index]` section and one `[buckets.<name>]` section with a `files` array:
+   ```toml
+   [index]
+   window = 200
+   salt = 6148914691236517205
+   output = "numerator-w200.ryxdi"
+
+   [buckets.numerator]
+   files = [ "../../perf-data/wol2-genomes/G001873845.fasta.gz", ... ]
+   ```
+
+2. **Build command** — output path is relative to the config file location:
+   ```bash
+   target/release/rype index from-config -c perf-assessment/config/numerator-w200.toml
+   ```
+
+3. **Verify** — must show exactly 1 bucket:
+   ```bash
+   target/release/rype index stats -i perf-assessment/config/numerator-w200.ryxdi
+   ```
+
+### Running Performance Tests
+
+**Always measure both time and space.** Use `/usr/bin/time -v` to capture peak RSS (resident set size) alongside `--timing` for per-phase breakdowns. Record both in plan docs.
+
+```bash
+# Log-ratio with minimum-length filter (the OOM-prone scenario):
+/usr/bin/time -v target/release/rype classify log-ratio \
+  -n perf-assessment/config/numerator-w200.ryxdi \
+  -d perf-assessment/config/denominator-w200.ryxdi \
+  -1 perf-assessment/query-files/long_read.parquet \
+  --minimum-length 100 --max-memory 4G --timing \
+  -o scratch/log-ratio-test.tsv
+
+# Standard classification with timing (for build_query_index benchmarking):
+/usr/bin/time -v target/release/rype classify run \
+  -i perf-assessment/parquet-index/n100-w200.ryxdi \
+  -1 perf-assessment/query-files/long_read.parquet \
+  -t 0.01 --timing \
+  -o scratch/classify-test.tsv
+```
+
+**Important**: Always use `target/release/rype` (absolute or relative path to the binary) rather than `cargo run --release --bin rype --` which can insert empty string arguments.
+
 ## Development Environment Notes
 
 - **Temporary files**: Do NOT use `/tmp` - it has insufficient space on this system. Use `scratch/` directory within the project for temporary files and test data. This directory is gitignored.

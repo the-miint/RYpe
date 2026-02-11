@@ -19,22 +19,6 @@ use super::scoring::compute_score;
 /// unique minimizer counts. When one index is much smaller (>16:1 ratio), it
 /// falls back to galloping search for O(Q * log(R/Q)) complexity.
 ///
-/// # Performance Characteristics
-///
-/// **Best for:**
-/// - Large batches (>1000 reads) with high minimizer overlap
-/// - Reads from similar genomic regions (amplicons, targeted sequencing)
-/// - Query minimizer reuse >30%
-///
-/// **Use `classify_batch` instead when:**
-/// - Small batches (<1000 reads)
-/// - Diverse read origins (low minimizer reuse)
-/// - Memory is extremely constrained (this builds an intermediate index)
-///
-/// **Complexity:**
-/// - Time: O(Q + R) for merge-join, O(Q * log(R/Q)) for galloping
-/// - Space: O(Q + num_reads * avg_buckets_hit)
-///
 /// # Arguments
 /// * `query_idx` - Query inverted index built from extracted minimizers
 /// * `ref_idx` - Reference inverted index
@@ -59,7 +43,8 @@ pub fn classify_batch_merge_join(
         .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
         .collect();
 
-    accumulate_merge_join(query_idx, ref_idx, &mut accumulators);
+    let unique_mins = query_idx.unique_minimizers();
+    accumulate_merge_join(query_idx, ref_idx, &mut accumulators, &unique_mins);
 
     // Score and filter
     let mut results = Vec::new();
@@ -82,70 +67,109 @@ pub fn classify_batch_merge_join(
     results
 }
 
+/// Accumulate hits into accumulators for all COO entries in `run`.
+/// Each entry is cross-producted with each bucket in `bucket_slice`.
+#[inline]
+fn accumulate_coo_run(
+    entries: &[(u64, u32)],
+    bucket_slice: &[u32],
+    accumulators: &mut [HashMap<u32, (u32, u32)>],
+) {
+    for &(_, packed) in entries {
+        let (read_idx, is_rc) = QueryInvertedIndex::unpack_read_id(packed);
+        for &bucket_id in bucket_slice {
+            let entry = accumulators[read_idx as usize]
+                .entry(bucket_id)
+                .or_insert((0, 0));
+            if is_rc {
+                entry.1 = entry.1.saturating_add(1);
+            } else {
+                entry.0 = entry.0.saturating_add(1);
+            }
+        }
+    }
+}
+
 /// Pure merge-join when query and reference have similar sizes.
-/// O(Q + R) complexity with excellent cache behavior.
+/// Walks COO entries with run detection. O(Q_unique + R) outer comparisons.
 pub(super) fn merge_join(
     query_idx: &QueryInvertedIndex,
     ref_idx: &InvertedIndex,
     accumulators: &mut [HashMap<u32, (u32, u32)>],
 ) {
+    let entries = &query_idx.entries;
     let mut qi = 0usize;
     let mut ri = 0usize;
 
-    while qi < query_idx.minimizers.len() && ri < ref_idx.minimizers.len() {
-        let q_min = query_idx.minimizers[qi];
+    while qi < entries.len() && ri < ref_idx.minimizers.len() {
+        let q_min = entries[qi].0;
         let r_min = ref_idx.minimizers[ri];
 
         if q_min < r_min {
-            qi += 1;
+            // Skip entire COO run — advance qi past all entries with q_min
+            qi = entries[qi..].partition_point(|e| e.0 == q_min) + qi;
         } else if q_min > r_min {
             ri += 1;
         } else {
-            ref_idx.accumulate_hits_for_match(query_idx, qi, ri, accumulators);
-            qi += 1;
+            // Match! Find end of COO run for this minimizer.
+            let run_end = entries[qi..].partition_point(|e| e.0 == q_min) + qi;
+
+            // Get ref bucket slice for this minimizer.
+            let r_start = ref_idx.offsets[ri] as usize;
+            let r_end = ref_idx.offsets[ri + 1] as usize;
+            let bucket_slice = &ref_idx.bucket_ids[r_start..r_end];
+
+            // Cross-product: each COO entry × each ref bucket
+            accumulate_coo_run(&entries[qi..run_end], bucket_slice, accumulators);
+
+            qi = run_end;
             ri += 1;
         }
     }
 }
 
-/// Incremental binary search with exponential probing for skewed size ratios.
+/// Galloping search for skewed size ratios.
 ///
-/// This is similar to the search pattern in `InvertedIndex::get_bucket_hits`,
-/// but operates on two CSR structures simultaneously. When one index is much
-/// larger, we iterate through the smaller one and use exponential probing
-/// followed by binary search to find matches in the larger one.
-///
-/// # Algorithm
-/// Uses `gallop_for_each` from core::orientation for the core galloping logic:
-/// 1. Exponential probe: jump 1, 2, 4, 8... positions until we overshoot
-/// 2. Binary search: search within [current_pos, current_pos + jump + 1)
-/// 3. Advance position on match or miss (leveraging sorted order)
-///
-/// # Requirements
-/// - Both `query_idx.minimizers` and `ref_idx.minimizers` must be sorted
-/// - This is guaranteed by `QueryInvertedIndex::build` and `InvertedIndex::build_from_index`
+/// Uses pre-computed `unique_mins` for the galloping outer loop,
+/// then finds COO runs via `partition_point` on match.
 ///
 /// # Arguments
+/// * `unique_mins` - Pre-computed sorted unique minimizers (avoids per-shard allocation)
 /// * `query_smaller` - if true, iterate query and search ref; else vice versa
 pub(super) fn gallop_join(
     query_idx: &QueryInvertedIndex,
     ref_idx: &InvertedIndex,
     accumulators: &mut [HashMap<u32, (u32, u32)>],
+    unique_mins: &[u64],
     query_smaller: bool,
 ) {
     let (smaller, larger) = if query_smaller {
-        (&query_idx.minimizers[..], &ref_idx.minimizers[..])
+        (unique_mins, &ref_idx.minimizers[..])
     } else {
-        (&ref_idx.minimizers[..], &query_idx.minimizers[..])
+        (&ref_idx.minimizers[..], unique_mins)
     };
 
     gallop_for_each(smaller, larger, |smaller_idx, larger_idx| {
-        let (qi, ri) = if query_smaller {
+        let (qi_unique, ri) = if query_smaller {
             (smaller_idx, larger_idx)
         } else {
             (larger_idx, smaller_idx)
         };
-        ref_idx.accumulate_hits_for_match(query_idx, qi, ri, accumulators);
+
+        // Find COO run for unique_mins[qi_unique] using two partition_points
+        let target = unique_mins[qi_unique];
+        let run_start = query_idx.entries.partition_point(|e| e.0 < target);
+        let run_end = query_idx.entries.partition_point(|e| e.0 <= target);
+
+        let r_start = ref_idx.offsets[ri] as usize;
+        let r_end = ref_idx.offsets[ri + 1] as usize;
+        let bucket_slice = &ref_idx.bucket_ids[r_start..r_end];
+
+        accumulate_coo_run(
+            &query_idx.entries[run_start..run_end],
+            bucket_slice,
+            accumulators,
+        );
     });
 }
 
@@ -153,24 +177,29 @@ pub(super) fn gallop_join(
 ///
 /// This is the core accumulation logic extracted for reuse by sharded classification.
 /// Chooses between pure merge-join and galloping based on size ratio.
+///
+/// # Arguments
+/// * `unique_mins` - Pre-computed sorted unique minimizers from the query index.
+///   Computed once per classification call and reused across shards.
 pub(super) fn accumulate_merge_join(
     query_idx: &QueryInvertedIndex,
     ref_idx: &InvertedIndex,
     accumulators: &mut [HashMap<u32, (u32, u32)>],
+    unique_mins: &[u64],
 ) {
-    if query_idx.num_minimizers() == 0 || ref_idx.num_minimizers() == 0 {
+    if query_idx.num_entries() == 0 || ref_idx.num_minimizers() == 0 {
         return;
     }
 
-    let q_len = query_idx.minimizers.len();
+    let q_len = unique_mins.len();
     let r_len = ref_idx.minimizers.len();
 
     if q_len * GALLOP_THRESHOLD < r_len {
         // Query much smaller: gallop through reference
-        gallop_join(query_idx, ref_idx, accumulators, true);
+        gallop_join(query_idx, ref_idx, accumulators, unique_mins, true);
     } else if r_len * GALLOP_THRESHOLD < q_len {
         // Reference much smaller: gallop through query
-        gallop_join(query_idx, ref_idx, accumulators, false);
+        gallop_join(query_idx, ref_idx, accumulators, unique_mins, false);
     } else {
         // Similar sizes: pure merge-join
         merge_join(query_idx, ref_idx, accumulators);
@@ -179,10 +208,7 @@ pub(super) fn accumulate_merge_join(
 
 /// A sparse hit: (read_idx, bucket_id, fwd_hits, rc_hits).
 ///
-/// Used for memory-efficient parallel row group processing. Each entry represents
-/// hits from a single minimizer match: fwd_hits=1 for forward strand, rc_hits=1
-/// for reverse complement. Multiple entries may exist for the same (read, bucket)
-/// pair when multiple minimizers match; the merge step accumulates them.
+/// Used for memory-efficient parallel row group processing.
 pub type SparseHit = (u32, u32, u32, u32);
 
 /// Merge-join query index against sorted pairs, returning sparse hits.
@@ -194,17 +220,11 @@ pub type SparseHit = (u32, u32, u32, u32);
 /// # Range-Bounded Query Filtering
 ///
 /// Since each row group covers only a small slice of the minimizer space, we
-/// narrow query minimizers to only those that could match:
-///
-/// 1. Determine min/max minimizer from ref_pairs (first and last elements)
-/// 2. Binary search query_idx.minimizers to find the overlapping range
-/// 3. Merge-join only within that bounded range
-///
-/// # Complexity
-/// O(Q_bounded + R) where Q_bounded = query minimizers in [rg_min, rg_max]
+/// narrow query entries to only those that could match using `partition_point`
+/// on the COO entries.
 ///
 /// # Arguments
-/// * `query_idx` - Query inverted index (CSR format, built once per batch)
+/// * `query_idx` - Query inverted index (COO format, built once per batch)
 /// * `ref_pairs` - Sorted (minimizer, bucket_id) pairs from a single row group
 ///
 /// # Returns
@@ -219,7 +239,7 @@ pub fn merge_join_pairs_sparse(
         "ref_pairs must be sorted by minimizer"
     );
 
-    if query_idx.num_minimizers() == 0 || ref_pairs.is_empty() {
+    if query_idx.num_entries() == 0 || ref_pairs.is_empty() {
         return Vec::new();
     }
 
@@ -227,35 +247,36 @@ pub fn merge_join_pairs_sparse(
     let rg_min = ref_pairs[0].0;
     let rg_max = ref_pairs[ref_pairs.len() - 1].0;
 
-    // Binary search to find bounded query range
-    let q_start = query_idx.minimizers.partition_point(|&m| m < rg_min);
-    let q_end = query_idx.minimizers.partition_point(|&m| m <= rg_max);
+    // Binary search on COO entries to find bounded range
+    let q_start = query_idx.entries.partition_point(|e| e.0 < rg_min);
+    let q_end = query_idx.entries.partition_point(|e| e.0 <= rg_max);
 
     if q_start >= q_end {
         return Vec::new();
     }
 
-    // Estimate capacity based on bounded query count
-    let bounded_query_count = q_end - q_start;
-    let mut hits = Vec::with_capacity(bounded_query_count);
+    let bounded = &query_idx.entries[q_start..q_end];
+    let bounded_count = bounded.len();
+    let mut hits = Vec::with_capacity(bounded_count);
 
-    let mut qi = q_start;
+    let mut qi = 0usize;
     let mut ri = 0usize;
 
-    while qi < q_end && ri < ref_pairs.len() {
-        let q_min = query_idx.minimizers[qi];
+    while qi < bounded.len() && ri < ref_pairs.len() {
+        let q_min = bounded[qi].0;
         let (r_min, bucket_id) = ref_pairs[ri];
 
         if q_min < r_min {
-            qi += 1;
+            // Skip entire COO run for this query minimizer
+            qi = bounded[qi..].partition_point(|e| e.0 == q_min) + qi;
         } else if q_min > r_min {
             ri += 1;
         } else {
-            // Match! Emit hit for each read with this query minimizer
-            let q_off_start = query_idx.offsets[qi] as usize;
-            let q_off_end = query_idx.offsets[qi + 1] as usize;
+            // Match! Find COO run for this minimizer
+            let run_end = bounded[qi..].partition_point(|e| e.0 == q_min) + qi;
 
-            for &packed in &query_idx.read_ids[q_off_start..q_off_end] {
+            // Emit hit for each read with this query minimizer
+            for &(_, packed) in &bounded[qi..run_end] {
                 let (read_idx, is_rc) = QueryInvertedIndex::unpack_read_id(packed);
                 if is_rc {
                     hits.push((read_idx, bucket_id, 0, 1));
@@ -424,15 +445,6 @@ mod tests {
 
     #[test]
     fn test_galloping_search_boundary_case() {
-        // This test triggers an off-by-one bug in gallop_join where matches
-        // at the gallop boundary position (larger_pos + jump) are missed.
-        //
-        // With query = [10] and ref = [0, 10, 20, ...], larger_pos=0:
-        // - gallop: jump=1, larger[1]=10, 10 < 10? NO → exit
-        // - search_end = min(0 + 1, len) = 1
-        // - search larger[0..1] = [0] for 10 → NOT FOUND (bug!)
-        //
-        // The match at position 1 is excluded from the search range.
         let queries = vec![
             (vec![10], vec![]), // Single minimizer at boundary position
         ];
@@ -443,11 +455,8 @@ mod tests {
         let ref_idx = build_test_inverted_index(vec![(1, "A", minimizers)]);
         let query_ids = vec![101i64];
 
-        // 10 is at position 1 in the reference (1 * 10 = 10)
         let results = classify_batch_merge_join(&query_idx, &ref_idx, &query_ids, 0.0);
 
-        // This assertion will FAIL with the bug (results.len() == 0)
-        // and PASS after the fix (results.len() == 1)
         assert_eq!(
             results.len(),
             1,
@@ -460,7 +469,6 @@ mod tests {
     #[test]
     fn test_galloping_search_small_ref() {
         // Create scenario where ref << query to trigger galloping (rare case)
-        // Need ref_len * 16 < query_len
         let minimizers: Vec<u64> = (0..100).map(|i| i * 10).collect();
         let queries = vec![
             (minimizers.clone(), vec![]), // 100 minimizers
