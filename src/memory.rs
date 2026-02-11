@@ -551,7 +551,14 @@ pub enum InputFormat {
     /// FASTX input (FASTQ/FASTA files)
     Fastx { is_paired: bool },
     /// Parquet input with Arrow RecordBatches
-    Parquet { is_paired: bool },
+    ///
+    /// When `trimmed_in_reader` is true, the Parquet reader thread converts
+    /// Arrow batches to `OwnedFastxRecord` (for trim/filter), so the prefetch
+    /// channel holds owned records instead of Arrow `RecordBatch` objects.
+    Parquet {
+        is_paired: bool,
+        trimmed_in_reader: bool,
+    },
 }
 
 impl InputFormat {
@@ -567,14 +574,25 @@ impl InputFormat {
     pub fn estimate_buffer_bytes_per_row(&self, profile: &ReadMemoryProfile) -> usize {
         match self {
             InputFormat::Fastx { is_paired } => profile.estimate_owned_record_bytes(*is_paired),
-            InputFormat::Parquet { is_paired } => profile.estimate_arrow_bytes_per_row(*is_paired),
+            InputFormat::Parquet {
+                is_paired,
+                trimmed_in_reader: true,
+            } => profile.estimate_owned_record_bytes(*is_paired),
+            InputFormat::Parquet {
+                is_paired,
+                trimmed_in_reader: false,
+            } => profile.estimate_arrow_bytes_per_row(*is_paired),
         }
     }
 
     /// Whether this format uses paired-end reads.
     pub fn is_paired(&self) -> bool {
         match self {
-            InputFormat::Fastx { is_paired } | InputFormat::Parquet { is_paired } => *is_paired,
+            InputFormat::Fastx { is_paired }
+            | InputFormat::Parquet {
+                is_paired,
+                trimmed_in_reader: _,
+            } => *is_paired,
         }
     }
 }
@@ -936,12 +954,19 @@ fn estimate_io_buffer_memory(batch_size: usize, config: &MemoryConfig) -> Option
         .checked_mul(batch_size)?
         .checked_mul(bytes_per_row)?;
 
-    // Apply builder overhead for Parquet (Arrow builders allocate extra capacity)
+    // Apply builder overhead for Parquet Arrow path (Arrow builders allocate extra capacity).
+    // When trimmed_in_reader is true, the channel holds OwnedFastxRecord, not Arrow batches,
+    // so no Arrow builder overhead applies.
     let result = match config.input_format {
-        InputFormat::Parquet { .. } => {
-            (base_memory as f64 * ARROW_BUILDER_OVERHEAD).round() as usize
+        InputFormat::Parquet {
+            trimmed_in_reader: false,
+            ..
+        } => (base_memory as f64 * ARROW_BUILDER_OVERHEAD).round() as usize,
+        InputFormat::Parquet {
+            trimmed_in_reader: true,
+            ..
         }
-        InputFormat::Fastx { .. } => base_memory,
+        | InputFormat::Fastx { .. } => base_memory,
     };
 
     Some(result)
@@ -1960,7 +1985,10 @@ mod tests {
             shard_reservation: 0,
             read_profile: profile.clone(),
             num_buckets: 100,
-            input_format: InputFormat::Parquet { is_paired: false },
+            input_format: InputFormat::Parquet {
+                is_paired: false,
+                trimmed_in_reader: false,
+            },
         };
 
         let batch_config = calculate_batch_config(&config);
@@ -2003,7 +2031,10 @@ mod tests {
             shard_reservation: 0,
             read_profile: profile,
             num_buckets: 100,
-            input_format: InputFormat::Parquet { is_paired: false },
+            input_format: InputFormat::Parquet {
+                is_paired: false,
+                trimmed_in_reader: false,
+            },
         };
 
         assert_eq!(
@@ -2085,7 +2116,10 @@ mod tests {
             shard_reservation: 100 * 1024 * 1024,
             read_profile: profile,
             num_buckets: 1000,
-            input_format: InputFormat::Parquet { is_paired: true },
+            input_format: InputFormat::Parquet {
+                is_paired: true,
+                trimmed_in_reader: false,
+            },
         };
 
         let batch_config = calculate_batch_config(&config);
@@ -2403,6 +2437,176 @@ mod tests {
             shard_reservation / (1024 * 1024),
             result_no.batch_size,
             result_with.batch_size
+        );
+    }
+
+    // =========================================================================
+    // Parquet trimmed_in_reader memory estimation tests
+    // =========================================================================
+
+    #[test]
+    fn test_parquet_trimmed_uses_owned_format_for_io_buffer_estimate() {
+        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+
+        let format_trimmed = InputFormat::Parquet {
+            is_paired: false,
+            trimmed_in_reader: true,
+        };
+        let format_fastx = InputFormat::Fastx { is_paired: false };
+
+        // When trimmed_in_reader is true, Parquet should use the same
+        // estimate_owned_record_bytes as FASTX (since channel holds OwnedFastxRecord)
+        let trimmed_bytes = format_trimmed.estimate_buffer_bytes_per_row(&profile);
+        let fastx_bytes = format_fastx.estimate_buffer_bytes_per_row(&profile);
+
+        assert_eq!(
+            trimmed_bytes, fastx_bytes,
+            "Parquet trimmed_in_reader should use owned record estimate ({}), not Arrow estimate (got {})",
+            fastx_bytes, trimmed_bytes
+        );
+
+        // Verify it's actually using estimate_owned_record_bytes
+        let expected = profile.estimate_owned_record_bytes(false);
+        assert_eq!(trimmed_bytes, expected);
+    }
+
+    #[test]
+    fn test_parquet_untrimmed_uses_arrow_estimate() {
+        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+
+        let format_untrimmed = InputFormat::Parquet {
+            is_paired: false,
+            trimmed_in_reader: false,
+        };
+
+        let bytes = format_untrimmed.estimate_buffer_bytes_per_row(&profile);
+        let expected = profile.estimate_arrow_bytes_per_row(false);
+
+        assert_eq!(
+            bytes, expected,
+            "Parquet untrimmed should use Arrow estimate ({}), got {}",
+            expected, bytes
+        );
+    }
+
+    #[test]
+    fn test_parquet_trimmed_prefetch_slots_still_four() {
+        let format_trimmed = InputFormat::Parquet {
+            is_paired: false,
+            trimmed_in_reader: true,
+        };
+        let format_untrimmed = InputFormat::Parquet {
+            is_paired: false,
+            trimmed_in_reader: false,
+        };
+
+        // Both trimmed and untrimmed Parquet should use 4 prefetch slots
+        assert_eq!(
+            format_trimmed.prefetch_slots(),
+            PARQUET_PREFETCH_BUFFER_SLOTS
+        );
+        assert_eq!(
+            format_untrimmed.prefetch_slots(),
+            PARQUET_PREFETCH_BUFFER_SLOTS
+        );
+        assert_eq!(format_trimmed.prefetch_slots(), 4);
+    }
+
+    #[test]
+    fn test_parquet_trimmed_no_arrow_builder_overhead() {
+        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let batch_size = 10_000;
+
+        // Untrimmed Parquet: should apply ARROW_BUILDER_OVERHEAD (1.5x)
+        let config_untrimmed = MemoryConfig {
+            max_memory: 1024 * 1024 * 1024,
+            num_threads: 4,
+            index_memory: 0,
+            shard_reservation: 0,
+            read_profile: profile.clone(),
+            num_buckets: 100,
+            input_format: InputFormat::Parquet {
+                is_paired: false,
+                trimmed_in_reader: false,
+            },
+        };
+        let io_untrimmed = estimate_io_buffer_memory(batch_size, &config_untrimmed).unwrap();
+
+        // Trimmed Parquet: should NOT apply ARROW_BUILDER_OVERHEAD
+        let config_trimmed = MemoryConfig {
+            max_memory: 1024 * 1024 * 1024,
+            num_threads: 4,
+            index_memory: 0,
+            shard_reservation: 0,
+            read_profile: profile,
+            num_buckets: 100,
+            input_format: InputFormat::Parquet {
+                is_paired: false,
+                trimmed_in_reader: true,
+            },
+        };
+        let io_trimmed = estimate_io_buffer_memory(batch_size, &config_trimmed).unwrap();
+
+        // Untrimmed should be larger due to ARROW_BUILDER_OVERHEAD (1.5x) and
+        // Arrow per-row estimate being larger than OwnedFastxRecord estimate.
+        // The key assertion: trimmed should NOT have the 1.5x overhead applied.
+        // Both use 4 prefetch slots, so the difference is from per-row estimate +
+        // builder overhead.
+        assert!(
+            io_untrimmed > io_trimmed,
+            "Untrimmed IO buffer ({}) should be > trimmed IO buffer ({}) \
+             due to Arrow builder overhead",
+            io_untrimmed,
+            io_trimmed
+        );
+
+        // Verify the trimmed value has no 1.5x overhead:
+        // io_trimmed = slots * batch_size * owned_bytes_per_row (no multiplier)
+        let expected_trimmed = config_trimmed.prefetch_buffer_slots()
+            * batch_size
+            * config_trimmed.buffer_bytes_per_row();
+        assert_eq!(
+            io_trimmed, expected_trimmed,
+            "Trimmed IO buffer should equal slots * batch * owned_bytes (no 1.5x overhead)"
+        );
+    }
+
+    #[test]
+    fn test_parquet_trimmed_paired_end_uses_paired_owned_estimate() {
+        let profile = ReadMemoryProfile::new(150, true, 64, 50);
+
+        let format_trimmed_paired = InputFormat::Parquet {
+            is_paired: true,
+            trimmed_in_reader: true,
+        };
+        let format_trimmed_single = InputFormat::Parquet {
+            is_paired: false,
+            trimmed_in_reader: true,
+        };
+
+        let paired_bytes = format_trimmed_paired.estimate_buffer_bytes_per_row(&profile);
+        let single_bytes = format_trimmed_single.estimate_buffer_bytes_per_row(&profile);
+
+        // Paired should be larger (adds seq2 overhead)
+        assert!(
+            paired_bytes > single_bytes,
+            "Paired trimmed Parquet ({}) should use more memory than single ({})",
+            paired_bytes,
+            single_bytes
+        );
+
+        // Should match the owned record estimate for paired-end
+        let expected_paired = profile.estimate_owned_record_bytes(true);
+        let expected_single = profile.estimate_owned_record_bytes(false);
+        assert_eq!(
+            paired_bytes, expected_paired,
+            "Paired trimmed Parquet should use paired owned estimate ({}), got {}",
+            expected_paired, paired_bytes
+        );
+        assert_eq!(
+            single_bytes, expected_single,
+            "Single trimmed Parquet should use single owned estimate ({}), got {}",
+            expected_single, single_bytes
         );
     }
 }

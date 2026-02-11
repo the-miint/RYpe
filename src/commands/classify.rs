@@ -16,9 +16,9 @@ use rype::{
 
 use super::helpers::seq_writer::rewalk_and_write_passing;
 use super::helpers::{
-    compute_effective_batch_size, create_input_reader, format_classification_results,
-    format_log_ratio_bucket_name, format_log_ratio_output, is_parquet_input,
-    load_index_for_classification, read_parquet_batch_trimmed, stacked_batches_to_records,
+    accumulate_owned_batches, compute_effective_batch_size, create_input_reader,
+    format_classification_results, format_log_ratio_bucket_name, format_log_ratio_output,
+    is_parquet_input, load_index_for_classification, stacked_batches_to_records,
     validate_input_config, BatchSizeConfig, ClassificationInput, DeferredDenomBuffer, DeferredRead,
     IndexLoadOptions, InputReaderConfig, OutputFormat, OutputWriter, PassingReadTracker,
 };
@@ -36,6 +36,7 @@ pub struct CommonClassifyArgs {
     pub use_bloom_filter: bool,
     pub parallel_input_rg: usize,
     pub trim_to: Option<usize>,
+    pub minimum_length: Option<usize>,
 }
 
 /// Arguments for the classify run command.
@@ -100,6 +101,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         is_parquet_input: input_is_parquet,
         index_path: &args.common.index,
         trim_to: args.common.trim_to,
+        minimum_length: args.common.minimum_length,
     })?;
     let effective_batch_size = batch_result.batch_size;
 
@@ -173,11 +175,8 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
             batch_size: effective_batch_size,
             parallel_input_rg: args.common.parallel_input_rg,
             is_parquet: input_is_parquet,
-            trim_to: if input_is_parquet {
-                None
-            } else {
-                args.common.trim_to
-            },
+            trim_to: args.common.trim_to,
+            minimum_length: args.common.minimum_length,
         },
         false, // Not writing sequences in run command
     )?;
@@ -198,11 +197,13 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     }
 
     // Log which I/O path will be used for Parquet input
+    let parquet_needs_owned = args.common.trim_to.is_some() || args.common.minimum_length.is_some();
     if input_is_parquet {
-        if args.common.trim_to.is_some() {
+        if parquet_needs_owned {
             log::info!(
-                "Using owned-copy Parquet path with trimming (--trim-to {})",
-                args.common.trim_to.unwrap()
+                "Using owned-copy Parquet path (trim_to={:?}, minimum_length={:?})",
+                args.common.trim_to,
+                args.common.minimum_length
             );
         } else {
             log::debug!("Using zero-copy Parquet path for maximum performance");
@@ -253,15 +254,11 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         // Handle Parquet and FASTX differently for zero-copy optimization
         match &mut input_reader {
             ClassificationInput::Parquet(reader) => {
-                // Parquet path: use owned-copy with trimming when trim_to is set,
+                // Parquet path: use owned-copy when trim/filter active,
                 // otherwise use zero-copy for better performance with short reads.
-                if args.common.trim_to.is_some() {
-                    // Owned-copy path: use shared helper for memory-efficient trimming
-                    let result = read_parquet_batch_trimmed(
-                        reader,
-                        effective_batch_size,
-                        args.common.trim_to,
-                    )?;
+                if parquet_needs_owned {
+                    // Owned-copy path: reader thread trims/filters, we accumulate
+                    let result = accumulate_owned_batches(reader, effective_batch_size)?;
 
                     log_timing("batch: io_read+trim", t_io_read.elapsed().as_millis());
 
@@ -331,10 +328,11 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                     // Accumulate batches until we have enough rows or run out of data
                     loop {
                         let batch_opt = reader.next_batch()?;
-                        let Some((record_batch, headers)) = batch_opt else {
+                        let Some(parquet_batch) = batch_opt else {
                             reached_end = true;
                             break;
                         };
+                        let (record_batch, headers) = parquet_batch.into_arrow();
 
                         let batch_rows = record_batch.num_rows();
                         stacked_rows += batch_rows;
@@ -492,6 +490,7 @@ pub struct ClassifyLogRatioArgs {
     pub use_bloom_filter: bool,
     pub parallel_input_rg: usize,
     pub trim_to: Option<usize>,
+    pub minimum_length: Option<usize>,
     /// Output path for passing sequences (gzipped FASTA/FASTQ).
     pub output_sequences: Option<PathBuf>,
     /// If true, pass sequences with POSITIVE log-ratio (default: pass NEGATIVE/zero).
@@ -693,6 +692,7 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
         is_parquet_input: input_is_parquet,
         index_path: &args.numerator,
         trim_to: args.trim_to,
+        minimum_length: args.minimum_length,
     })?;
     let effective_batch_size = batch_result.batch_size;
 
@@ -735,7 +735,8 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
             batch_size: effective_batch_size,
             parallel_input_rg: args.parallel_input_rg,
             is_parquet: input_is_parquet,
-            trim_to: if input_is_parquet { None } else { args.trim_to },
+            trim_to: args.trim_to,
+            minimum_length: args.minimum_length,
         },
         false,
     )?;
@@ -786,10 +787,10 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
 
         match &mut input_reader {
             ClassificationInput::Parquet(reader) => {
-                if args.trim_to.is_some() {
-                    // Owned-copy path with trimming
-                    let result =
-                        read_parquet_batch_trimmed(reader, effective_batch_size, args.trim_to)?;
+                let log_ratio_needs_owned = args.trim_to.is_some() || args.minimum_length.is_some();
+                if log_ratio_needs_owned {
+                    // Owned-copy path: reader thread trims/filters, we accumulate
+                    let result = accumulate_owned_batches(reader, effective_batch_size)?;
 
                     log_timing("batch: io_read+trim", t_io_read.elapsed().as_millis());
 
@@ -837,10 +838,11 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
 
                     loop {
                         let batch_opt = reader.next_batch()?;
-                        let Some((record_batch, headers)) = batch_opt else {
+                        let Some(parquet_batch) = batch_opt else {
                             reached_end = true;
                             break;
                         };
+                        let (record_batch, headers) = parquet_batch.into_arrow();
 
                         let batch_rows = record_batch.num_rows();
                         stacked_rows += batch_rows;

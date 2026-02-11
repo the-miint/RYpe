@@ -30,6 +30,8 @@ pub struct BatchSizeConfig<'a> {
     pub index_path: &'a Path,
     /// Optional trim-to length (caps read lengths for memory estimation)
     pub trim_to: Option<usize>,
+    /// Optional minimum read length filter
+    pub minimum_length: Option<usize>,
 }
 
 /// Result of batch size computation with logging metadata.
@@ -42,6 +44,22 @@ pub struct BatchSizeResult {
     pub input_format: InputFormat,
     /// Memory reserved for shard loading (for logging)
     pub shard_reservation: usize,
+}
+
+/// Determine the correct `InputFormat` for memory estimation.
+///
+/// For Parquet input with trim/filter active, the reader thread converts Arrow batches
+/// to `OwnedFastxRecord`, so memory estimation should use owned-record sizing.
+fn determine_input_format(config: &BatchSizeConfig, is_paired: bool) -> InputFormat {
+    if config.is_parquet_input {
+        let trimmed_in_reader = config.trim_to.is_some() || config.minimum_length.is_some();
+        InputFormat::Parquet {
+            is_paired,
+            trimmed_in_reader,
+        }
+    } else {
+        InputFormat::Fastx { is_paired }
+    }
 }
 
 /// Compute effective batch size with memory-aware auto-sizing.
@@ -67,15 +85,7 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
     if let Some(bs) = config.batch_size_override {
         log::info!("Using user-specified batch size: {}", bs);
         // For user-specified batch, return minimal metadata
-        let input_format = if config.is_parquet_input {
-            InputFormat::Parquet {
-                is_paired: is_paired_hint,
-            }
-        } else {
-            InputFormat::Fastx {
-                is_paired: is_paired_hint,
-            }
-        };
+        let input_format = determine_input_format(config, is_paired_hint);
         return Ok(BatchSizeResult {
             batch_size: bs,
             peak_memory: 0, // Unknown for user-specified
@@ -152,12 +162,7 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
     let num_buckets = metadata.bucket_names.len();
 
     // Determine input format for accurate memory estimation
-    // FASTX uses 2 prefetch slots, Parquet uses 4
-    let input_format = if config.is_parquet_input {
-        InputFormat::Parquet { is_paired }
-    } else {
-        InputFormat::Fastx { is_paired }
-    };
+    let input_format = determine_input_format(config, is_paired);
 
     // Estimate shard loading memory from largest shard size
     let shard_reservation =
@@ -315,6 +320,7 @@ num_entries = 3
             is_parquet_input: false,
             index_path: &index_path,
             trim_to: None,
+            minimum_length: None,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -335,6 +341,7 @@ num_entries = 3
             is_parquet_input: false,
             index_path: &index_path,
             trim_to: None,
+            minimum_length: None,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -363,6 +370,7 @@ num_entries = 3
             is_parquet_input: false,
             index_path: &index_path,
             trim_to: None,
+            minimum_length: None,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -388,13 +396,17 @@ num_entries = 3
             is_parquet_input: true,
             index_path: &index_path,
             trim_to: None,
+            minimum_length: None,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
 
         assert!(matches!(
             result.input_format,
-            InputFormat::Parquet { is_paired: false }
+            InputFormat::Parquet {
+                is_paired: false,
+                trimmed_in_reader: false
+            }
         ));
     }
 
@@ -432,6 +444,7 @@ num_entries = 3
             is_parquet_input: true,
             index_path,
             trim_to: None,
+            minimum_length: None,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();

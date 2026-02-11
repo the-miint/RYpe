@@ -29,7 +29,8 @@ pub(crate) mod seq_writer;
 // Some items are marked #[allow(dead_code)] in their modules as they provide
 // complete API surface for future use; we re-export them here for API stability.
 pub use arg_parsing::{
-    parse_bloom_fpp, parse_max_memory_arg, parse_shard_size_arg, validate_trim_to,
+    parse_bloom_fpp, parse_max_memory_arg, parse_shard_size_arg, validate_minimum_length,
+    validate_trim_to,
 };
 pub use batch_config::{compute_effective_batch_size, BatchSizeConfig};
 #[allow(unused_imports)]
@@ -55,9 +56,9 @@ pub use metadata::{load_index_metadata, resolve_bucket_id, sanitize_bucket_name}
 pub use output::{OutputFormat, OutputWriter};
 #[allow(unused_imports)]
 pub use parquet_io::{
-    batch_to_owned_records_trimmed, batch_to_records_parquet, batch_to_records_parquet_with_offset,
-    is_parquet_input, read_parquet_batch_trimmed, stacked_batches_to_records, ParquetInputReader,
-    PrefetchingParquetReader, TrimmedBatchResult,
+    accumulate_owned_batches, batch_to_owned_records_trimmed, batch_to_records_parquet,
+    batch_to_records_parquet_with_offset, is_parquet_input, stacked_batches_to_records,
+    ParquetBatch, ParquetInputReader, PrefetchingParquetReader, TrimmedBatchResult,
 };
 pub use passing_tracker::PassingReadTracker;
 #[allow(unused_imports)]

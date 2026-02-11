@@ -144,7 +144,7 @@ impl PrefetchingIoHandler {
         batch_size: usize,
         trim_to: Option<usize>,
     ) -> Result<Self> {
-        Self::with_options(r1_path, r2_path, out_path, batch_size, trim_to, false)
+        Self::with_options(r1_path, r2_path, out_path, batch_size, trim_to, None, false)
     }
 
     /// Create a new prefetching I/O handler with full options.
@@ -158,6 +158,8 @@ impl PrefetchingIoHandler {
     /// * `out_path` - Optional output path (stdout if None)
     /// * `batch_size` - Number of records per batch
     /// * `trim_to` - Optional maximum sequence length
+    /// * `minimum_length` - Optional minimum R1 length filter. Applied before `trim_to`:
+    ///   reads with R1 shorter than this are skipped entirely (not modified).
     /// * `preserve_for_output` - When true, capture quality scores for FASTQ output.
     ///   Only enable when using `--output-sequences` to avoid wasting memory.
     ///
@@ -169,6 +171,7 @@ impl PrefetchingIoHandler {
         out_path: Option<PathBuf>,
         batch_size: usize,
         trim_to: Option<usize>,
+        minimum_length: Option<usize>,
         preserve_for_output: bool,
     ) -> Result<Self> {
         // Clone paths for the background thread
@@ -192,6 +195,7 @@ impl PrefetchingIoHandler {
                 r2_path,
                 batch_size,
                 trim_to,
+                minimum_length,
                 preserve_for_output,
                 sender,
                 thread_error,
@@ -253,11 +257,13 @@ impl PrefetchingIoHandler {
     /// When `preserve_for_output` is true:
     /// - Quality scores are captured for FASTQ files (needed for `--output-sequences`)
     /// - This uses more memory, so only enable when writing sequences out
+    #[allow(clippy::too_many_arguments)]
     fn reader_thread(
         r1_path: PathBuf,
         r2_path: Option<PathBuf>,
         batch_size: usize,
         trim_to: Option<usize>,
+        minimum_length: Option<usize>,
         preserve_for_output: bool,
         sender: SyncSender<BatchResult>,
         error_capture: Arc<FirstErrorCapture>,
@@ -293,6 +299,32 @@ impl PrefetchingIoHandler {
 
         let mut global_record_id: i64 = 0; // For error messages only
 
+        // Macro for skipping a record: consume R2 if paired to keep files in sync,
+        // increment global_record_id, and continue to the next record.
+        macro_rules! skip_record {
+            () => {{
+                if let Some(ref mut r2_reader) = r2 {
+                    match r2_reader.next() {
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            send_error!(format!(
+                                "Error reading R2 at record {}: {}",
+                                global_record_id, e
+                            ));
+                        }
+                        None => {
+                            send_error!(format!(
+                                "R1/R2 mismatch: R2 ended early at record {}",
+                                global_record_id
+                            ));
+                        }
+                    }
+                }
+                global_record_id += 1;
+                continue;
+            }};
+        }
+
         loop {
             let mut records = Vec::with_capacity(batch_size);
             let mut headers = Vec::with_capacity(batch_size);
@@ -309,31 +341,20 @@ impl PrefetchingIoHandler {
                     None => break, // End of file
                 };
 
-                // Get R1 sequence - check trim_to requirement
+                // Get R1 sequence
                 let s1_seq = s1_rec.seq();
+
+                // Check minimum_length on original R1 length (before trim_to)
+                if let Some(min_len) = minimum_length {
+                    if s1_seq.len() < min_len {
+                        skip_record!();
+                    }
+                }
+
+                // Check trim_to requirement on original R1 length
                 if let Some(trim_len) = trim_to {
                     if s1_seq.len() < trim_len {
-                        // R1 too short - skip this record (and its R2 pair if present)
-                        if let Some(ref mut r2_reader) = r2 {
-                            // Must consume R2 to keep files in sync
-                            match r2_reader.next() {
-                                Some(Ok(_)) => {}
-                                Some(Err(e)) => {
-                                    send_error!(format!(
-                                        "Error reading R2 at record {}: {}",
-                                        global_record_id, e
-                                    ));
-                                }
-                                None => {
-                                    send_error!(format!(
-                                        "R1/R2 mismatch: R2 ended early at record {}",
-                                        global_record_id
-                                    ));
-                                }
-                            }
-                        }
-                        global_record_id += 1;
-                        continue; // Skip this record
+                        skip_record!();
                     }
                 }
 
@@ -669,6 +690,7 @@ mod tests {
             None,
             100,
             None,
+            None,
             true, // preserve_for_output
         )
         .unwrap();
@@ -719,6 +741,7 @@ mod tests {
             None,
             100,
             None,
+            None,
             true, // preserve_for_output
         )
         .unwrap();
@@ -747,6 +770,7 @@ mod tests {
             None,
             100,
             None,
+            None,
             true, // preserve_for_output
         )
         .unwrap();
@@ -773,6 +797,7 @@ mod tests {
             None,
             100,
             Some(4), // trim_to
+            None,    // minimum_length
             true,    // preserve_for_output
         )
         .unwrap();
@@ -782,5 +807,147 @@ mod tests {
         assert_eq!(records[0].seq1, b"ACGT");
         // Quality should also be trimmed to 4bp
         assert_eq!(records[0].qual1.as_ref().unwrap(), b"IIII");
+    }
+
+    // -------------------------------------------------------------------------
+    // Tests for minimum_length filtering
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_fastx_reader_minimum_length_filters_short_reads() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // 3 reads: 30bp, 80bp, 50bp
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, ">read1\n{}", "A".repeat(30)).unwrap();
+        writeln!(tmp, ">read2\n{}", "C".repeat(80)).unwrap();
+        writeln!(tmp, ">read3\n{}", "G".repeat(50)).unwrap();
+        tmp.flush().unwrap();
+
+        // minimum_length=50 should skip read1 (30bp), keep read2 (80bp) and read3 (50bp)
+        let mut handler = PrefetchingIoHandler::with_options(
+            tmp.path(),
+            None,
+            None,
+            100,
+            None,     // trim_to
+            Some(50), // minimum_length
+            false,
+        )
+        .unwrap();
+
+        let (records, headers) = handler.next_batch().unwrap().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(headers, vec!["read2", "read3"]);
+        assert_eq!(records[0].seq1.len(), 80);
+        assert_eq!(records[1].seq1.len(), 50);
+    }
+
+    #[test]
+    fn test_fastx_reader_minimum_length_before_trim_to() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // 3 reads: 40bp, 100bp, 60bp
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, ">read1\n{}", "A".repeat(40)).unwrap();
+        writeln!(tmp, ">read2\n{}", "C".repeat(100)).unwrap();
+        writeln!(tmp, ">read3\n{}", "G".repeat(60)).unwrap();
+        tmp.flush().unwrap();
+
+        // minimum_length=50, trim_to=70
+        // read1 (40bp): skipped by minimum_length
+        // read2 (100bp): passes min_len, trimmed to 70
+        // read3 (60bp): passes min_len, passes trim_to (60 < 70 → skipped by trim_to)
+        let mut handler = PrefetchingIoHandler::with_options(
+            tmp.path(),
+            None,
+            None,
+            100,
+            Some(70), // trim_to
+            Some(50), // minimum_length
+            false,
+        )
+        .unwrap();
+
+        let (records, headers) = handler.next_batch().unwrap().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(headers, vec!["read2"]);
+        assert_eq!(records[0].seq1.len(), 70); // trimmed from 100 to 70
+    }
+
+    #[test]
+    fn test_fastx_reader_minimum_length_paired_end() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // R1: 40bp and 60bp
+        let mut tmp_r1 = NamedTempFile::new().unwrap();
+        writeln!(tmp_r1, ">read1/1\n{}", "A".repeat(40)).unwrap();
+        writeln!(tmp_r1, ">read2/1\n{}", "C".repeat(60)).unwrap();
+        tmp_r1.flush().unwrap();
+
+        // R2: 50bp and 70bp
+        let mut tmp_r2 = NamedTempFile::new().unwrap();
+        writeln!(tmp_r2, ">read1/2\n{}", "T".repeat(50)).unwrap();
+        writeln!(tmp_r2, ">read2/2\n{}", "G".repeat(70)).unwrap();
+        tmp_r2.flush().unwrap();
+
+        let r2_path = tmp_r2.path().to_path_buf();
+
+        // minimum_length=50: read1 R1=40bp skipped (with its R2), read2 R1=60bp kept
+        let mut handler = PrefetchingIoHandler::with_options(
+            tmp_r1.path(),
+            Some(&r2_path),
+            None,
+            100,
+            None,     // trim_to
+            Some(50), // minimum_length
+            false,
+        )
+        .unwrap();
+
+        let (records, headers) = handler.next_batch().unwrap().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(headers, vec!["read2"]);
+        assert_eq!(records[0].seq1.len(), 60);
+        assert_eq!(records[0].seq2.as_ref().unwrap().len(), 70);
+    }
+
+    #[test]
+    fn test_fastx_reader_minimum_length_gt_trim_to() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // 3 reads: 80bp, 120bp, 100bp
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, ">read1\n{}", "A".repeat(80)).unwrap();
+        writeln!(tmp, ">read2\n{}", "C".repeat(120)).unwrap();
+        writeln!(tmp, ">read3\n{}", "G".repeat(100)).unwrap();
+        tmp.flush().unwrap();
+
+        // minimum_length=100, trim_to=50
+        // minimum_length is binding: reads must be >= 100bp
+        // read1 (80bp): skipped by minimum_length
+        // read2 (120bp): passes min_len (>= 100), trimmed to 50
+        // read3 (100bp): passes min_len (>= 100), trimmed to 50
+        let mut handler = PrefetchingIoHandler::with_options(
+            tmp.path(),
+            None,
+            None,
+            100,
+            Some(50),  // trim_to
+            Some(100), // minimum_length
+            false,
+        )
+        .unwrap();
+
+        let (records, headers) = handler.next_batch().unwrap().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(headers, vec!["read2", "read3"]);
+        // Both surviving reads are trimmed to 50
+        assert_eq!(records[0].seq1.len(), 50);
+        assert_eq!(records[1].seq1.len(), 50);
     }
 }

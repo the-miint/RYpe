@@ -3,11 +3,15 @@
 //! These tests verify that CLI commands work correctly with Parquet indices.
 
 use anyhow::Result;
+use arrow::array::LargeStringArray;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::ArrowWriter;
 use rype::{extract_with_positions, get_paired_minimizers_into, MinimizerWorkspace, Strand};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tempfile::tempdir;
 
 static BINARY_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -4828,6 +4832,716 @@ files = ["{}"]
         ])
         .output()?;
     assert!(stats.status.success());
+
+    Ok(())
+}
+
+// ============================================================================
+// Parquet Input with Trim/Filter Tests (Cycle 9)
+// ============================================================================
+
+/// Write a Parquet input file with read_id + sequence1 columns.
+fn write_parquet_input(path: &Path, ids: &[&str], seqs: &[&str]) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("read_id", DataType::LargeUtf8, false),
+        Field::new("sequence1", DataType::LargeUtf8, false),
+    ]));
+    let file = fs::File::create(path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+    let id_array = LargeStringArray::from_iter_values(ids.iter().copied());
+    let seq_array = LargeStringArray::from_iter_values(seqs.iter().copied());
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+/// Test classify run with Parquet input + --trim-to: short reads skipped, long reads trimmed.
+#[test]
+fn test_classify_run_with_parquet_trim() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Read the first 100 bases from phiX174 for a realistic long sequence
+    let phix_content = fs::read_to_string(&phix_path)?;
+    let phix_seq: String = phix_content
+        .lines()
+        .filter(|l| !l.starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("");
+    let long_seq = &phix_seq[0..100]; // 100bp from phiX174
+    let short_seq = &phix_seq[0..40]; // 40bp — too short for trim_to=50
+
+    // Write Parquet input file with mixed lengths
+    let parquet_path = dir.path().join("input.parquet");
+    write_parquet_input(
+        &parquet_path,
+        &["short_read", "long_read"],
+        &[short_seq, long_seq],
+    );
+
+    // Run classification with --trim-to 50
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            parquet_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+            "--trim-to",
+            "50",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Classification with Parquet --trim-to failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    // short_read (40bp) should be skipped (< 50bp trim_to)
+    assert!(
+        !lines.iter().any(|l| l.contains("short_read")),
+        "short_read (40bp) should be skipped with --trim-to 50, but found in output:\n{}",
+        stdout
+    );
+
+    // long_read (100bp) should be present (trimmed to 50bp and classified)
+    assert!(
+        lines.iter().any(|l| l.contains("long_read")),
+        "long_read (100bp) should be present with --trim-to 50, but not found:\n{}",
+        stdout
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// --minimum-length Integration Tests (Cycle 12)
+// ============================================================================
+
+/// Test that --minimum-length filters out short reads from FASTX input.
+#[test]
+fn test_cli_minimum_length_skips_short_reads_fastx() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("test.ryxdi");
+
+    // Create index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Create query with:
+    // - short_query: 40bp (below --minimum-length 50, should be SKIPPED)
+    // - long_query: 100bp (above --minimum-length 50, should be INCLUDED)
+    let phix_content = fs::read_to_string(&phix_path)?;
+    let phix_seq: String = phix_content
+        .lines()
+        .filter(|l| !l.starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("");
+    let short_seq = &phix_seq[0..40];
+    let long_seq = &phix_seq[0..100];
+
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        format!(
+            "@short_query\n{}\n+\n{}\n@long_query\n{}\n+\n{}\n",
+            short_seq,
+            "I".repeat(40),
+            long_seq,
+            "I".repeat(100)
+        ),
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+            "--minimum-length",
+            "50",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Classification with --minimum-length failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    assert!(
+        !lines.iter().any(|l| l.contains("short_query")),
+        "short_query (40bp) should be skipped with --minimum-length 50, but found in output:\n{}",
+        stdout
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("long_query")),
+        "long_query (100bp) should be present with --minimum-length 50, but not found:\n{}",
+        stdout
+    );
+
+    Ok(())
+}
+
+/// Test that --minimum-length is applied before --trim-to.
+/// With --minimum-length 50 --trim-to 70:
+/// - 40bp read: filtered by minimum_length (< 50)
+/// - 60bp read: passes minimum_length (60 >= 50), but skipped by trim_to (60 < 70)
+/// - 100bp read: passes both checks, trimmed to 70, classified
+#[test]
+fn test_cli_minimum_length_before_trim_to_fastx() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("test.ryxdi");
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(output.status.success());
+
+    let phix_content = fs::read_to_string(&phix_path)?;
+    let phix_seq: String = phix_content
+        .lines()
+        .filter(|l| !l.starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("");
+    let seq_40 = &phix_seq[0..40];
+    let seq_60 = &phix_seq[0..60];
+    let seq_100 = &phix_seq[0..100];
+
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        format!(
+            "@read_40bp\n{}\n+\n{}\n@read_60bp\n{}\n+\n{}\n@read_100bp\n{}\n+\n{}\n",
+            seq_40,
+            "I".repeat(40),
+            seq_60,
+            "I".repeat(60),
+            seq_100,
+            "I".repeat(100)
+        ),
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+            "--minimum-length",
+            "50",
+            "--trim-to",
+            "70",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Classification with --minimum-length + --trim-to failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    // 40bp read filtered by minimum_length (40 < 50)
+    assert!(
+        !lines.iter().any(|l| l.contains("read_40bp")),
+        "read_40bp should be skipped with --minimum-length 50:\n{}",
+        stdout
+    );
+    // 60bp read passes minimum_length (60 >= 50) but skipped by trim_to (60 < 70)
+    assert!(
+        !lines.iter().any(|l| l.contains("read_60bp")),
+        "read_60bp (60bp) should be skipped by --trim-to 70 (60 < 70):\n{}",
+        stdout
+    );
+    // 100bp read passes both checks, trimmed to 70, classified
+    assert!(
+        lines.iter().any(|l| l.contains("read_100bp")),
+        "read_100bp (100bp >= 50, >= 70) should be present:\n{}",
+        stdout
+    );
+
+    Ok(())
+}
+
+/// Test that --minimum-length > --trim-to works correctly.
+/// With --minimum-length 100 --trim-to 50:
+/// - minimum_length is the binding constraint
+/// - 60bp read: filtered (< 100)
+/// - 100bp read: passes minimum_length (>= 100), trimmed to 50, classified
+#[test]
+fn test_cli_minimum_length_gt_trim_to_fastx() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("test.ryxdi");
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(output.status.success());
+
+    let phix_content = fs::read_to_string(&phix_path)?;
+    let phix_seq: String = phix_content
+        .lines()
+        .filter(|l| !l.starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("");
+    let seq_60 = &phix_seq[0..60];
+    let seq_100 = &phix_seq[0..100];
+
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        format!(
+            "@read_60bp\n{}\n+\n{}\n@read_100bp\n{}\n+\n{}\n",
+            seq_60,
+            "I".repeat(60),
+            seq_100,
+            "I".repeat(100)
+        ),
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+            "--minimum-length",
+            "100",
+            "--trim-to",
+            "50",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Classification with --minimum-length 100 --trim-to 50 failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    // 60bp read: filtered by minimum_length (60 < 100)
+    assert!(
+        !lines.iter().any(|l| l.contains("read_60bp")),
+        "read_60bp (60bp < 100) should be skipped with --minimum-length 100:\n{}",
+        stdout
+    );
+    // 100bp read: passes minimum_length (100 >= 100), trimmed to 50, classified
+    assert!(
+        lines.iter().any(|l| l.contains("read_100bp")),
+        "read_100bp (100bp >= 100, trimmed to 50) should be present:\n{}",
+        stdout
+    );
+
+    Ok(())
+}
+
+/// Test --minimum-length with Parquet input.
+#[test]
+fn test_cli_minimum_length_with_parquet_input() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("test.ryxdi");
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(output.status.success());
+
+    let phix_content = fs::read_to_string(&phix_path)?;
+    let phix_seq: String = phix_content
+        .lines()
+        .filter(|l| !l.starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("");
+    let short_seq = &phix_seq[0..40];
+    let long_seq = &phix_seq[0..100];
+
+    let parquet_path = dir.path().join("input.parquet");
+    write_parquet_input(
+        &parquet_path,
+        &["short_read", "long_read"],
+        &[short_seq, long_seq],
+    );
+
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            parquet_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+            "--minimum-length",
+            "50",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Classification with Parquet --minimum-length failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    assert!(
+        !lines.iter().any(|l| l.contains("short_read")),
+        "short_read (40bp) should be skipped with --minimum-length 50:\n{}",
+        stdout
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("long_read")),
+        "long_read (100bp) should be present with --minimum-length 50:\n{}",
+        stdout
+    );
+
+    Ok(())
+}
+
+/// Test --minimum-length with log-ratio classification.
+#[test]
+fn test_cli_minimum_length_log_ratio() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
+
+    // Create two single-bucket indices
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            num_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(output.status.success());
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(output.status.success());
+
+    let phix_content = fs::read_to_string(&phix_path)?;
+    let phix_seq: String = phix_content
+        .lines()
+        .filter(|l| !l.starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("");
+    let short_seq = &phix_seq[0..40];
+    let long_seq = &phix_seq[0..100];
+
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        format!(
+            "@short_query\n{}\n+\n{}\n@long_query\n{}\n+\n{}\n",
+            short_seq,
+            "I".repeat(40),
+            long_seq,
+            "I".repeat(100)
+        ),
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "--minimum-length",
+            "50",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Log-ratio with --minimum-length failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    assert!(
+        !lines.iter().any(|l| l.contains("short_query")),
+        "short_query (40bp) should be skipped with --minimum-length 50:\n{}",
+        stdout
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("long_query")),
+        "long_query (100bp) should be present with --minimum-length 50:\n{}",
+        stdout
+    );
+
+    Ok(())
+}
+
+/// Test that --minimum-length is compatible with --output-sequences on log-ratio
+/// (unlike --trim-to which is rejected).
+#[test]
+fn test_cli_minimum_length_with_output_sequences() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let num_path = dir.path().join("num.ryxdi");
+    let denom_path = dir.path().join("denom.ryxdi");
+
+    // Create two single-bucket indices
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            num_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(output.status.success());
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            denom_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(output.status.success());
+
+    let phix_content = fs::read_to_string(&phix_path)?;
+    let phix_seq: String = phix_content
+        .lines()
+        .filter(|l| !l.starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("");
+    let long_seq = &phix_seq[0..100];
+
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        format!("@long_query\n{}\n+\n{}\n", long_seq, "I".repeat(100)),
+    )?;
+
+    let output_sequences_path = dir.path().join("filtered.fastq.gz");
+
+    // --minimum-length + --output-sequences should succeed (unlike --trim-to)
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "log-ratio",
+            "-n",
+            num_path.to_str().unwrap(),
+            "-d",
+            denom_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "--minimum-length",
+            "50",
+            "--output-sequences",
+            output_sequences_path.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "--minimum-length with --output-sequences should succeed, but failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify the output sequences file was created
+    assert!(
+        output_sequences_path.exists(),
+        "Output sequences file should exist"
+    );
 
     Ok(())
 }

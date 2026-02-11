@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use super::helpers::{
-    parse_bloom_fpp, parse_max_memory_arg, parse_shard_size_arg, validate_trim_to,
+    parse_bloom_fpp, parse_max_memory_arg, parse_shard_size_arg, validate_minimum_length,
+    validate_trim_to,
 };
 
 #[derive(Parser)]
@@ -472,6 +473,12 @@ WHEN TO USE 'run' vs 'aggregate':
         #[arg(long, value_parser = validate_trim_to)]
         trim_to: Option<usize>,
 
+        /// Skip reads with R1 shorter than N bases.
+        /// Applied before --trim-to: reads must be at least N bases to be processed.
+        /// Unlike --trim-to, surviving reads are not modified (compatible with --output-sequences).
+        #[arg(long, value_parser = validate_minimum_length)]
+        minimum_length: Option<usize>,
+
         /// Output wide-form matrix instead of long-form TSV.
         /// Columns: read_id, then one column per bucket (ordered by bucket_id).
         /// Each row contains scores for all buckets (0.0 if no hit).
@@ -620,6 +627,12 @@ EXAMPLES:
         /// Trim sequences to first N nucleotides before classification.
         #[arg(long, value_parser = validate_trim_to)]
         trim_to: Option<usize>,
+
+        /// Skip reads with R1 shorter than N bases.
+        /// Applied before --trim-to: reads must be at least N bases to be processed.
+        /// Unlike --trim-to, surviving reads are not modified (compatible with --output-sequences).
+        #[arg(long, value_parser = validate_minimum_length)]
+        minimum_length: Option<usize>,
 
         /// Output passing sequences to gzipped FASTA/FASTQ.
         /// For paired-end: foo.fastq.gz creates foo.R1.fastq.gz and foo.R2.fastq.gz.

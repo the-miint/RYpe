@@ -348,6 +348,7 @@ fn main() -> Result<()> {
                 timing,
                 best_hit,
                 trim_to,
+                minimum_length,
                 wide,
             } => {
                 // Enable timing diagnostics if requested
@@ -368,6 +369,7 @@ fn main() -> Result<()> {
                         use_bloom_filter,
                         parallel_input_rg,
                         trim_to,
+                        minimum_length,
                     },
                     negative_index,
                     best_hit,
@@ -410,6 +412,7 @@ fn main() -> Result<()> {
                 parallel_input_rg,
                 timing,
                 trim_to,
+                minimum_length,
                 output_sequences,
                 passing_is_positive,
                 numerator_skip_threshold,
@@ -431,6 +434,7 @@ fn main() -> Result<()> {
                     use_bloom_filter,
                     parallel_input_rg,
                     trim_to,
+                    minimum_length,
                     output_sequences,
                     passing_is_positive,
                     numerator_skip_threshold,

@@ -33,25 +33,75 @@ pub fn parse_bloom_fpp(s: &str) -> Result<f64, String> {
     Ok(fpp)
 }
 
-/// Validate the --trim-to argument.
+/// Shared validation for positive-length arguments (--trim-to, --minimum-length).
 ///
 /// - Must be a positive integer greater than 0
 /// - Values smaller than typical k-mer sizes (16) will produce a warning but are allowed
-pub fn validate_trim_to(s: &str) -> Result<usize, String> {
+fn validate_positive_length(s: &str, flag_name: &str) -> Result<usize, String> {
     let val: usize = s
         .parse()
         .map_err(|_| format!("'{}' is not a valid positive integer", s))?;
     if val == 0 {
-        return Err("trim_to must be greater than 0".to_string());
+        return Err(format!("{} must be greater than 0", flag_name));
     }
-    // Warn about very small values that won't produce useful results
-    // (minimum k-mer size is 16, so anything less won't generate minimizers)
     if val < 16 {
         eprintln!(
-            "Warning: --trim-to {} is smaller than the minimum k-mer size (16). \
+            "Warning: --{} {} is smaller than the minimum k-mer size (16). \
              This will likely produce no classification results.",
-            val
+            flag_name, val
         );
     }
     Ok(val)
+}
+
+/// Validate the --trim-to argument.
+pub fn validate_trim_to(s: &str) -> Result<usize, String> {
+    validate_positive_length(s, "trim-to")
+}
+
+/// Validate the --minimum-length argument.
+pub fn validate_minimum_length(s: &str) -> Result<usize, String> {
+    validate_positive_length(s, "minimum-length")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_minimum_length_valid() {
+        assert_eq!(validate_minimum_length("100").unwrap(), 100);
+        assert_eq!(validate_minimum_length("1").unwrap(), 1);
+        assert_eq!(validate_minimum_length("16").unwrap(), 16);
+    }
+
+    #[test]
+    fn test_validate_minimum_length_zero() {
+        let err = validate_minimum_length("0").unwrap_err();
+        assert!(err.contains("must be greater than 0"));
+    }
+
+    #[test]
+    fn test_validate_minimum_length_non_numeric() {
+        let err = validate_minimum_length("abc").unwrap_err();
+        assert!(err.contains("not a valid positive integer"));
+    }
+
+    #[test]
+    fn test_validate_trim_to_valid() {
+        assert_eq!(validate_trim_to("100").unwrap(), 100);
+        assert_eq!(validate_trim_to("1").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_validate_trim_to_zero() {
+        let err = validate_trim_to("0").unwrap_err();
+        assert!(err.contains("must be greater than 0"));
+    }
+
+    #[test]
+    fn test_validate_trim_to_non_numeric() {
+        let err = validate_trim_to("abc").unwrap_err();
+        assert!(err.contains("not a valid positive integer"));
+    }
 }

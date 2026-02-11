@@ -24,6 +24,9 @@ pub struct InputReaderConfig<'a> {
     /// Optional trim length for sequences. When set, sequences are trimmed at read time
     /// to reduce memory usage for long reads. Records with R1 shorter than this are skipped.
     pub trim_to: Option<usize>,
+    /// Optional minimum R1 length filter. Applied before `trim_to`:
+    /// reads with R1 shorter than this are skipped entirely (not modified).
+    pub minimum_length: Option<usize>,
 }
 
 /// Unified input reader for classification.
@@ -96,6 +99,8 @@ pub fn create_input_reader(
             config.r1_path,
             config.batch_size,
             parallel_rg_opt,
+            config.trim_to,
+            config.minimum_length,
         )?;
         Ok(ClassificationInput::Parquet(reader))
     } else {
@@ -111,6 +116,7 @@ pub fn create_input_reader(
             None, // No output - just reading
             config.batch_size,
             config.trim_to,
+            config.minimum_length,
             preserve_for_output,
         )?;
         Ok(ClassificationInput::Fastx(reader))

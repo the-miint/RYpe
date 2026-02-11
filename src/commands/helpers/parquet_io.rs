@@ -238,9 +238,48 @@ impl ParquetInputReader {
 // Prefetching Parquet Reader
 // ============================================================================
 
+/// A batch of data from the Parquet reader, either zero-copy Arrow or owned records.
+///
+/// The reader thread produces `Arrow` batches by default (zero-copy path).
+/// When trim/filter options are active (Cycle 7+), the reader thread converts
+/// batches to `Owned` records before sending, so the large Arrow buffers are
+/// freed immediately in the reader thread.
+pub enum ParquetBatch {
+    /// Zero-copy Arrow batch with pre-extracted headers.
+    Arrow(RecordBatch, Vec<String>),
+    /// Owned records (trimmed/filtered) with headers.
+    Owned(Vec<OwnedFastxRecord>, Vec<String>),
+}
+
+impl ParquetBatch {
+    /// Unwrap as Arrow variant, panicking if Owned.
+    ///
+    /// Use this in code paths that know trimming/filtering is not active.
+    pub fn into_arrow(self) -> (RecordBatch, Vec<String>) {
+        match self {
+            ParquetBatch::Arrow(batch, headers) => (batch, headers),
+            ParquetBatch::Owned(..) => {
+                panic!("Expected ParquetBatch::Arrow but got Owned")
+            }
+        }
+    }
+
+    /// Unwrap as Owned variant, panicking if Arrow.
+    ///
+    /// Use this in code paths that know trimming/filtering is active.
+    #[allow(dead_code)]
+    pub fn into_owned(self) -> (Vec<OwnedFastxRecord>, Vec<String>) {
+        match self {
+            ParquetBatch::Owned(records, headers) => (records, headers),
+            ParquetBatch::Arrow(..) => {
+                panic!("Expected ParquetBatch::Owned but got Arrow")
+            }
+        }
+    }
+}
+
 /// Type alias for Parquet batch data sent through the prefetch channel.
-/// Contains the raw RecordBatch for zero-copy access and pre-extracted headers.
-type ParquetBatchResult = Result<Option<(RecordBatch, Vec<String>)>>;
+type ParquetBatchResult = Result<Option<ParquetBatch>>;
 
 /// Default timeout for waiting on Parquet prefetch batches (5 minutes).
 const DEFAULT_PARQUET_PREFETCH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -288,7 +327,7 @@ impl PrefetchingParquetReader {
     /// A reader that prefetches RecordBatch objects in a background thread.
     #[allow(dead_code)]
     pub fn new(path: &Path, batch_size: usize) -> Result<Self> {
-        Self::with_parallel_row_groups(path, batch_size, None)
+        Self::with_parallel_row_groups(path, batch_size, None, None, None)
     }
 
     /// Create a new prefetching Parquet reader with optional parallel row group processing.
@@ -319,6 +358,8 @@ impl PrefetchingParquetReader {
         path: &Path,
         batch_size: usize,
         parallel_row_groups: Option<usize>,
+        trim_to: Option<usize>,
+        minimum_length: Option<usize>,
     ) -> Result<Self> {
         // Clone path for the background thread
         let path = path.to_path_buf();
@@ -357,13 +398,23 @@ impl PrefetchingParquetReader {
                     batch_size,
                     col_indices,
                     parallel_rg,
+                    trim_to,
+                    minimum_length,
                     sender,
                     thread_error,
                 );
             })
         } else {
             thread::spawn(move || {
-                Self::reader_thread(path, batch_size, col_indices, sender, thread_error);
+                Self::reader_thread(
+                    path,
+                    batch_size,
+                    col_indices,
+                    trim_to,
+                    minimum_length,
+                    sender,
+                    thread_error,
+                );
             })
         };
 
@@ -447,9 +498,12 @@ impl PrefetchingParquetReader {
         path: PathBuf,
         _batch_size: usize, // Ignored - use natural Parquet batching to avoid overflow
         col_indices: Vec<usize>,
+        trim_to: Option<usize>,
+        minimum_length: Option<usize>,
         sender: SyncSender<ParquetBatchResult>,
         error_capture: Arc<FirstErrorCapture>,
     ) {
+        let needs_trim_filter = trim_to.is_some() || minimum_length.is_some();
         // Helper macro to send error and store if send fails
         macro_rules! send_error {
             ($msg:expr) => {{
@@ -506,8 +560,23 @@ impl PrefetchingParquetReader {
                 }
             };
 
-            // Send the batch and headers
-            if sender.send(Ok(Some((batch, headers)))).is_err() {
+            // If trim/filter active, convert to Owned in this thread so the channel
+            // holds trimmed data (fixing the OOM bug with large --trim-to values).
+            // Each batch uses id_offset=0; ID remapping happens during accumulation.
+            let parquet_batch = if needs_trim_filter {
+                match batch_to_owned_records_trimmed(&batch, &headers, trim_to, minimum_length, 0) {
+                    Ok((records, filtered_headers)) => {
+                        ParquetBatch::Owned(records, filtered_headers)
+                    }
+                    Err(e) => {
+                        send_error!(format!("Error trimming batch: {}", e));
+                    }
+                }
+            } else {
+                ParquetBatch::Arrow(batch, headers)
+            };
+
+            if sender.send(Ok(Some(parquet_batch))).is_err() {
                 // Receiver was dropped - exit cleanly
                 return;
             }
@@ -530,14 +599,18 @@ impl PrefetchingParquetReader {
     /// * `parallel_rg` - Number of row groups to process in parallel per chunk
     /// * `sender` - Channel sender for batch results
     /// * `error_capture` - Thread-safe error capture for errors during send failures
+    #[allow(clippy::too_many_arguments)]
     fn reader_thread_parallel(
         path: PathBuf,
         _batch_size: usize, // Ignored - use natural Parquet batching to avoid overflow
         col_indices: Vec<usize>,
         parallel_rg: usize,
+        trim_to: Option<usize>,
+        minimum_length: Option<usize>,
         sender: SyncSender<ParquetBatchResult>,
         error_capture: Arc<FirstErrorCapture>,
     ) {
+        let needs_trim_filter = trim_to.is_some() || minimum_length.is_some();
         // Helper macro to send error and store if send fails
         macro_rules! send_error {
             ($msg:expr) => {{
@@ -591,10 +664,7 @@ impl PrefetchingParquetReader {
             // Read row groups in parallel, each task loads its own metadata for robustness
             // Use Result collection pattern for clean error handling - first error fails the chunk
             #[allow(clippy::type_complexity)]
-            let chunk_results: Result<
-                Vec<(usize, Vec<(RecordBatch, Vec<String>)>)>,
-                String,
-            > = rg_indices
+            let chunk_results: Result<Vec<(usize, Vec<ParquetBatch>)>, String> = rg_indices
                 .into_par_iter()
                 .map(|rg_idx| {
                     // Each parallel task opens its own file handle and loads fresh metadata
@@ -630,7 +700,23 @@ impl PrefetchingParquetReader {
                             format!("Error extracting headers from RG {}: {}", rg_idx, e)
                         })?;
 
-                        batches.push((batch, headers));
+                        // If trim/filter active, convert to Owned in this thread.
+                        // Each batch uses id_offset=0; ID remapping happens during accumulation.
+                        if needs_trim_filter {
+                            let (records, filtered_headers) = batch_to_owned_records_trimmed(
+                                &batch,
+                                &headers,
+                                trim_to,
+                                minimum_length,
+                                0,
+                            )
+                            .map_err(|e| {
+                                format!("Error trimming batch from RG {}: {}", rg_idx, e)
+                            })?;
+                            batches.push(ParquetBatch::Owned(records, filtered_headers));
+                        } else {
+                            batches.push(ParquetBatch::Arrow(batch, headers));
+                        }
                     }
 
                     Ok((rg_idx, batches))
@@ -651,8 +737,8 @@ impl PrefetchingParquetReader {
 
             // Send batches in order
             for (_, batches) in sorted_results {
-                for (batch, headers) in batches {
-                    if sender.send(Ok(Some((batch, headers)))).is_err() {
+                for parquet_batch in batches {
+                    if sender.send(Ok(Some(parquet_batch))).is_err() {
                         // Receiver dropped - exit cleanly
                         return;
                     }
@@ -701,13 +787,14 @@ impl PrefetchingParquetReader {
 
     /// Get the next batch of records.
     ///
-    /// Returns `Ok(Some((batch, headers)))` for each batch,
+    /// Returns `Ok(Some(ParquetBatch))` for each batch,
     /// `Ok(None)` when all records have been read,
     /// or `Err` if an error occurred during reading.
     ///
-    /// The returned RecordBatch contains the raw Arrow data. Use `batch_to_records_parquet()`
-    /// for zero-copy conversion to QueryRecord references.
-    pub fn next_batch(&mut self) -> Result<Option<(RecordBatch, Vec<String>)>> {
+    /// The variant depends on reader configuration:
+    /// - `ParquetBatch::Arrow` — zero-copy path (no trim/filter active)
+    /// - `ParquetBatch::Owned` — owned records (trim/filter active, Cycle 7+)
+    pub fn next_batch(&mut self) -> Result<Option<ParquetBatch>> {
         match self.receiver.recv_timeout(self.timeout) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
@@ -889,6 +976,7 @@ pub fn batch_to_owned_records_trimmed(
     batch: &RecordBatch,
     headers: &[String],
     trim_to: Option<usize>,
+    minimum_length: Option<usize>,
     id_offset: usize,
 ) -> Result<(Vec<OwnedFastxRecord>, Vec<String>)> {
     let num_rows = batch.num_rows();
@@ -912,6 +1000,13 @@ pub fn batch_to_owned_records_trimmed(
     #[allow(clippy::needless_range_loop)]
     for i in 0..num_rows {
         let seq1 = seq_col.value(i);
+
+        // Skip if R1 is shorter than minimum_length (checked on original length)
+        if let Some(min_len) = minimum_length {
+            if seq1.len() < min_len {
+                continue;
+            }
+        }
 
         // Skip if R1 is too short for trim_to requirement
         if let Some(trim_len) = trim_to {
@@ -978,49 +1073,53 @@ pub struct TrimmedBatchResult {
     pub reached_end: bool,
 }
 
-/// Read and accumulate trimmed records from a Parquet reader.
+/// Accumulate pre-trimmed/filtered owned records from a Parquet reader.
 ///
-/// This function reads batches from the reader, converts them to owned records
-/// with trimming, and accumulates them until the target batch size is reached
-/// or end of input. The Arrow buffers are dropped after each batch conversion,
-/// keeping memory bounded.
+/// This function reads `ParquetBatch::Owned` batches from the reader and
+/// accumulates them until the target batch size is reached or end of input.
+/// The reader thread has already applied trim_to and minimum_length filtering,
+/// so this function only needs to remap query IDs for global uniqueness.
+///
+/// # Panics
+/// Panics if the reader produces `ParquetBatch::Arrow` batches. This function
+/// should only be called when trim/filter is active (which forces Owned output).
 ///
 /// # Arguments
-/// * `reader` - The Parquet reader to read from
+/// * `reader` - The Parquet reader (must have trim_to or minimum_length set)
 /// * `target_batch_size` - Stop accumulating when this many records are collected
-/// * `trim_to` - Optional trim length for sequences
 ///
 /// # Returns
 /// A `TrimmedBatchResult` containing the accumulated records, headers, row group
 /// count, and whether end of input was reached.
-pub fn read_parquet_batch_trimmed(
+pub fn accumulate_owned_batches(
     reader: &mut PrefetchingParquetReader,
     target_batch_size: usize,
-    trim_to: Option<usize>,
 ) -> Result<TrimmedBatchResult> {
     let mut records: Vec<OwnedFastxRecord> = Vec::new();
     let mut headers: Vec<String> = Vec::new();
     let mut reached_end = false;
     let mut rg_count = 0usize;
 
-    // Accumulate trimmed records until we have enough
     while records.len() < target_batch_size {
-        let batch_opt = reader.next_batch()?;
-        let Some((record_batch, batch_headers)) = batch_opt else {
-            reached_end = true;
-            break;
-        };
-
-        rg_count += 1;
-
-        // Convert to owned records with trimming - this copies only
-        // the trimmed portion, then the RecordBatch can be dropped
-        let (batch_records, batch_hdrs) =
-            batch_to_owned_records_trimmed(&record_batch, &batch_headers, trim_to, records.len())?;
-
-        records.extend(batch_records);
-        headers.extend(batch_hdrs);
-        // record_batch dropped here, freeing Arrow buffer memory
+        match reader.next_batch()? {
+            Some(ParquetBatch::Owned(mut batch_records, batch_headers)) => {
+                rg_count += 1;
+                // Remap query_ids to be globally sequential across accumulated batches
+                let offset = records.len() as i64;
+                for rec in &mut batch_records {
+                    rec.query_id += offset;
+                }
+                records.extend(batch_records);
+                headers.extend(batch_headers);
+            }
+            Some(ParquetBatch::Arrow(..)) => {
+                unreachable!("Expected Owned variant when trim/filter is active");
+            }
+            None => {
+                reached_end = true;
+                break;
+            }
+        }
     }
 
     Ok(TrimmedBatchResult {
@@ -1157,7 +1256,7 @@ mod tests {
         let headers = vec!["read1".to_string(), "read2".to_string()];
 
         let (records, out_headers) =
-            batch_to_owned_records_trimmed(&batch, &headers, None, 0).unwrap();
+            batch_to_owned_records_trimmed(&batch, &headers, None, None, 0).unwrap();
 
         assert_eq!(records.len(), 2);
         assert_eq!(out_headers.len(), 2);
@@ -1174,7 +1273,7 @@ mod tests {
         let headers = vec!["read1".to_string(), "read2".to_string()];
 
         let (records, out_headers) =
-            batch_to_owned_records_trimmed(&batch, &headers, Some(4), 0).unwrap();
+            batch_to_owned_records_trimmed(&batch, &headers, Some(4), None, 0).unwrap();
 
         assert_eq!(records.len(), 2);
         assert_eq!(out_headers.len(), 2);
@@ -1192,7 +1291,7 @@ mod tests {
 
         // Trim to 8bp - should skip the 4bp read
         let (records, out_headers) =
-            batch_to_owned_records_trimmed(&batch, &headers, Some(8), 0).unwrap();
+            batch_to_owned_records_trimmed(&batch, &headers, Some(8), None, 0).unwrap();
 
         assert_eq!(records.len(), 1, "Short read should be skipped");
         assert_eq!(out_headers.len(), 1);
@@ -1207,7 +1306,8 @@ mod tests {
         let headers = vec!["read1".to_string(), "read2".to_string()];
 
         // Start with offset 100
-        let (records, _) = batch_to_owned_records_trimmed(&batch, &headers, None, 100).unwrap();
+        let (records, _) =
+            batch_to_owned_records_trimmed(&batch, &headers, None, None, 100).unwrap();
 
         assert_eq!(records[0].query_id, 100, "First query_id should be offset");
         assert_eq!(
@@ -1229,7 +1329,7 @@ mod tests {
 
         // Trim to 8bp - middle read should be skipped
         let (records, out_headers) =
-            batch_to_owned_records_trimmed(&batch, &headers, Some(8), 0).unwrap();
+            batch_to_owned_records_trimmed(&batch, &headers, Some(8), None, 0).unwrap();
 
         assert_eq!(records.len(), 2);
         // Query IDs should be sequential based on OUTPUT count, not input row
@@ -1246,7 +1346,8 @@ mod tests {
         let batch = make_test_batch_paired(&seqs1, &seqs2);
         let headers = vec!["read1".to_string(), "read2".to_string()];
 
-        let (records, _) = batch_to_owned_records_trimmed(&batch, &headers, Some(4), 0).unwrap();
+        let (records, _) =
+            batch_to_owned_records_trimmed(&batch, &headers, Some(4), None, 0).unwrap();
 
         assert_eq!(records.len(), 2);
         // Both R1 and R2 should be trimmed
@@ -1263,7 +1364,7 @@ mod tests {
         let headers: Vec<String> = vec![];
 
         let (records, out_headers) =
-            batch_to_owned_records_trimmed(&batch, &headers, Some(100), 0).unwrap();
+            batch_to_owned_records_trimmed(&batch, &headers, Some(100), None, 0).unwrap();
 
         assert!(records.is_empty());
         assert!(out_headers.is_empty());
@@ -1281,7 +1382,7 @@ mod tests {
 
         // Trim to 100bp - all reads are shorter
         let (records, out_headers) =
-            batch_to_owned_records_trimmed(&batch, &headers, Some(100), 0).unwrap();
+            batch_to_owned_records_trimmed(&batch, &headers, Some(100), None, 0).unwrap();
 
         assert!(records.is_empty(), "All reads should be skipped");
         assert!(out_headers.is_empty());
@@ -1300,7 +1401,7 @@ mod tests {
         ];
 
         let (records, out_headers) =
-            batch_to_owned_records_trimmed(&batch, &headers, Some(8), 0).unwrap();
+            batch_to_owned_records_trimmed(&batch, &headers, Some(8), None, 0).unwrap();
 
         // Records and headers must have same length
         assert_eq!(
@@ -1312,5 +1413,313 @@ mod tests {
         // Verify the kept reads match the kept headers
         assert_eq!(out_headers[0], "keep1");
         assert_eq!(out_headers[1], "keep2");
+    }
+
+    // -------------------------------------------------------------------------
+    // Tests for batch_to_owned_records_trimmed with minimum_length
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_batch_to_owned_records_with_minimum_length() {
+        // 3 reads: 30bp, 80bp, 50bp; min_length=50 → 2 records (30bp skipped)
+        let s0 = "A".repeat(30);
+        let s1 = "G".repeat(80);
+        let s2 = "T".repeat(50);
+        let seqs_ref = vec![s0.as_str(), s1.as_str(), s2.as_str()];
+        let batch = make_test_batch(&seqs_ref);
+        let headers = vec![
+            "short30".to_string(),
+            "long80".to_string(),
+            "exact50".to_string(),
+        ];
+
+        let (records, out_headers) =
+            batch_to_owned_records_trimmed(&batch, &headers, None, Some(50), 0).unwrap();
+
+        assert_eq!(records.len(), 2, "30bp read should be skipped");
+        assert_eq!(out_headers.len(), 2);
+        assert_eq!(records[0].seq1.len(), 80);
+        assert_eq!(records[1].seq1.len(), 50);
+        assert_eq!(out_headers[0], "long80");
+        assert_eq!(out_headers[1], "exact50");
+    }
+
+    #[test]
+    fn test_batch_to_owned_records_minimum_length_before_trim() {
+        // min_length=50, trim_to=70:
+        //   40bp → skipped by min_length (40 < 50)
+        //   100bp → passes min_length, passes trim_to, trimmed to 70
+        //   60bp → passes min_length (60 >= 50), but skipped by trim_to (60 < 70)
+        //   80bp → passes both, trimmed to 70
+        let s0 = "A".repeat(40);
+        let s1 = "G".repeat(100);
+        let s2 = "T".repeat(60);
+        let s3 = "C".repeat(80);
+        let seqs_ref = vec![s0.as_str(), s1.as_str(), s2.as_str(), s3.as_str()];
+        let batch = make_test_batch(&seqs_ref);
+        let headers = vec![
+            "short40".to_string(),
+            "long100".to_string(),
+            "mid60".to_string(),
+            "mid80".to_string(),
+        ];
+
+        let (records, out_headers) =
+            batch_to_owned_records_trimmed(&batch, &headers, Some(70), Some(50), 0).unwrap();
+
+        // 40bp skipped by min_length, 60bp skipped by trim_to, 100bp and 80bp kept
+        assert_eq!(records.len(), 2);
+        assert_eq!(out_headers[0], "long100");
+        assert_eq!(out_headers[1], "mid80");
+        assert_eq!(records[0].seq1.len(), 70, "100bp trimmed to 70");
+        assert_eq!(records[1].seq1.len(), 70, "80bp trimmed to 70");
+    }
+
+    #[test]
+    fn test_batch_to_owned_records_minimum_length_with_paired() {
+        // Pair skipped when R1 < min_length, even if R2 is long
+        let s1_short = "A".repeat(30);
+        let s1_long = "G".repeat(80);
+        let s2_long = "T".repeat(100);
+        let s2_short = "C".repeat(20);
+        let seqs1 = vec![s1_short.as_str(), s1_long.as_str()];
+        let seqs2: Vec<Option<&str>> = vec![Some(s2_long.as_str()), Some(s2_short.as_str())];
+        let batch = make_test_batch_paired(&seqs1, &seqs2);
+        let headers = vec!["pair_short_r1".to_string(), "pair_long_r1".to_string()];
+
+        let (records, out_headers) =
+            batch_to_owned_records_trimmed(&batch, &headers, None, Some(50), 0).unwrap();
+
+        assert_eq!(records.len(), 1, "Pair with R1=30bp should be skipped");
+        assert_eq!(out_headers[0], "pair_long_r1");
+        assert_eq!(records[0].seq1.len(), 80);
+        assert_eq!(records[0].seq2.as_ref().unwrap().len(), 20);
+    }
+
+    #[test]
+    fn test_batch_to_owned_records_minimum_length_gt_trim_to() {
+        // min_length=100, trim_to=50: only reads >= 100bp kept, trimmed to 50
+        let s0 = "A".repeat(80); // < 100, skipped
+        let s1 = "G".repeat(120); // >= 100, kept and trimmed to 50
+        let s2 = "T".repeat(100); // >= 100, kept and trimmed to 50
+        let s3 = "C".repeat(40); // < 100, skipped
+        let seqs_ref = vec![s0.as_str(), s1.as_str(), s2.as_str(), s3.as_str()];
+        let batch = make_test_batch(&seqs_ref);
+        let headers = vec![
+            "r80".to_string(),
+            "r120".to_string(),
+            "r100".to_string(),
+            "r40".to_string(),
+        ];
+
+        let (records, out_headers) =
+            batch_to_owned_records_trimmed(&batch, &headers, Some(50), Some(100), 0).unwrap();
+
+        assert_eq!(records.len(), 2, "Only reads >= 100bp should survive");
+        assert_eq!(out_headers[0], "r120");
+        assert_eq!(out_headers[1], "r100");
+        assert_eq!(records[0].seq1.len(), 50, "120bp trimmed to 50");
+        assert_eq!(records[1].seq1.len(), 50, "100bp trimmed to 50");
+        // Query IDs should be sequential
+        assert_eq!(records[0].query_id, 0);
+        assert_eq!(records[1].query_id, 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Tests for ParquetBatch enum
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parquet_batch_enum_arrow_into_arrow() {
+        let seqs = vec!["ACGTACGT"];
+        let batch = make_test_batch(&seqs);
+        let headers = vec!["read1".to_string()];
+
+        let pb = ParquetBatch::Arrow(batch, headers);
+        let (record_batch, hdrs) = pb.into_arrow();
+
+        assert_eq!(record_batch.num_rows(), 1);
+        assert_eq!(hdrs.len(), 1);
+        assert_eq!(hdrs[0], "read1");
+    }
+
+    #[test]
+    fn test_parquet_batch_enum_owned_into_owned() {
+        let records = vec![OwnedFastxRecord::new(
+            0,
+            b"ACGTACGT".to_vec(),
+            None,
+            None,
+            None,
+        )];
+        let headers = vec!["read1".to_string()];
+
+        let pb = ParquetBatch::Owned(records, headers);
+        let (owned_records, hdrs) = pb.into_owned();
+
+        assert_eq!(owned_records.len(), 1);
+        assert_eq!(owned_records[0].seq1, b"ACGTACGT");
+        assert_eq!(hdrs.len(), 1);
+        assert_eq!(hdrs[0], "read1");
+    }
+
+    #[test]
+    #[should_panic(expected = "Expected ParquetBatch::Arrow but got Owned")]
+    fn test_parquet_batch_enum_owned_into_arrow_panics() {
+        let records = vec![OwnedFastxRecord::new(0, b"ACGT".to_vec(), None, None, None)];
+        let headers = vec!["read1".to_string()];
+
+        let pb = ParquetBatch::Owned(records, headers);
+        let _ = pb.into_arrow(); // should panic
+    }
+
+    #[test]
+    #[should_panic(expected = "Expected ParquetBatch::Owned but got Arrow")]
+    fn test_parquet_batch_enum_arrow_into_owned_panics() {
+        let seqs = vec!["ACGT"];
+        let batch = make_test_batch(&seqs);
+        let headers = vec!["read1".to_string()];
+
+        let pb = ParquetBatch::Arrow(batch, headers);
+        let _ = pb.into_owned(); // should panic
+    }
+
+    // -------------------------------------------------------------------------
+    // Tests for PrefetchingParquetReader trim/filter in reader thread
+    // -------------------------------------------------------------------------
+
+    use parquet::arrow::ArrowWriter;
+    use tempfile::tempdir;
+
+    /// Write a Parquet file with read_id + sequence1 columns (the schema
+    /// PrefetchingParquetReader expects).
+    fn write_test_parquet(dir: &std::path::Path, ids: &[&str], seqs: &[&str]) -> PathBuf {
+        let path = dir.join("test.parquet");
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("read_id", DataType::LargeUtf8, false),
+            Field::new("sequence1", DataType::LargeUtf8, false),
+        ]));
+
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+
+        let id_array = LargeStringArray::from_iter_values(ids.iter().copied());
+        let seq_array = LargeStringArray::from_iter_values(seqs.iter().copied());
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap();
+
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        path
+    }
+
+    #[test]
+    fn test_prefetching_parquet_reader_trims_in_reader_thread() {
+        let dir = tempdir().unwrap();
+        let s0 = "A".repeat(30);
+        let s1 = "G".repeat(100);
+        let s2 = "T".repeat(60);
+        let path = write_test_parquet(dir.path(), &["r0", "r1", "r2"], &[&s0, &s1, &s2]);
+
+        // trim_to=50, minimum_length=40 → r0 (30bp) skipped by min_length,
+        // r1 (100bp) trimmed to 50, r2 (60bp) trimmed to 50
+        let mut reader = PrefetchingParquetReader::with_parallel_row_groups(
+            &path,
+            1000,
+            None, // sequential
+            Some(50),
+            Some(40),
+        )
+        .unwrap();
+
+        let mut all_records = Vec::new();
+        let mut all_headers = Vec::new();
+        while let Some(batch) = reader.next_batch().unwrap() {
+            // Must be Owned variant when trim/filter active
+            let (records, headers) = batch.into_owned();
+            all_records.extend(records);
+            all_headers.extend(headers);
+        }
+
+        assert_eq!(all_records.len(), 2, "30bp read should be filtered out");
+        assert_eq!(all_headers.len(), 2);
+
+        assert_eq!(all_headers[0], "r1");
+        assert_eq!(all_headers[1], "r2");
+        assert_eq!(
+            all_records[0].seq1.len(),
+            50,
+            "100bp should be trimmed to 50"
+        );
+        assert_eq!(
+            all_records[1].seq1.len(),
+            50,
+            "60bp should be trimmed to 50"
+        );
+
+        reader.finish().unwrap();
+    }
+
+    #[test]
+    fn test_prefetching_parquet_reader_parallel_trims_in_reader_thread() {
+        let dir = tempdir().unwrap();
+        let s0 = "A".repeat(30);
+        let s1 = "G".repeat(100);
+        let s2 = "T".repeat(60);
+        let path = write_test_parquet(dir.path(), &["r0", "r1", "r2"], &[&s0, &s1, &s2]);
+
+        // Same trim/filter as sequential test but with parallel_row_groups=Some(2)
+        let mut reader = PrefetchingParquetReader::with_parallel_row_groups(
+            &path,
+            1000,
+            Some(2), // parallel
+            Some(50),
+            Some(40),
+        )
+        .unwrap();
+
+        let mut all_records = Vec::new();
+        let mut all_headers = Vec::new();
+        while let Some(batch) = reader.next_batch().unwrap() {
+            let (records, headers) = batch.into_owned();
+            all_records.extend(records);
+            all_headers.extend(headers);
+        }
+
+        assert_eq!(all_records.len(), 2, "30bp read should be filtered out");
+        assert_eq!(all_headers.len(), 2);
+
+        assert_eq!(all_headers[0], "r1");
+        assert_eq!(all_headers[1], "r2");
+        assert_eq!(all_records[0].seq1.len(), 50);
+        assert_eq!(all_records[1].seq1.len(), 50);
+
+        reader.finish().unwrap();
+    }
+
+    #[test]
+    fn test_prefetching_parquet_reader_no_filter_returns_arrow() {
+        let dir = tempdir().unwrap();
+        let path = write_test_parquet(
+            dir.path(),
+            &["r0", "r1", "r2"],
+            &["ACGTACGT", "GGGGCCCC", "TTTTAAAA"],
+        );
+
+        // No trim/filter → Arrow variant (zero-copy preserved)
+        let mut reader =
+            PrefetchingParquetReader::with_parallel_row_groups(&path, 1000, None, None, None)
+                .unwrap();
+
+        let mut total_rows = 0;
+        while let Some(batch) = reader.next_batch().unwrap() {
+            // Must be Arrow variant when no trim/filter
+            let (record_batch, headers) = batch.into_arrow();
+            total_rows += record_batch.num_rows();
+            assert_eq!(record_batch.num_rows(), headers.len());
+        }
+
+        assert_eq!(total_rows, 3);
+        reader.finish().unwrap();
     }
 }
