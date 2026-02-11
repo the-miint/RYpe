@@ -103,6 +103,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         trim_to: args.common.trim_to,
         minimum_length: args.common.minimum_length,
         is_log_ratio: false,
+        denominator_index_path: None,
     })?;
     let effective_batch_size = batch_result.batch_size;
 
@@ -684,7 +685,7 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
     // Validate compatible k/w/salt
     validate_compatible_indices(&num_loaded.metadata, &denom_loaded.metadata)?;
 
-    // Compute effective batch size (use numerator index for sizing)
+    // Compute effective batch size (use max of numerator/denominator shard sizes)
     let batch_result = compute_effective_batch_size(&BatchSizeConfig {
         batch_size_override: args.batch_size,
         max_memory: args.max_memory,
@@ -695,6 +696,7 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
         trim_to: args.trim_to,
         minimum_length: args.minimum_length,
         is_log_ratio: true,
+        denominator_index_path: Some(&args.denominator),
     })?;
     let effective_batch_size = batch_result.batch_size;
 

@@ -34,6 +34,9 @@ pub struct BatchSizeConfig<'a> {
     pub minimum_length: Option<usize>,
     /// Whether this is a log-ratio classification (adds deferred buffer memory)
     pub is_log_ratio: bool,
+    /// Optional path to denominator index (log-ratio only).
+    /// When set, shard reservation uses the larger of numerator/denominator shards.
+    pub denominator_index_path: Option<&'a Path>,
 }
 
 /// Result of batch size computation with logging metadata.
@@ -98,6 +101,16 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
 
     // Load index metadata to get k, w, num_buckets
     let metadata = load_index_metadata(config.index_path)?;
+
+    // For log-ratio, use the larger shard from numerator or denominator
+    let largest_shard_entries = if let Some(denom_path) = config.denominator_index_path {
+        let denom_meta = load_index_metadata(denom_path)?;
+        metadata
+            .largest_shard_entries
+            .max(denom_meta.largest_shard_entries)
+    } else {
+        metadata.largest_shard_entries
+    };
 
     // Detect or use specified memory limit (0 = auto)
     let mem_limit = if config.max_memory == 0 {
@@ -168,7 +181,7 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
 
     // Estimate shard loading memory from largest shard size
     let shard_reservation =
-        estimate_shard_reservation(metadata.largest_shard_entries, rayon::current_num_threads());
+        estimate_shard_reservation(largest_shard_entries, rayon::current_num_threads());
 
     let mem_config = MemoryConfig {
         max_memory: mem_limit,
@@ -325,6 +338,7 @@ num_entries = 3
             trim_to: None,
             minimum_length: None,
             is_log_ratio: false,
+            denominator_index_path: None,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -347,6 +361,7 @@ num_entries = 3
             trim_to: None,
             minimum_length: None,
             is_log_ratio: false,
+            denominator_index_path: None,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -377,6 +392,7 @@ num_entries = 3
             trim_to: None,
             minimum_length: None,
             is_log_ratio: false,
+            denominator_index_path: None,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -404,6 +420,7 @@ num_entries = 3
             trim_to: None,
             minimum_length: None,
             is_log_ratio: false,
+            denominator_index_path: None,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -453,6 +470,7 @@ num_entries = 3
             trim_to: None,
             minimum_length: None,
             is_log_ratio: false,
+            denominator_index_path: None,
         };
 
         let result = compute_effective_batch_size(&config).unwrap();
@@ -533,6 +551,193 @@ num_entries = 3
         assert_eq!(
             metadata.largest_shard_entries, 3,
             "load_index_metadata should populate largest_shard_entries from manifest"
+        );
+    }
+
+    // =========================================================================
+    // Log-ratio denominator shard reservation tests
+    // =========================================================================
+
+    /// Create a minimal Parquet index with a configurable number of shard entries.
+    fn create_test_index_with_entries(num_entries: usize) -> TempDir {
+        use std::fs;
+
+        let dir = TempDir::new().unwrap();
+        let index_path = dir.path().join("test.ryxdi");
+        fs::create_dir(&index_path).unwrap();
+
+        // Create manifest with parameterized num_entries
+        let manifest = format!(
+            r#"magic = "RYPE_PARQUET_V1"
+format_version = 1
+k = 64
+w = 50
+salt = "0x5555555555555555"
+source_hash = "0xDEADBEEF"
+num_buckets = 1
+total_minimizers = {num_entries}
+
+[inverted]
+num_shards = 1
+total_entries = {num_entries}
+has_overlapping_shards = false
+
+[[inverted.shards]]
+shard_id = 0
+min_minimizer = "0x0000000000000001"
+max_minimizer = "0xFFFFFFFFFFFFFFFF"
+num_entries = {num_entries}
+"#
+        );
+        fs::write(index_path.join("manifest.toml"), manifest).unwrap();
+
+        // Create minimal buckets.parquet (1 bucket)
+        use arrow::array::{
+            ArrayRef, LargeListBuilder, LargeStringArray, LargeStringBuilder, UInt32Array,
+        };
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("bucket_id", DataType::UInt32, false),
+            Field::new("bucket_name", DataType::LargeUtf8, false),
+            Field::new(
+                "sources",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
+                false,
+            ),
+        ]));
+
+        let mut list_builder = LargeListBuilder::new(LargeStringBuilder::new());
+        list_builder.values().append_value("source0");
+        list_builder.append(true);
+        let sources_array: ArrayRef = Arc::new(list_builder.finish());
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec!["bucket0"])) as ArrayRef,
+                sources_array,
+            ],
+        )
+        .unwrap();
+
+        let file = fs::File::create(index_path.join("buckets.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Create inverted directory with minimal shard (actual parquet data not needed
+        // for metadata loading, but the directory must exist)
+        let inverted_path = index_path.join("inverted");
+        fs::create_dir(&inverted_path).unwrap();
+
+        let shard_schema = Arc::new(Schema::new(vec![
+            Field::new("minimizer", DataType::UInt64, false),
+            Field::new("bucket_id", DataType::UInt32, false),
+        ]));
+
+        // Write a minimal shard (just 1 entry — the manifest num_entries is what matters)
+        let shard_batch = RecordBatch::try_new(
+            shard_schema.clone(),
+            vec![
+                Arc::new(arrow::array::UInt64Array::from(vec![1u64])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![0])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let shard_file = fs::File::create(inverted_path.join("shard.0.parquet")).unwrap();
+        let mut shard_writer = ArrowWriter::try_new(shard_file, shard_schema, None).unwrap();
+        shard_writer.write(&shard_batch).unwrap();
+        shard_writer.close().unwrap();
+
+        dir
+    }
+
+    #[test]
+    fn test_log_ratio_uses_larger_denominator_shard() {
+        // When denominator has a much larger shard than numerator, the shard
+        // reservation must use the denominator's shard size.
+        let num_dir = create_test_index_with_entries(3); // tiny numerator
+        let denom_dir = create_test_index_with_entries(1_000_000); // large denominator
+        let num_path = num_dir.path().join("test.ryxdi");
+        let denom_path = denom_dir.path().join("test.ryxdi");
+        let r1_file = create_test_fastq(150, 10);
+
+        let config = BatchSizeConfig {
+            batch_size_override: None,
+            max_memory: 4 * 1024 * 1024 * 1024, // 4GB
+            r1_path: r1_file.path(),
+            r2_path: None,
+            is_parquet_input: false,
+            index_path: &num_path,
+            trim_to: None,
+            minimum_length: None,
+            is_log_ratio: true,
+            denominator_index_path: Some(&denom_path),
+        };
+
+        let result = compute_effective_batch_size(&config).unwrap();
+        let threads = rayon::current_num_threads();
+        let expected_reservation = estimate_shard_reservation(1_000_000, threads);
+
+        assert!(
+            result.shard_reservation >= expected_reservation,
+            "shard_reservation {} should be >= {} (from denominator's 1M-entry shard)",
+            result.shard_reservation,
+            expected_reservation
+        );
+    }
+
+    #[test]
+    fn test_log_ratio_batch_size_shrinks_for_large_denominator() {
+        // With a large denominator shard, the batch size should be smaller than
+        // without a denominator (more memory reserved for shard loading).
+        let num_dir = create_test_index_with_entries(3);
+        let denom_dir = create_test_index_with_entries(1_000_000);
+        let num_path = num_dir.path().join("test.ryxdi");
+        let denom_path = denom_dir.path().join("test.ryxdi");
+        let r1_file = create_test_fastq(150, 10);
+
+        let config_no_denom = BatchSizeConfig {
+            batch_size_override: None,
+            max_memory: 4 * 1024 * 1024 * 1024,
+            r1_path: r1_file.path(),
+            r2_path: None,
+            is_parquet_input: false,
+            index_path: &num_path,
+            trim_to: None,
+            minimum_length: None,
+            is_log_ratio: true,
+            denominator_index_path: None,
+        };
+
+        let config_with_denom = BatchSizeConfig {
+            batch_size_override: None,
+            max_memory: 4 * 1024 * 1024 * 1024,
+            r1_path: r1_file.path(),
+            r2_path: None,
+            is_parquet_input: false,
+            index_path: &num_path,
+            trim_to: None,
+            minimum_length: None,
+            is_log_ratio: true,
+            denominator_index_path: Some(&denom_path),
+        };
+
+        let result_no_denom = compute_effective_batch_size(&config_no_denom).unwrap();
+        let result_with_denom = compute_effective_batch_size(&config_with_denom).unwrap();
+
+        assert!(
+            result_with_denom.batch_size < result_no_denom.batch_size,
+            "Batch size with large denom {} should be < without denom {} \
+             (more memory reserved for shard loading)",
+            result_with_denom.batch_size,
+            result_no_denom.batch_size
         );
     }
 }

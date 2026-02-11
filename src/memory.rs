@@ -938,10 +938,11 @@ pub fn estimate_batch_memory(
         .checked_add(query_index)?
         .checked_add(accumulators)?;
 
-    // Deferred denominator buffer: log-ratio holds up to batch_size/2 reads
-    // across batches, each retaining their minimizer Vecs plus metadata.
+    // Deferred denominator buffer: log-ratio can defer up to batch_size reads
+    // in a single batch (flush only triggers at batch boundaries), so budget
+    // must cover the worst case where 100% of reads need denominator classification.
     if is_log_ratio {
-        let deferred_reads = batch_size / 2;
+        let deferred_reads = batch_size;
         // DeferredMeta: header String + f64 + usize + u32 + u32 ≈ 48 bytes stack
         let meta_bytes: usize = 48;
         let estimated_header_bytes: usize = 60;
@@ -1451,6 +1452,32 @@ mod tests {
             "Log-ratio batch_size {} should be < normal batch_size {}",
             batch_log_ratio.batch_size,
             batch_normal.batch_size
+        );
+    }
+
+    #[test]
+    fn test_log_ratio_deferred_covers_full_batch() {
+        // The deferred buffer must budget for batch_size reads (not batch_size/2),
+        // because flush only triggers at batch boundaries and a single batch can
+        // defer 100% of its reads when the skip threshold is high.
+        let profile = ReadMemoryProfile::new(1000, false, 64, 50);
+        let batch_size: usize = 10_000;
+        let num_buckets: usize = 100;
+
+        let mem_normal = estimate_batch_memory(batch_size, &profile, num_buckets, false).unwrap();
+        let mem_lr = estimate_batch_memory(batch_size, &profile, num_buckets, true).unwrap();
+        let deferred_component = mem_lr - mem_normal;
+
+        // Expected: batch_size * (48 meta + 60 header + minimizers_per_query * 12) * fudge
+        let per_read = 48 + 60 + profile.minimizers_per_query * 12;
+        let expected_min =
+            (batch_size as f64 * per_read as f64 * MEMORY_FUDGE_FACTOR * 0.95) as usize;
+
+        assert!(
+            deferred_component >= expected_min,
+            "Deferred component {} should be >= {} (full batch_size, not batch_size/2)",
+            deferred_component,
+            expected_min
         );
     }
 
