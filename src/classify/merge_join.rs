@@ -304,6 +304,7 @@ pub fn merge_join_pairs_sparse(
 ///
 /// # Returns
 /// Dense accumulator: Vec<HashMap<bucket_id, (fwd_total, rc_total)>>
+#[allow(dead_code)]
 pub fn merge_sparse_hits(
     sparse_hits_list: Vec<Vec<SparseHit>>,
     num_reads: usize,

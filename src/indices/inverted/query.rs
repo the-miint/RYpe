@@ -71,9 +71,13 @@ impl QueryInvertedIndex {
     /// Used for shard filtering and bloom filter hints. Allocates a new Vec on each call;
     /// prefer `num_unique_minimizers()` when only the count is needed.
     pub fn unique_minimizers(&self) -> Vec<u64> {
-        let mut mins: Vec<u64> = self.entries.iter().map(|(m, _)| *m).collect();
-        mins.dedup();
-        mins
+        let mut result = Vec::with_capacity(self.unique_count);
+        for &(m, _) in &self.entries {
+            if result.last() != Some(&m) {
+                result.push(m);
+            }
+        }
+        result
     }
 
     /// Get (min, max) minimizer range, or None if empty.
@@ -453,5 +457,26 @@ mod tests {
     fn test_from_sorted_coo_rejects_unsorted() {
         let entries = vec![(200, 0u32), (100, 1)]; // NOT sorted
         QueryInvertedIndex::from_sorted_coo(entries, vec![1], vec![1]);
+    }
+
+    #[test]
+    fn test_unique_minimizers_capacity_is_minimal() {
+        // Two reads sharing some minimizers: tests that capacity == len (no over-allocation)
+        let queries = vec![
+            (vec![100, 200, 300], vec![150, 250]),
+            (vec![100, 300, 400], vec![150, 350]),
+        ];
+        let qidx = QueryInvertedIndex::build(&queries);
+        let mins = qidx.unique_minimizers();
+
+        assert_eq!(
+            mins.capacity(),
+            mins.len(),
+            "unique_minimizers() should allocate exactly unique_count capacity, got cap={} len={}",
+            mins.capacity(),
+            mins.len()
+        );
+        // Verify correctness: 100, 150, 200, 250, 300, 350, 400
+        assert_eq!(mins, vec![100, 150, 200, 250, 300, 350, 400]);
     }
 }

@@ -950,8 +950,13 @@ pub fn estimate_batch_memory(
         // minimizers_per_query already includes both strands.
         // Each minimizer stored as (u64, u32) = 12 bytes in COO entries.
         let minimizer_cost = profile.minimizers_per_query.checked_mul(12)?;
-        let deferred_memory =
-            deferred_reads.checked_mul(per_read_overhead.checked_add(minimizer_cost)?)?;
+        // unique_minimizers() Vec: 8 bytes per minimizer (upper bound)
+        let query_mins_cost = profile.minimizers_per_query.checked_mul(8)?;
+        let deferred_memory = deferred_reads.checked_mul(
+            per_read_overhead
+                .checked_add(minimizer_cost)?
+                .checked_add(query_mins_cost)?,
+        )?;
         base_estimate = base_estimate.checked_add(deferred_memory)?;
     }
 
@@ -1468,8 +1473,9 @@ mod tests {
         let mem_lr = estimate_batch_memory(batch_size, &profile, num_buckets, true).unwrap();
         let deferred_component = mem_lr - mem_normal;
 
-        // Expected: batch_size * (48 meta + 60 header + minimizers_per_query * 12) * fudge
-        let per_read = 48 + 60 + profile.minimizers_per_query * 12;
+        // Expected: batch_size * (48 meta + 60 header + minimizers_per_query * 20) * fudge
+        // 20 = 12 (COO entries) + 8 (unique_minimizers Vec)
+        let per_read = 48 + 60 + profile.minimizers_per_query * 20;
         let expected_min =
             (batch_size as f64 * per_read as f64 * MEMORY_FUDGE_FACTOR * 0.95) as usize;
 

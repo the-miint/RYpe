@@ -18,9 +18,7 @@ use crate::types::{HitResult, QueryRecord};
 use crate::log_timing;
 
 use super::common::{collect_negative_minimizers_sharded, filter_negative_mins};
-use super::merge_join::{
-    accumulate_merge_join, merge_join_pairs_sparse, merge_sparse_hits, SparseHit,
-};
+use super::merge_join::{accumulate_merge_join, merge_join_pairs_sparse};
 use super::scoring::compute_score;
 
 /// Score accumulated hits and filter by threshold.
@@ -345,35 +343,51 @@ pub fn classify_from_query_index_parallel_rg(
     let filtered_rg_count = work_items.len();
     log_timing("parallel_rg: rg_filter", t_filter.elapsed().as_millis());
 
-    // Process overlapping row groups in parallel, collecting sparse hits
+    // Stream-merge: each thread merges hits into a local accumulator immediately,
+    // avoiding materializing all SparseHits across all RGs at once.
     let t_parallel = Instant::now();
-    let results: Result<Vec<Vec<SparseHit>>> = work_items
+    let final_accumulators = work_items
         .into_par_iter()
-        .map(|(shard_path, rg_idx)| {
-            let pairs = load_row_group_pairs(&shard_path, rg_idx, &query_minimizers)?;
-            if pairs.is_empty() {
-                Ok(Vec::new())
-            } else {
-                Ok(merge_join_pairs_sparse(query_idx, &pairs))
-            }
-        })
-        .filter_map(|result: Result<Vec<SparseHit>>| match result {
-            Ok(hits) if hits.is_empty() => None,
-            Ok(hits) => Some(Ok(hits)),
-            Err(e) => Some(Err(e)),
-        })
-        .collect();
-
-    let all_sparse_hits = results?;
+        .try_fold(
+            || -> Vec<HashMap<u32, (u32, u32)>> {
+                (0..num_reads)
+                    .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
+                    .collect()
+            },
+            |mut acc, (shard_path, rg_idx)| -> Result<Vec<HashMap<u32, (u32, u32)>>> {
+                let pairs = load_row_group_pairs(&shard_path, rg_idx, &query_minimizers)?;
+                if !pairs.is_empty() {
+                    let hits = merge_join_pairs_sparse(query_idx, &pairs);
+                    for (read_idx, bucket_id, fwd, rc) in hits {
+                        let entry = acc[read_idx as usize].entry(bucket_id).or_insert((0, 0));
+                        entry.0 += fwd;
+                        entry.1 += rc;
+                    }
+                }
+                Ok(acc)
+            },
+        )
+        .try_reduce(
+            || {
+                (0..num_reads)
+                    .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
+                    .collect()
+            },
+            |mut a, b| {
+                for (i, map) in b.into_iter().enumerate() {
+                    for (bucket_id, (fwd, rc)) in map {
+                        let entry = a[i].entry(bucket_id).or_insert((0, 0));
+                        entry.0 += fwd;
+                        entry.1 += rc;
+                    }
+                }
+                Ok(a)
+            },
+        )?;
     log_timing(
-        "parallel_rg: rg_process_total",
+        "parallel_rg: fold_reduce_total",
         t_parallel.elapsed().as_millis(),
     );
-
-    // Merge all sparse hits into final accumulators
-    let t_merge = Instant::now();
-    let final_accumulators = merge_sparse_hits(all_sparse_hits, num_reads);
-    log_timing("parallel_rg: merge_total", t_merge.elapsed().as_millis());
     log_timing("parallel_rg: total_rg_count", total_rg_count as u128);
     log_timing("parallel_rg: filtered_rg_count", filtered_rg_count as u128);
 

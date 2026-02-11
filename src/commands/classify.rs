@@ -762,7 +762,7 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
     // Memory overhead: the buffer stores cached minimizers (not sequences), so memory
     // is proportional to minimizer count (~8 bytes × ~6 minimizers/read for short reads)
     // rather than sequence length. Much smaller than the previous OwnedFastxRecord approach.
-    let deferred_threshold = effective_batch_size / 2;
+    let deferred_threshold = effective_batch_size;
     let mut deferred_buffer = DeferredDenomBuffer::new(deferred_threshold.max(1));
     let mut global_read_offset: usize = 0;
 
