@@ -78,6 +78,13 @@ pub use classify::{
     extract_batch_minimizers, filter_best_hits,
 };
 
+// Log-ratio types and functions
+pub use classify::log_ratio::{
+    classify_log_ratio_batch, compute_log_ratio, partition_by_numerator_score,
+    validate_compatible_indices, validate_log_ratio_indices, validate_single_bucket_index,
+    FastPath, LogRatioResult, PartitionResult,
+};
+
 // ============================================================================
 // Specialized types (for advanced use cases - consider using qualified paths)
 // e.g., `rype::indices::sharded::ShardManifest` or `rype::parquet_index::ParquetWriteOptions`

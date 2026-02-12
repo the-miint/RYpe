@@ -84,8 +84,8 @@ pub use error::ArrowClassifyError;
 pub use input::{batch_to_records, batch_to_records_with_columns};
 pub use output::{empty_result_batch, hits_to_record_batch};
 pub use schema::{
-    result_schema, validate_input_schema, COL_BUCKET_ID, COL_ID, COL_PAIR_SEQUENCE, COL_QUERY_ID,
-    COL_SCORE, COL_SEQUENCE,
+    log_ratio_result_schema, result_schema, validate_input_schema, COL_BUCKET_ID, COL_FAST_PATH,
+    COL_ID, COL_LOG_RATIO, COL_PAIR_SEQUENCE, COL_QUERY_ID, COL_SCORE, COL_SEQUENCE,
 };
 pub use stream::ShardedStreamClassifier;
 

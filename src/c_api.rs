@@ -27,7 +27,7 @@ use crate::classify_with_sharded_negative;
 use crate::constants::MAX_SEQUENCE_LENGTH;
 use crate::memory::{detect_available_memory, parse_byte_suffix};
 use crate::{QueryRecord, ShardedInvertedIndex};
-use libc::{c_char, c_double, size_t};
+use libc::{c_char, c_double, c_int, size_t};
 use std::cell::RefCell;
 use std::collections::HashMap;
 #[cfg(feature = "arrow-ffi")]
@@ -210,6 +210,28 @@ pub struct RypeHit {
 #[repr(C)]
 pub struct RypeResultArray {
     pub data: *mut RypeHit,
+    pub len: size_t,
+    pub capacity: size_t,
+}
+
+// --- Log-Ratio C-Compatible Structs ---
+
+/// A single log-ratio classification result for one query.
+///
+/// `fast_path`: 0 = computed exactly (None), 1 = numerator exceeded skip threshold (NumHigh).
+#[repr(C)]
+pub struct RypeLogRatioHit {
+    pub query_id: i64,
+    pub log_ratio: c_double,
+    pub fast_path: i32,
+}
+
+/// Array of log-ratio results returned by `rype_classify_log_ratio`.
+///
+/// Free with `rype_log_ratio_results_free`. Do NOT call twice on the same pointer.
+#[repr(C)]
+pub struct RypeLogRatioResultArray {
+    pub data: *mut RypeLogRatioHit,
     pub len: size_t,
     pub capacity: size_t,
 }
@@ -819,6 +841,186 @@ pub extern "C" fn rype_results_free(ptr: *mut RypeResultArray) {
     }
 }
 
+// --- Log-Ratio API Functions ---
+
+/// Validate two indices are compatible for log-ratio classification.
+///
+/// Each index must have exactly 1 bucket, and both must share the same k, w, and salt.
+/// Returns 0 on success, -1 on error (call `rype_get_last_error()` for details).
+///
+/// Thread Safety: Thread-safe (read-only access).
+#[no_mangle]
+pub extern "C" fn rype_validate_log_ratio_indices(
+    numerator: *const RypeIndex,
+    denominator: *const RypeIndex,
+) -> c_int {
+    if numerator.is_null() || (numerator as usize) % std::mem::align_of::<RypeIndex>() != 0 {
+        set_last_error("numerator is NULL or misaligned".to_string());
+        return -1;
+    }
+    if denominator.is_null() || (denominator as usize) % std::mem::align_of::<RypeIndex>() != 0 {
+        set_last_error("denominator is NULL or misaligned".to_string());
+        return -1;
+    }
+
+    let num = unsafe { &*numerator };
+    let denom = unsafe { &*denominator };
+
+    if let Err(e) = crate::validate_log_ratio_indices(&num.0, &denom.0) {
+        set_last_error(format!("{}", e));
+        return -1;
+    }
+
+    clear_last_error();
+    0
+}
+
+/// Classify a batch using log-ratio (numerator vs denominator).
+///
+/// `numerator_skip_threshold` semantics:
+///   - `<= 0.0` → disabled (all reads classified against both indices)
+///   - `(0.0, 1.0]` → enabled; reads scoring >= threshold get +inf fast-path
+///   - `> 1.0`, NaN, inf → error (returns NULL)
+///
+/// Thread Safety: Thread-safe. Multiple threads can classify concurrently
+/// with the same RypeIndex pointers.
+#[no_mangle]
+pub extern "C" fn rype_classify_log_ratio(
+    numerator: *const RypeIndex,
+    denominator: *const RypeIndex,
+    queries: *const RypeQuery,
+    num_queries: size_t,
+    numerator_skip_threshold: c_double,
+) -> *mut RypeLogRatioResultArray {
+    let result = std::panic::catch_unwind(|| {
+        // Validate pointers
+        if numerator.is_null() || (numerator as usize) % std::mem::align_of::<RypeIndex>() != 0 {
+            set_last_error("numerator is NULL or misaligned".to_string());
+            return std::ptr::null_mut();
+        }
+        if denominator.is_null() || (denominator as usize) % std::mem::align_of::<RypeIndex>() != 0
+        {
+            set_last_error("denominator is NULL or misaligned".to_string());
+            return std::ptr::null_mut();
+        }
+        if queries.is_null() || num_queries == 0 {
+            set_last_error("Invalid arguments: queries is NULL or num_queries is zero".to_string());
+            return std::ptr::null_mut();
+        }
+        if (queries as usize) % std::mem::align_of::<RypeQuery>() != 0 {
+            set_last_error("queries pointer is misaligned".to_string());
+            return std::ptr::null_mut();
+        }
+
+        // Validate threshold
+        let skip_threshold = if numerator_skip_threshold.is_nan()
+            || numerator_skip_threshold.is_infinite()
+            || numerator_skip_threshold > 1.0
+        {
+            set_last_error(format!(
+                "Invalid numerator_skip_threshold: {}. Must be <= 1.0 and finite, or <= 0.0 to disable.",
+                numerator_skip_threshold
+            ));
+            return std::ptr::null_mut();
+        } else if numerator_skip_threshold <= 0.0 {
+            None
+        } else {
+            Some(numerator_skip_threshold)
+        };
+
+        let num = unsafe { &*numerator };
+        let denom = unsafe { &*denominator };
+
+        // Build QueryRecords from C queries
+        let query_slice = unsafe { std::slice::from_raw_parts(queries, num_queries) };
+        let mut records: Vec<QueryRecord> = Vec::with_capacity(num_queries);
+        for (idx, q) in query_slice.iter().enumerate() {
+            if let Err(msg) = validate_query(q) {
+                set_last_error(format!("Query {} validation failed: {}", idx, msg));
+                return std::ptr::null_mut();
+            }
+            let seq = unsafe { std::slice::from_raw_parts(q.seq as *const u8, q.seq_len) };
+            let pair_seq = if !q.pair_seq.is_null() && q.pair_len > 0 {
+                Some(unsafe { std::slice::from_raw_parts(q.pair_seq as *const u8, q.pair_len) })
+            } else {
+                None
+            };
+            records.push((q.id, seq, pair_seq));
+        }
+
+        // Run log-ratio classification (validates indices internally)
+        let lr_results =
+            match crate::classify_log_ratio_batch(&num.0, &denom.0, &records, skip_threshold) {
+                Ok(r) => r,
+                Err(e) => {
+                    set_last_error(format!("Log-ratio classification failed: {}", e));
+                    return std::ptr::null_mut();
+                }
+            };
+
+        // Convert LogRatioResult → RypeLogRatioHit
+        let mut results: Vec<RypeLogRatioHit> = lr_results
+            .into_iter()
+            .map(|lr| RypeLogRatioHit {
+                query_id: lr.query_id,
+                log_ratio: lr.log_ratio,
+                fast_path: match lr.fast_path {
+                    crate::FastPath::NumHigh => 1,
+                    crate::FastPath::None => 0,
+                },
+            })
+            .collect();
+
+        let len = results.len();
+        let capacity = results.capacity();
+        let data = results.as_mut_ptr();
+        std::mem::forget(results);
+
+        clear_last_error();
+        Box::into_raw(Box::new(RypeLogRatioResultArray {
+            data,
+            len,
+            capacity,
+        }))
+    });
+
+    match result {
+        Ok(ptr) => ptr,
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = e.downcast_ref::<&str>() {
+                s.to_string()
+            } else {
+                "Unknown panic in rype_classify_log_ratio".to_string()
+            };
+            set_last_error(msg);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Free log-ratio results. NULL is safe to pass.
+/// Do NOT call twice on the same pointer (undefined behavior).
+#[no_mangle]
+pub extern "C" fn rype_log_ratio_results_free(ptr: *mut RypeLogRatioResultArray) {
+    if !ptr.is_null() {
+        unsafe {
+            let array = Box::from_raw(ptr);
+
+            if array.data.is_null() {
+                if array.len > 0 || array.capacity > 0 {
+                    eprintln!("FATAL: Corrupted RypeLogRatioResultArray detected in rype_log_ratio_results_free (null data with len={}, capacity={}). Possible double-free.", array.len, array.capacity);
+                    std::process::abort();
+                }
+                return;
+            }
+
+            let _ = Vec::from_raw_parts(array.data, array.len, array.capacity);
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn rype_get_last_error() -> *const c_char {
     LAST_ERROR.with(|e| {
@@ -864,6 +1066,25 @@ mod layout_tests {
         use std::mem::{align_of, size_of};
         assert_eq!(size_of::<RypeResultArray>(), 24);
         assert_eq!(align_of::<RypeResultArray>(), 8);
+    }
+
+    #[test]
+    fn test_rype_log_ratio_hit_layout() {
+        use std::mem::{align_of, size_of};
+        // i64 (8) + f64 (8) + i32 (4) + padding (4) = 24 bytes
+        assert_eq!(size_of::<RypeLogRatioHit>(), 24);
+        assert_eq!(align_of::<RypeLogRatioHit>(), 8);
+
+        assert_eq!(std::mem::offset_of!(RypeLogRatioHit, query_id), 0);
+        assert_eq!(std::mem::offset_of!(RypeLogRatioHit, log_ratio), 8);
+        assert_eq!(std::mem::offset_of!(RypeLogRatioHit, fast_path), 16);
+    }
+
+    #[test]
+    fn test_rype_log_ratio_result_array_layout() {
+        use std::mem::{align_of, size_of};
+        assert_eq!(size_of::<RypeLogRatioResultArray>(), 24);
+        assert_eq!(align_of::<RypeLogRatioResultArray>(), 8);
     }
 }
 
@@ -1100,6 +1321,7 @@ mod arrow_ffi {
     unsafe fn create_streaming_output<F>(
         input_stream: *mut FFI_ArrowArrayStream,
         out_stream: *mut FFI_ArrowArrayStream,
+        output_schema: SchemaRef,
         classify_fn: F,
     ) -> Result<(), String>
     where
@@ -1108,7 +1330,6 @@ mod arrow_ffi {
         let input_reader = ArrowArrayStreamReader::from_raw(input_stream)
             .map_err(|e| format!("Failed to create stream reader: {}", e))?;
 
-        let output_schema = crate::arrow::result_schema();
         let streaming = StreamingClassifier::new(input_reader, output_schema, classify_fn);
 
         let export_stream = FFI_ArrowArrayStream::new(Box::new(streaming));
@@ -1200,7 +1421,12 @@ mod arrow_ffi {
             result.map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
         };
 
-        match create_streaming_output(input_stream, out_stream, classify_fn) {
+        match create_streaming_output(
+            input_stream,
+            out_stream,
+            crate::arrow::result_schema(),
+            classify_fn,
+        ) {
             Ok(()) => {
                 clear_last_error();
                 0
@@ -1292,7 +1518,12 @@ mod arrow_ffi {
             result.map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
         };
 
-        match create_streaming_output(input_stream, out_stream, classify_fn) {
+        match create_streaming_output(
+            input_stream,
+            out_stream,
+            crate::arrow::result_schema(),
+            classify_fn,
+        ) {
             Ok(()) => {
                 clear_last_error();
                 0
@@ -1334,6 +1565,178 @@ mod arrow_ffi {
             }
             Err(e) => {
                 set_last_error(format!("Failed to export schema: {}", e));
+                -1
+            }
+        }
+    }
+
+    /// Get the output schema for Arrow log-ratio results.
+    ///
+    /// Schema: query_id (Int64), log_ratio (Float64), fast_path (Int32)
+    ///
+    /// Caller must release the schema.
+    ///
+    /// # Safety
+    ///
+    /// `out_schema` must be a valid, non-null pointer to an uninitialized `FFI_ArrowSchema`.
+    ///
+    /// # Returns
+    ///
+    /// 0 on success, -1 on error.
+    #[no_mangle]
+    pub unsafe extern "C" fn rype_arrow_log_ratio_result_schema(
+        out_schema: *mut FFI_ArrowSchema,
+    ) -> i32 {
+        if out_schema.is_null() {
+            set_last_error("out_schema is NULL".to_string());
+            return -1;
+        }
+
+        let schema = crate::arrow::log_ratio_result_schema();
+
+        match FFI_ArrowSchema::try_from(schema.as_ref()) {
+            Ok(ffi_schema) => {
+                std::ptr::write(out_schema, ffi_schema);
+                clear_last_error();
+                0
+            }
+            Err(e) => {
+                set_last_error(format!("Failed to export schema: {}", e));
+                -1
+            }
+        }
+    }
+
+    /// Classify sequences from an Arrow stream using log-ratio (numerator vs denominator).
+    ///
+    /// TRUE STREAMING: Processes one batch at a time. Memory usage is O(batch_size).
+    ///
+    /// `numerator_skip_threshold` semantics:
+    ///   - `<= 0.0` → disabled (all reads classified against both indices)
+    ///   - `(0.0, 1.0]` → enabled; reads scoring >= threshold get +inf fast-path
+    ///   - `> 1.0`, NaN, inf → error (returns -1)
+    ///
+    /// # Safety
+    ///
+    /// - numerator and denominator must remain valid until the output stream is fully consumed
+    ///
+    /// # Returns
+    ///
+    /// 0 on success, -1 on error. Call rype_get_last_error() for details.
+    #[no_mangle]
+    pub unsafe extern "C" fn rype_classify_arrow_log_ratio(
+        numerator: *const RypeIndex,
+        denominator: *const RypeIndex,
+        input_stream: *mut FFI_ArrowArrayStream,
+        numerator_skip_threshold: c_double,
+        out_stream: *mut FFI_ArrowArrayStream,
+    ) -> i32 {
+        // Validate pointers
+        if numerator.is_null() || (numerator as usize) % std::mem::align_of::<RypeIndex>() != 0 {
+            set_last_error("numerator is NULL or misaligned".to_string());
+            return -1;
+        }
+        if denominator.is_null() || (denominator as usize) % std::mem::align_of::<RypeIndex>() != 0
+        {
+            set_last_error("denominator is NULL or misaligned".to_string());
+            return -1;
+        }
+        if input_stream.is_null() {
+            set_last_error("input_stream is NULL".to_string());
+            return -1;
+        }
+        if out_stream.is_null() {
+            set_last_error("out_stream is NULL".to_string());
+            return -1;
+        }
+
+        // Validate threshold
+        let skip_threshold = if numerator_skip_threshold.is_nan()
+            || numerator_skip_threshold.is_infinite()
+            || numerator_skip_threshold > 1.0
+        {
+            set_last_error(format!(
+                "Invalid numerator_skip_threshold: {}. Must be <= 1.0 and finite, or <= 0.0 to disable.",
+                numerator_skip_threshold
+            ));
+            return -1;
+        } else if numerator_skip_threshold <= 0.0 {
+            None
+        } else {
+            Some(numerator_skip_threshold)
+        };
+
+        // Validate indices eagerly (fail fast before creating the stream)
+        let num = &*numerator;
+        let denom = &*denominator;
+        if let Err(e) = crate::validate_log_ratio_indices(&num.0, &denom.0) {
+            set_last_error(format!("{}", e));
+            return -1;
+        }
+
+        // Wrap pointers in Send-safe wrappers
+        let num_send = SendRypeIndexPtr::new(numerator);
+        let denom_send = SendRypeIndexPtr::new(denominator);
+
+        let classify_fn = move |batch: &RecordBatch| {
+            use crate::arrow::batch_to_records;
+
+            let num_idx = unsafe { num_send.get() };
+            let denom_idx = unsafe { denom_send.get() };
+
+            let records = batch_to_records(batch)
+                .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
+
+            // classify_log_ratio_batch validates indices internally on each call,
+            // but we already validated eagerly above for fast failure
+            let lr_results =
+                crate::classify_log_ratio_batch(&num_idx.0, &denom_idx.0, &records, skip_threshold)
+                    .map_err(|e| arrow::error::ArrowError::ExternalError(e.into()))?;
+
+            // Convert Vec<LogRatioResult> → Arrow RecordBatch
+            use arrow::array::{Float64Array, Int32Array, Int64Array};
+
+            let schema = crate::arrow::log_ratio_result_schema();
+            if lr_results.is_empty() {
+                return Ok(RecordBatch::new_empty(schema));
+            }
+
+            let mut query_ids = Vec::with_capacity(lr_results.len());
+            let mut log_ratios = Vec::with_capacity(lr_results.len());
+            let mut fast_paths = Vec::with_capacity(lr_results.len());
+
+            for lr in &lr_results {
+                query_ids.push(lr.query_id);
+                log_ratios.push(lr.log_ratio);
+                fast_paths.push(match lr.fast_path {
+                    crate::FastPath::NumHigh => 1i32,
+                    crate::FastPath::None => 0i32,
+                });
+            }
+
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(query_ids)),
+                    Arc::new(Float64Array::from(log_ratios)),
+                    Arc::new(Int32Array::from(fast_paths)),
+                ],
+            )
+            .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
+        };
+
+        match create_streaming_output(
+            input_stream,
+            out_stream,
+            crate::arrow::log_ratio_result_schema(),
+            classify_fn,
+        ) {
+            Ok(()) => {
+                clear_last_error();
+                0
+            }
+            Err(e) => {
+                set_last_error(e);
                 -1
             }
         }
@@ -1503,5 +1906,200 @@ mod c_api_tests {
             CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
         };
         assert!(err.contains("threshold") || err.contains("Invalid"));
+    }
+
+    // --- Log-ratio validation tests (Cycle 2) ---
+
+    #[test]
+    fn test_rype_validate_log_ratio_null_numerator() {
+        let result = rype_validate_log_ratio_indices(std::ptr::null(), 0x1000 as *const RypeIndex);
+        assert_eq!(result, -1);
+
+        let err = unsafe {
+            let err_ptr = rype_get_last_error();
+            assert!(!err_ptr.is_null());
+            CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+        };
+        assert!(err.contains("NULL") || err.contains("misaligned"));
+    }
+
+    #[test]
+    fn test_rype_validate_log_ratio_null_denominator() {
+        let result = rype_validate_log_ratio_indices(0x1000 as *const RypeIndex, std::ptr::null());
+        assert_eq!(result, -1);
+
+        let err = unsafe {
+            let err_ptr = rype_get_last_error();
+            assert!(!err_ptr.is_null());
+            CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+        };
+        assert!(err.contains("NULL") || err.contains("misaligned"));
+    }
+
+    // --- Log-ratio free tests (Cycle 3) ---
+
+    #[test]
+    fn test_rype_log_ratio_results_free_null() {
+        // Should not crash
+        rype_log_ratio_results_free(std::ptr::null_mut());
+    }
+
+    // --- Log-ratio classify error path tests (Cycle 4) ---
+
+    #[test]
+    fn test_rype_classify_log_ratio_null_numerator() {
+        let seq = CString::new("ACGTACGTACGT").unwrap();
+        let query = RypeQuery {
+            id: 0,
+            seq: seq.as_ptr(),
+            seq_len: 12,
+            pair_seq: std::ptr::null(),
+            pair_len: 0,
+        };
+
+        let result = rype_classify_log_ratio(
+            std::ptr::null(),
+            0x1000 as *const RypeIndex,
+            &query,
+            1,
+            -1.0,
+        );
+        assert!(result.is_null());
+
+        let err = unsafe {
+            CStr::from_ptr(rype_get_last_error())
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(err.contains("NULL") || err.contains("misaligned"));
+    }
+
+    #[test]
+    fn test_rype_classify_log_ratio_null_queries() {
+        let result = rype_classify_log_ratio(
+            0x1000 as *const RypeIndex,
+            0x2000 as *const RypeIndex,
+            std::ptr::null(),
+            1,
+            -1.0,
+        );
+        assert!(result.is_null());
+
+        let err = unsafe {
+            CStr::from_ptr(rype_get_last_error())
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(err.contains("NULL") || err.contains("zero"));
+    }
+
+    #[test]
+    fn test_rype_classify_log_ratio_invalid_threshold() {
+        let seq = CString::new("ACGTACGTACGT").unwrap();
+        let query = RypeQuery {
+            id: 0,
+            seq: seq.as_ptr(),
+            seq_len: 12,
+            pair_seq: std::ptr::null(),
+            pair_len: 0,
+        };
+
+        // threshold > 1.0 — threshold check happens after pointer validation
+        // but before any dereference, so fake aligned pointers are safe here
+        let result = rype_classify_log_ratio(
+            0x1000 as *const RypeIndex,
+            0x2000 as *const RypeIndex,
+            &query,
+            1,
+            1.5,
+        );
+        assert!(result.is_null());
+
+        let err = unsafe {
+            CStr::from_ptr(rype_get_last_error())
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(err.contains("threshold") || err.contains("Invalid"));
+
+        // threshold NaN — also fails before touching index pointers
+        let result = rype_classify_log_ratio(
+            0x1000 as *const RypeIndex,
+            0x2000 as *const RypeIndex,
+            &query,
+            1,
+            f64::NAN,
+        );
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_rype_classify_log_ratio_disabled_threshold() {
+        // threshold -1.0 should NOT error at the threshold validation stage
+        // Use NULL denominator so it fails at the NULL pointer check, not dereference
+        let seq = CString::new("ACGTACGTACGT").unwrap();
+        let query = RypeQuery {
+            id: 0,
+            seq: seq.as_ptr(),
+            seq_len: 12,
+            pair_seq: std::ptr::null(),
+            pair_len: 0,
+        };
+
+        let result = rype_classify_log_ratio(
+            0x1000 as *const RypeIndex,
+            std::ptr::null(), // NULL denom → fails at NULL check, not threshold
+            &query,
+            1,
+            -1.0,
+        );
+        assert!(result.is_null());
+
+        let err = unsafe {
+            CStr::from_ptr(rype_get_last_error())
+                .to_string_lossy()
+                .into_owned()
+        };
+        // Error should be about NULL denominator, NOT about threshold
+        assert!(
+            !err.contains("threshold"),
+            "Disabled threshold (-1.0) should not cause a threshold error, got: {}",
+            err
+        );
+        assert!(err.contains("NULL") || err.contains("misaligned"));
+    }
+
+    #[test]
+    fn test_rype_classify_log_ratio_zero_threshold() {
+        // threshold 0.0 should disable fast-path (not error)
+        // Use NULL numerator so it fails at the NULL pointer check
+        let seq = CString::new("ACGTACGTACGT").unwrap();
+        let query = RypeQuery {
+            id: 0,
+            seq: seq.as_ptr(),
+            seq_len: 12,
+            pair_seq: std::ptr::null(),
+            pair_len: 0,
+        };
+
+        let result = rype_classify_log_ratio(
+            std::ptr::null(), // NULL num → fails at NULL check
+            0x2000 as *const RypeIndex,
+            &query,
+            1,
+            0.0,
+        );
+        assert!(result.is_null());
+
+        let err = unsafe {
+            CStr::from_ptr(rype_get_last_error())
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(
+            !err.contains("threshold"),
+            "Zero threshold should not cause a threshold error, got: {}",
+            err
+        );
     }
 }

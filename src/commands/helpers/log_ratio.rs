@@ -1,55 +1,17 @@
-//! Log-ratio computation for two-bucket classification.
+//! Log-ratio formatting for CLI output.
 //!
-//! This module provides functions for computing log10(score_A / score_B)
-//! between exactly two buckets for each read.
+//! Core types (`FastPath`, `LogRatioResult`) and computation (`compute_log_ratio`)
+//! live in the library crate at `rype::classify::log_ratio`. This module re-exports
+//! them and provides CLI-specific formatting functions.
 
 use std::io::Write;
 
-/// Indicates whether a log-ratio result was determined via a fast path
-/// (skipping the denominator classification) or computed exactly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FastPath {
-    /// Result was computed exactly (both numerator and denominator classified).
-    None,
-    /// Numerator score exceeded the skip threshold, so log-ratio is +inf without needing denominator.
-    NumHigh,
-}
-
-impl FastPath {
-    /// Return a short string label for TSV output.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            FastPath::None => "none",
-            FastPath::NumHigh => "num_high",
-        }
-    }
-}
-
-/// Result of log-ratio computation for a single query.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LogRatioResult {
-    pub query_id: i64,
-    pub log_ratio: f64,
-    pub fast_path: FastPath,
-}
-
-/// Compute log10(numerator / denominator) with special handling for edge cases.
-///
-/// Edge cases:
-/// - numerator = 0, denominator > 0 → -infinity (read matches denom but not num)
-/// - numerator > 0, denominator = 0 → +infinity (read matches num but not denom)
-/// - both = 0 → NaN (no evidence for or against)
-pub fn compute_log_ratio(numerator: f64, denominator: f64) -> f64 {
-    if numerator == 0.0 && denominator == 0.0 {
-        f64::NAN
-    } else if numerator == 0.0 {
-        f64::NEG_INFINITY
-    } else if denominator == 0.0 {
-        f64::INFINITY
-    } else {
-        (numerator / denominator).log10()
-    }
-}
+// Re-export core types from the library crate.
+#[allow(unused_imports)]
+pub use rype::{
+    compute_log_ratio, partition_by_numerator_score, validate_compatible_indices,
+    validate_single_bucket_index, FastPath, LogRatioResult, PartitionResult,
+};
 
 /// Format the bucket name for log-ratio output.
 ///

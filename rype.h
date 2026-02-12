@@ -674,6 +674,130 @@ RypeResultArray* rype_classify_best_hit_with_negative(
 void rype_results_free(RypeResultArray* results);
 
 // ============================================================================
+// LOG-RATIO CLASSIFICATION API
+// ============================================================================
+//
+// Log-ratio classification computes log10(numerator_score / denominator_score)
+// for each read against two single-bucket indices. This is useful for
+// differential abundance analysis.
+//
+// ## Score Semantics
+//
+// - Positive log-ratio: read matches numerator more strongly
+// - Negative log-ratio: read matches denominator more strongly
+// - +inf: numerator > 0, denominator = 0 (or fast-path: numerator exceeded skip threshold)
+// - -inf: numerator = 0, denominator > 0
+// - NaN: both numerator and denominator = 0 (no evidence)
+//
+// ## Fast-Path
+//
+// When numerator_skip_threshold is set (0.0 < threshold <= 1.0), reads whose
+// numerator score exceeds the threshold are assigned +inf without classifying
+// against the denominator, saving computation.
+
+/**
+ * Log-ratio classification result for a single query
+ *
+ * @field query_id   The id value from the corresponding RypeQuery
+ * @field log_ratio  log10(numerator_score / denominator_score).
+ *                   Can be +inf, -inf, or NaN (see score semantics above).
+ * @field fast_path  0 = computed exactly (both indices classified),
+ *                   1 = numerator exceeded skip threshold (+inf fast-path)
+ */
+typedef struct {
+    int64_t query_id;    ///< Query ID from RypeQuery
+    double log_ratio;    ///< log10(num/denom), can be +inf, -inf, NaN
+    int32_t fast_path;   ///< 0 = None, 1 = NumHigh
+} RypeLogRatioHit;
+
+/**
+ * Array of log-ratio classification results
+ *
+ * Contains one result per input query (unlike RypeResultArray which only
+ * includes queries exceeding the threshold).
+ *
+ * @field data     Pointer to array of RypeLogRatioHit structs
+ * @field len      Number of results in data array
+ * @field capacity Internal capacity (ignore this field)
+ *
+ * ## Memory
+ *
+ * Owned by caller after rype_classify_log_ratio() returns.
+ * MUST be freed with rype_log_ratio_results_free() exactly once.
+ */
+typedef struct {
+    RypeLogRatioHit* data;  ///< Array of log-ratio results
+    size_t len;             ///< Number of results
+    size_t capacity;        ///< Capacity (internal use)
+} RypeLogRatioResultArray;
+
+/**
+ * Validate two indices are compatible for log-ratio classification
+ *
+ * Checks that both indices have exactly 1 bucket and that their k, w, and
+ * salt parameters match.
+ *
+ * @param numerator    Non-NULL RypeIndex pointer (must be single-bucket)
+ * @param denominator  Non-NULL RypeIndex pointer (must be single-bucket)
+ * @return             0 on success, -1 on error
+ *
+ * ## Thread Safety
+ *
+ * Thread-safe (read-only access).
+ */
+int rype_validate_log_ratio_indices(
+    const RypeIndex* numerator,
+    const RypeIndex* denominator
+);
+
+/**
+ * Classify a batch using log-ratio (numerator vs denominator)
+ *
+ * @param numerator                Non-NULL RypeIndex pointer (single-bucket)
+ * @param denominator              Non-NULL RypeIndex pointer (single-bucket)
+ * @param queries                  Array of RypeQuery structs
+ * @param num_queries              Number of queries (must be > 0)
+ * @param numerator_skip_threshold Fast-path threshold:
+ *                                 <= 0.0: disabled (classify all against both)
+ *                                 (0.0, 1.0]: enabled (fast-path for high-scoring reads)
+ *                                 > 1.0, NaN, inf: error (returns NULL)
+ * @return                         Non-NULL RypeLogRatioResultArray on success, NULL on failure
+ *
+ * ## Paired-End Support
+ *
+ * Paired-end reads are supported via RypeQuery pair_seq/pair_len fields.
+ * Minimizers from both ends are combined before scoring.
+ *
+ * ## Thread Safety
+ *
+ * Thread-safe. Multiple threads can classify concurrently with the same
+ * RypeIndex pointers.
+ *
+ * ## Memory
+ *
+ * Returned RypeLogRatioResultArray MUST be freed with rype_log_ratio_results_free().
+ */
+RypeLogRatioResultArray* rype_classify_log_ratio(
+    const RypeIndex* numerator,
+    const RypeIndex* denominator,
+    const RypeQuery* queries,
+    size_t num_queries,
+    double numerator_skip_threshold
+);
+
+/**
+ * Free a log-ratio result array
+ *
+ * @param results  RypeLogRatioResultArray pointer, or NULL (no-op)
+ *
+ * ## Warning
+ *
+ * - Do NOT call twice on the same pointer (undefined behavior)
+ * - Do NOT access results->data after calling this function
+ */
+void rype_log_ratio_results_free(RypeLogRatioResultArray* results);
+
+// ============================================================================
 // ERROR HANDLING
 // ============================================================================
 
@@ -845,6 +969,60 @@ int rype_classify_arrow_best_hit(
  * Caller must call out_schema->release(out_schema) when done.
  */
 int rype_arrow_result_schema(struct ArrowSchema* out_schema);
+
+// ----------------------------------------------------------------------------
+// Arrow Log-Ratio Classification Functions
+// ----------------------------------------------------------------------------
+
+/**
+ * Get the output schema for Arrow log-ratio results
+ *
+ * Schema: query_id (Int64), log_ratio (Float64), fast_path (Int32)
+ *
+ * @param out_schema  Pointer to caller-allocated ArrowSchema to initialize
+ * @return            0 on success, -1 on error
+ *
+ * Caller must call out_schema->release(out_schema) when done.
+ */
+int rype_arrow_log_ratio_result_schema(struct ArrowSchema* out_schema);
+
+/**
+ * Classify sequences from an Arrow stream using log-ratio
+ *
+ * TRUE STREAMING: Processes one batch at a time. Memory usage is O(batch_size).
+ *
+ * @param numerator                Non-NULL RypeIndex pointer (single-bucket)
+ * @param denominator              Non-NULL RypeIndex pointer (single-bucket)
+ * @param input_stream             Input ArrowArrayStream containing sequence batches
+ * @param numerator_skip_threshold Fast-path threshold (see rype_classify_log_ratio)
+ * @param out_stream               Output ArrowArrayStream for results (caller-allocated)
+ * @return                         0 on success, -1 on error
+ *
+ * ## Output Schema
+ *
+ * | Column    | Type    | Description                                     |
+ * |-----------|---------|-------------------------------------------------|
+ * | query_id  | Int64   | Query ID from input                             |
+ * | log_ratio | Float64 | log10(num/denom), can be +inf, -inf, NaN        |
+ * | fast_path | Int32   | 0 = computed exactly, 1 = numerator fast-path   |
+ *
+ * ## Memory Management
+ *
+ * - This function TAKES OWNERSHIP of input_stream
+ * - Caller owns out_stream and MUST call out_stream->release() when done
+ * - Do NOT release out_stream if this function returns -1
+ *
+ * ## Thread Safety
+ *
+ * Thread-safe for concurrent classification with the same RypeIndex pointers.
+ */
+int rype_classify_arrow_log_ratio(
+    const RypeIndex* numerator,
+    const RypeIndex* denominator,
+    struct ArrowArrayStream* input_stream,
+    double numerator_skip_threshold,
+    struct ArrowArrayStream* out_stream
+);
 
 #endif // RYPE_ARROW
 

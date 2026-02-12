@@ -4,11 +4,11 @@
 
 use anyhow::Result;
 use rype::c_api::{
-    rype_bucket_name, rype_classify, rype_classify_best_hit, rype_classify_with_negative,
-    rype_get_last_error, rype_index_free, rype_index_is_sharded, rype_index_k, rype_index_load,
-    rype_index_num_buckets, rype_index_num_shards, rype_index_salt, rype_index_w,
-    rype_negative_set_create, rype_negative_set_free, rype_negative_set_size, rype_results_free,
-    RypeQuery,
+    rype_bucket_name, rype_classify, rype_classify_best_hit, rype_classify_log_ratio,
+    rype_classify_with_negative, rype_get_last_error, rype_index_free, rype_index_is_sharded,
+    rype_index_k, rype_index_load, rype_index_num_buckets, rype_index_num_shards, rype_index_salt,
+    rype_index_w, rype_log_ratio_results_free, rype_negative_set_create, rype_negative_set_free,
+    rype_negative_set_size, rype_results_free, rype_validate_log_ratio_indices, RypeQuery,
 };
 use rype::{
     extract_into, BucketData, IndexMetadata, InvertedIndex, MinimizerWorkspace, ParquetWriteOptions,
@@ -911,5 +911,266 @@ fn test_rype_classify_best_hit_filters_results() -> Result<()> {
     rype_results_free(results_all);
     rype_results_free(results_best);
     rype_index_free(loaded);
+    Ok(())
+}
+
+// =============================================================================
+// Log-Ratio Classification Tests
+// =============================================================================
+
+/// Helper to create a single-bucket Parquet index for log-ratio testing.
+fn create_single_bucket_index(
+    dir: &std::path::Path,
+    name: &str,
+    k: usize,
+    w: usize,
+    salt: u64,
+    seq: &[u8],
+) -> Result<std::path::PathBuf> {
+    let index_path = dir.join(format!("{}.ryxdi", name));
+
+    let mut ws = MinimizerWorkspace::new();
+    extract_into(seq, k, w, salt, &mut ws);
+    let mut mins: Vec<u64> = ws.buffer.drain(..).collect();
+    mins.sort();
+    mins.dedup();
+
+    let buckets = vec![BucketData {
+        bucket_id: 0,
+        bucket_name: name.to_string(),
+        sources: vec![format!("test::{}", name)],
+        minimizers: mins,
+    }];
+
+    let options = ParquetWriteOptions::default();
+    rype::create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))?;
+
+    Ok(index_path)
+}
+
+#[test]
+fn test_log_ratio_c_api_end_to_end() -> Result<()> {
+    let dir = tempdir()?;
+    let k = 32;
+    let w = 10;
+    let salt = 0x5555555555555555_u64;
+
+    // Create two single-bucket indices with very different sequences
+    // Use long, dissimilar sequences to ensure distinct minimizer sets
+    let seq_num: Vec<u8> = (0..1000)
+        .map(|i| b"ACGTACGTACGTACGTAACCGGTTAACCGGTTACGTACGTACGT"[i % 44])
+        .collect();
+    let seq_denom: Vec<u8> = (0..1000)
+        .map(|i| b"TGCATGCATGCATGCATTGGCCAATTGGCCAATGCATGCATGCA"[i % 44])
+        .collect();
+
+    let num_path = create_single_bucket_index(dir.path(), "numerator", k, w, salt, &seq_num)?;
+    let denom_path = create_single_bucket_index(dir.path(), "denominator", k, w, salt, &seq_denom)?;
+
+    // Load both via C API
+    let num_cstr = CString::new(num_path.to_str().unwrap())?;
+    let denom_cstr = CString::new(denom_path.to_str().unwrap())?;
+
+    let num_idx = rype_index_load(num_cstr.as_ptr());
+    let denom_idx = rype_index_load(denom_cstr.as_ptr());
+    assert!(!num_idx.is_null(), "numerator index should load");
+    assert!(!denom_idx.is_null(), "denominator index should load");
+
+    // Validate indices are compatible
+    let validate_result = rype_validate_log_ratio_indices(num_idx, denom_idx);
+    assert_eq!(
+        validate_result, 0,
+        "Indices should be compatible for log-ratio"
+    );
+
+    // Build queries: one that matches numerator, one that matches denominator
+    let (query_num, _hold_num) = make_query(0, &seq_num);
+    let (query_denom, _hold_denom) = make_query(1, &seq_denom);
+    let queries = [query_num, query_denom];
+
+    // Classify with threshold disabled
+    let results = rype_classify_log_ratio(num_idx, denom_idx, queries.as_ptr(), 2, -1.0);
+    assert!(
+        !results.is_null(),
+        "Log-ratio classification should succeed"
+    );
+
+    let results_ref = unsafe { &*results };
+    assert_eq!(results_ref.len, 2, "Should have one result per query");
+
+    let hits = unsafe { std::slice::from_raw_parts(results_ref.data, results_ref.len) };
+
+    // Query 0 (matches numerator) should have positive log-ratio
+    let q0 = hits.iter().find(|h| h.query_id == 0).unwrap();
+    assert!(
+        q0.log_ratio > 0.0 || q0.log_ratio.is_infinite() && q0.log_ratio.is_sign_positive(),
+        "Query matching numerator should have positive log-ratio, got {}",
+        q0.log_ratio
+    );
+    assert_eq!(q0.fast_path, 0, "No fast-path with threshold disabled");
+
+    // Query 1 (matches denominator) should have negative log-ratio
+    let q1 = hits.iter().find(|h| h.query_id == 1).unwrap();
+    assert!(
+        q1.log_ratio < 0.0 || q1.log_ratio.is_infinite() && q1.log_ratio.is_sign_negative(),
+        "Query matching denominator should have negative log-ratio, got {}",
+        q1.log_ratio
+    );
+
+    rype_log_ratio_results_free(results);
+
+    // Classify with fast-path threshold enabled
+    let results2 = rype_classify_log_ratio(num_idx, denom_idx, queries.as_ptr(), 2, 0.5);
+    assert!(
+        !results2.is_null(),
+        "Log-ratio with threshold should succeed"
+    );
+
+    let results2_ref = unsafe { &*results2 };
+    let hits2 = unsafe { std::slice::from_raw_parts(results2_ref.data, results2_ref.len) };
+
+    // Query 0 should likely be fast-path (high numerator score)
+    let q0_fp = hits2.iter().find(|h| h.query_id == 0).unwrap();
+    // If the numerator score >= 0.5, this should be fast-path (1), log_ratio = +inf
+    if q0_fp.fast_path == 1 {
+        assert!(
+            q0_fp.log_ratio.is_infinite() && q0_fp.log_ratio.is_sign_positive(),
+            "Fast-path should produce +inf"
+        );
+    }
+
+    rype_log_ratio_results_free(results2);
+    rype_index_free(num_idx);
+    rype_index_free(denom_idx);
+    Ok(())
+}
+
+/// Test that log-ratio classification works with non-sequential query IDs.
+/// This catches the bug where partition_by_numerator_score assumes dense 0..N IDs.
+#[test]
+fn test_log_ratio_c_api_nonsequential_query_ids() -> Result<()> {
+    let dir = tempdir()?;
+    let k = 32;
+    let w = 10;
+    let salt = 0x5555555555555555_u64;
+
+    let seq_num: Vec<u8> = (0..1000)
+        .map(|i| b"ACGTACGTACGTACGTAACCGGTTAACCGGTTACGTACGTACGT"[i % 44])
+        .collect();
+    let seq_denom: Vec<u8> = (0..1000)
+        .map(|i| b"TGCATGCATGCATGCATTGGCCAATTGGCCAATGCATGCATGCA"[i % 44])
+        .collect();
+
+    let num_path = create_single_bucket_index(dir.path(), "numerator", k, w, salt, &seq_num)?;
+    let denom_path = create_single_bucket_index(dir.path(), "denominator", k, w, salt, &seq_denom)?;
+
+    let num_cstr = CString::new(num_path.to_str().unwrap())?;
+    let denom_cstr = CString::new(denom_path.to_str().unwrap())?;
+
+    let num_idx = rype_index_load(num_cstr.as_ptr());
+    let denom_idx = rype_index_load(denom_cstr.as_ptr());
+    assert!(!num_idx.is_null());
+    assert!(!denom_idx.is_null());
+
+    // Use non-sequential query IDs (100, 999) — would panic without the fix
+    let (query_num, _hold_num) = make_query(100, &seq_num);
+    let (query_denom, _hold_denom) = make_query(999, &seq_denom);
+    let queries = [query_num, query_denom];
+
+    let results = rype_classify_log_ratio(num_idx, denom_idx, queries.as_ptr(), 2, -1.0);
+    assert!(
+        !results.is_null(),
+        "Log-ratio with non-sequential IDs should succeed"
+    );
+
+    let results_ref = unsafe { &*results };
+    assert_eq!(results_ref.len, 2);
+
+    let hits = unsafe { std::slice::from_raw_parts(results_ref.data, results_ref.len) };
+
+    // Verify original query IDs are preserved in results
+    let q100 = hits.iter().find(|h| h.query_id == 100).unwrap();
+    assert!(
+        q100.log_ratio > 0.0 || q100.log_ratio.is_infinite() && q100.log_ratio.is_sign_positive(),
+        "Query 100 (matches numerator) should have positive log-ratio, got {}",
+        q100.log_ratio
+    );
+
+    let q999 = hits.iter().find(|h| h.query_id == 999).unwrap();
+    assert!(
+        q999.log_ratio < 0.0 || q999.log_ratio.is_infinite() && q999.log_ratio.is_sign_negative(),
+        "Query 999 (matches denominator) should have negative log-ratio, got {}",
+        q999.log_ratio
+    );
+
+    rype_log_ratio_results_free(results);
+    rype_index_free(num_idx);
+    rype_index_free(denom_idx);
+    Ok(())
+}
+
+#[test]
+fn test_log_ratio_c_api_validation_incompatible_indices() -> Result<()> {
+    let dir = tempdir()?;
+    let seq = generate_sequence(500, 0);
+
+    // Create indices with different k values
+    let idx1_path = create_single_bucket_index(dir.path(), "idx1", 32, 10, 0x5555, &seq)?;
+    let idx2_path = create_single_bucket_index(dir.path(), "idx2", 64, 10, 0x5555, &seq)?;
+
+    let cstr1 = CString::new(idx1_path.to_str().unwrap())?;
+    let cstr2 = CString::new(idx2_path.to_str().unwrap())?;
+
+    let idx1 = rype_index_load(cstr1.as_ptr());
+    let idx2 = rype_index_load(cstr2.as_ptr());
+    assert!(!idx1.is_null());
+    assert!(!idx2.is_null());
+
+    // Validation should fail — different k
+    let result = rype_validate_log_ratio_indices(idx1, idx2);
+    assert_eq!(result, -1, "Should fail for incompatible indices");
+
+    let err = unsafe {
+        std::ffi::CStr::from_ptr(rype_get_last_error())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(err.contains("different k values"), "Error: {}", err);
+
+    rype_index_free(idx1);
+    rype_index_free(idx2);
+    Ok(())
+}
+
+#[test]
+fn test_log_ratio_c_api_validation_multi_bucket_rejected() -> Result<()> {
+    let dir = tempdir()?;
+    let seq = generate_sequence(500, 0);
+
+    // Create a multi-bucket index (the standard test helper creates 2 buckets)
+    let multi_path = create_test_parquet_index(dir.path(), 32, 10, 0x5555)?;
+    let single_path = create_single_bucket_index(dir.path(), "single", 32, 10, 0x5555, &seq)?;
+
+    let cstr_multi = CString::new(multi_path.to_str().unwrap())?;
+    let cstr_single = CString::new(single_path.to_str().unwrap())?;
+
+    let multi_idx = rype_index_load(cstr_multi.as_ptr());
+    let single_idx = rype_index_load(cstr_single.as_ptr());
+    assert!(!multi_idx.is_null());
+    assert!(!single_idx.is_null());
+
+    // Multi-bucket as numerator should fail
+    let result = rype_validate_log_ratio_indices(multi_idx, single_idx);
+    assert_eq!(result, -1, "Multi-bucket numerator should fail");
+
+    let err = unsafe {
+        std::ffi::CStr::from_ptr(rype_get_last_error())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(err.contains("exactly 1 bucket"), "Error: {}", err);
+
+    rype_index_free(multi_idx);
+    rype_index_free(single_idx);
     Ok(())
 }

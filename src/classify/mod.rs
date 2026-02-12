@@ -5,6 +5,7 @@
 //! - `classify_batch_sharded_parallel_rg`: Parallel row group processing
 
 mod common;
+pub mod log_ratio;
 mod merge_join;
 mod scoring;
 mod sharded;

@@ -35,6 +35,11 @@ pub const COL_BUCKET_ID: &str = "bucket_id";
 /// Column name for score in output batches.
 pub const COL_SCORE: &str = "score";
 
+/// Column name for log-ratio score in log-ratio output batches.
+pub const COL_LOG_RATIO: &str = "log_ratio";
+/// Column name for fast-path indicator in log-ratio output batches.
+pub const COL_FAST_PATH: &str = "fast_path";
+
 /// Returns the schema for classification result batches.
 ///
 /// Schema:
@@ -46,6 +51,20 @@ pub fn result_schema() -> SchemaRef {
         Field::new(COL_QUERY_ID, DataType::Int64, false),
         Field::new(COL_BUCKET_ID, DataType::UInt32, false),
         Field::new(COL_SCORE, DataType::Float64, false),
+    ]))
+}
+
+/// Returns the schema for log-ratio classification result batches.
+///
+/// Schema:
+/// - `query_id`: Int64 (non-nullable)
+/// - `log_ratio`: Float64 (non-nullable)
+/// - `fast_path`: Int32 (non-nullable) — 0 = None, 1 = NumHigh
+pub fn log_ratio_result_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(COL_QUERY_ID, DataType::Int64, false),
+        Field::new(COL_LOG_RATIO, DataType::Float64, false),
+        Field::new(COL_FAST_PATH, DataType::Int32, false),
     ]))
 }
 
@@ -238,6 +257,25 @@ mod tests {
             Field::new("another_extra", DataType::Float64, true),
         ]);
         assert!(validate_input_schema(&schema).is_ok());
+    }
+
+    #[test]
+    fn test_log_ratio_output_schema_structure() {
+        let schema = log_ratio_result_schema();
+
+        assert_eq!(schema.fields().len(), 3);
+
+        let query_id_field = schema.field_with_name(COL_QUERY_ID).unwrap();
+        assert_eq!(query_id_field.data_type(), &DataType::Int64);
+        assert!(!query_id_field.is_nullable());
+
+        let log_ratio_field = schema.field_with_name(COL_LOG_RATIO).unwrap();
+        assert_eq!(log_ratio_field.data_type(), &DataType::Float64);
+        assert!(!log_ratio_field.is_nullable());
+
+        let fast_path_field = schema.field_with_name(COL_FAST_PATH).unwrap();
+        assert_eq!(fast_path_field.data_type(), &DataType::Int32);
+        assert!(!fast_path_field.is_nullable());
     }
 
     #[test]
