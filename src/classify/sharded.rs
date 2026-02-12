@@ -18,7 +18,9 @@ use crate::types::{HitResult, QueryRecord};
 use crate::log_timing;
 
 use super::common::{collect_negative_minimizers_sharded, filter_negative_mins};
-use super::merge_join::{accumulate_merge_join, merge_join_pairs_sparse};
+use super::merge_join::{
+    accumulate_merge_join, merge_join_pairs_sparse, merge_sparse_hits, SparseHit,
+};
 use super::scoring::compute_score;
 
 /// Score accumulated hits and filter by threshold.
@@ -343,49 +345,78 @@ pub fn classify_from_query_index_parallel_rg(
     let filtered_rg_count = work_items.len();
     log_timing("parallel_rg: rg_filter", t_filter.elapsed().as_millis());
 
-    // Stream-merge: each thread merges hits into a local accumulator immediately,
-    // avoiding materializing all SparseHits across all RGs at once.
+    // Strategy selection: fold/reduce creates per-thread Vec<HashMap> accumulators
+    // (~200 bytes × num_reads each). For large batches (millions of short reads),
+    // this exceeds available memory. Use collect+merge instead, which materializes
+    // SparseHits (small for short reads with few minimizer matches).
+    // Threshold: 128 MB per accumulator → ~640K reads.
+    const FOLD_REDUCE_MAX_READS: usize = 500_000;
+
     let t_parallel = Instant::now();
-    let final_accumulators = work_items
-        .into_par_iter()
-        .try_fold(
-            || -> Vec<HashMap<u32, (u32, u32)>> {
-                (0..num_reads)
-                    .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
-                    .collect()
-            },
-            |mut acc, (shard_path, rg_idx)| -> Result<Vec<HashMap<u32, (u32, u32)>>> {
+    let final_accumulators = if num_reads <= FOLD_REDUCE_MAX_READS {
+        // Fold/reduce: efficient for small batches (long reads).
+        // Each thread merges hits into a local accumulator immediately.
+        work_items
+            .into_par_iter()
+            .try_fold(
+                || -> Vec<HashMap<u32, (u32, u32)>> {
+                    (0..num_reads)
+                        .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
+                        .collect()
+                },
+                |mut acc, (shard_path, rg_idx)| -> Result<Vec<HashMap<u32, (u32, u32)>>> {
+                    let pairs = load_row_group_pairs(&shard_path, rg_idx, &query_minimizers)?;
+                    if !pairs.is_empty() {
+                        let hits = merge_join_pairs_sparse(query_idx, &pairs);
+                        for (read_idx, bucket_id, fwd, rc) in hits {
+                            let entry = acc[read_idx as usize].entry(bucket_id).or_insert((0, 0));
+                            entry.0 += fwd;
+                            entry.1 += rc;
+                        }
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || {
+                    (0..num_reads)
+                        .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
+                        .collect()
+                },
+                |mut a, b| {
+                    for (i, map) in b.into_iter().enumerate() {
+                        for (bucket_id, (fwd, rc)) in map {
+                            let entry = a[i].entry(bucket_id).or_insert((0, 0));
+                            entry.0 += fwd;
+                            entry.1 += rc;
+                        }
+                    }
+                    Ok(a)
+                },
+            )?
+    } else {
+        // Collect+merge: efficient for large batches (millions of short reads).
+        // SparseHits are small per-read, so materializing all at once is fine.
+        let results: Result<Vec<Vec<SparseHit>>> = work_items
+            .into_par_iter()
+            .map(|(shard_path, rg_idx)| {
                 let pairs = load_row_group_pairs(&shard_path, rg_idx, &query_minimizers)?;
-                if !pairs.is_empty() {
-                    let hits = merge_join_pairs_sparse(query_idx, &pairs);
-                    for (read_idx, bucket_id, fwd, rc) in hits {
-                        let entry = acc[read_idx as usize].entry(bucket_id).or_insert((0, 0));
-                        entry.0 += fwd;
-                        entry.1 += rc;
-                    }
+                if pairs.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    Ok(merge_join_pairs_sparse(query_idx, &pairs))
                 }
-                Ok(acc)
-            },
-        )
-        .try_reduce(
-            || {
-                (0..num_reads)
-                    .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
-                    .collect()
-            },
-            |mut a, b| {
-                for (i, map) in b.into_iter().enumerate() {
-                    for (bucket_id, (fwd, rc)) in map {
-                        let entry = a[i].entry(bucket_id).or_insert((0, 0));
-                        entry.0 += fwd;
-                        entry.1 += rc;
-                    }
-                }
-                Ok(a)
-            },
-        )?;
+            })
+            .filter_map(|result: Result<Vec<SparseHit>>| match result {
+                Ok(hits) if hits.is_empty() => None,
+                Ok(hits) => Some(Ok(hits)),
+                Err(e) => Some(Err(e)),
+            })
+            .collect();
+        merge_sparse_hits(results?, num_reads)
+    };
     log_timing(
-        "parallel_rg: fold_reduce_total",
+        "parallel_rg: rg_process_total",
         t_parallel.elapsed().as_millis(),
     );
     log_timing("parallel_rg: total_rg_count", total_rg_count as u128);
