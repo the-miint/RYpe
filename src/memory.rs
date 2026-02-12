@@ -886,7 +886,7 @@ const SAFETY_MARGIN_MIN_BYTES: usize = 256 * 1024 * 1024;
 /// - Temporary allocations during minimizer extraction
 /// - Rayon's per-thread workspace overhead
 /// - Parallel RG per-thread accumulator overhead (Vec<HashMap> per thread)
-const MEMORY_FUDGE_FACTOR: f64 = 1.6;
+const MEMORY_FUDGE_FACTOR: f64 = 1.8;
 
 /// Builder overhead factor for Arrow RecordBatch construction.
 ///
