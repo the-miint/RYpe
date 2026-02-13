@@ -372,6 +372,8 @@ Log-ratio mode (`classify log-ratio`) requires single-bucket indices (exactly 1 
 
 **Important**: Always use `target/release/rype` (absolute or relative path to the binary) rather than `cargo run --release --bin rype --` which can insert empty string arguments.
 
+**CRITICAL**: NEVER run multiple performance tests in parallel. These benchmarks are I/O-bound (shard loading dominates), so concurrent tests produce misleading timings due to disk contention. Always run performance tests sequentially — one at a time.
+
 ## Development Environment Notes
 
 - **Temporary files**: Do NOT use `/tmp` - it has insufficient space on this system. Use `scratch/` directory within the project for temporary files and test data. This directory is gitignored.

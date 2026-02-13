@@ -49,12 +49,37 @@ pub(crate) const QUERY_HASHSET_THRESHOLD: usize = 1000;
 /// build a local HashSet for O(1) lookups instead of O(log n) binary search.
 pub(crate) const BOUNDED_QUERY_HASHSET_THRESHOLD: usize = 100;
 
-/// Threshold for switching to galloping search in merge-join.
-/// When one index is more than GALLOP_THRESHOLD times larger, use galloping.
-pub(crate) const GALLOP_THRESHOLD: usize = 16;
-
 /// Estimated buckets per read for HashMap pre-allocation.
 pub(crate) const ESTIMATED_BUCKETS_PER_READ: usize = 4;
+
+/// Maximum bucket count for using dense (array-based) accumulators.
+/// Indices with more buckets fall back to sparse (HashMap-based) accumulators.
+/// At 256 buckets, a dense accumulator uses 2 KB per read (256 × 8 bytes).
+pub(crate) const DENSE_ACCUMULATOR_MAX_BUCKETS: usize = 256;
+
+/// Size ratio threshold for switching from merge-join to galloping search.
+/// When one index is more than GALLOP_THRESHOLD times larger, galloping is used.
+pub(crate) const GALLOP_THRESHOLD: usize = 16;
+
+/// Maximum bucket count for using COO merge-join in the shard loop.
+/// Indices with more buckets use CSR merge-join, which iterates only unique
+/// minimizers and does compact bucket-slice lookups — much faster when the
+/// reference COO would be N× larger than the unique minimizer array.
+///
+/// Set to 10 based on the Phase 2 regression analysis: at 160 buckets, COO
+/// merge-join was 8× slower than CSR (COO pairs are ~160× larger than unique
+/// minimizers). At 10 buckets, COO overhead is ≤10× — comparable to the
+/// CSR conversion cost it avoids. Conservative to avoid regressions; could
+/// potentially be raised to ~20 with further benchmarking.
+pub(crate) const COO_MERGE_JOIN_MAX_BUCKETS: usize = 10;
+
+/// Minimum reference shard size (COO pairs) for parallel within-shard merge-join.
+/// Shards smaller than this use single-threaded merge-join to avoid parallelism
+/// overhead (thread spawning, chunk splitting, sparse hit merging).
+///
+/// At 10K pairs with 8 threads, each chunk gets ~1.25K pairs — enough work to
+/// amortize rayon overhead (~10μs per task) against merge-join cost (~1μs per pair).
+pub(crate) const MIN_PARALLEL_SHARD_SIZE: usize = 10_000;
 
 // ============================================================================
 // Delimiters
@@ -103,14 +128,6 @@ pub(crate) const MIN_ENTRIES_PER_PARALLEL_PARTITION: usize = 1_000_000;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_gallop_threshold_sane() {
-        assert!(
-            GALLOP_THRESHOLD > 1,
-            "GALLOP_THRESHOLD must be > 1 for the algorithm to work"
-        );
-    }
 
     #[test]
     fn test_bit_packing_constants_consistent() {

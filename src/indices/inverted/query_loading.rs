@@ -119,308 +119,7 @@ impl InvertedIndex {
         query_minimizers: &[u64],
         options: Option<&super::super::parquet::ParquetReadOptions>,
     ) -> Result<Self> {
-        use arrow::array::{Array, UInt32Array, UInt64Array};
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-        use parquet::file::properties::ReaderProperties;
-        use parquet::file::reader::FileReader;
-        use parquet::file::serialized_reader::{ReadOptionsBuilder, SerializedFileReader};
-        use parquet::file::statistics::Statistics;
-        use rayon::prelude::*;
-        use std::fs::File;
-
-        let use_bloom_filter = options.map(|o| o.use_bloom_filter).unwrap_or(false);
-
-        // Validate query_minimizers is sorted - required for binary search correctness
-        // in find_matching_row_groups() and row-level filtering.
-        if !query_minimizers.is_empty() && !query_minimizers.windows(2).all(|w| w[0] <= w[1]) {
-            return Err(RypeError::validation(
-                "query_minimizers must be sorted in ascending order",
-            ));
-        }
-
-        // Validate k value
-        if !matches!(k, 16 | 32 | 64) {
-            return Err(RypeError::validation(format!(
-                "Invalid K value for Parquet shard: {} (must be 16, 32, or 64)",
-                k
-            )));
-        }
-
-        if query_minimizers.is_empty() {
-            return Ok(InvertedIndex {
-                k,
-                w,
-                salt,
-                source_hash,
-                minimizers: Vec::new(),
-                offsets: vec![0],
-                bucket_ids: Vec::new(),
-            });
-        }
-
-        // Read Parquet footer (metadata) only - not the full file data.
-        // SerializedFileReader::new(File) reads just the footer (~few KB) to get metadata.
-        // The file handle is explicitly scoped so it's closed before parallel reads begin.
-        //
-        // When bloom filter is enabled, we keep the reader alive longer to access bloom
-        // filters for each row group after statistics filtering.
-        let matching_row_groups: Vec<usize> = {
-            let file =
-                File::open(path).map_err(|e| RypeError::io(path, "open Parquet shard", e))?;
-
-            // Use new_with_options when bloom filter reading is requested
-            let parquet_reader = if use_bloom_filter {
-                SerializedFileReader::new_with_options(
-                    file,
-                    ReadOptionsBuilder::new()
-                        .with_reader_properties(
-                            ReaderProperties::builder()
-                                .set_read_bloom_filter(true)
-                                .build(),
-                        )
-                        .build(),
-                )?
-            } else {
-                SerializedFileReader::new(file)?
-            };
-
-            let metadata = parquet_reader.metadata();
-            let num_row_groups = metadata.num_row_groups();
-
-            if num_row_groups == 0 {
-                return Ok(InvertedIndex {
-                    k,
-                    w,
-                    salt,
-                    source_hash,
-                    minimizers: Vec::new(),
-                    offsets: vec![0],
-                    bucket_ids: Vec::new(),
-                });
-            }
-
-            // Build row group stats from Parquet metadata.
-            // Statistics (min/max) enable filtering row groups before reading data.
-            // Array is indexed by row group index for O(1) lookup.
-            let mut rg_stats: Vec<(u64, u64)> = Vec::with_capacity(num_row_groups);
-            let mut stats_missing_count = 0;
-
-            for rg_idx in 0..num_row_groups {
-                let rg_meta = metadata.row_group(rg_idx);
-                let col_meta = rg_meta.column(0); // minimizer column
-
-                let (rg_min, rg_max) = if let Some(Statistics::Int64(s)) = col_meta.statistics() {
-                    let min = s.min_opt().map(|v| *v as u64).unwrap_or(0);
-                    let max = s.max_opt().map(|v| *v as u64).unwrap_or(u64::MAX);
-                    (min, max)
-                } else {
-                    // No stats available - assume full range (disables filtering for this row group)
-                    stats_missing_count += 1;
-                    (0, u64::MAX)
-                };
-
-                rg_stats.push((rg_min, rg_max));
-            }
-
-            // Warn if statistics are missing - this disables the row group filtering optimization
-            if stats_missing_count == num_row_groups {
-                eprintln!(
-                    "Warning: Parquet file {} has no row group statistics; \
-                     row group filtering disabled (all {} row groups will be read)",
-                    path.display(),
-                    num_row_groups
-                );
-            } else if stats_missing_count > 0 {
-                eprintln!(
-                    "Warning: Parquet file {} has {} of {} row groups without statistics",
-                    path.display(),
-                    stats_missing_count,
-                    num_row_groups
-                );
-            }
-
-            // Phase 1: Filter by min/max statistics
-            let stats_filtered = Self::find_matching_row_groups(query_minimizers, &rg_stats);
-
-            if stats_filtered.is_empty() {
-                return Ok(InvertedIndex {
-                    k,
-                    w,
-                    salt,
-                    source_hash,
-                    minimizers: Vec::new(),
-                    offsets: vec![0],
-                    bucket_ids: Vec::new(),
-                });
-            }
-
-            // Phase 2: Filter by bloom filter (if enabled)
-            // This happens while we still have the parquet_reader alive.
-            //
-            // Why we do a SECOND range check here (after find_matching_row_groups):
-            // - Phase 1 checks: Does ANY query minimizer overlap this row group? (gate)
-            // - Phase 2 checks: WHICH query minimizers overlap? (scope bloom filter checks)
-            // Both are necessary - the first is O(1) per row group, the second gives us
-            // the exact slice to check against the bloom filter, reducing checks from
-            // O(Q * R) to O(sum of overlapping minimizers per row group).
-            //
-            // Parquet min/max statistics are inclusive ranges [min, max], so we use
-            // partition_point with <= for the max bound.
-            //
-            if use_bloom_filter {
-                let _t_bloom = std::time::Instant::now();
-                let mut bloom_filtered = Vec::with_capacity(stats_filtered.len());
-                let mut bloom_rejected_count = 0usize;
-                let mut bloom_filters_found = 0usize;
-
-                for &rg_idx in &stats_filtered {
-                    // Get the min/max for this row group (indexed directly by rg_idx)
-                    let (rg_min, rg_max) = rg_stats[rg_idx];
-
-                    // Binary search to find query minimizers within [rg_min, rg_max]
-                    let start = query_minimizers.partition_point(|&m| m < rg_min);
-                    let end = query_minimizers.partition_point(|&m| m <= rg_max);
-                    let relevant_mins = &query_minimizers[start..end];
-
-                    let rg_reader = parquet_reader.get_row_group(rg_idx)?;
-                    let bf = rg_reader.get_column_bloom_filter(0); // minimizer column
-
-                    if bf.is_some() {
-                        bloom_filters_found += 1;
-                    }
-
-                    // Check only the relevant minimizers against bloom filter
-                    if Self::bloom_filter_may_contain_any(bf, relevant_mins) {
-                        bloom_filtered.push(rg_idx);
-                    } else {
-                        bloom_rejected_count += 1;
-                    }
-                }
-
-                // Warn if bloom filter was requested but file has no bloom filters
-                if bloom_filters_found == 0 && !stats_filtered.is_empty() {
-                    eprintln!(
-                        "Warning: --use-bloom-filter specified but {} has no bloom filters. \
-                         Rebuild index with --parquet-bloom-filter to enable bloom filtering.",
-                        path.display()
-                    );
-                }
-
-                // Log filtering statistics when verbose mode is enabled
-                if std::env::var("RYPE_VERBOSE").is_ok() {
-                    let stats_rejected = num_row_groups - stats_filtered.len();
-                    eprintln!(
-                        "[{}] {} RGs: {} passed stats ({} rejected), {} passed bloom ({} rejected, {} had BF)",
-                        path.file_name().unwrap_or_default().to_string_lossy(),
-                        num_row_groups,
-                        stats_filtered.len(),
-                        stats_rejected,
-                        bloom_filtered.len(),
-                        bloom_rejected_count,
-                        bloom_filters_found
-                    );
-                }
-
-                bloom_filtered
-            } else {
-                stats_filtered
-            }
-        }; // parquet_reader and file handle dropped here
-
-        if matching_row_groups.is_empty() {
-            return Ok(InvertedIndex {
-                k,
-                w,
-                salt,
-                source_hash,
-                minimizers: Vec::new(),
-                offsets: vec![0],
-                bucket_ids: Vec::new(),
-            });
-        }
-
-        // Filtered loading is always beneficial - even loading 90% of row groups
-        // still filters individual rows within those groups, reducing memory usage.
-        let use_hashset = query_minimizers.len() > QUERY_HASHSET_THRESHOLD;
-        let query_set: Option<std::collections::HashSet<u64>> = if use_hashset {
-            Some(query_minimizers.iter().copied().collect())
-        } else {
-            None
-        };
-
-        // Parallel read of matching row groups only.
-        // Each row group is internally sorted by minimizer (enforced at write time).
-        // Results from different row groups may overlap, so we sort after concatenation.
-        // Each thread opens its own file handle; OS page cache handles deduplication.
-        let path = path.to_path_buf(); // Clone path for parallel closure
-
-        // Estimate pairs per row group for pre-allocation.
-        // We expect query selectivity to filter most rows. Conservative estimate: 10%.
-        let estimated_pairs_per_rg = DEFAULT_ROW_GROUP_SIZE / 10;
-
-        let row_group_results: Vec<Result<Vec<(u64, u32)>>> = matching_row_groups
-            .par_iter()
-            .map(|&rg_idx| {
-                let file = File::open(&path)?;
-                let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-                let reader = builder.with_row_groups(vec![rg_idx]).build()?;
-
-                let mut pairs = Vec::with_capacity(estimated_pairs_per_rg);
-
-                for batch in reader {
-                    let batch = batch?;
-
-                    let min_col = batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| {
-                            RypeError::format(&path, "Expected UInt64Array for minimizer column")
-                        })?;
-
-                    let bid_col = batch
-                        .column(1)
-                        .as_any()
-                        .downcast_ref::<UInt32Array>()
-                        .ok_or_else(|| {
-                            RypeError::format(&path, "Expected UInt32Array for bucket_id column")
-                        })?;
-
-                    for i in 0..batch.num_rows() {
-                        let m = min_col.value(i);
-                        // Filter: only include pairs where minimizer is in query set
-                        let matches = if let Some(ref hs) = query_set {
-                            hs.contains(&m)
-                        } else {
-                            // Binary search for small query sets
-                            query_minimizers.binary_search(&m).is_ok()
-                        };
-                        if matches {
-                            pairs.push((m, bid_col.value(i)));
-                        }
-                    }
-                }
-
-                Ok(pairs)
-            })
-            .collect();
-
-        // Concatenate results from all row groups, adding context for failures
-        let mut all_pairs: Vec<(u64, u32)> = Vec::new();
-
-        for (idx, result) in matching_row_groups.iter().zip(row_group_results) {
-            let pairs = result.map_err(|e| {
-                RypeError::io(
-                    path.clone(),
-                    "read row group",
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("row group {}: {}", idx, e),
-                    ),
-                )
-            })?;
-            all_pairs.extend(pairs);
-        }
+        let all_pairs = load_filtered_coo_pairs(path, k, query_minimizers, options)?;
 
         if all_pairs.is_empty() {
             return Ok(InvertedIndex {
@@ -434,12 +133,7 @@ impl InvertedIndex {
             });
         }
 
-        // Sort concatenated results to handle overlapping row groups.
-        // Multiple row groups may contain the same minimizer if a bucket list spans
-        // the row group size boundary during write.
-        all_pairs.sort_unstable_by_key(|&(m, _)| m);
-
-        // Build CSR structure
+        // Build CSR structure from sorted COO pairs
         let mut minimizers: Vec<u64> = Vec::with_capacity(all_pairs.len() / 2);
         let mut offsets: Vec<u32> = Vec::with_capacity(all_pairs.len() / 2 + 1);
         let mut bucket_ids_out: Vec<u32> = Vec::with_capacity(all_pairs.len());
@@ -459,9 +153,6 @@ impl InvertedIndex {
 
         offsets.push(bucket_ids_out.len() as u32);
 
-        // Note: We intentionally don't call shrink_to_fit() here.
-        // The slight memory overhead is preferable to the reallocation cost.
-
         Ok(InvertedIndex {
             k,
             w,
@@ -472,6 +163,322 @@ impl InvertedIndex {
             bucket_ids: bucket_ids_out,
         })
     }
+
+    /// Load a Parquet shard as sorted COO pairs, filtering to query minimizers.
+    ///
+    /// Same filtering logic as `load_shard_parquet_for_query` (row group stats,
+    /// bloom filters, row-level filtering) but returns sorted `(minimizer, bucket_id)`
+    /// pairs directly instead of converting to CSR format. This eliminates CSR
+    /// conversion overhead and reduces peak memory (no concurrent COO + CSR).
+    ///
+    /// # Arguments
+    /// * `path` - Path to the Parquet shard file
+    /// * `k` - K-mer size (for validation only)
+    /// * `query_minimizers` - Sorted slice of query minimizers to match against
+    /// * `options` - Read options (None = default behavior without bloom filters)
+    ///
+    /// # Returns
+    /// Sorted `(minimizer, bucket_id)` pairs for minimizers in the query set.
+    pub fn load_shard_coo_for_query(
+        path: &Path,
+        k: usize,
+        query_minimizers: &[u64],
+        options: Option<&super::super::parquet::ParquetReadOptions>,
+    ) -> Result<Vec<(u64, u32)>> {
+        load_filtered_coo_pairs(path, k, query_minimizers, options)
+    }
+}
+
+/// Load filtered COO pairs from a Parquet shard.
+///
+/// Core implementation shared by `load_shard_parquet_for_query` (CSR output) and
+/// `load_shard_coo_for_query` (COO output). Handles validation, row group selection
+/// (stats + bloom filter), parallel row group loading, row-level filtering, and sorting.
+///
+/// # Returns
+/// Sorted `(minimizer, bucket_id)` pairs. Empty Vec if no matches.
+fn load_filtered_coo_pairs(
+    path: &Path,
+    k: usize,
+    query_minimizers: &[u64],
+    options: Option<&super::super::parquet::ParquetReadOptions>,
+) -> Result<Vec<(u64, u32)>> {
+    use arrow::array::{Array, UInt32Array, UInt64Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::properties::ReaderProperties;
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::{ReadOptionsBuilder, SerializedFileReader};
+    use parquet::file::statistics::Statistics;
+    use rayon::prelude::*;
+    use std::fs::File;
+
+    let use_bloom_filter = options.map(|o| o.use_bloom_filter).unwrap_or(false);
+
+    // Validate query_minimizers is sorted - required for binary search correctness
+    // in find_matching_row_groups() and row-level filtering.
+    if !query_minimizers.is_empty() && !query_minimizers.windows(2).all(|w| w[0] <= w[1]) {
+        return Err(RypeError::validation(
+            "query_minimizers must be sorted in ascending order",
+        ));
+    }
+
+    // Validate k value
+    if !matches!(k, 16 | 32 | 64) {
+        return Err(RypeError::validation(format!(
+            "Invalid K value for Parquet shard: {} (must be 16, 32, or 64)",
+            k
+        )));
+    }
+
+    if query_minimizers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Read Parquet footer (metadata) only - not the full file data.
+    // SerializedFileReader::new(File) reads just the footer (~few KB) to get metadata.
+    // The file handle is explicitly scoped so it's closed before parallel reads begin.
+    //
+    // When bloom filter is enabled, we keep the reader alive longer to access bloom
+    // filters for each row group after statistics filtering.
+    let matching_row_groups: Vec<usize> = {
+        let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet shard", e))?;
+
+        // Use new_with_options when bloom filter reading is requested
+        let parquet_reader = if use_bloom_filter {
+            SerializedFileReader::new_with_options(
+                file,
+                ReadOptionsBuilder::new()
+                    .with_reader_properties(
+                        ReaderProperties::builder()
+                            .set_read_bloom_filter(true)
+                            .build(),
+                    )
+                    .build(),
+            )?
+        } else {
+            SerializedFileReader::new(file)?
+        };
+
+        let metadata = parquet_reader.metadata();
+        let num_row_groups = metadata.num_row_groups();
+
+        if num_row_groups == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Build row group stats from Parquet metadata.
+        // Statistics (min/max) enable filtering row groups before reading data.
+        // Array is indexed by row group index for O(1) lookup.
+        let mut rg_stats: Vec<(u64, u64)> = Vec::with_capacity(num_row_groups);
+        let mut stats_missing_count = 0;
+
+        for rg_idx in 0..num_row_groups {
+            let rg_meta = metadata.row_group(rg_idx);
+            let col_meta = rg_meta.column(0); // minimizer column
+
+            let (rg_min, rg_max) = if let Some(Statistics::Int64(s)) = col_meta.statistics() {
+                let min = s.min_opt().map(|v| *v as u64).unwrap_or(0);
+                let max = s.max_opt().map(|v| *v as u64).unwrap_or(u64::MAX);
+                (min, max)
+            } else {
+                // No stats available - assume full range (disables filtering for this row group)
+                stats_missing_count += 1;
+                (0, u64::MAX)
+            };
+
+            rg_stats.push((rg_min, rg_max));
+        }
+
+        // Warn if statistics are missing - this disables the row group filtering optimization
+        if stats_missing_count == num_row_groups {
+            eprintln!(
+                "Warning: Parquet file {} has no row group statistics; \
+                 row group filtering disabled (all {} row groups will be read)",
+                path.display(),
+                num_row_groups
+            );
+        } else if stats_missing_count > 0 {
+            eprintln!(
+                "Warning: Parquet file {} has {} of {} row groups without statistics",
+                path.display(),
+                stats_missing_count,
+                num_row_groups
+            );
+        }
+
+        // Phase 1: Filter by min/max statistics
+        let stats_filtered = InvertedIndex::find_matching_row_groups(query_minimizers, &rg_stats);
+
+        if stats_filtered.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: Filter by bloom filter (if enabled)
+        // This happens while we still have the parquet_reader alive.
+        //
+        // Why we do a SECOND range check here (after find_matching_row_groups):
+        // - Phase 1 checks: Does ANY query minimizer overlap this row group? (gate)
+        // - Phase 2 checks: WHICH query minimizers overlap? (scope bloom filter checks)
+        // Both are necessary - the first is O(1) per row group, the second gives us
+        // the exact slice to check against the bloom filter, reducing checks from
+        // O(Q * R) to O(sum of overlapping minimizers per row group).
+        //
+        // Parquet min/max statistics are inclusive ranges [min, max], so we use
+        // partition_point with <= for the max bound.
+        //
+        if use_bloom_filter {
+            let _t_bloom = std::time::Instant::now();
+            let mut bloom_filtered = Vec::with_capacity(stats_filtered.len());
+            let mut bloom_rejected_count = 0usize;
+            let mut bloom_filters_found = 0usize;
+
+            for &rg_idx in &stats_filtered {
+                // Get the min/max for this row group (indexed directly by rg_idx)
+                let (rg_min, rg_max) = rg_stats[rg_idx];
+
+                // Binary search to find query minimizers within [rg_min, rg_max]
+                let start = query_minimizers.partition_point(|&m| m < rg_min);
+                let end = query_minimizers.partition_point(|&m| m <= rg_max);
+                let relevant_mins = &query_minimizers[start..end];
+
+                let rg_reader = parquet_reader.get_row_group(rg_idx)?;
+                let bf = rg_reader.get_column_bloom_filter(0); // minimizer column
+
+                if bf.is_some() {
+                    bloom_filters_found += 1;
+                }
+
+                // Check only the relevant minimizers against bloom filter
+                if InvertedIndex::bloom_filter_may_contain_any(bf, relevant_mins) {
+                    bloom_filtered.push(rg_idx);
+                } else {
+                    bloom_rejected_count += 1;
+                }
+            }
+
+            // Warn if bloom filter was requested but file has no bloom filters
+            if bloom_filters_found == 0 && !stats_filtered.is_empty() {
+                eprintln!(
+                    "Warning: --use-bloom-filter specified but {} has no bloom filters. \
+                     Rebuild index with --parquet-bloom-filter to enable bloom filtering.",
+                    path.display()
+                );
+            }
+
+            // Log filtering statistics when verbose mode is enabled
+            if std::env::var("RYPE_VERBOSE").is_ok() {
+                let stats_rejected = num_row_groups - stats_filtered.len();
+                eprintln!(
+                    "[{}] {} RGs: {} passed stats ({} rejected), {} passed bloom ({} rejected, {} had BF)",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    num_row_groups,
+                    stats_filtered.len(),
+                    stats_rejected,
+                    bloom_filtered.len(),
+                    bloom_rejected_count,
+                    bloom_filters_found
+                );
+            }
+
+            bloom_filtered
+        } else {
+            stats_filtered
+        }
+    }; // parquet_reader and file handle dropped here
+
+    if matching_row_groups.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Filtered loading is always beneficial - even loading 90% of row groups
+    // still filters individual rows within those groups, reducing memory usage.
+    let use_hashset = query_minimizers.len() > QUERY_HASHSET_THRESHOLD;
+    let query_set: Option<std::collections::HashSet<u64>> = if use_hashset {
+        Some(query_minimizers.iter().copied().collect())
+    } else {
+        None
+    };
+
+    // Parallel read of matching row groups only.
+    // Each row group is internally sorted by minimizer (enforced at write time).
+    // Results from different row groups may overlap, so we sort after concatenation.
+    // Each thread opens its own file handle; OS page cache handles deduplication.
+    let path = path.to_path_buf(); // Clone path for parallel closure
+
+    // Estimate pairs per row group for pre-allocation.
+    // We expect query selectivity to filter most rows. Conservative estimate: 10%.
+    let estimated_pairs_per_rg = DEFAULT_ROW_GROUP_SIZE / 10;
+
+    let row_group_results: Vec<Result<Vec<(u64, u32)>>> = matching_row_groups
+        .par_iter()
+        .map(|&rg_idx| {
+            let file = File::open(&path)?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+            let reader = builder.with_row_groups(vec![rg_idx]).build()?;
+
+            let mut pairs = Vec::with_capacity(estimated_pairs_per_rg);
+
+            for batch in reader {
+                let batch = batch?;
+
+                let min_col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| {
+                        RypeError::format(&path, "Expected UInt64Array for minimizer column")
+                    })?;
+
+                let bid_col = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| {
+                        RypeError::format(&path, "Expected UInt32Array for bucket_id column")
+                    })?;
+
+                for i in 0..batch.num_rows() {
+                    let m = min_col.value(i);
+                    // Filter: only include pairs where minimizer is in query set
+                    let matches = if let Some(ref hs) = query_set {
+                        hs.contains(&m)
+                    } else {
+                        // Binary search for small query sets
+                        query_minimizers.binary_search(&m).is_ok()
+                    };
+                    if matches {
+                        pairs.push((m, bid_col.value(i)));
+                    }
+                }
+            }
+
+            Ok(pairs)
+        })
+        .collect();
+
+    // Concatenate results from all row groups, adding context for failures
+    let mut all_pairs: Vec<(u64, u32)> = Vec::new();
+
+    for (idx, result) in matching_row_groups.iter().zip(row_group_results) {
+        let pairs = result.map_err(|e| {
+            RypeError::io(
+                path.clone(),
+                "read row group",
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("row group {}: {}", idx, e),
+                ),
+            )
+        })?;
+        all_pairs.extend(pairs);
+    }
+
+    // Sort concatenated results to handle overlapping row groups.
+    // Multiple row groups may contain the same minimizer if a bucket list spans
+    // the row group size boundary during write.
+    all_pairs.sort_unstable_by_key(|&(m, _)| m);
+
+    Ok(all_pairs)
 }
 
 /// Load a single row group and return filtered (minimizer, bucket_id) pairs.

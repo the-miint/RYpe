@@ -221,6 +221,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_format_log_ratio_output_mixed_fast_paths() {
         let log_ratios = vec![
             LogRatioResult {

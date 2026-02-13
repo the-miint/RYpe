@@ -5,51 +5,40 @@
 
 use anyhow::Result;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::Instant;
 
-use crate::constants::{ESTIMATED_BUCKETS_PER_READ, ESTIMATED_MINIMIZERS_PER_SEQUENCE};
+use crate::constants::{
+    COO_MERGE_JOIN_MAX_BUCKETS, DENSE_ACCUMULATOR_MAX_BUCKETS, ESTIMATED_MINIMIZERS_PER_SEQUENCE,
+};
 use crate::core::extraction::get_paired_minimizers_into;
 use crate::core::workspace::MinimizerWorkspace;
 use crate::indices::sharded::{ShardManifest, ShardedInvertedIndex};
-use crate::indices::QueryInvertedIndex;
+use crate::indices::{InvertedIndex, QueryInvertedIndex};
 use crate::types::{HitResult, QueryRecord};
 
 use crate::log_timing;
 
 use super::common::{collect_negative_minimizers_sharded, filter_negative_mins};
 use super::merge_join::{
-    accumulate_merge_join, merge_join_pairs_sparse, merge_sparse_hits, SparseHit,
+    merge_join_coo_parallel, merge_join_csr, merge_join_pairs_sparse, DenseAccumulator,
+    HitAccumulator, SparseAccumulator, SparseHit,
 };
-use super::scoring::compute_score;
 
-/// Score accumulated hits and filter by threshold.
+/// A loaded shard ready for merge-join, either COO or CSR format.
 ///
-/// Shared scoring logic used by both sequential and parallel-RG classification.
-fn score_and_filter(
-    accumulators: Vec<HashMap<u32, (u32, u32)>>,
-    query_idx: &QueryInvertedIndex,
-    query_ids: &[i64],
-    threshold: f64,
-) -> Vec<HitResult> {
-    let mut results = Vec::new();
-    for (read_idx, buckets) in accumulators.into_iter().enumerate() {
-        let fwd_total = query_idx.fwd_counts[read_idx] as usize;
-        let rc_total = query_idx.rc_counts[read_idx] as usize;
-        let query_id = query_ids[read_idx];
-
-        for (bucket_id, (fwd_hits, rc_hits)) in buckets {
-            let score = compute_score(fwd_hits as usize, fwd_total, rc_hits as usize, rc_total);
-            if score >= threshold {
-                results.push(HitResult {
-                    query_id,
-                    bucket_id,
-                    score,
-                });
-            }
-        }
-    }
-    results
+/// - `Coo`: Sorted (minimizer, bucket_id) pairs. Used when
+///   `num_buckets <= COO_MERGE_JOIN_MAX_BUCKETS`. Avoids CSR conversion
+///   overhead and reduces peak memory (no concurrent COO + CSR).
+/// - `Csr`: Compressed Sparse Row format (`InvertedIndex`). Used when
+///   `num_buckets > COO_MERGE_JOIN_MAX_BUCKETS`. Iterates only unique
+///   minimizers, avoiding the N× blowup when reference COO is much
+///   larger than the unique minimizer array.
+enum LoadedShard {
+    Coo(Vec<(u64, u32)>),
+    Csr(InvertedIndex),
 }
 
 /// Estimate minimizers per query from the first record in a batch.
@@ -112,6 +101,141 @@ pub fn extract_batch_minimizers(
         .collect()
 }
 
+/// Get the max bucket ID from a manifest's bucket_names.
+/// Returns 0 if no buckets exist.
+fn max_bucket_id_from_manifest(manifest: &crate::indices::sharded::ShardManifest) -> u32 {
+    manifest.bucket_names.keys().max().copied().unwrap_or(0)
+}
+
+/// Check if dense accumulators should be used for this manifest.
+fn use_dense_accumulator(manifest: &crate::indices::sharded::ShardManifest) -> bool {
+    let max_id = max_bucket_id_from_manifest(manifest);
+    max_id > 0 && (max_id as usize) <= DENSE_ACCUMULATOR_MAX_BUCKETS
+}
+
+/// Check if COO merge-join should be used for this manifest.
+///
+/// COO merge-join is faster for indices with few buckets (reference COO is
+/// close to 1:1 with unique minimizers). For many-bucket indices, CSR
+/// merge-join iterates only unique minimizers and does compact bucket-slice
+/// lookups, avoiding the N× blowup in the reference COO representation.
+fn use_coo_merge_join(manifest: &crate::indices::sharded::ShardManifest) -> bool {
+    manifest.bucket_names.len() <= COO_MERGE_JOIN_MAX_BUCKETS
+}
+
+// ============================================================================
+// Pipelined shard loop (classify_from_query_index)
+// ============================================================================
+
+/// Inner shard loop generic over accumulator type.
+///
+/// Uses pipelined I/O: a background thread loads shard N+1 while the main
+/// thread merge-joins shard N. This overlaps I/O latency with CPU work.
+/// For single-shard indices, the overhead is minimal (one send + one receive).
+///
+/// When `use_coo` is true, loads shards as COO pairs and uses `merge_join_coo`.
+/// When false, loads shards as CSR (InvertedIndex) and uses `accumulate_merge_join_csr`,
+/// which iterates only unique minimizers — much faster for multi-bucket indices.
+fn classify_shard_loop<A: HitAccumulator>(
+    sharded: &ShardedInvertedIndex,
+    query_idx: &QueryInvertedIndex,
+    query_ids: &[i64],
+    threshold: f64,
+    read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
+    mut accumulator: A,
+    use_coo: bool,
+) -> Result<Vec<HitResult>> {
+    let t_start = Instant::now();
+    let manifest = sharded.manifest();
+
+    let mut total_shard_load_ms = 0u128;
+    let mut total_merge_join_ms = 0u128;
+
+    // Compute unique query minimizers once for filtered shard loading.
+    // Returns sorted, deduplicated minimizers — required for binary search
+    // correctness in load_shard_*_for_query() and for gallop_join_csr().
+    let query_minimizers = query_idx.unique_minimizers();
+
+    // Debug: show query minimizer statistics
+    if std::env::var("RYPE_DEBUG").is_ok() && !query_minimizers.is_empty() {
+        eprintln!(
+            "[DEBUG] Query minimizers: {} unique, range: {} to {}",
+            query_minimizers.len(),
+            query_minimizers[0],
+            query_minimizers[query_minimizers.len() - 1]
+        );
+    }
+
+    // Pipelined shard processing: background loader thread + main merge-join thread.
+    // sync_channel(1) allows at most one shard buffered ahead, bounding memory to
+    // at most 2 loaded shards simultaneously.
+    let load_result: Result<()> = std::thread::scope(|scope| {
+        let (tx, rx) = mpsc::sync_channel::<Result<(LoadedShard, u128)>>(1);
+        let query_mins_ref = &query_minimizers;
+
+        // Background loader thread.
+        // MUST use scoped thread (not std::thread::spawn) because we borrow
+        // `sharded`, `manifest.shards`, and `query_mins_ref` from the enclosing
+        // scope. thread::scope guarantees these borrows don't outlive the thread.
+        let loader = scope.spawn(move || {
+            for shard_info in &manifest.shards {
+                let t_load = Instant::now();
+                let loaded: Result<LoadedShard> = if use_coo {
+                    sharded
+                        .load_shard_coo_for_query(shard_info.shard_id, query_mins_ref, read_options)
+                        .map(LoadedShard::Coo)
+                        .map_err(Into::into)
+                } else {
+                    sharded
+                        .load_shard_for_query(shard_info.shard_id, query_mins_ref, read_options)
+                        .map(LoadedShard::Csr)
+                        .map_err(Into::into)
+                };
+                let load_ms = t_load.elapsed().as_millis();
+
+                // If receiver dropped (main thread errored/stopped), stop loading
+                if tx.send(loaded.map(|s| (s, load_ms))).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Main thread: receive loaded shards and merge-join
+        for received in rx {
+            let (shard, load_ms) = received?;
+            total_shard_load_ms += load_ms;
+
+            let t_merge = Instant::now();
+            match shard {
+                LoadedShard::Coo(ref pairs) => {
+                    merge_join_coo_parallel(query_idx, pairs, &mut accumulator);
+                }
+                LoadedShard::Csr(ref idx) => {
+                    merge_join_csr(query_idx, idx, &mut accumulator, &query_minimizers);
+                }
+            }
+            total_merge_join_ms += t_merge.elapsed().as_millis();
+        }
+
+        // Join the loader thread (propagates panics)
+        loader.join().expect("shard loader thread panicked");
+
+        Ok(())
+    });
+
+    load_result?;
+
+    log_timing("merge_join: shard_load_total", total_shard_load_ms);
+    log_timing("merge_join: merge_join_total", total_merge_join_ms);
+
+    let t_score = Instant::now();
+    let results = accumulator.score_and_filter(query_idx, query_ids, threshold);
+    log_timing("merge_join: scoring", t_score.elapsed().as_millis());
+    log_timing("merge_join: total", t_start.elapsed().as_millis());
+
+    Ok(results)
+}
+
 /// Classify using a pre-built QueryInvertedIndex against a sharded inverted index.
 ///
 /// This is the core classification step that processes each shard sequentially
@@ -134,56 +258,36 @@ pub fn classify_from_query_index(
     threshold: f64,
     read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
 ) -> Result<Vec<HitResult>> {
-    let t_start = Instant::now();
-
     let num_reads = query_idx.num_reads();
     if num_reads == 0 {
         return Ok(Vec::new());
     }
 
     let manifest = sharded.manifest();
+    let max_id = max_bucket_id_from_manifest(manifest);
+    let use_coo = use_coo_merge_join(manifest);
 
-    // Per-read accumulator: bucket_id -> (fwd_hits, rc_hits)
-    let mut accumulators: Vec<HashMap<u32, (u32, u32)>> = (0..num_reads)
-        .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
-        .collect();
-
-    let mut total_shard_load_ms = 0u128;
-    let mut total_merge_join_ms = 0u128;
-
-    // Compute unique query minimizers once for filtered shard loading
-    let query_minimizers = query_idx.unique_minimizers();
-
-    // Debug: show query minimizer statistics
-    if std::env::var("RYPE_DEBUG").is_ok() && !query_minimizers.is_empty() {
-        eprintln!(
-            "[DEBUG] Query minimizers: {} unique, range: {} to {}",
-            query_minimizers.len(),
-            query_minimizers[0],
-            query_minimizers[query_minimizers.len() - 1]
-        );
+    if use_dense_accumulator(manifest) {
+        classify_shard_loop(
+            sharded,
+            query_idx,
+            query_ids,
+            threshold,
+            read_options,
+            DenseAccumulator::new(num_reads, max_id),
+            use_coo,
+        )
+    } else {
+        classify_shard_loop(
+            sharded,
+            query_idx,
+            query_ids,
+            threshold,
+            read_options,
+            SparseAccumulator::new(num_reads),
+            use_coo,
+        )
     }
-
-    // Process each shard sequentially
-    for shard_info in &manifest.shards {
-        let t_load = Instant::now();
-        let shard =
-            sharded.load_shard_for_query(shard_info.shard_id, &query_minimizers, read_options)?;
-        total_shard_load_ms += t_load.elapsed().as_millis();
-
-        let t_merge = Instant::now();
-        accumulate_merge_join(query_idx, &shard, &mut accumulators, &query_minimizers);
-        total_merge_join_ms += t_merge.elapsed().as_millis();
-    }
-    log_timing("merge_join: shard_load_total", total_shard_load_ms);
-    log_timing("merge_join: merge_join_total", total_merge_join_ms);
-
-    let t_score = Instant::now();
-    let results = score_and_filter(accumulators, query_idx, query_ids, threshold);
-    log_timing("merge_join: scoring", t_score.elapsed().as_millis());
-    log_timing("merge_join: total", t_start.elapsed().as_millis());
-
-    Ok(results)
 }
 
 /// Classify from pre-extracted minimizers against a sharded inverted index using merge-join.
@@ -265,6 +369,99 @@ pub fn classify_batch_sharded_merge_join(
     classify_from_extracted_minimizers(sharded, &extracted, &query_ids, threshold, read_options)
 }
 
+// ============================================================================
+// Parallel row group processing (classify_from_query_index_parallel_rg)
+// ============================================================================
+
+/// Inner parallel RG processing generic over accumulator type.
+///
+/// Handles both fold/reduce (for small batches) and collect+merge (for large
+/// batches) strategies, using the accumulator trait for hit accumulation.
+#[allow(clippy::too_many_arguments)]
+fn parallel_rg_inner<A>(
+    work_items: Vec<(PathBuf, usize)>,
+    query_idx: &QueryInvertedIndex,
+    query_ids: &[i64],
+    query_minimizers: &[u64],
+    threshold: f64,
+    num_reads: usize,
+    total_rg_count: usize,
+    filtered_rg_count: usize,
+    t_start: Instant,
+    make_acc: impl Fn() -> A + Send + Sync,
+) -> Result<Vec<HitResult>>
+where
+    A: HitAccumulator,
+{
+    use crate::indices::load_row_group_pairs;
+
+    // Strategy selection: fold/reduce creates per-thread accumulators.
+    // For large batches (millions of short reads), this may exceed available
+    // memory with dense accumulators. Use collect+merge instead.
+    //
+    // At DENSE_ACCUMULATOR_MAX_BUCKETS=256 and 8 bytes per bucket:
+    // 256 × 8 × num_reads bytes per accumulator × num_threads.
+    // At 8 threads and 640K reads: 256 × 8 × 640K × 8 ≈ 10 GB — too much.
+    // 500K is a conservative threshold (~80% of theoretical 640K) to stay
+    // well within memory bounds across varying thread counts.
+    const FOLD_REDUCE_MAX_READS: usize = 500_000;
+
+    let t_parallel = Instant::now();
+    let final_accumulator = if num_reads <= FOLD_REDUCE_MAX_READS {
+        // Fold/reduce: efficient for small batches (long reads).
+        // Each thread merges hits into a local accumulator immediately.
+        work_items
+            .into_par_iter()
+            .try_fold(&make_acc, |mut acc, (shard_path, rg_idx)| -> Result<A> {
+                let pairs = load_row_group_pairs(&shard_path, rg_idx, query_minimizers)?;
+                if !pairs.is_empty() {
+                    let hits = merge_join_pairs_sparse(query_idx, &pairs);
+                    for (read_idx, bucket_id, fwd, rc) in hits {
+                        acc.record_hit_counts(read_idx as usize, bucket_id, fwd, rc);
+                    }
+                }
+                Ok(acc)
+            })
+            .try_reduce(&make_acc, |mut a, b| {
+                a.merge(b);
+                Ok(a)
+            })?
+    } else {
+        // Collect+merge: efficient for large batches (millions of short reads).
+        // SparseHits are small per-read, so materializing all at once is fine.
+        let results: Result<Vec<Vec<SparseHit>>> = work_items
+            .into_par_iter()
+            .map(|(shard_path, rg_idx)| {
+                let pairs = load_row_group_pairs(&shard_path, rg_idx, query_minimizers)?;
+                Ok(merge_join_pairs_sparse(query_idx, &pairs))
+            })
+            .collect();
+        let mut acc = make_acc();
+        for rg_hits in results? {
+            if rg_hits.is_empty() {
+                continue;
+            }
+            for (read_idx, bucket_id, fwd, rc) in rg_hits {
+                acc.record_hit_counts(read_idx as usize, bucket_id, fwd, rc);
+            }
+        }
+        acc
+    };
+    log_timing(
+        "parallel_rg: rg_process_total",
+        t_parallel.elapsed().as_millis(),
+    );
+    log_timing("parallel_rg: total_rg_count", total_rg_count as u128);
+    log_timing("parallel_rg: filtered_rg_count", filtered_rg_count as u128);
+
+    let t_score = Instant::now();
+    let results = final_accumulator.score_and_filter(query_idx, query_ids, threshold);
+    log_timing("parallel_rg: scoring", t_score.elapsed().as_millis());
+    log_timing("parallel_rg: total", t_start.elapsed().as_millis());
+
+    Ok(results)
+}
+
 /// Classify using a pre-built QueryInvertedIndex with parallel row group processing.
 ///
 /// This is the core parallel-RG classification step. Use this when you have a
@@ -292,7 +489,7 @@ pub fn classify_from_query_index_parallel_rg(
     threshold: f64,
     _read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
 ) -> Result<Vec<HitResult>> {
-    use crate::indices::{get_row_group_ranges, load_row_group_pairs};
+    use crate::indices::get_row_group_ranges;
 
     let t_start = Instant::now();
 
@@ -313,7 +510,7 @@ pub fn classify_from_query_index_parallel_rg(
     let mut total_rg_count = 0usize;
 
     // Collect (shard_path, rg_idx) pairs that overlap with query range
-    let mut work_items: Vec<(std::path::PathBuf, usize)> = Vec::new();
+    let mut work_items: Vec<(PathBuf, usize)> = Vec::new();
 
     let t_filter = Instant::now();
 
@@ -345,89 +542,36 @@ pub fn classify_from_query_index_parallel_rg(
     let filtered_rg_count = work_items.len();
     log_timing("parallel_rg: rg_filter", t_filter.elapsed().as_millis());
 
-    // Strategy selection: fold/reduce creates per-thread Vec<HashMap> accumulators
-    // (~200 bytes × num_reads each). For large batches (millions of short reads),
-    // this exceeds available memory. Use collect+merge instead, which materializes
-    // SparseHits (small for short reads with few minimizer matches).
-    // Threshold: 128 MB per accumulator → ~640K reads.
-    const FOLD_REDUCE_MAX_READS: usize = 500_000;
+    // Dispatch to generic inner function based on accumulator type
+    let max_id = max_bucket_id_from_manifest(manifest);
 
-    let t_parallel = Instant::now();
-    let final_accumulators = if num_reads <= FOLD_REDUCE_MAX_READS {
-        // Fold/reduce: efficient for small batches (long reads).
-        // Each thread merges hits into a local accumulator immediately.
-        work_items
-            .into_par_iter()
-            .try_fold(
-                || -> Vec<HashMap<u32, (u32, u32)>> {
-                    (0..num_reads)
-                        .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
-                        .collect()
-                },
-                |mut acc, (shard_path, rg_idx)| -> Result<Vec<HashMap<u32, (u32, u32)>>> {
-                    let pairs = load_row_group_pairs(&shard_path, rg_idx, &query_minimizers)?;
-                    if !pairs.is_empty() {
-                        let hits = merge_join_pairs_sparse(query_idx, &pairs);
-                        for (read_idx, bucket_id, fwd, rc) in hits {
-                            let entry = acc[read_idx as usize].entry(bucket_id).or_insert((0, 0));
-                            entry.0 += fwd;
-                            entry.1 += rc;
-                        }
-                    }
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || {
-                    (0..num_reads)
-                        .map(|_| HashMap::with_capacity(ESTIMATED_BUCKETS_PER_READ))
-                        .collect()
-                },
-                |mut a, b| {
-                    for (i, map) in b.into_iter().enumerate() {
-                        for (bucket_id, (fwd, rc)) in map {
-                            let entry = a[i].entry(bucket_id).or_insert((0, 0));
-                            entry.0 += fwd;
-                            entry.1 += rc;
-                        }
-                    }
-                    Ok(a)
-                },
-            )?
+    if use_dense_accumulator(manifest) {
+        parallel_rg_inner(
+            work_items,
+            query_idx,
+            query_ids,
+            &query_minimizers,
+            threshold,
+            num_reads,
+            total_rg_count,
+            filtered_rg_count,
+            t_start,
+            || DenseAccumulator::new(num_reads, max_id),
+        )
     } else {
-        // Collect+merge: efficient for large batches (millions of short reads).
-        // SparseHits are small per-read, so materializing all at once is fine.
-        let results: Result<Vec<Vec<SparseHit>>> = work_items
-            .into_par_iter()
-            .map(|(shard_path, rg_idx)| {
-                let pairs = load_row_group_pairs(&shard_path, rg_idx, &query_minimizers)?;
-                if pairs.is_empty() {
-                    Ok(Vec::new())
-                } else {
-                    Ok(merge_join_pairs_sparse(query_idx, &pairs))
-                }
-            })
-            .filter_map(|result: Result<Vec<SparseHit>>| match result {
-                Ok(hits) if hits.is_empty() => None,
-                Ok(hits) => Some(Ok(hits)),
-                Err(e) => Some(Err(e)),
-            })
-            .collect();
-        merge_sparse_hits(results?, num_reads)
-    };
-    log_timing(
-        "parallel_rg: rg_process_total",
-        t_parallel.elapsed().as_millis(),
-    );
-    log_timing("parallel_rg: total_rg_count", total_rg_count as u128);
-    log_timing("parallel_rg: filtered_rg_count", filtered_rg_count as u128);
-
-    let t_score = Instant::now();
-    let results = score_and_filter(final_accumulators, query_idx, query_ids, threshold);
-    log_timing("parallel_rg: scoring", t_score.elapsed().as_millis());
-    log_timing("parallel_rg: total", t_start.elapsed().as_millis());
-
-    Ok(results)
+        parallel_rg_inner(
+            work_items,
+            query_idx,
+            query_ids,
+            &query_minimizers,
+            threshold,
+            num_reads,
+            total_rg_count,
+            filtered_rg_count,
+            t_start,
+            || SparseAccumulator::new(num_reads),
+        )
+    }
 }
 
 /// Classify from pre-extracted minimizers using parallel row group processing.

@@ -10,9 +10,9 @@ mod merge_join;
 mod scoring;
 mod sharded;
 
-// Re-export public API
-pub use common::collect_negative_minimizers_sharded;
-pub use merge_join::classify_batch_merge_join;
+// Re-export for crate-internal use (c_api.rs)
+#[allow(unused_imports)]
+pub(crate) use common::collect_negative_minimizers_sharded;
 pub use sharded::{
     classify_batch_sharded_merge_join, classify_batch_sharded_parallel_rg,
     classify_from_extracted_minimizers, classify_from_extracted_minimizers_parallel_rg,

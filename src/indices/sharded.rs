@@ -409,6 +409,26 @@ impl ShardedInvertedIndex {
         .map_err(|e| RypeError::format(&path, e.to_string()))
     }
 
+    /// Load a shard as sorted COO pairs, filtering to query minimizers.
+    ///
+    /// Returns sorted `(minimizer, bucket_id)` pairs directly without CSR conversion.
+    /// Used by the COO merge-join path for lower overhead and reduced peak memory.
+    ///
+    /// # Arguments
+    /// * `shard_id` - The shard to load
+    /// * `query_minimizers` - Sorted slice of query minimizers
+    /// * `options` - Parquet read options (None = default behavior without bloom filters)
+    pub fn load_shard_coo_for_query(
+        &self,
+        shard_id: u32,
+        query_minimizers: &[u64],
+        options: Option<&super::parquet::ParquetReadOptions>,
+    ) -> Result<Vec<(u64, u32)>> {
+        let path = self.shard_path(shard_id);
+        InvertedIndex::load_shard_coo_for_query(&path, self.manifest.k, query_minimizers, options)
+            .map_err(|e| RypeError::format(&path, e.to_string()))
+    }
+
     /// Check if this index uses Parquet format (always true).
     pub fn is_parquet(&self) -> bool {
         true

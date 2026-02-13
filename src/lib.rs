@@ -71,11 +71,10 @@ pub use core::{extract_into, get_paired_minimizers_into, MinimizerWorkspace, Str
 
 // Classification functions
 pub use classify::{
-    classify_batch_merge_join, classify_batch_sharded_merge_join,
-    classify_batch_sharded_parallel_rg, classify_from_extracted_minimizers,
-    classify_from_extracted_minimizers_parallel_rg, classify_from_query_index,
-    classify_from_query_index_parallel_rg, classify_with_sharded_negative,
-    extract_batch_minimizers, filter_best_hits,
+    classify_batch_sharded_merge_join, classify_batch_sharded_parallel_rg,
+    classify_from_extracted_minimizers, classify_from_extracted_minimizers_parallel_rg,
+    classify_from_query_index, classify_from_query_index_parallel_rg,
+    classify_with_sharded_negative, extract_batch_minimizers, filter_best_hits,
 };
 
 // Log-ratio types and functions
