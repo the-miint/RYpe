@@ -1,6 +1,6 @@
-# Rype C API Examples
+# Rype API Examples
 
-This directory contains example C programs demonstrating the Rype library API.
+This directory contains examples demonstrating the Rype library API from C and Python.
 
 ## Examples
 
@@ -21,6 +21,44 @@ Demonstrates the Arrow C Data Interface API:
 - Consuming output streams with correct schema lifetime
 - Proper cleanup order
 
+### extraction_example.c
+
+Demonstrates the C struct-based minimizer extraction API:
+- `rype_extract_minimizer_set()` — sorted, deduplicated hash sets per strand
+- `rype_extract_strand_minimizers()` — ordered hashes + positions per strand
+
+### arrow_extraction_example.c
+
+Demonstrates the Arrow C Data Interface extraction API using Arrow GLib:
+- `rype_extract_minimizer_set_arrow()` — streaming set extraction
+- `rype_extract_strand_minimizers_arrow()` — streaming strand extraction
+- Requires `libarrow-glib-dev`
+
+### ctypes_extraction_example.py
+
+Demonstrates calling the single-sequence extraction C API from Python via
+ctypes. No special dependencies beyond the standard library — uses
+`librype.so` directly.
+
+- `rype_extract_minimizer_set()` — sorted, deduplicated hash sets per strand
+- `rype_extract_strand_minimizers()` — ordered hashes + positions per strand
+- Includes invariant checks (sorted, positions in bounds, SoA lengths)
+- Only requires `cargo build --release` (no `--features arrow-ffi`)
+
+### pyarrow_extraction_example.py
+
+Demonstrates calling the Arrow streaming extraction API from Python via
+PyArrow's C Data Interface and ctypes. No Rust changes or native Python
+extension needed — uses the same `librype.so` shared library.
+
+- `rype_extract_minimizer_set_arrow()` — streaming batch set extraction
+- `rype_extract_strand_minimizers_arrow()` — streaming batch strand extraction
+- Requires `pyarrow` (tested with 23.0.0, Python 3.13)
+- Requires `cargo build --release --lib --features arrow-ffi`
+
+**These Python examples are NOT part of the regular test suite or build
+dependencies.** They have been manually verified but are not run by `cargo test`.
+
 ## Building
 
 ### Prerequisites
@@ -30,11 +68,11 @@ Demonstrates the Arrow C Data Interface API:
 cd ..
 cargo build --release
 
-# For Arrow support
-cargo build --release --features arrow
+# For Arrow FFI support (required for Arrow and PyArrow examples)
+cargo build --release --lib --features arrow-ffi
 ```
 
-### Compile Examples
+### Compile C Examples
 
 ```bash
 # Basic example
@@ -42,10 +80,35 @@ gcc -o basic_example basic_example.c \
     -L../target/release -lrype \
     -Wl,-rpath,../target/release
 
-# Arrow example (requires --features arrow)
+# Extraction example (struct-based, no Arrow dependency)
+gcc -o extraction_example extraction_example.c \
+    -L../target/release -lrype \
+    -Wl,-rpath,../target/release
+
+# Arrow example (requires --features arrow-ffi)
 gcc -DRYPE_ARROW -o arrow_example arrow_example.c \
     -L../target/release -lrype \
     -Wl,-rpath,../target/release
+
+# Arrow extraction example (requires Arrow GLib + --features arrow-ffi)
+gcc -o arrow_extraction_example arrow_extraction_example.c \
+    $(pkg-config --cflags arrow-glib) \
+    -L../target/release -lrype -Wl,-rpath,../target/release \
+    $(pkg-config --libs arrow-glib)
+```
+
+### Run Python Examples
+
+No compilation needed — uses ctypes to load `librype.so` directly.
+
+```bash
+# Single-sequence extraction (no extra dependencies)
+python examples/ctypes_extraction_example.py
+
+# PyArrow streaming extraction (requires pyarrow)
+# One-time setup: create a conda environment with pyarrow
+conda create -n rype-pyarrow python=3.13 pyarrow -y
+conda run -n rype-pyarrow python examples/pyarrow_extraction_example.py
 ```
 
 ### Debug Build
