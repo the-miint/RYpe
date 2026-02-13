@@ -30,9 +30,6 @@ Thumbs.db
 # C example build artifacts
 /c_example
 
-# Rust PoC examples (require optional feature flags, break default cargo test)
-examples/*.rs
-
 # Logs
 *.log
 

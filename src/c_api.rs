@@ -1031,6 +1031,276 @@ pub extern "C" fn rype_get_last_error() -> *const c_char {
     })
 }
 
+// =============================================================================
+// Minimizer Extraction API
+// =============================================================================
+//
+// These functions expose minimizer extraction to C callers without requiring
+// an index. They are pure computation functions that extract minimizer hashes
+// and/or positions from raw DNA sequences.
+//
+// Thread Safety:
+// - All extraction functions are thread-safe (no shared mutable state)
+// - Each call creates a fresh MinimizerWorkspace internally
+
+// --- Extraction C-Compatible Structs ---
+
+/// Array of u64 values. Used as a building block for extraction results.
+///
+/// Free the containing result struct (NOT this directly).
+#[repr(C)]
+pub struct RypeU64Array {
+    pub data: *mut u64,
+    pub len: size_t,
+}
+
+/// Result of `rype_extract_minimizer_set`: sorted, deduplicated hash sets per strand.
+///
+/// Free with `rype_minimizer_set_result_free()`. Do NOT call twice.
+#[repr(C)]
+pub struct RypeMinimizerSetResult {
+    pub forward: RypeU64Array,
+    pub reverse_complement: RypeU64Array,
+}
+
+/// Minimizer hashes and positions for a single strand (SoA layout).
+///
+/// `hashes[i]` corresponds to `positions[i]`. Both arrays have length `len`.
+#[repr(C)]
+pub struct RypeStrandResult {
+    pub hashes: *mut u64,
+    pub positions: *mut u64,
+    pub len: size_t,
+}
+
+/// Result of `rype_extract_strand_minimizers`: hashes + positions per strand.
+///
+/// Free with `rype_strand_minimizers_result_free()`. Do NOT call twice.
+#[repr(C)]
+pub struct RypeStrandMinimizersResult {
+    pub forward: RypeStrandResult,
+    pub reverse_complement: RypeStrandResult,
+}
+
+// --- Extraction Helpers ---
+
+/// Validate extraction parameters. Returns Ok(()) or Err(error message).
+fn validate_extraction_params(
+    seq: *const u8,
+    seq_len: size_t,
+    k: size_t,
+    w: size_t,
+) -> Result<(), String> {
+    if seq.is_null() {
+        return Err("seq is NULL".to_string());
+    }
+    if seq_len == 0 {
+        return Err("seq_len is zero".to_string());
+    }
+    if !matches!(k, 16 | 32 | 64) {
+        return Err(format!("Invalid k: {} (must be 16, 32, or 64)", k));
+    }
+    if w == 0 {
+        return Err("w is zero".to_string());
+    }
+    Ok(())
+}
+
+/// Convert a Vec<u64> into a RypeU64Array using the boxed-slice pattern.
+///
+/// The Vec is converted to a boxed slice (capacity == len) so that C code
+/// only needs (data, len) to reconstruct and free.
+fn vec_to_rype_u64_array(v: Vec<u64>) -> RypeU64Array {
+    if v.is_empty() {
+        return RypeU64Array {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+    }
+    let boxed = v.into_boxed_slice();
+    let len = boxed.len();
+    let data = Box::into_raw(boxed) as *mut u64;
+    RypeU64Array { data, len }
+}
+
+/// Free a RypeU64Array's backing memory. Does nothing if data is null.
+///
+/// # Safety
+/// Must only be called once per array, and only on arrays created by vec_to_rype_u64_array.
+unsafe fn free_rype_u64_array(arr: &RypeU64Array) {
+    if !arr.data.is_null() && arr.len > 0 {
+        let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(arr.data, arr.len));
+    }
+}
+
+/// Convert a StrandMinimizers into a RypeStrandResult, casting usize positions to u64.
+fn strand_to_c_result(sm: crate::StrandMinimizers) -> RypeStrandResult {
+    let len = sm.hashes.len();
+    debug_assert_eq!(len, sm.positions.len());
+
+    if len == 0 {
+        return RypeStrandResult {
+            hashes: std::ptr::null_mut(),
+            positions: std::ptr::null_mut(),
+            len: 0,
+        };
+    }
+
+    // Convert positions from usize to u64
+    let positions_u64: Vec<u64> = sm.positions.into_iter().map(|p| p as u64).collect();
+
+    let hashes_boxed = sm.hashes.into_boxed_slice();
+    let positions_boxed = positions_u64.into_boxed_slice();
+
+    let hashes = Box::into_raw(hashes_boxed) as *mut u64;
+    let positions = Box::into_raw(positions_boxed) as *mut u64;
+
+    RypeStrandResult {
+        hashes,
+        positions,
+        len,
+    }
+}
+
+/// Free a RypeStrandResult's backing memory.
+///
+/// # Safety
+/// Must only be called once per result, and only on results created by strand_to_c_result.
+unsafe fn free_strand_result(sr: &RypeStrandResult) {
+    if !sr.hashes.is_null() && sr.len > 0 {
+        let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(sr.hashes, sr.len));
+    }
+    if !sr.positions.is_null() && sr.len > 0 {
+        let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(sr.positions, sr.len));
+    }
+}
+
+// --- Extraction API Functions ---
+
+/// Extract sorted, deduplicated minimizer hash sets per strand.
+///
+/// Returns a heap-allocated `RypeMinimizerSetResult` containing two sorted,
+/// deduplicated arrays of minimizer hashes (forward and reverse complement).
+///
+/// # Parameters
+/// - `seq`: Pointer to DNA sequence bytes (A/C/G/T, case-insensitive)
+/// - `seq_len`: Length of sequence in bytes
+/// - `k`: K-mer size (must be 16, 32, or 64)
+/// - `w`: Window size for minimizer selection (must be > 0)
+/// - `salt`: XOR salt applied to k-mer hashes
+///
+/// # Returns
+/// Non-NULL pointer on success, NULL on error.
+/// Call `rype_get_last_error()` for error details.
+///
+/// # Memory
+/// Caller must free with `rype_minimizer_set_result_free()`.
+///
+/// # Thread Safety
+/// Thread-safe. No shared state.
+#[no_mangle]
+pub extern "C" fn rype_extract_minimizer_set(
+    seq: *const u8,
+    seq_len: size_t,
+    k: size_t,
+    w: size_t,
+    salt: u64,
+) -> *mut RypeMinimizerSetResult {
+    if let Err(e) = validate_extraction_params(seq, seq_len, k, w) {
+        set_last_error(e);
+        return std::ptr::null_mut();
+    }
+
+    let seq_slice = unsafe { slice::from_raw_parts(seq, seq_len) };
+    let mut ws = crate::MinimizerWorkspace::new();
+
+    let (fwd, rc) = crate::extract_minimizer_set(seq_slice, k, w, salt, &mut ws);
+
+    let result = Box::new(RypeMinimizerSetResult {
+        forward: vec_to_rype_u64_array(fwd),
+        reverse_complement: vec_to_rype_u64_array(rc),
+    });
+
+    clear_last_error();
+    Box::into_raw(result)
+}
+
+/// Free a minimizer set result. NULL is safe to pass.
+///
+/// Do NOT call twice on the same pointer.
+#[no_mangle]
+pub extern "C" fn rype_minimizer_set_result_free(ptr: *mut RypeMinimizerSetResult) {
+    if !ptr.is_null() {
+        unsafe {
+            let result = Box::from_raw(ptr);
+            free_rype_u64_array(&result.forward);
+            free_rype_u64_array(&result.reverse_complement);
+        }
+    }
+}
+
+/// Extract ordered minimizers with positions per strand (SoA layout).
+///
+/// Returns a heap-allocated `RypeStrandMinimizersResult` containing hashes
+/// and 0-based positions for both forward and reverse complement strands.
+/// Positions are non-decreasing within each strand.
+///
+/// # Parameters
+/// - `seq`: Pointer to DNA sequence bytes
+/// - `seq_len`: Length of sequence in bytes
+/// - `k`: K-mer size (must be 16, 32, or 64)
+/// - `w`: Window size for minimizer selection (must be > 0)
+/// - `salt`: XOR salt applied to k-mer hashes
+///
+/// # Returns
+/// Non-NULL pointer on success, NULL on error.
+///
+/// # Memory
+/// Caller must free with `rype_strand_minimizers_result_free()`.
+///
+/// # Thread Safety
+/// Thread-safe. No shared state.
+#[no_mangle]
+pub extern "C" fn rype_extract_strand_minimizers(
+    seq: *const u8,
+    seq_len: size_t,
+    k: size_t,
+    w: size_t,
+    salt: u64,
+) -> *mut RypeStrandMinimizersResult {
+    if let Err(e) = validate_extraction_params(seq, seq_len, k, w) {
+        set_last_error(e);
+        return std::ptr::null_mut();
+    }
+
+    let seq_slice = unsafe { slice::from_raw_parts(seq, seq_len) };
+    let mut ws = crate::MinimizerWorkspace::new();
+
+    let (fwd, rc) = crate::extract_strand_minimizers(seq_slice, k, w, salt, &mut ws);
+
+    let result = Box::new(RypeStrandMinimizersResult {
+        forward: strand_to_c_result(fwd),
+        reverse_complement: strand_to_c_result(rc),
+    });
+
+    clear_last_error();
+    Box::into_raw(result)
+}
+
+/// Free a strand minimizers result. NULL is safe to pass.
+///
+/// Do NOT call twice on the same pointer.
+#[no_mangle]
+pub extern "C" fn rype_strand_minimizers_result_free(ptr: *mut RypeStrandMinimizersResult) {
+    if !ptr.is_null() {
+        unsafe {
+            let result = Box::from_raw(ptr);
+            free_strand_result(&result.forward);
+            free_strand_result(&result.reverse_complement);
+        }
+    }
+}
+
 // --- ABI Layout Tests ---
 
 #[cfg(test)]
@@ -1085,6 +1355,51 @@ mod layout_tests {
         use std::mem::{align_of, size_of};
         assert_eq!(size_of::<RypeLogRatioResultArray>(), 24);
         assert_eq!(align_of::<RypeLogRatioResultArray>(), 8);
+    }
+
+    // --- Extraction struct layout tests ---
+
+    #[test]
+    fn test_rype_u64_array_layout() {
+        use std::mem::{align_of, size_of};
+        assert_eq!(size_of::<RypeU64Array>(), 16);
+        assert_eq!(align_of::<RypeU64Array>(), 8);
+        assert_eq!(std::mem::offset_of!(RypeU64Array, data), 0);
+        assert_eq!(std::mem::offset_of!(RypeU64Array, len), 8);
+    }
+
+    #[test]
+    fn test_rype_minimizer_set_result_layout() {
+        use std::mem::{align_of, size_of};
+        assert_eq!(size_of::<RypeMinimizerSetResult>(), 32);
+        assert_eq!(align_of::<RypeMinimizerSetResult>(), 8);
+        assert_eq!(std::mem::offset_of!(RypeMinimizerSetResult, forward), 0);
+        assert_eq!(
+            std::mem::offset_of!(RypeMinimizerSetResult, reverse_complement),
+            16
+        );
+    }
+
+    #[test]
+    fn test_rype_strand_result_layout() {
+        use std::mem::{align_of, size_of};
+        assert_eq!(size_of::<RypeStrandResult>(), 24);
+        assert_eq!(align_of::<RypeStrandResult>(), 8);
+        assert_eq!(std::mem::offset_of!(RypeStrandResult, hashes), 0);
+        assert_eq!(std::mem::offset_of!(RypeStrandResult, positions), 8);
+        assert_eq!(std::mem::offset_of!(RypeStrandResult, len), 16);
+    }
+
+    #[test]
+    fn test_rype_strand_minimizers_result_layout() {
+        use std::mem::{align_of, size_of};
+        assert_eq!(size_of::<RypeStrandMinimizersResult>(), 48);
+        assert_eq!(align_of::<RypeStrandMinimizersResult>(), 8);
+        assert_eq!(std::mem::offset_of!(RypeStrandMinimizersResult, forward), 0);
+        assert_eq!(
+            std::mem::offset_of!(RypeStrandMinimizersResult, reverse_complement),
+            24
+        );
     }
 }
 
@@ -1607,6 +1922,212 @@ mod arrow_ffi {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Arrow Minimizer Extraction
+    // -------------------------------------------------------------------------
+
+    /// Get the output schema for Arrow minimizer set extraction.
+    ///
+    /// Schema: id (Int64), fwd_set (List\<UInt64\>), rc_set (List\<UInt64\>)
+    ///
+    /// # Safety
+    /// `out_schema` must be a valid, non-null pointer to an uninitialized `FFI_ArrowSchema`.
+    ///
+    /// # Returns
+    /// 0 on success, -1 on error.
+    #[no_mangle]
+    pub unsafe extern "C" fn rype_arrow_minimizer_set_schema(
+        out_schema: *mut FFI_ArrowSchema,
+    ) -> i32 {
+        if out_schema.is_null() {
+            set_last_error("out_schema is NULL".to_string());
+            return -1;
+        }
+
+        let schema = crate::arrow::minimizer_set_schema();
+
+        match FFI_ArrowSchema::try_from(schema.as_ref()) {
+            Ok(ffi_schema) => {
+                std::ptr::write(out_schema, ffi_schema);
+                clear_last_error();
+                0
+            }
+            Err(e) => {
+                set_last_error(format!("Failed to export schema: {}", e));
+                -1
+            }
+        }
+    }
+
+    /// Get the output schema for Arrow strand minimizers extraction.
+    ///
+    /// Schema: id (Int64), fwd_hashes (List\<UInt64\>), fwd_positions (List\<UInt64\>),
+    /// rc_hashes (List\<UInt64\>), rc_positions (List\<UInt64\>)
+    ///
+    /// # Safety
+    /// `out_schema` must be a valid, non-null pointer to an uninitialized `FFI_ArrowSchema`.
+    ///
+    /// # Returns
+    /// 0 on success, -1 on error.
+    #[no_mangle]
+    pub unsafe extern "C" fn rype_arrow_strand_minimizers_schema(
+        out_schema: *mut FFI_ArrowSchema,
+    ) -> i32 {
+        if out_schema.is_null() {
+            set_last_error("out_schema is NULL".to_string());
+            return -1;
+        }
+
+        let schema = crate::arrow::strand_minimizers_schema();
+
+        match FFI_ArrowSchema::try_from(schema.as_ref()) {
+            Ok(ffi_schema) => {
+                std::ptr::write(out_schema, ffi_schema);
+                clear_last_error();
+                0
+            }
+            Err(e) => {
+                set_last_error(format!("Failed to export schema: {}", e));
+                -1
+            }
+        }
+    }
+
+    /// Extract minimizer sets from an Arrow stream.
+    ///
+    /// TRUE STREAMING: Processes one batch at a time.
+    ///
+    /// # Arguments
+    /// - `input_stream`: Arrow input stream with `id` (Int64) and `sequence` (Binary) columns
+    /// - `k`: K-mer size (must be 16, 32, or 64)
+    /// - `w`: Window size (must be > 0)
+    /// - `salt`: XOR salt for k-mer hashing
+    /// - `out_stream`: Output stream pointer to receive results
+    ///
+    /// # Output Schema
+    /// `id` (Int64), `fwd_set` (List\<UInt64\>), `rc_set` (List\<UInt64\>)
+    ///
+    /// # Safety
+    /// - input_stream is consumed (ownership transferred)
+    /// - Caller owns out_stream and must call out_stream->release() when done
+    ///
+    /// # Returns
+    /// 0 on success, -1 on error.
+    #[no_mangle]
+    pub unsafe extern "C" fn rype_extract_minimizer_set_arrow(
+        input_stream: *mut FFI_ArrowArrayStream,
+        k: size_t,
+        w: size_t,
+        salt: u64,
+        out_stream: *mut FFI_ArrowArrayStream,
+    ) -> i32 {
+        if input_stream.is_null() {
+            set_last_error("input_stream is NULL".to_string());
+            return -1;
+        }
+        if out_stream.is_null() {
+            set_last_error("out_stream is NULL".to_string());
+            return -1;
+        }
+        if !matches!(k, 16 | 32 | 64) {
+            set_last_error(format!("Invalid k: {} (must be 16, 32, or 64)", k));
+            return -1;
+        }
+        if w == 0 {
+            set_last_error("w is zero".to_string());
+            return -1;
+        }
+
+        let extract_fn = move |batch: &RecordBatch| {
+            crate::arrow::extract_minimizer_set_batch(batch, k, w, salt)
+                .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
+        };
+
+        match create_streaming_output(
+            input_stream,
+            out_stream,
+            crate::arrow::minimizer_set_schema(),
+            extract_fn,
+        ) {
+            Ok(()) => {
+                clear_last_error();
+                0
+            }
+            Err(e) => {
+                set_last_error(e);
+                -1
+            }
+        }
+    }
+
+    /// Extract strand minimizers (hashes + positions) from an Arrow stream.
+    ///
+    /// TRUE STREAMING: Processes one batch at a time.
+    ///
+    /// # Arguments
+    /// - `input_stream`: Arrow input stream with `id` (Int64) and `sequence` (Binary) columns
+    /// - `k`: K-mer size (must be 16, 32, or 64)
+    /// - `w`: Window size (must be > 0)
+    /// - `salt`: XOR salt for k-mer hashing
+    /// - `out_stream`: Output stream pointer to receive results
+    ///
+    /// # Output Schema
+    /// `id` (Int64), `fwd_hashes` (List\<UInt64\>), `fwd_positions` (List\<UInt64\>),
+    /// `rc_hashes` (List\<UInt64\>), `rc_positions` (List\<UInt64\>)
+    ///
+    /// # Safety
+    /// - input_stream is consumed (ownership transferred)
+    /// - Caller owns out_stream and must call out_stream->release() when done
+    ///
+    /// # Returns
+    /// 0 on success, -1 on error.
+    #[no_mangle]
+    pub unsafe extern "C" fn rype_extract_strand_minimizers_arrow(
+        input_stream: *mut FFI_ArrowArrayStream,
+        k: size_t,
+        w: size_t,
+        salt: u64,
+        out_stream: *mut FFI_ArrowArrayStream,
+    ) -> i32 {
+        if input_stream.is_null() {
+            set_last_error("input_stream is NULL".to_string());
+            return -1;
+        }
+        if out_stream.is_null() {
+            set_last_error("out_stream is NULL".to_string());
+            return -1;
+        }
+        if !matches!(k, 16 | 32 | 64) {
+            set_last_error(format!("Invalid k: {} (must be 16, 32, or 64)", k));
+            return -1;
+        }
+        if w == 0 {
+            set_last_error("w is zero".to_string());
+            return -1;
+        }
+
+        let extract_fn = move |batch: &RecordBatch| {
+            crate::arrow::extract_strand_minimizers_batch(batch, k, w, salt)
+                .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
+        };
+
+        match create_streaming_output(
+            input_stream,
+            out_stream,
+            crate::arrow::strand_minimizers_schema(),
+            extract_fn,
+        ) {
+            Ok(()) => {
+                clear_last_error();
+                0
+            }
+            Err(e) => {
+                set_last_error(e);
+                -1
+            }
+        }
+    }
+
     /// Classify sequences from an Arrow stream using log-ratio (numerator vs denominator).
     ///
     /// TRUE STREAMING: Processes one batch at a time. Memory usage is O(batch_size).
@@ -2101,5 +2622,188 @@ mod c_api_tests {
             "Zero threshold should not cause a threshold error, got: {}",
             err
         );
+    }
+
+    // =========================================================================
+    // Minimizer Extraction Tests
+    // =========================================================================
+
+    // --- extract_minimizer_set tests ---
+
+    #[test]
+    fn test_rype_extract_minimizer_set_null_seq() {
+        let result = rype_extract_minimizer_set(std::ptr::null(), 100, 16, 5, 0);
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_rype_extract_minimizer_set_zero_len() {
+        let seq = b"ACGT";
+        let result = rype_extract_minimizer_set(seq.as_ptr(), 0, 16, 5, 0);
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_rype_extract_minimizer_set_invalid_k() {
+        let seq = b"ACGTACGTACGTACGTACGT";
+        // k=0
+        let result = rype_extract_minimizer_set(seq.as_ptr(), seq.len(), 0, 5, 0);
+        assert!(result.is_null());
+        // k=100
+        let result = rype_extract_minimizer_set(seq.as_ptr(), seq.len(), 100, 5, 0);
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_rype_extract_minimizer_set_short_seq() {
+        // 10 bytes, k=16: too short to produce minimizers
+        let seq = b"ACGTACGTAC";
+        let result = rype_extract_minimizer_set(seq.as_ptr(), seq.len(), 16, 5, 0);
+        assert!(!result.is_null());
+        unsafe {
+            let r = &*result;
+            assert_eq!(r.forward.len, 0);
+            assert!(r.forward.data.is_null());
+            assert_eq!(r.reverse_complement.len, 0);
+            assert!(r.reverse_complement.data.is_null());
+            rype_minimizer_set_result_free(result);
+        }
+    }
+
+    #[test]
+    fn test_rype_extract_minimizer_set_basic() {
+        // 67-byte sequence with mixed bases
+        let seq = b"AAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCC";
+        let result = rype_extract_minimizer_set(seq.as_ptr(), seq.len(), 16, 5, 0);
+        assert!(!result.is_null());
+        unsafe {
+            let r = &*result;
+            // Should have non-empty results
+            assert!(r.forward.len > 0, "Forward set should be non-empty");
+            assert!(r.reverse_complement.len > 0, "RC set should be non-empty");
+
+            // Forward should be sorted
+            let fwd = slice::from_raw_parts(r.forward.data, r.forward.len);
+            for w in fwd.windows(2) {
+                assert!(
+                    w[0] < w[1],
+                    "Forward not strictly sorted: {} >= {}",
+                    w[0],
+                    w[1]
+                );
+            }
+
+            // RC should be sorted
+            let rc = slice::from_raw_parts(r.reverse_complement.data, r.reverse_complement.len);
+            for w in rc.windows(2) {
+                assert!(w[0] < w[1], "RC not strictly sorted: {} >= {}", w[0], w[1]);
+            }
+
+            rype_minimizer_set_result_free(result);
+        }
+    }
+
+    #[test]
+    fn test_rype_minimizer_set_result_free_null() {
+        // Should not crash
+        rype_minimizer_set_result_free(std::ptr::null_mut());
+    }
+
+    // --- extract_strand_minimizers tests ---
+
+    #[test]
+    fn test_rype_extract_strand_minimizers_null_seq() {
+        let result = rype_extract_strand_minimizers(std::ptr::null(), 100, 16, 5, 0);
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_rype_extract_strand_minimizers_invalid_k() {
+        let seq = b"ACGTACGTACGTACGTACGT";
+        let result = rype_extract_strand_minimizers(seq.as_ptr(), seq.len(), 0, 5, 0);
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_rype_extract_strand_minimizers_short_seq() {
+        // 10 bytes, k=16: too short
+        let seq = b"ACGTACGTAC";
+        let result = rype_extract_strand_minimizers(seq.as_ptr(), seq.len(), 16, 5, 0);
+        assert!(!result.is_null());
+        unsafe {
+            let r = &*result;
+            assert_eq!(r.forward.len, 0);
+            assert!(r.forward.hashes.is_null());
+            assert!(r.forward.positions.is_null());
+            assert_eq!(r.reverse_complement.len, 0);
+            rype_strand_minimizers_result_free(result);
+        }
+    }
+
+    #[test]
+    fn test_rype_extract_strand_minimizers_basic() {
+        let seq = b"AAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCCAAAAACCCCC";
+        let result = rype_extract_strand_minimizers(seq.as_ptr(), seq.len(), 16, 5, 0);
+        assert!(!result.is_null());
+        unsafe {
+            let r = &*result;
+
+            // Both strands should be non-empty
+            assert!(r.forward.len > 0, "Forward should be non-empty");
+            assert!(r.reverse_complement.len > 0, "RC should be non-empty");
+
+            // Check forward strand
+            let fwd_hashes = slice::from_raw_parts(r.forward.hashes, r.forward.len);
+            let fwd_positions = slice::from_raw_parts(r.forward.positions, r.forward.len);
+
+            // Positions should be non-decreasing
+            for w in fwd_positions.windows(2) {
+                assert!(
+                    w[0] <= w[1],
+                    "Forward positions not non-decreasing: {} > {}",
+                    w[0],
+                    w[1]
+                );
+            }
+
+            // Positions should be in bounds: pos + k <= seq_len
+            for &p in fwd_positions {
+                assert!(
+                    (p as usize) + 16 <= seq.len(),
+                    "Forward position {} out of bounds",
+                    p
+                );
+            }
+
+            // Hashes should be non-zero (sanity check)
+            assert!(fwd_hashes.iter().any(|&h| h != 0), "All hashes are zero");
+
+            // Check RC strand positions
+            let rc_positions =
+                slice::from_raw_parts(r.reverse_complement.positions, r.reverse_complement.len);
+            for w in rc_positions.windows(2) {
+                assert!(
+                    w[0] <= w[1],
+                    "RC positions not non-decreasing: {} > {}",
+                    w[0],
+                    w[1]
+                );
+            }
+            for &p in rc_positions {
+                assert!(
+                    (p as usize) + 16 <= seq.len(),
+                    "RC position {} out of bounds",
+                    p
+                );
+            }
+
+            rype_strand_minimizers_result_free(result);
+        }
+    }
+
+    #[test]
+    fn test_rype_strand_minimizers_result_free_null() {
+        // Should not crash
+        rype_strand_minimizers_result_free(std::ptr::null_mut());
     }
 }

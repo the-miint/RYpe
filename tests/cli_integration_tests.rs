@@ -5520,3 +5520,157 @@ fn test_cli_minimum_length_with_output_sequences() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// C API Extraction Example Tests
+// ============================================================================
+
+/// Test that the C extraction example compiles and runs correctly.
+///
+/// Compiles examples/extraction_example.c against librype, runs it, and
+/// parses the structured output to verify correctness.
+#[test]
+fn test_c_extraction_example() -> Result<()> {
+    // Check if gcc is available
+    let gcc_check = Command::new("gcc").arg("--version").output();
+    if gcc_check.is_err() || !gcc_check.unwrap().status.success() {
+        eprintln!("Skipping test_c_extraction_example: gcc not available");
+        return Ok(());
+    }
+
+    let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let example_src = project_root.join("examples/extraction_example.c");
+    assert!(
+        example_src.exists(),
+        "Missing examples/extraction_example.c"
+    );
+
+    // Build the cdylib (cargo test only builds rlib, not the shared library)
+    let build = Command::new("cargo")
+        .args(["build", "--lib"])
+        .current_dir(project_root)
+        .output()?;
+    assert!(
+        build.status.success(),
+        "Failed to build cdylib:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let dir = tempdir()?;
+    let binary_path = dir.path().join("extraction_example");
+
+    // Find the library directory (debug build)
+    let target_dir = project_root.join("target/debug");
+
+    // Compile the C example
+    let compile = Command::new("gcc")
+        .args([
+            "-o",
+            binary_path.to_str().unwrap(),
+            example_src.to_str().unwrap(),
+            &format!("-L{}", target_dir.display()),
+            "-lrype",
+            &format!("-Wl,-rpath,{}", target_dir.display()),
+            "-Wall",
+            "-Wextra",
+        ])
+        .output()?;
+
+    assert!(
+        compile.status.success(),
+        "Failed to compile extraction_example.c:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    // Run the example
+    let run = Command::new(&binary_path)
+        .env("LD_LIBRARY_PATH", &target_dir)
+        .output()?;
+
+    assert!(
+        run.status.success(),
+        "extraction_example failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // Parse structured output
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let mut values = std::collections::HashMap::new();
+    for line in stdout.lines() {
+        if let Some((key, val)) = line.split_once('=') {
+            values.insert(key.to_string(), val.to_string());
+        }
+    }
+
+    // Verify minimizer_set results
+    assert_eq!(
+        values.get("MINIMIZER_SET_OK").map(|s| s.as_str()),
+        Some("1"),
+        "extract_minimizer_set should succeed"
+    );
+    let fwd_set_len: usize = values
+        .get("FWD_SET_LEN")
+        .expect("Missing FWD_SET_LEN")
+        .parse()
+        .expect("FWD_SET_LEN not a number");
+    assert!(fwd_set_len > 0, "Forward set should be non-empty");
+    let rc_set_len: usize = values
+        .get("RC_SET_LEN")
+        .expect("Missing RC_SET_LEN")
+        .parse()
+        .expect("RC_SET_LEN not a number");
+    assert!(rc_set_len > 0, "RC set should be non-empty");
+    assert_eq!(
+        values.get("FWD_SET_SORTED").map(|s| s.as_str()),
+        Some("1"),
+        "Forward set should be sorted"
+    );
+    assert_eq!(
+        values.get("RC_SET_SORTED").map(|s| s.as_str()),
+        Some("1"),
+        "RC set should be sorted"
+    );
+
+    // Verify strand_minimizers results
+    assert_eq!(
+        values.get("STRAND_MINIMIZERS_OK").map(|s| s.as_str()),
+        Some("1"),
+        "extract_strand_minimizers should succeed"
+    );
+    let fwd_strand_len: usize = values
+        .get("FWD_STRAND_LEN")
+        .expect("Missing FWD_STRAND_LEN")
+        .parse()
+        .expect("FWD_STRAND_LEN not a number");
+    assert!(fwd_strand_len > 0, "Forward strand should be non-empty");
+    let rc_strand_len: usize = values
+        .get("RC_STRAND_LEN")
+        .expect("Missing RC_STRAND_LEN")
+        .parse()
+        .expect("RC_STRAND_LEN not a number");
+    assert!(rc_strand_len > 0, "RC strand should be non-empty");
+    assert_eq!(
+        values.get("FWD_POSITIONS_ORDERED").map(|s| s.as_str()),
+        Some("1"),
+        "Forward positions should be non-decreasing"
+    );
+    assert_eq!(
+        values.get("FWD_POSITIONS_INBOUNDS").map(|s| s.as_str()),
+        Some("1"),
+        "Forward positions should be in bounds"
+    );
+    assert_eq!(
+        values.get("RC_POSITIONS_ORDERED").map(|s| s.as_str()),
+        Some("1"),
+        "RC positions should be non-decreasing"
+    );
+    assert_eq!(
+        values.get("RC_POSITIONS_INBOUNDS").map(|s| s.as_str()),
+        Some("1"),
+        "RC positions should be in bounds"
+    );
+
+    Ok(())
+}

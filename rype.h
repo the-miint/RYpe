@@ -820,6 +820,156 @@ void rype_log_ratio_results_free(RypeLogRatioResultArray* results);
 const char* rype_get_last_error(void);
 
 // ============================================================================
+// MINIMIZER EXTRACTION API
+// ============================================================================
+//
+// These functions extract minimizer hashes (and optionally positions) from
+// raw DNA sequences without requiring an index. Useful for building custom
+// pipelines, sequence comparison, or pre-computing minimizer sketches.
+//
+// ## Parameters (common to both functions)
+//
+// - seq:     Pointer to DNA sequence bytes (A/C/G/T, case-insensitive)
+// - seq_len: Length of seq in bytes (must be > 0)
+// - k:       K-mer size (must be 16, 32, or 64)
+// - w:       Window size for minimizer selection (must be > 0)
+// - salt:    XOR salt applied to k-mer hashes (use 0 for no salt)
+//
+// ## Thread Safety
+//
+// All extraction functions are thread-safe (pure computation, no shared state).
+
+/**
+ * Array of uint64_t values.
+ *
+ * Used as a building block for extraction results. Do NOT free this
+ * directly - free the containing result struct instead.
+ */
+typedef struct {
+    uint64_t* data;  ///< Array of values (NULL if len == 0)
+    size_t len;      ///< Number of elements
+} RypeU64Array;
+
+/**
+ * Result of rype_extract_minimizer_set()
+ *
+ * Contains sorted, deduplicated minimizer hash sets for forward and
+ * reverse complement strands.
+ *
+ * Free with rype_minimizer_set_result_free(). Do NOT call twice.
+ */
+typedef struct {
+    RypeU64Array forward;              ///< Sorted, deduplicated forward strand hashes
+    RypeU64Array reverse_complement;   ///< Sorted, deduplicated RC strand hashes
+} RypeMinimizerSetResult;
+
+/**
+ * Minimizer hashes and positions for a single strand (SoA layout)
+ *
+ * hashes[i] corresponds to positions[i]. Both arrays have length len.
+ * Positions are 0-based byte offsets into the input sequence where the
+ * k-mer starts.
+ */
+typedef struct {
+    uint64_t* hashes;    ///< Minimizer hash values
+    uint64_t* positions; ///< 0-based positions in sequence
+    size_t len;          ///< Number of minimizers (length of both arrays)
+} RypeStrandResult;
+
+/**
+ * Result of rype_extract_strand_minimizers()
+ *
+ * Contains ordered minimizer hashes and positions for forward and
+ * reverse complement strands. Positions are non-decreasing within
+ * each strand.
+ *
+ * Free with rype_strand_minimizers_result_free(). Do NOT call twice.
+ */
+typedef struct {
+    RypeStrandResult forward;              ///< Forward strand minimizers
+    RypeStrandResult reverse_complement;   ///< Reverse complement minimizers
+} RypeStrandMinimizersResult;
+
+/**
+ * Extract sorted, deduplicated minimizer hash sets per strand
+ *
+ * Returns two sorted, deduplicated arrays of minimizer hashes - one for the
+ * forward strand and one for the reverse complement.
+ *
+ * @param seq      Pointer to DNA sequence bytes
+ * @param seq_len  Length of seq in bytes (must be > 0)
+ * @param k        K-mer size (must be 16, 32, or 64)
+ * @param w        Window size (must be > 0)
+ * @param salt     XOR salt for k-mer hashing
+ * @return         Non-NULL result on success, NULL on error
+ *
+ * ## Notes
+ *
+ * - Sequences shorter than k produce empty (len=0) arrays
+ * - N bases and other non-ACGT characters reset k-mer extraction
+ *
+ * ## Memory
+ *
+ * Caller must free with rype_minimizer_set_result_free().
+ */
+RypeMinimizerSetResult* rype_extract_minimizer_set(
+    const uint8_t* seq,
+    size_t seq_len,
+    size_t k,
+    size_t w,
+    uint64_t salt
+);
+
+/**
+ * Free a minimizer set result
+ *
+ * @param result  Pointer from rype_extract_minimizer_set(), or NULL (no-op)
+ *
+ * Do NOT call twice on the same pointer.
+ */
+void rype_minimizer_set_result_free(RypeMinimizerSetResult* result);
+
+/**
+ * Extract ordered minimizers with positions per strand (SoA layout)
+ *
+ * Returns minimizer hashes and their 0-based positions for both forward
+ * and reverse complement strands. Positions are non-decreasing within
+ * each strand.
+ *
+ * @param seq      Pointer to DNA sequence bytes
+ * @param seq_len  Length of seq in bytes (must be > 0)
+ * @param k        K-mer size (must be 16, 32, or 64)
+ * @param w        Window size (must be > 0)
+ * @param salt     XOR salt for k-mer hashing
+ * @return         Non-NULL result on success, NULL on error
+ *
+ * ## Notes
+ *
+ * - Sequences shorter than k produce empty (len=0) results
+ * - positions[i] + k <= seq_len for all i
+ *
+ * ## Memory
+ *
+ * Caller must free with rype_strand_minimizers_result_free().
+ */
+RypeStrandMinimizersResult* rype_extract_strand_minimizers(
+    const uint8_t* seq,
+    size_t seq_len,
+    size_t k,
+    size_t w,
+    uint64_t salt
+);
+
+/**
+ * Free a strand minimizers result
+ *
+ * @param result  Pointer from rype_extract_strand_minimizers(), or NULL (no-op)
+ *
+ * Do NOT call twice on the same pointer.
+ */
+void rype_strand_minimizers_result_free(RypeStrandMinimizersResult* result);
+
+// ============================================================================
 // ARROW C DATA INTERFACE API (Optional Feature)
 // ============================================================================
 //
@@ -1021,6 +1171,103 @@ int rype_classify_arrow_log_ratio(
     const RypeIndex* denominator,
     struct ArrowArrayStream* input_stream,
     double numerator_skip_threshold,
+    struct ArrowArrayStream* out_stream
+);
+
+// ----------------------------------------------------------------------------
+// Arrow Minimizer Extraction Functions
+// ----------------------------------------------------------------------------
+
+/**
+ * Get the output schema for Arrow minimizer set extraction
+ *
+ * Schema: id (Int64), fwd_set (List<UInt64>), rc_set (List<UInt64>)
+ *
+ * @param out_schema  Pointer to caller-allocated ArrowSchema to initialize
+ * @return            0 on success, -1 on error
+ *
+ * Caller must call out_schema->release(out_schema) when done.
+ */
+int rype_arrow_minimizer_set_schema(struct ArrowSchema* out_schema);
+
+/**
+ * Get the output schema for Arrow strand minimizers extraction
+ *
+ * Schema: id (Int64), fwd_hashes (List<UInt64>), fwd_positions (List<UInt64>),
+ * rc_hashes (List<UInt64>), rc_positions (List<UInt64>)
+ *
+ * @param out_schema  Pointer to caller-allocated ArrowSchema to initialize
+ * @return            0 on success, -1 on error
+ *
+ * Caller must call out_schema->release(out_schema) when done.
+ */
+int rype_arrow_strand_minimizers_schema(struct ArrowSchema* out_schema);
+
+/**
+ * Extract minimizer sets from an Arrow stream
+ *
+ * TRUE STREAMING: Processes one batch at a time.
+ *
+ * @param input_stream  Input ArrowArrayStream with id (Int64) and sequence (Binary) columns
+ * @param k             K-mer size (must be 16, 32, or 64)
+ * @param w             Window size (must be > 0)
+ * @param salt          XOR salt for k-mer hashing
+ * @param out_stream    Output ArrowArrayStream for results (caller-allocated)
+ * @return              0 on success, -1 on error
+ *
+ * ## Output Schema
+ *
+ * | Column   | Type           | Description                          |
+ * |----------|----------------|--------------------------------------|
+ * | id       | Int64          | Query identifier from input          |
+ * | fwd_set  | List<UInt64>   | Sorted, deduplicated forward hashes  |
+ * | rc_set   | List<UInt64>   | Sorted, deduplicated RC hashes       |
+ *
+ * ## Memory Management
+ *
+ * - This function TAKES OWNERSHIP of input_stream
+ * - Caller owns out_stream and MUST call out_stream->release() when done
+ */
+int rype_extract_minimizer_set_arrow(
+    struct ArrowArrayStream* input_stream,
+    size_t k,
+    size_t w,
+    uint64_t salt,
+    struct ArrowArrayStream* out_stream
+);
+
+/**
+ * Extract strand minimizers (hashes + positions) from an Arrow stream
+ *
+ * TRUE STREAMING: Processes one batch at a time.
+ *
+ * @param input_stream  Input ArrowArrayStream with id (Int64) and sequence (Binary) columns
+ * @param k             K-mer size (must be 16, 32, or 64)
+ * @param w             Window size (must be > 0)
+ * @param salt          XOR salt for k-mer hashing
+ * @param out_stream    Output ArrowArrayStream for results (caller-allocated)
+ * @return              0 on success, -1 on error
+ *
+ * ## Output Schema
+ *
+ * | Column        | Type           | Description                     |
+ * |---------------|----------------|---------------------------------|
+ * | id            | Int64          | Query identifier from input     |
+ * | fwd_hashes    | List<UInt64>   | Forward strand hash values      |
+ * | fwd_positions | List<UInt64>   | Forward strand positions        |
+ * | rc_hashes     | List<UInt64>   | RC strand hash values           |
+ * | rc_positions  | List<UInt64>   | RC strand positions             |
+ *
+ * ## Memory Management
+ *
+ * - This function TAKES OWNERSHIP of input_stream
+ * - Caller owns out_stream and MUST call out_stream->release() when done
+ */
+int rype_extract_strand_minimizers_arrow(
+    struct ArrowArrayStream* input_stream,
+    size_t k,
+    size_t w,
+    uint64_t salt,
     struct ArrowArrayStream* out_stream
 );
 

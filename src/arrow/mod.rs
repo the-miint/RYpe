@@ -74,6 +74,7 @@
 //! ```
 
 mod error;
+pub mod extraction;
 mod input;
 mod output;
 mod schema;
@@ -81,6 +82,10 @@ mod stream;
 
 // Re-export public API
 pub use error::ArrowClassifyError;
+pub use extraction::{
+    extract_minimizer_set_batch, extract_strand_minimizers_batch, minimizer_set_schema,
+    strand_minimizers_schema,
+};
 pub use input::{batch_to_records, batch_to_records_with_columns};
 pub use output::{empty_result_batch, hits_to_record_batch};
 pub use schema::{
