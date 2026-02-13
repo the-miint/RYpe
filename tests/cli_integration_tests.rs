@@ -11,26 +11,12 @@ use rype::{extract_with_positions, get_paired_minimizers_into, MinimizerWorkspac
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tempfile::tempdir;
 
-static BINARY_PATH: OnceLock<PathBuf> = OnceLock::new();
-
-/// Build the binary once and return its path. Safe to call from multiple tests in parallel.
+/// Return path to the rype binary built by `cargo test`.
 fn get_binary_path() -> PathBuf {
-    BINARY_PATH
-        .get_or_init(|| {
-            let manifest_dir = env!("CARGO_MANIFEST_DIR");
-            let status = std::process::Command::new("cargo")
-                .args(["build"])
-                .current_dir(manifest_dir)
-                .status()
-                .expect("Failed to run cargo build");
-            assert!(status.success(), "Failed to build rype binary");
-
-            PathBuf::from(manifest_dir).join("target/debug/rype")
-        })
-        .clone()
+    PathBuf::from(env!("CARGO_BIN_EXE_rype"))
 }
 
 /// Test extract_with_positions returns correct positions and strands
