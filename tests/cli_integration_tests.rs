@@ -7,7 +7,7 @@ use arrow::array::LargeStringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
-use rype::{extract_with_positions, get_paired_minimizers_into, MinimizerWorkspace, Strand};
+use rype::{extract_strand_minimizers, get_paired_minimizers_into, MinimizerWorkspace};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,42 +19,31 @@ fn get_binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_rype"))
 }
 
-/// Test extract_with_positions returns correct positions and strands
+/// Test extract_strand_minimizers returns correct positions and both strands
 #[test]
-fn test_extract_with_positions_correctness() -> Result<()> {
+fn test_extract_strand_minimizers_correctness() -> Result<()> {
     let mut ws = MinimizerWorkspace::new();
 
     // Create a simple sequence
     let seq = b"AAAATTTTGGGGCCCCAAAATTTTGGGGCCCC"; // 32 bases
 
-    let results = extract_with_positions(seq, 16, 4, 0, &mut ws);
+    let (fwd, rc) = extract_strand_minimizers(seq, 16, 4, 0, &mut ws);
 
-    // Should have some minimizers
-    assert!(!results.is_empty(), "Should extract minimizers");
+    // Should have some minimizers on both strands
+    assert!(!fwd.hashes.is_empty(), "Should have forward minimizers");
+    assert!(!rc.hashes.is_empty(), "Should have RC minimizers");
+
+    // SoA invariant
+    assert_eq!(fwd.hashes.len(), fwd.positions.len());
+    assert_eq!(rc.hashes.len(), rc.positions.len());
 
     // All positions should be valid
-    for m in &results {
-        assert!(
-            m.position + 16 <= seq.len(),
-            "Position {} invalid for seq len {}",
-            m.position,
-            seq.len()
-        );
-
-        // Strand should be either Forward or ReverseComplement
-        match m.strand {
-            Strand::Forward | Strand::ReverseComplement => {}
-        }
+    for &p in &fwd.positions {
+        assert!(p + 16 <= seq.len(), "Forward position {} invalid", p);
     }
-
-    // Should have both forward and reverse complement minimizers
-    let has_fwd = results.iter().any(|m| m.strand == Strand::Forward);
-    let has_rc = results
-        .iter()
-        .any(|m| m.strand == Strand::ReverseComplement);
-
-    assert!(has_fwd, "Should have forward strand minimizers");
-    assert!(has_rc, "Should have reverse complement minimizers");
+    for &p in &rc.positions {
+        assert!(p + 16 <= seq.len(), "RC position {} invalid", p);
+    }
 
     Ok(())
 }

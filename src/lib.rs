@@ -91,8 +91,8 @@ pub use classify::log_ratio::{
 
 // Core utilities (low-level extraction)
 pub use core::{
-    base_to_bit, count_hits, extract_dual_strand_into, extract_with_positions,
-    MinimizerWithPosition,
+    base_to_bit, count_hits, extract_dual_strand_into, extract_minimizer_set,
+    extract_strand_minimizers, StrandMinimizers,
 };
 
 // Orientation utilities (for bucket building)
