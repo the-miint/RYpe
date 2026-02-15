@@ -7,7 +7,7 @@ This directory contains examples demonstrating the Rype library API from C and P
 ### basic_example.c
 
 Demonstrates the core C API:
-- Loading indices (main, inverted, sharded)
+- Loading Parquet inverted indices (.ryxdi)
 - Querying index metadata
 - Single-end and paired-end classification
 - Batch classification
@@ -86,7 +86,7 @@ gcc -o extraction_example extraction_example.c \
     -Wl,-rpath,../target/release
 
 # Arrow example (requires --features arrow-ffi)
-gcc -DRYPE_ARROW -o arrow_example arrow_example.c \
+gcc -o arrow_example arrow_example.c \
     -L../target/release -lrype \
     -Wl,-rpath,../target/release
 
@@ -125,12 +125,12 @@ gcc -o basic_example basic_example.c \
 ```bash
 # Create a test index first
 cd ..
-cargo run --release -- index create -o test.ryidx -r some_reference.fasta -k 64 -w 50
+cargo run --release -- index create -o test.ryxdi -r some_reference.fasta -k 64 -w 50
 
 # Run examples
 cd examples
-./basic_example ../test.ryidx
-./arrow_example ../test.ryidx
+./basic_example ../test.ryxdi
+./arrow_example ../test.ryxdi
 ```
 
 ## Key API Concepts

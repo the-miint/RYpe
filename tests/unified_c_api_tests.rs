@@ -2,6 +2,8 @@
 //!
 //! These tests verify that the C API works correctly with Parquet inverted indices.
 
+#![allow(deprecated)] // rype_index_is_sharded is deprecated but tested for backward compat
+
 use anyhow::Result;
 use rype::c_api::{
     rype_bucket_name, rype_classify, rype_classify_best_hit, rype_classify_log_ratio,

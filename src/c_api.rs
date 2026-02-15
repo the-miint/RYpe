@@ -143,16 +143,13 @@ fn clear_last_error() {
     });
 }
 
-/// Validates that a pointer is non-null and properly aligned for type T.
-/// Returns true if valid, false otherwise.
+/// Debug sanity check: pointer is non-null and has correct alignment for T.
 ///
-/// # Limitations
-///
-/// This does NOT verify the pointer points to valid memory or a live object.
-/// Dereferencing an aligned pointer to freed memory causes undefined behavior.
-/// This is an inherent limitation of C FFI - we cannot fully validate C pointers.
+/// This catches accidental null or obviously-garbled pointers (e.g. truncated
+/// casts). It CANNOT detect use-after-free, wild pointers, or other real
+/// memory errors — those are inherent C FFI limitations.
 #[inline]
-fn is_valid_ptr<T>(ptr: *const T) -> bool {
+fn is_nonnull_aligned<T>(ptr: *const T) -> bool {
     !ptr.is_null() && (ptr as usize) % std::mem::align_of::<T>() == 0
 }
 
@@ -301,7 +298,7 @@ pub extern "C" fn rype_index_free(ptr: *mut RypeIndex) {
 /// Returns the k-mer size of the index, or 0 if index is NULL or misaligned.
 #[no_mangle]
 pub extern "C" fn rype_index_k(index_ptr: *const RypeIndex) -> size_t {
-    if !is_valid_ptr(index_ptr) {
+    if !is_nonnull_aligned(index_ptr) {
         return 0;
     }
     let index = unsafe { &*index_ptr };
@@ -311,7 +308,7 @@ pub extern "C" fn rype_index_k(index_ptr: *const RypeIndex) -> size_t {
 /// Returns the window size of the index, or 0 if index is NULL or misaligned.
 #[no_mangle]
 pub extern "C" fn rype_index_w(index_ptr: *const RypeIndex) -> size_t {
-    if !is_valid_ptr(index_ptr) {
+    if !is_nonnull_aligned(index_ptr) {
         return 0;
     }
     let index = unsafe { &*index_ptr };
@@ -321,7 +318,7 @@ pub extern "C" fn rype_index_w(index_ptr: *const RypeIndex) -> size_t {
 /// Returns the salt of the index, or 0 if index is NULL or misaligned.
 #[no_mangle]
 pub extern "C" fn rype_index_salt(index_ptr: *const RypeIndex) -> u64 {
-    if !is_valid_ptr(index_ptr) {
+    if !is_nonnull_aligned(index_ptr) {
         return 0;
     }
     let index = unsafe { &*index_ptr };
@@ -332,18 +329,23 @@ pub extern "C" fn rype_index_salt(index_ptr: *const RypeIndex) -> u64 {
 ///
 /// Returns 0 if index is NULL or misaligned.
 #[no_mangle]
-pub extern "C" fn rype_index_num_buckets(index_ptr: *const RypeIndex) -> i32 {
-    if !is_valid_ptr(index_ptr) {
+pub extern "C" fn rype_index_num_buckets(index_ptr: *const RypeIndex) -> u32 {
+    if !is_nonnull_aligned(index_ptr) {
         return 0;
     }
     let index = unsafe { &*index_ptr };
-    index.num_buckets() as i32
+    index.num_buckets() as u32
 }
 
 /// Returns whether the index is sharded (always true for Parquet indices).
+///
+/// # Deprecated
+/// This function always returns 1, since all indices are now Parquet-based and
+/// sharded. It is retained for backward compatibility with existing C callers.
+#[deprecated(note = "Always returns 1. All indices are Parquet-based and sharded.")]
 #[no_mangle]
 pub extern "C" fn rype_index_is_sharded(index_ptr: *const RypeIndex) -> i32 {
-    if !is_valid_ptr(index_ptr) {
+    if !is_nonnull_aligned(index_ptr) {
         return 0;
     }
     1 // Always true for Parquet format
@@ -352,7 +354,7 @@ pub extern "C" fn rype_index_is_sharded(index_ptr: *const RypeIndex) -> i32 {
 /// Returns the number of shards in the index.
 #[no_mangle]
 pub extern "C" fn rype_index_num_shards(index_ptr: *const RypeIndex) -> u32 {
-    if !is_valid_ptr(index_ptr) {
+    if !is_nonnull_aligned(index_ptr) {
         return 0;
     }
     let index = unsafe { &*index_ptr };
@@ -368,7 +370,7 @@ pub extern "C" fn rype_index_num_shards(index_ptr: *const RypeIndex) -> u32 {
 /// Returns 0 if index_ptr is invalid.
 #[no_mangle]
 pub extern "C" fn rype_index_memory_bytes(index_ptr: *const RypeIndex) -> size_t {
-    if !is_valid_ptr(index_ptr) {
+    if !is_nonnull_aligned(index_ptr) {
         return 0;
     }
     let index = unsafe { &*index_ptr };
@@ -380,7 +382,7 @@ pub extern "C" fn rype_index_memory_bytes(index_ptr: *const RypeIndex) -> size_t
 /// Use this for memory planning when classifying against sharded indices.
 #[no_mangle]
 pub extern "C" fn rype_index_largest_shard_bytes(index_ptr: *const RypeIndex) -> size_t {
-    if !is_valid_ptr(index_ptr) {
+    if !is_nonnull_aligned(index_ptr) {
         return 0;
     }
     let index = unsafe { &*index_ptr };
@@ -460,7 +462,7 @@ thread_local! {
 /// - The returned pointer is only valid while index_ptr remains valid
 #[no_mangle]
 pub extern "C" fn rype_bucket_name(index_ptr: *const RypeIndex, bucket_id: u32) -> *const c_char {
-    if !is_valid_ptr(index_ptr) {
+    if !is_nonnull_aligned(index_ptr) {
         return std::ptr::null();
     }
 
@@ -470,19 +472,18 @@ pub extern "C" fn rype_bucket_name(index_ptr: *const RypeIndex, bucket_id: u32) 
         Some(name) => {
             BUCKET_NAME_CACHE.with(|cache| {
                 let mut cache = cache.borrow_mut();
-                // Key includes index pointer to avoid collisions between indices
                 let key = (index_ptr as usize, bucket_id);
-                // Insert/update the CString in our cache
-                let cstring = match CString::new(name) {
-                    Ok(s) => s,
-                    Err(_) => return std::ptr::null(),
-                };
-                cache.insert(key, cstring);
-                // Return pointer to the cached CString
-                cache
-                    .get(&key)
-                    .map(|s| s.as_ptr())
-                    .unwrap_or(std::ptr::null())
+                let entry = cache
+                    .entry(key)
+                    .or_insert_with(|| CString::new("").unwrap());
+                // Update the cached CString (name may change if index is reloaded at same address)
+                match CString::new(name) {
+                    Ok(s) => {
+                        *entry = s;
+                        entry.as_ptr()
+                    }
+                    Err(_) => std::ptr::null(),
+                }
             })
         }
         None => std::ptr::null(),
@@ -517,7 +518,7 @@ pub struct RypeNegativeSet {
 pub extern "C" fn rype_negative_set_create(
     negative_index_ptr: *const RypeIndex,
 ) -> *mut RypeNegativeSet {
-    if !is_valid_ptr(negative_index_ptr) {
+    if !is_nonnull_aligned(negative_index_ptr) {
         set_last_error("negative_index_ptr is NULL or misaligned".to_string());
         return std::ptr::null_mut();
     }
@@ -549,7 +550,7 @@ pub extern "C" fn rype_negative_set_free(ptr: *mut RypeNegativeSet) {
 /// is an upper bound rather than an exact count.
 #[no_mangle]
 pub extern "C" fn rype_negative_set_size(ptr: *const RypeNegativeSet) -> size_t {
-    if ptr.is_null() {
+    if !is_nonnull_aligned(ptr) {
         return 0;
     }
     let neg_set = unsafe { &*ptr };
@@ -625,7 +626,7 @@ fn classify_internal(
     best_hit_only: bool,
 ) -> *mut RypeResultArray {
     // Validate pointers with alignment checks
-    if !is_valid_ptr(index_ptr) {
+    if !is_nonnull_aligned(index_ptr) {
         set_last_error("index is NULL or misaligned".to_string());
         return std::ptr::null_mut();
     }
@@ -633,11 +634,11 @@ fn classify_internal(
         set_last_error("Invalid arguments: queries is NULL or num_queries is zero".to_string());
         return std::ptr::null_mut();
     }
-    if (queries_ptr as usize) % std::mem::align_of::<RypeQuery>() != 0 {
+    if !is_nonnull_aligned(queries_ptr) {
         set_last_error("queries pointer is misaligned".to_string());
         return std::ptr::null_mut();
     }
-    if !negative_set_ptr.is_null() && !is_valid_ptr(negative_set_ptr) {
+    if !negative_set_ptr.is_null() && !is_nonnull_aligned(negative_set_ptr) {
         set_last_error("negative_set pointer is misaligned".to_string());
         return std::ptr::null_mut();
     }
@@ -818,27 +819,34 @@ pub extern "C" fn rype_classify_best_hit_with_negative(
     )
 }
 
-#[no_mangle]
-pub extern "C" fn rype_results_free(ptr: *mut RypeResultArray) {
+/// Common layout shared by `RypeResultArray` and `RypeLogRatioResultArray`.
+/// Used only inside `free_result_array_inner` to avoid function-pointer indirection.
+#[repr(C)]
+struct ResultArrayRepr<T> {
+    data: *mut T,
+    len: size_t,
+    capacity: size_t,
+}
+
+/// Free a result array (outer Box + inner Vec).
+///
+/// # Safety
+/// - `ptr` must be a valid pointer previously obtained from Box::into_raw, or null.
+/// - The struct at `ptr` must have the layout of `ResultArrayRepr<T>`.
+unsafe fn free_result_array_inner<T>(ptr: *mut ResultArrayRepr<T>) {
     if !ptr.is_null() {
-        unsafe {
-            let array = Box::from_raw(ptr);
-
-            // Safety check: verify data pointer is valid before reconstructing Vec
-            // A null data pointer with non-zero len/capacity indicates corruption or double-free
-            if array.data.is_null() {
-                if array.len > 0 || array.capacity > 0 {
-                    // This is undefined behavior territory - abort to prevent memory corruption
-                    eprintln!("FATAL: Corrupted RypeResultArray detected in rype_results_free (null data with len={}, capacity={}). Possible double-free.", array.len, array.capacity);
-                    std::process::abort();
-                }
-                // Empty array with null data is valid (no allocation to free)
-                return;
-            }
-
+        let array = Box::from_raw(ptr);
+        if !array.data.is_null() {
             let _ = Vec::from_raw_parts(array.data, array.len, array.capacity);
         }
+        // Empty result (data=null, len=0, capacity=0): Box drop handles the outer struct.
     }
+}
+
+#[no_mangle]
+pub extern "C" fn rype_results_free(ptr: *mut RypeResultArray) {
+    // SAFETY: RypeResultArray has identical layout to ResultArrayRepr<RypeHit>.
+    unsafe { free_result_array_inner(ptr as *mut ResultArrayRepr<RypeHit>) }
 }
 
 // --- Log-Ratio API Functions ---
@@ -854,11 +862,11 @@ pub extern "C" fn rype_validate_log_ratio_indices(
     numerator: *const RypeIndex,
     denominator: *const RypeIndex,
 ) -> c_int {
-    if numerator.is_null() || (numerator as usize) % std::mem::align_of::<RypeIndex>() != 0 {
+    if !is_nonnull_aligned(numerator) {
         set_last_error("numerator is NULL or misaligned".to_string());
         return -1;
     }
-    if denominator.is_null() || (denominator as usize) % std::mem::align_of::<RypeIndex>() != 0 {
+    if !is_nonnull_aligned(denominator) {
         set_last_error("denominator is NULL or misaligned".to_string());
         return -1;
     }
@@ -894,12 +902,11 @@ pub extern "C" fn rype_classify_log_ratio(
 ) -> *mut RypeLogRatioResultArray {
     let result = std::panic::catch_unwind(|| {
         // Validate pointers
-        if numerator.is_null() || (numerator as usize) % std::mem::align_of::<RypeIndex>() != 0 {
+        if !is_nonnull_aligned(numerator) {
             set_last_error("numerator is NULL or misaligned".to_string());
             return std::ptr::null_mut();
         }
-        if denominator.is_null() || (denominator as usize) % std::mem::align_of::<RypeIndex>() != 0
-        {
+        if !is_nonnull_aligned(denominator) {
             set_last_error("denominator is NULL or misaligned".to_string());
             return std::ptr::null_mut();
         }
@@ -907,7 +914,7 @@ pub extern "C" fn rype_classify_log_ratio(
             set_last_error("Invalid arguments: queries is NULL or num_queries is zero".to_string());
             return std::ptr::null_mut();
         }
-        if (queries as usize) % std::mem::align_of::<RypeQuery>() != 0 {
+        if !is_nonnull_aligned(queries) {
             set_last_error("queries pointer is misaligned".to_string());
             return std::ptr::null_mut();
         }
@@ -973,8 +980,13 @@ pub extern "C" fn rype_classify_log_ratio(
 
         let len = results.len();
         let capacity = results.capacity();
-        let data = results.as_mut_ptr();
-        std::mem::forget(results);
+        let data = if results.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            let ptr = results.as_mut_ptr();
+            std::mem::forget(results);
+            ptr
+        };
 
         clear_last_error();
         Box::into_raw(Box::new(RypeLogRatioResultArray {
@@ -1004,21 +1016,8 @@ pub extern "C" fn rype_classify_log_ratio(
 /// Do NOT call twice on the same pointer (undefined behavior).
 #[no_mangle]
 pub extern "C" fn rype_log_ratio_results_free(ptr: *mut RypeLogRatioResultArray) {
-    if !ptr.is_null() {
-        unsafe {
-            let array = Box::from_raw(ptr);
-
-            if array.data.is_null() {
-                if array.len > 0 || array.capacity > 0 {
-                    eprintln!("FATAL: Corrupted RypeLogRatioResultArray detected in rype_log_ratio_results_free (null data with len={}, capacity={}). Possible double-free.", array.len, array.capacity);
-                    std::process::abort();
-                }
-                return;
-            }
-
-            let _ = Vec::from_raw_parts(array.data, array.len, array.capacity);
-        }
-    }
+    // SAFETY: RypeLogRatioResultArray has identical layout to ResultArrayRepr<RypeLogRatioHit>.
+    unsafe { free_result_array_inner(ptr as *mut ResultArrayRepr<RypeLogRatioHit>) }
 }
 
 #[no_mangle]
@@ -1211,18 +1210,35 @@ pub extern "C" fn rype_extract_minimizer_set(
         return std::ptr::null_mut();
     }
 
-    let seq_slice = unsafe { slice::from_raw_parts(seq, seq_len) };
-    let mut ws = crate::MinimizerWorkspace::new();
+    let result = std::panic::catch_unwind(|| {
+        let seq_slice = unsafe { slice::from_raw_parts(seq, seq_len) };
+        let mut ws = crate::MinimizerWorkspace::new();
 
-    let (fwd, rc) = crate::extract_minimizer_set(seq_slice, k, w, salt, &mut ws);
+        let (fwd, rc) = crate::extract_minimizer_set(seq_slice, k, w, salt, &mut ws);
 
-    let result = Box::new(RypeMinimizerSetResult {
-        forward: vec_to_rype_u64_array(fwd),
-        reverse_complement: vec_to_rype_u64_array(rc),
+        Box::new(RypeMinimizerSetResult {
+            forward: vec_to_rype_u64_array(fwd),
+            reverse_complement: vec_to_rype_u64_array(rc),
+        })
     });
 
-    clear_last_error();
-    Box::into_raw(result)
+    match result {
+        Ok(boxed) => {
+            clear_last_error();
+            Box::into_raw(boxed)
+        }
+        Err(panic_err) => {
+            let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "Unknown panic in rype_extract_minimizer_set".to_string()
+            };
+            set_last_error(msg);
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// Free a minimizer set result. NULL is safe to pass.
@@ -1273,18 +1289,35 @@ pub extern "C" fn rype_extract_strand_minimizers(
         return std::ptr::null_mut();
     }
 
-    let seq_slice = unsafe { slice::from_raw_parts(seq, seq_len) };
-    let mut ws = crate::MinimizerWorkspace::new();
+    let result = std::panic::catch_unwind(|| {
+        let seq_slice = unsafe { slice::from_raw_parts(seq, seq_len) };
+        let mut ws = crate::MinimizerWorkspace::new();
 
-    let (fwd, rc) = crate::extract_strand_minimizers(seq_slice, k, w, salt, &mut ws);
+        let (fwd, rc) = crate::extract_strand_minimizers(seq_slice, k, w, salt, &mut ws);
 
-    let result = Box::new(RypeStrandMinimizersResult {
-        forward: strand_to_c_result(fwd),
-        reverse_complement: strand_to_c_result(rc),
+        Box::new(RypeStrandMinimizersResult {
+            forward: strand_to_c_result(fwd),
+            reverse_complement: strand_to_c_result(rc),
+        })
     });
 
-    clear_last_error();
-    Box::into_raw(result)
+    match result {
+        Ok(boxed) => {
+            clear_last_error();
+            Box::into_raw(boxed)
+        }
+        Err(panic_err) => {
+            let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "Unknown panic in rype_extract_strand_minimizers".to_string()
+            };
+            set_last_error(msg);
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// Free a strand minimizers result. NULL is safe to pass.
@@ -1455,8 +1488,6 @@ mod arrow_ffi {
     ) -> Result<HashSet<u64>, arrow::error::ArrowError> {
         use crate::arrow::batch_to_records;
         use crate::classify::collect_negative_minimizers_sharded;
-        use crate::{get_paired_minimizers_into, MinimizerWorkspace};
-        use rayon::prelude::*;
 
         // Convert batch to records
         let records = batch_to_records(batch)
@@ -1466,30 +1497,14 @@ mod arrow_ffi {
             return Ok(HashSet::new());
         }
 
-        // Get index parameters
         let manifest = positive_index.manifest();
 
-        // Extract minimizers from records in parallel
-        let processed: Vec<_> = records
-            .par_iter()
-            .map_init(
-                || MinimizerWorkspace::with_estimate(256),
-                |ws, (_, s1, s2)| {
-                    let (fwd, rc) = get_paired_minimizers_into(
-                        s1,
-                        *s2,
-                        manifest.k,
-                        manifest.w,
-                        manifest.salt,
-                        ws,
-                    );
-                    (fwd, rc)
-                },
-            )
-            .collect();
+        // Extract minimizers using the shared batch extraction function
+        let extracted =
+            crate::extract_batch_minimizers(manifest.k, manifest.w, manifest.salt, None, &records);
 
         // Build sorted unique minimizers for querying negative index
-        let mut all_minimizers: Vec<u64> = processed
+        let mut all_minimizers: Vec<u64> = extracted
             .iter()
             .flat_map(|(fwd, rc)| fwd.iter().chain(rc.iter()).copied())
             .collect();
@@ -1615,8 +1630,13 @@ mod arrow_ffi {
         }
     }
 
-    // SAFETY: StreamingClassifier is Send if F is Send, which we require
-    // in create_streaming_output. The ArrowArrayStreamReader is also Send.
+    // SAFETY: StreamingClassifier<F> is Send when F: Send because:
+    // 1. ArrowArrayStreamReader is Send in arrow v57+ (wraps FFI_ArrowArrayStream
+    //    which transfers ownership across threads via the C Data Interface).
+    // 2. SchemaRef (Arc<Schema>) is Send+Sync.
+    // 3. The closure F captures only Send-safe wrapped pointers (SendRypeIndexPtr,
+    //    SendRypeNegativeSetPtr) which wrap Arc<ShardedInvertedIndex> — itself
+    //    Send+Sync due to immutable read-only access during classification.
     unsafe impl<F: Send> Send for StreamingClassifier<F> {}
 
     impl<F> RecordBatchReader for StreamingClassifier<F>
@@ -1651,6 +1671,118 @@ mod arrow_ffi {
         std::ptr::write(out_stream, export_stream);
 
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal helper: Shared Arrow classification logic
+    // -------------------------------------------------------------------------
+
+    /// Internal helper for Arrow FFI classification, shared by both
+    /// `rype_classify_arrow` and `rype_classify_arrow_best_hit`.
+    ///
+    /// Validates parameters, sets up Send-safe pointer wrappers, builds the
+    /// classify closure (with optional negative filtering and best-hit filtering),
+    /// and creates the streaming output.
+    ///
+    /// # Safety
+    /// - index_ptr must remain valid until the output stream is fully consumed
+    /// - negative_set_ptr (if non-null) must remain valid until output is consumed
+    unsafe fn classify_arrow_internal(
+        index_ptr: *const RypeIndex,
+        negative_set_ptr: *const RypeNegativeSet,
+        input_stream: *mut FFI_ArrowArrayStream,
+        threshold: c_double,
+        out_stream: *mut FFI_ArrowArrayStream,
+        best_hit: bool,
+    ) -> i32 {
+        // Validate parameters
+        if index_ptr.is_null() {
+            set_last_error("index is NULL".to_string());
+            return -1;
+        }
+        if input_stream.is_null() {
+            set_last_error("input_stream is NULL".to_string());
+            return -1;
+        }
+        if out_stream.is_null() {
+            set_last_error("out_stream is NULL".to_string());
+            return -1;
+        }
+        if let Err(e) = validate_threshold(threshold) {
+            set_last_error(e);
+            return -1;
+        }
+
+        // Wrap pointers in type-specific Send-safe wrappers
+        // SAFETY: Caller guarantees pointers remain valid until stream is consumed
+        let index_send = SendRypeIndexPtr::new(index_ptr);
+        let neg_set_send = if negative_set_ptr.is_null() {
+            None
+        } else {
+            Some(SendRypeNegativeSetPtr::new(negative_set_ptr))
+        };
+
+        // Validate negative index compatibility upfront (not per-batch)
+        if let Some(ref neg_send) = neg_set_send {
+            let pos_manifest = unsafe { &*index_ptr }.0.manifest();
+            let neg_manifest = unsafe { &neg_send.get().index }.manifest();
+            if pos_manifest.k != neg_manifest.k
+                || pos_manifest.w != neg_manifest.w
+                || pos_manifest.salt != neg_manifest.salt
+            {
+                set_last_error(format!(
+                    "Negative index parameters (k={}, w={}, salt=0x{:x}) do not match \
+                     positive index (k={}, w={}, salt=0x{:x})",
+                    neg_manifest.k,
+                    neg_manifest.w,
+                    neg_manifest.salt,
+                    pos_manifest.k,
+                    pos_manifest.w,
+                    pos_manifest.salt,
+                ));
+                return -1;
+            }
+        }
+
+        let classify_fn = move |batch: &RecordBatch| {
+            let index = unsafe { index_send.get() };
+
+            // Handle sharded negative filtering: collect hitting minimizers per batch
+            let neg_mins_owned: Option<HashSet<u64>> = if let Some(ref neg_send) = neg_set_send {
+                let neg_index = unsafe { &neg_send.get().index };
+                Some(collect_negative_mins_for_batch(neg_index, batch, &index.0)?)
+            } else {
+                None
+            };
+
+            let result = if best_hit {
+                classify_arrow_batch_sharded_best_hit(
+                    &index.0,
+                    neg_mins_owned.as_ref(),
+                    batch,
+                    threshold,
+                )
+            } else {
+                classify_arrow_batch_sharded(&index.0, neg_mins_owned.as_ref(), batch, threshold)
+            };
+            result.map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
+        };
+
+        match create_streaming_output(
+            input_stream,
+            out_stream,
+            crate::arrow::result_schema(),
+            classify_fn,
+        ) {
+            Ok(()) => {
+                clear_last_error();
+                0
+            }
+            Err(e) => {
+                set_last_error(e);
+                -1
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1693,64 +1825,14 @@ mod arrow_ffi {
         threshold: c_double,
         out_stream: *mut FFI_ArrowArrayStream,
     ) -> i32 {
-        // Validate parameters
-        if index_ptr.is_null() {
-            set_last_error("index is NULL".to_string());
-            return -1;
-        }
-        if input_stream.is_null() {
-            set_last_error("input_stream is NULL".to_string());
-            return -1;
-        }
-        if out_stream.is_null() {
-            set_last_error("out_stream is NULL".to_string());
-            return -1;
-        }
-        if let Err(e) = validate_threshold(threshold) {
-            set_last_error(e);
-            return -1;
-        }
-
-        // Wrap pointers in type-specific Send-safe wrappers
-        // SAFETY: Caller guarantees pointers remain valid until stream is consumed
-        let index_send = SendRypeIndexPtr::new(index_ptr);
-        let neg_set_send = if negative_set_ptr.is_null() {
-            None
-        } else {
-            Some(SendRypeNegativeSetPtr::new(negative_set_ptr))
-        };
-
-        let classify_fn = move |batch: &RecordBatch| {
-            let index = unsafe { index_send.get() };
-
-            // Handle sharded negative filtering: collect hitting minimizers per batch
-            let neg_mins_owned: Option<HashSet<u64>> = if let Some(ref neg_send) = neg_set_send {
-                let neg_index = unsafe { &neg_send.get().index };
-                Some(collect_negative_mins_for_batch(neg_index, batch, &index.0)?)
-            } else {
-                None
-            };
-
-            let result =
-                classify_arrow_batch_sharded(&index.0, neg_mins_owned.as_ref(), batch, threshold);
-            result.map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
-        };
-
-        match create_streaming_output(
+        classify_arrow_internal(
+            index_ptr,
+            negative_set_ptr,
             input_stream,
+            threshold,
             out_stream,
-            crate::arrow::result_schema(),
-            classify_fn,
-        ) {
-            Ok(()) => {
-                clear_last_error();
-                0
-            }
-            Err(e) => {
-                set_last_error(e);
-                -1
-            }
-        }
+            false,
+        )
     }
 
     /// Classify sequences from an Arrow stream and return only the best hit per query.
@@ -1787,67 +1869,14 @@ mod arrow_ffi {
         threshold: c_double,
         out_stream: *mut FFI_ArrowArrayStream,
     ) -> i32 {
-        // Validate parameters
-        if index_ptr.is_null() {
-            set_last_error("index is NULL".to_string());
-            return -1;
-        }
-        if input_stream.is_null() {
-            set_last_error("input_stream is NULL".to_string());
-            return -1;
-        }
-        if out_stream.is_null() {
-            set_last_error("out_stream is NULL".to_string());
-            return -1;
-        }
-        if let Err(e) = validate_threshold(threshold) {
-            set_last_error(e);
-            return -1;
-        }
-
-        // Wrap pointers in Send-safe wrappers
-        let index_send = SendRypeIndexPtr::new(index_ptr);
-        let neg_set_send = if negative_set_ptr.is_null() {
-            None
-        } else {
-            Some(SendRypeNegativeSetPtr::new(negative_set_ptr))
-        };
-
-        let classify_fn = move |batch: &RecordBatch| {
-            let index = unsafe { index_send.get() };
-
-            // Handle sharded negative filtering: collect hitting minimizers per batch
-            let neg_mins_owned: Option<HashSet<u64>> = if let Some(ref neg_send) = neg_set_send {
-                let neg_index = unsafe { &neg_send.get().index };
-                Some(collect_negative_mins_for_batch(neg_index, batch, &index.0)?)
-            } else {
-                None
-            };
-
-            let result = classify_arrow_batch_sharded_best_hit(
-                &index.0,
-                neg_mins_owned.as_ref(),
-                batch,
-                threshold,
-            );
-            result.map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
-        };
-
-        match create_streaming_output(
+        classify_arrow_internal(
+            index_ptr,
+            negative_set_ptr,
             input_stream,
+            threshold,
             out_stream,
-            crate::arrow::result_schema(),
-            classify_fn,
-        ) {
-            Ok(()) => {
-                clear_last_error();
-                0
-            }
-            Err(e) => {
-                set_last_error(e);
-                -1
-            }
-        }
+            true,
+        )
     }
 
     /// Returns the schema for classification result batches as an FFI_ArrowSchema.
@@ -2153,12 +2182,11 @@ mod arrow_ffi {
         out_stream: *mut FFI_ArrowArrayStream,
     ) -> i32 {
         // Validate pointers
-        if numerator.is_null() || (numerator as usize) % std::mem::align_of::<RypeIndex>() != 0 {
+        if !is_nonnull_aligned(numerator) {
             set_last_error("numerator is NULL or misaligned".to_string());
             return -1;
         }
-        if denominator.is_null() || (denominator as usize) % std::mem::align_of::<RypeIndex>() != 0
-        {
+        if !is_nonnull_aligned(denominator) {
             set_last_error("denominator is NULL or misaligned".to_string());
             return -1;
         }

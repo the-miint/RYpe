@@ -335,17 +335,15 @@ uint64_t rype_index_salt(const RypeIndex* index);
  *
  * Thread-safe (read-only access).
  */
-int32_t rype_index_num_buckets(const RypeIndex* index);
+uint32_t rype_index_num_buckets(const RypeIndex* index);
 
 /**
- * Check if an index is sharded
+ * Check if an index is sharded (DEPRECATED)
+ *
+ * @deprecated Always returns 1. All indices are Parquet-based and sharded.
  *
  * @param index  Non-NULL RypeIndex pointer
  * @return       Always 1 (all Parquet indices are sharded), or 0 if NULL
- *
- * ## Note
- *
- * All Parquet indices are sharded, even if they contain only one shard.
  *
  * ## Thread Safety
  *
@@ -1091,7 +1089,6 @@ int rype_classify_arrow(
     const RypeNegativeSet* negative_set,
     struct ArrowArrayStream* input_stream,
     double threshold,
-    int use_merge_join,
     struct ArrowArrayStream* out_stream
 );
 
@@ -1106,7 +1103,6 @@ int rype_classify_arrow_best_hit(
     const RypeNegativeSet* negative_set,
     struct ArrowArrayStream* input_stream,
     double threshold,
-    int use_merge_join,
     struct ArrowArrayStream* out_stream
 );
 

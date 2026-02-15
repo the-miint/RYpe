@@ -11,20 +11,22 @@
  * 3. Consuming output streams correctly (schema lifetime)
  * 4. Proper cleanup
  *
- * Build (requires Arrow feature):
- *     cargo build --release --features arrow
- *     gcc -DRYPE_ARROW -o arrow_example arrow_example.c \
+ * Build (requires Arrow FFI feature):
+ *     cargo build --release --lib --features arrow-ffi
+ *     gcc -o arrow_example arrow_example.c \
  *         -L../target/release -lrype -Wl,-rpath,../target/release
  *
  * Run:
- *     ./arrow_example path/to/index.ryidx
+ *     ./arrow_example path/to/index.ryxdi
  *
  * NOTE: This is a simplified example showing the API flow. In practice, you
  * would typically receive Arrow streams from PyArrow, DuckDB, or similar
  * rather than constructing them manually in C.
  */
 
+#ifndef RYPE_ARROW
 #define RYPE_ARROW
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -378,9 +380,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("Index loaded: k=%zu, w=%zu, inverted=%d, sharded=%d\n",
+    printf("Index loaded: k=%zu, w=%zu, shards=%u\n",
            rype_index_k(idx), rype_index_w(idx),
-           rype_index_is_inverted(idx), rype_index_is_sharded(idx));
+           rype_index_num_shards(idx));
 
     // Step 2: Create input stream
     // In practice, you'd receive this from PyArrow, DuckDB, etc.
@@ -407,7 +409,6 @@ int main(int argc, char** argv) {
         NULL,           // no negative filtering
         &input_stream,  // CONSUMED - do not release after!
         0.05,           // threshold
-        0,              // use_merge_join (for sharded inverted indices)
         &output_stream
     );
 

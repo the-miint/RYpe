@@ -42,7 +42,9 @@
 #include <arrow-glib/arrow-glib.h>
 
 /* We only need the Arrow FFI declarations from rype.h */
+#ifndef RYPE_ARROW
 #define RYPE_ARROW
+#endif
 #include "../rype.h"
 
 /* Test sequences */

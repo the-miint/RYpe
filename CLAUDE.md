@@ -40,6 +40,15 @@ gcc example.c -L target/debug -lrype -o c_example
 LD_LIBRARY_PATH=target/debug ./c_example
 ```
 
+### Python Examples
+```bash
+# ctypes extraction example (no extra dependencies)
+python3 examples/ctypes_extraction_example.py
+
+# PyArrow extraction example (requires pyarrow via conda env)
+conda run -n rype-pyarrow python3 examples/pyarrow_extraction_example.py
+```
+
 ### CLI Usage
 ```bash
 # Create an index from reference sequences

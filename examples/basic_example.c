@@ -15,7 +15,7 @@
  *     gcc -o basic_example basic_example.c -L../target/debug -lrype -Wl,-rpath,../target/debug
  *
  * Run:
- *     ./basic_example path/to/index.ryidx
+ *     ./basic_example path/to/index.ryxdi
  */
 
 #include <stdio.h>
@@ -43,16 +43,10 @@ static void print_index_info(const RypeIndex* idx) {
     printf("  K-mer size:    %zu\n", rype_index_k(idx));
     printf("  Window size:   %zu\n", rype_index_w(idx));
     printf("  Salt:          0x%016lx\n", (unsigned long)rype_index_salt(idx));
-    printf("  Is inverted:   %s\n", rype_index_is_inverted(idx) ? "yes" : "no");
-    printf("  Is sharded:    %s\n", rype_index_is_sharded(idx) ? "yes" : "no");
     printf("  Num shards:    %u\n", rype_index_num_shards(idx));
 
-    int32_t num_buckets = rype_index_num_buckets(idx);
-    if (num_buckets >= 0) {
-        printf("  Num buckets:   %d\n", num_buckets);
-    } else {
-        printf("  Num buckets:   N/A (inverted index)\n");
-    }
+    uint32_t num_buckets = rype_index_num_buckets(idx);
+    printf("  Num buckets:   %u\n", num_buckets);
     printf("\n");
 }
 
@@ -72,19 +66,9 @@ static void print_results(const RypeIndex* idx, const RypeResultArray* results) 
     for (size_t i = 0; i < results->len; i++) {
         const RypeHit* hit = &results->data[i];
 
-        // Look up bucket name - handle NULL cases properly
+        // Look up bucket name
         const char* name = rype_bucket_name(idx, hit->bucket_id);
-        const char* display_name;
-
-        if (name) {
-            display_name = name;
-        } else if (rype_index_is_inverted(idx)) {
-            // Expected for inverted indices - they don't store names
-            display_name = "(use main idx)";
-        } else {
-            // Unexpected - bucket should exist in main index
-            display_name = "(unknown)";
-        }
+        const char* display_name = name ? name : "(unknown)";
 
         printf("  %-10ld %-10u %-20s %.4f\n",
                (long)hit->query_id,
@@ -208,7 +192,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <index_path>\n", argv[0]);
         fprintf(stderr, "\nExample:\n");
-        fprintf(stderr, "  %s ../my_index.ryidx\n", argv[0]);
+        fprintf(stderr, "  %s ../my_index.ryxdi\n", argv[0]);
         return 1;
     }
 
