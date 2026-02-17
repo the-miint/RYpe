@@ -5674,3 +5674,169 @@ fn test_c_extraction_example() -> Result<()> {
 
     Ok(())
 }
+
+/// Test that a reverse-complement read classifies to the same bucket as the forward read.
+///
+/// This is an end-to-end test: build an index from phiX174, classify a forward fragment,
+/// classify the DNA reverse complement of that fragment, and assert both hit the same
+/// bucket with the same score.
+#[test]
+fn test_classify_rc_read_matches_forward() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("test_rc.ryxdi");
+
+    // Create index from phiX174
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // A 200bp fragment from phiX174 (lines 2-4 of the FASTA)
+    let fwd_seq = "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\
+                    GATAAAGCAGGAATTACTACTGCTTGTTTACGAATTAAATCGAAGTGGACTGCTGGCGGAAAATGAGAAA\
+                    ATTCGACCTATCCTTGCGCAGCTCGAGAAGCTCTTACTTTGCGACCTTTCGCCATCAACTAACGATTCTG";
+
+    // DNA reverse complement: reverse the string, then complement each base
+    let rc_seq: String = fwd_seq
+        .bytes()
+        .rev()
+        .map(|b| match b {
+            b'A' => 'T',
+            b'T' => 'A',
+            b'G' => 'C',
+            b'C' => 'G',
+            _ => 'N',
+        })
+        .collect();
+
+    // Write forward query FASTQ
+    let fwd_query_path = dir.path().join("fwd_query.fastq");
+    let fwd_qual = "I".repeat(fwd_seq.len());
+    fs::write(
+        &fwd_query_path,
+        format!("@fwd_read\n{}\n+\n{}\n", fwd_seq, fwd_qual),
+    )?;
+
+    // Write RC query FASTQ
+    let rc_query_path = dir.path().join("rc_query.fastq");
+    let rc_qual = "I".repeat(rc_seq.len());
+    fs::write(
+        &rc_query_path,
+        format!("@rc_read\n{}\n+\n{}\n", rc_seq, rc_qual),
+    )?;
+
+    // Classify forward read
+    let fwd_output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            fwd_query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+        ])
+        .output()?;
+    assert!(
+        fwd_output.status.success(),
+        "Forward classification failed: {}",
+        String::from_utf8_lossy(&fwd_output.stderr)
+    );
+
+    // Classify RC read
+    let rc_output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            rc_query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+        ])
+        .output()?;
+    assert!(
+        rc_output.status.success(),
+        "RC classification failed: {}",
+        String::from_utf8_lossy(&rc_output.stderr)
+    );
+
+    // Parse TSV output: read_id\tbucket_name\tscore
+    let fwd_stdout = String::from_utf8_lossy(&fwd_output.stdout);
+    let rc_stdout = String::from_utf8_lossy(&rc_output.stdout);
+
+    let parse_hit = |output: &str| -> Option<(String, f64)> {
+        output
+            .lines()
+            .find(|line| !line.starts_with("read_id"))
+            .map(|line| {
+                let fields: Vec<&str> = line.split('\t').collect();
+                let bucket = fields[1].to_string();
+                let score: f64 = fields[2].parse().unwrap();
+                (bucket, score)
+            })
+    };
+
+    let fwd_hit = parse_hit(&fwd_stdout);
+    let rc_hit = parse_hit(&rc_stdout);
+
+    assert!(
+        fwd_hit.is_some(),
+        "Forward read should have a hit. Output: {}",
+        fwd_stdout
+    );
+    assert!(
+        rc_hit.is_some(),
+        "RC read should have a hit. Output: {}",
+        rc_stdout
+    );
+
+    let (fwd_bucket, fwd_score) = fwd_hit.unwrap();
+    let (rc_bucket, rc_score) = rc_hit.unwrap();
+
+    assert_eq!(
+        fwd_bucket, rc_bucket,
+        "Forward and RC reads should hit the same bucket"
+    );
+    assert!(
+        (fwd_score - rc_score).abs() < 1e-9,
+        "Forward and RC reads should have the same score, got fwd={} rc={}",
+        fwd_score,
+        rc_score
+    );
+
+    // Sanity: score should be high since the query comes directly from the reference
+    assert!(
+        fwd_score > 0.9,
+        "Score should be high for a self-match, got {}",
+        fwd_score
+    );
+
+    Ok(())
+}
