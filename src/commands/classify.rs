@@ -161,8 +161,9 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         writer
     };
 
-    // For wide format, use threshold 0.0 to get all bucket scores
-    let effective_threshold = if args.wide {
+    // For wide format or best-hit, use threshold 0.0 to get all scores.
+    // Best-hit needs all scores so it can select the highest per query.
+    let effective_threshold = if args.wide || args.best_hit {
         0.0
     } else {
         args.common.threshold
