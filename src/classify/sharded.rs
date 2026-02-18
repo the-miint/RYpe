@@ -124,6 +124,52 @@ fn use_coo_merge_join(manifest: &crate::indices::sharded::ShardManifest) -> bool
 }
 
 // ============================================================================
+// Dedup helpers for overlapping shards
+// ============================================================================
+
+/// Filter out (minimizer, bucket_id) pairs that are duplicates within `loaded`
+/// (consecutive, since sorted) or already present in `seen`.
+/// Both inputs must be sorted. Returns only unique unseen pairs.
+fn filter_unseen(loaded: &[(u64, u32)], seen: &[(u64, u32)]) -> Vec<(u64, u32)> {
+    let mut result = Vec::new();
+    let mut si = 0;
+    let mut prev: Option<(u64, u32)> = None;
+    for &pair in loaded {
+        // Skip within-shard duplicates (consecutive in sorted order)
+        if prev == Some(pair) {
+            continue;
+        }
+        prev = Some(pair);
+        // Skip cross-shard duplicates
+        while si < seen.len() && seen[si] < pair {
+            si += 1;
+        }
+        if si >= seen.len() || seen[si] != pair {
+            result.push(pair);
+        }
+    }
+    result
+}
+
+/// Merge two sorted slices into `out`. Clears `out` first; reuses its allocation.
+fn merge_sorted_into(a: &[(u64, u32)], b: &[(u64, u32)], out: &mut Vec<(u64, u32)>) {
+    out.clear();
+    out.reserve(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] <= b[j] {
+            out.push(a[i]);
+            i += 1;
+        } else {
+            out.push(b[j]);
+            j += 1;
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+}
+
+// ============================================================================
 // Pipelined shard loop (classify_from_query_index)
 // ============================================================================
 
@@ -156,15 +202,10 @@ fn classify_shard_loop<A: HitAccumulator>(
     // correctness in load_shard_*_for_query() and for gallop_join_csr().
     let query_minimizers = query_idx.unique_minimizers();
 
-    // Debug: show query minimizer statistics
-    if std::env::var("RYPE_DEBUG").is_ok() && !query_minimizers.is_empty() {
-        eprintln!(
-            "[DEBUG] Query minimizers: {} unique, range: {} to {}",
-            query_minimizers.len(),
-            query_minimizers[0],
-            query_minimizers[query_minimizers.len() - 1]
-        );
-    }
+    // When shards have overlapping minimizer ranges (single-bucket from-config indices),
+    // the same (minimizer, bucket_id) pair can appear in multiple shards. Track seen
+    // pairs across shards to avoid double-counting hits in the accumulator.
+    let needs_dedup = manifest.has_overlapping_shards && manifest.shards.len() > 1;
 
     // Pipelined shard processing: background loader thread + main merge-join thread.
     // sync_channel(1) allows at most one shard buffered ahead, bounding memory to
@@ -200,7 +241,12 @@ fn classify_shard_loop<A: HitAccumulator>(
             }
         });
 
-        // Main thread: receive loaded shards and merge-join
+        // Main thread: receive loaded shards and merge-join.
+        // When needs_dedup is true, maintain a sorted Vec of seen (minimizer, bucket_id)
+        // pairs to filter duplicates across shards. Uses two buffers with swap to avoid
+        // per-shard allocation after the first shard.
+        let mut seen: Vec<(u64, u32)> = Vec::new();
+        let mut merge_buf: Vec<(u64, u32)> = Vec::new();
         for received in rx {
             let (shard, load_ms) = received?;
             total_shard_load_ms += load_ms;
@@ -208,9 +254,19 @@ fn classify_shard_loop<A: HitAccumulator>(
             let t_merge = Instant::now();
             match shard {
                 LoadedShard::Coo(ref pairs) => {
-                    merge_join_coo_parallel(query_idx, pairs, &mut accumulator);
+                    if needs_dedup {
+                        let filtered = filter_unseen(pairs, &seen);
+                        merge_sorted_into(&seen, &filtered, &mut merge_buf);
+                        std::mem::swap(&mut seen, &mut merge_buf);
+                        merge_join_coo_parallel(query_idx, &filtered, &mut accumulator);
+                    } else {
+                        merge_join_coo_parallel(query_idx, pairs, &mut accumulator);
+                    }
                 }
                 LoadedShard::Csr(ref idx) => {
+                    // CSR path: has_overlapping_shards indices are always single-bucket
+                    // (from-config streaming build), so they always use COO (num_buckets
+                    // <= COO_MERGE_JOIN_MAX_BUCKETS). No dedup needed here.
                     merge_join_csr(query_idx, idx, &mut accumulator, &query_minimizers);
                 }
             }
@@ -499,6 +555,12 @@ pub fn classify_from_query_index_parallel_rg(
     }
 
     let manifest = sharded.manifest();
+
+    // Parallel RG processing cannot deduplicate across row groups from different
+    // shards. Fall back to the sequential shard path which has cross-shard dedup.
+    if manifest.has_overlapping_shards && manifest.shards.len() > 1 {
+        return classify_from_query_index(sharded, query_idx, query_ids, threshold, _read_options);
+    }
 
     // Compute unique query minimizers once for shard/RG filtering and bloom filter hints
     let query_minimizers = query_idx.unique_minimizers();
@@ -1329,5 +1391,150 @@ mod tests {
                 score_sharded
             );
         }
+    }
+
+    // =========================================================================
+    // Overlapping shards dedup tests
+    // =========================================================================
+
+    #[test]
+    fn test_filter_unseen_empty_seen() {
+        let loaded = vec![(1, 0), (2, 0), (3, 0)];
+        let seen: Vec<(u64, u32)> = vec![];
+        let result = filter_unseen(&loaded, &seen);
+        assert_eq!(result, loaded);
+    }
+
+    #[test]
+    fn test_filter_unseen_all_seen() {
+        let loaded = vec![(1, 0), (2, 0), (3, 0)];
+        let seen = vec![(1, 0), (2, 0), (3, 0)];
+        let result = filter_unseen(&loaded, &seen);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_unseen_partial() {
+        let loaded = vec![(1, 0), (2, 0), (3, 0), (4, 0)];
+        let seen = vec![(2, 0), (4, 0)];
+        let result = filter_unseen(&loaded, &seen);
+        assert_eq!(result, vec![(1, 0), (3, 0)]);
+    }
+
+    #[test]
+    fn test_filter_unseen_within_shard_duplicates() {
+        // Loaded has consecutive duplicates (within-shard dupes from streaming build)
+        let loaded = vec![(1, 0), (1, 0), (2, 0), (3, 0), (3, 0), (3, 0)];
+        let seen: Vec<(u64, u32)> = vec![];
+        let result = filter_unseen(&loaded, &seen);
+        assert_eq!(result, vec![(1, 0), (2, 0), (3, 0)]);
+    }
+
+    #[test]
+    fn test_filter_unseen_both_within_and_cross_shard() {
+        // Loaded has within-shard dupes, and some are also in seen
+        let loaded = vec![(1, 0), (1, 0), (2, 0), (3, 0), (3, 0), (4, 0)];
+        let seen = vec![(1, 0), (3, 0)];
+        let result = filter_unseen(&loaded, &seen);
+        assert_eq!(result, vec![(2, 0), (4, 0)]);
+    }
+
+    #[test]
+    fn test_merge_sorted_into_both_nonempty() {
+        let a = vec![(1, 0), (3, 0), (5, 0)];
+        let b = vec![(2, 0), (4, 0), (6, 0)];
+        let mut out = Vec::new();
+        merge_sorted_into(&a, &b, &mut out);
+        assert_eq!(out, vec![(1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0)]);
+    }
+
+    #[test]
+    fn test_merge_sorted_into_reuses_allocation() {
+        let a = vec![(1, 0), (3, 0)];
+        let b = vec![(2, 0)];
+        let mut out = Vec::with_capacity(100);
+        merge_sorted_into(&a, &b, &mut out);
+        assert_eq!(out, vec![(1, 0), (2, 0), (3, 0)]);
+        assert!(out.capacity() >= 100, "should reuse pre-allocated capacity");
+    }
+
+    #[test]
+    fn test_overlapping_shards_dedup() {
+        // Regression test: when has_overlapping_shards is true and the same
+        // (minimizer, bucket_id) pairs appear in multiple shards, classification
+        // must not double-count hits.
+        use crate::indices::parquet::{InvertedManifest, InvertedShardInfo, ParquetManifest};
+
+        let dir = tempdir().unwrap();
+        let index_path = dir.path().join("test.ryxdi");
+
+        let k = 32;
+        let w = 10;
+        let salt = 0x12345u64;
+
+        // Create a single-bucket index with one sequence
+        let seq = generate_sequence(500, 7);
+        let mut ws = MinimizerWorkspace::new();
+        extract_into(&seq, k, w, salt, &mut ws);
+        let mut mins: Vec<u64> = ws.buffer.drain(..).collect();
+        mins.sort();
+        mins.dedup();
+
+        let buckets = vec![BucketData {
+            bucket_id: 1,
+            bucket_name: "TestBucket".to_string(),
+            sources: vec!["seq".to_string()],
+            minimizers: mins,
+        }];
+
+        let options = ParquetWriteOptions::default();
+        create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))
+            .unwrap();
+
+        // Baseline: classify with 1-shard index
+        let index_1shard = ShardedInvertedIndex::open(&index_path).unwrap();
+        let records: Vec<QueryRecord> = vec![(1, seq.as_slice(), None)];
+        let baseline =
+            classify_batch_sharded_merge_join(&index_1shard, None, &records, 0.0, None).unwrap();
+        assert!(!baseline.is_empty(), "self-match should produce hits");
+        let baseline_score = baseline[0].score;
+
+        // Duplicate shard.0.parquet → shard.1.parquet to create 100% overlap
+        let shard0 = index_path.join("inverted").join("shard.0.parquet");
+        let shard1 = index_path.join("inverted").join("shard.1.parquet");
+        std::fs::copy(&shard0, &shard1).unwrap();
+
+        // Rewrite manifest with 2 shards and has_overlapping_shards = true
+        let mut manifest = ParquetManifest::load(&index_path).unwrap();
+        let inv = manifest.inverted.as_ref().unwrap();
+        let shard0_info = inv.shards[0];
+        manifest.inverted = Some(InvertedManifest {
+            format: inv.format,
+            num_shards: 2,
+            total_entries: inv.total_entries * 2,
+            has_overlapping_shards: true,
+            shards: vec![
+                shard0_info,
+                InvertedShardInfo {
+                    shard_id: 1,
+                    ..shard0_info
+                },
+            ],
+        });
+        manifest.save(&index_path).unwrap();
+
+        // Classify with 2-shard overlapping index — should equal baseline (no inflation)
+        let index_2shard = ShardedInvertedIndex::open(&index_path).unwrap();
+        let deduped =
+            classify_batch_sharded_merge_join(&index_2shard, None, &records, 0.0, None).unwrap();
+        assert!(!deduped.is_empty(), "2-shard should still produce hits");
+        let deduped_score = deduped[0].score;
+
+        assert!(
+            (deduped_score - baseline_score).abs() < 1e-10,
+            "Deduped 2-shard score ({}) should equal 1-shard baseline ({})",
+            deduped_score,
+            baseline_score,
+        );
     }
 }

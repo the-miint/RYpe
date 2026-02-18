@@ -179,7 +179,12 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
     // Determine input format for accurate memory estimation
     let input_format = determine_input_format(config, is_paired);
 
-    // Estimate shard loading memory from largest shard size
+    // Estimate shard loading memory from largest shard size.
+    // TODO: When has_overlapping_shards is true, classify_shard_loop maintains a `seen`
+    // Vec<(u64, u32)> that grows up to min(total_ref_entries, batch_unique_minimizers) × 12
+    // bytes. This is not yet accounted for here. For most workloads the existing headroom
+    // is sufficient, but extreme cases (400k+ long reads, 30 overlapping shards) may
+    // exceed --max-memory. See PLAN-overlapping-shards-bug.md Step 3.
     let shard_reservation =
         estimate_shard_reservation(largest_shard_entries, rayon::current_num_threads());
 
