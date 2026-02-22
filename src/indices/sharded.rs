@@ -65,6 +65,9 @@ pub struct ShardManifest {
     pub bucket_sources: HashMap<u32, Vec<String>>,
     /// Bucket minimizer counts. Maps bucket_id to number of minimizers.
     pub bucket_minimizer_counts: HashMap<u32, usize>,
+    /// Per-bucket file-level sequence length statistics.
+    /// `None` for indices built before this feature was added.
+    pub bucket_file_stats: Option<HashMap<u32, crate::types::BucketFileStats>>,
 }
 
 impl ShardManifest {
@@ -92,6 +95,7 @@ impl ShardManifest {
             bucket_sources: self.bucket_sources.clone(),
             bucket_minimizer_counts: self.bucket_minimizer_counts.clone(),
             largest_shard_entries,
+            bucket_file_stats: self.bucket_file_stats.clone(),
         }
     }
 
@@ -139,8 +143,9 @@ impl ShardedInvertedIndex {
             .map_err(|e| RypeError::format(base_path, e.to_string()))?;
 
         // Load bucket metadata from buckets.parquet
-        let (bucket_names, bucket_sources) = super::parquet::read_buckets_parquet(base_path)
-            .map_err(|e| RypeError::format(base_path, e.to_string()))?;
+        let (bucket_names, bucket_sources, bucket_file_stats) =
+            super::parquet::read_buckets_parquet(base_path)
+                .map_err(|e| RypeError::format(base_path, e.to_string()))?;
 
         // Convert to ShardManifest format
         let inverted = parquet_manifest
@@ -173,6 +178,7 @@ impl ShardedInvertedIndex {
             bucket_names,
             bucket_sources,
             bucket_minimizer_counts: HashMap::new(), // Not stored in Parquet format
+            bucket_file_stats,
         };
 
         // Preload row group ranges for Parquet shards

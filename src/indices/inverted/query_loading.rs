@@ -748,6 +748,7 @@ mod tests {
             bucket_sources: HashMap::new(),
             bucket_minimizer_counts,
             largest_shard_entries: 0,
+            bucket_file_stats: None,
         };
 
         InvertedIndex::build_from_bucket_map(k, w, salt, &bucket_map, &metadata)

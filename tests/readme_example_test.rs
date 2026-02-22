@@ -128,8 +128,17 @@ fn test_readme_c_example_compiles_and_runs() {
         }];
 
         let options = ParquetWriteOptions::default();
-        rype::create_parquet_inverted_index(&index_path, buckets, 32, 10, 0, None, Some(&options))
-            .expect("Failed to create index");
+        rype::create_parquet_inverted_index(
+            &index_path,
+            buckets,
+            32,
+            10,
+            0,
+            None,
+            Some(&options),
+            None,
+        )
+        .expect("Failed to create index");
     }
 
     for (i, c_code) in c_blocks.iter().enumerate() {

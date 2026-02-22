@@ -102,7 +102,7 @@ mod tests {
             .collect();
 
         let options = ParquetWriteOptions::default();
-        create_parquet_inverted_index(base_path, buckets, k, w, salt, None, Some(&options))
+        create_parquet_inverted_index(base_path, buckets, k, w, salt, None, Some(&options), None)
             .unwrap();
 
         ShardedInvertedIndex::open(base_path).unwrap()
@@ -268,7 +268,7 @@ mod tests {
             minimizers: contaminant_mins.clone(),
         }];
         let options = ParquetWriteOptions::default();
-        create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))
+        create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options), None)
             .unwrap();
 
         let neg_index = ShardedInvertedIndex::open(&index_path).unwrap();

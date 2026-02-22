@@ -490,6 +490,101 @@ pub extern "C" fn rype_bucket_name(index_ptr: *const RypeIndex, bucket_id: u32) 
     }
 }
 
+// --- Bucket File Stats API ---
+
+/// Per-bucket file statistics, exposed to C callers.
+#[repr(C)]
+pub struct RypeBucketFileStats {
+    /// Bucket ID this stats entry belongs to.
+    pub bucket_id: u32,
+    /// Mean of per-file total sequence lengths.
+    pub mean: c_double,
+    /// Median of per-file total sequence lengths.
+    pub median: c_double,
+    /// Population standard deviation of per-file total sequence lengths.
+    pub stdev: c_double,
+    /// Minimum per-file total sequence length.
+    pub min: c_double,
+    /// Maximum per-file total sequence length.
+    pub max: c_double,
+}
+
+/// Array of per-bucket file statistics returned by `rype_bucket_file_stats()`.
+#[repr(C)]
+pub struct RypeBucketFileStatsArray {
+    /// Pointer to array of stats entries (owned by this struct).
+    pub stats: *mut RypeBucketFileStats,
+    /// Number of entries in the array.
+    pub count: size_t,
+}
+
+/// Returns per-bucket file statistics for all buckets that have them.
+///
+/// Returns NULL if the index has no file statistics (e.g., old format indices
+/// or merged indices). The caller takes ownership and must call
+/// `rype_bucket_file_stats_free()` when done.
+///
+/// # Safety
+/// - index_ptr must be a valid pointer obtained from rype_index_load()
+#[no_mangle]
+pub extern "C" fn rype_bucket_file_stats(
+    index_ptr: *const RypeIndex,
+) -> *mut RypeBucketFileStatsArray {
+    if !is_nonnull_aligned(index_ptr) {
+        set_last_error("index_ptr is NULL or misaligned".to_string());
+        return std::ptr::null_mut();
+    }
+
+    let index = unsafe { &*index_ptr };
+    let manifest = index.0.manifest();
+
+    match &manifest.bucket_file_stats {
+        Some(stats_map) if !stats_map.is_empty() => {
+            let mut entries: Vec<RypeBucketFileStats> = stats_map
+                .iter()
+                .map(|(&bucket_id, stats)| RypeBucketFileStats {
+                    bucket_id,
+                    mean: stats.mean,
+                    median: stats.median,
+                    stdev: stats.stdev,
+                    min: stats.min,
+                    max: stats.max,
+                })
+                .collect();
+
+            // Sort by bucket_id for deterministic ordering
+            entries.sort_by_key(|e| e.bucket_id);
+
+            let count = entries.len();
+            let stats_ptr = entries.as_mut_ptr();
+            std::mem::forget(entries);
+
+            let result = Box::new(RypeBucketFileStatsArray {
+                stats: stats_ptr,
+                count,
+            });
+            Box::into_raw(result)
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// Frees a `RypeBucketFileStatsArray` previously returned by `rype_bucket_file_stats()`.
+///
+/// Safe to call with NULL.
+#[no_mangle]
+pub extern "C" fn rype_bucket_file_stats_free(ptr: *mut RypeBucketFileStatsArray) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let array = Box::from_raw(ptr);
+        if !array.stats.is_null() && array.count > 0 {
+            let _ = Vec::from_raw_parts(array.stats, array.count, array.count);
+        }
+    }
+}
+
 // --- Negative Index API ---
 
 /// Opaque handle to a negative index for memory-efficient filtering.

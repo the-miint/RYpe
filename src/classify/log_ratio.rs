@@ -445,6 +445,7 @@ mod tests {
             bucket_sources: HashMap::new(),
             bucket_minimizer_counts: HashMap::new(),
             largest_shard_entries: 0,
+            bucket_file_stats: None,
         }
     }
 

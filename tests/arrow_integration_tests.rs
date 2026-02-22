@@ -100,8 +100,17 @@ fn create_test_parquet_index() -> (tempfile::TempDir, ShardedInvertedIndex) {
     ];
 
     let options = ParquetWriteOptions::default();
-    create_parquet_inverted_index(&index_path, buckets, 16, 5, 0x12345, None, Some(&options))
-        .unwrap();
+    create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        16,
+        5,
+        0x12345,
+        None,
+        Some(&options),
+        None,
+    )
+    .unwrap();
 
     let index = ShardedInvertedIndex::open(&index_path).unwrap();
     (dir, index)

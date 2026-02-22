@@ -47,6 +47,7 @@ type MergeHeapEntry = (Reverse<(u64, u32)>, usize, usize);
 ///
 /// # Errors
 /// Returns an error if any bucket has unsorted or duplicate minimizers.
+#[allow(clippy::too_many_arguments)]
 pub fn create_parquet_inverted_index(
     output_dir: &Path,
     buckets: Vec<BucketData>,
@@ -55,6 +56,7 @@ pub fn create_parquet_inverted_index(
     salt: u64,
     max_shard_bytes: Option<usize>,
     options: Option<&ParquetWriteOptions>,
+    bucket_file_stats: Option<&HashMap<u32, crate::types::BucketFileStats>>,
 ) -> Result<ParquetManifest> {
     let opts = options.cloned().unwrap_or_default();
     opts.validate()?;
@@ -86,7 +88,12 @@ pub fn create_parquet_inverted_index(
     }
 
     // Write bucket metadata
-    write_buckets_parquet(output_dir, &bucket_names, &bucket_sources)?;
+    write_buckets_parquet(
+        output_dir,
+        &bucket_names,
+        &bucket_sources,
+        bucket_file_stats,
+    )?;
 
     // Stream inverted pairs to Parquet shards
     let (shard_infos, has_overlapping_shards) = stream_to_parquet_shards(
@@ -996,7 +1003,8 @@ mod tests {
         ];
 
         let _streaming_manifest =
-            create_parquet_inverted_index(&streaming_dir, buckets, k, w, salt, None, None).unwrap();
+            create_parquet_inverted_index(&streaming_dir, buckets, k, w, salt, None, None, None)
+                .unwrap();
 
         // Open the created index
         let streaming_sharded = ShardedInvertedIndex::open(&streaming_dir).unwrap();
@@ -1078,6 +1086,7 @@ mod tests {
             salt,
             None,
             Some(&options),
+            None,
         )
         .unwrap();
 
@@ -1129,6 +1138,7 @@ mod tests {
             salt,
             None,
             Some(&options),
+            None,
         )
         .unwrap();
 

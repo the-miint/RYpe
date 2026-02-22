@@ -845,7 +845,7 @@ mod tests {
         ];
 
         let options = ParquetWriteOptions::default();
-        create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))
+        create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options), None)
             .unwrap();
 
         let index = ShardedInvertedIndex::open(&index_path).unwrap();
@@ -1066,7 +1066,8 @@ mod tests {
             .collect();
 
         let options = ParquetWriteOptions::default();
-        create_parquet_inverted_index(path, buckets, k, w, salt, None, Some(&options)).unwrap();
+        create_parquet_inverted_index(path, buckets, k, w, salt, None, Some(&options), None)
+            .unwrap();
 
         ShardedInvertedIndex::open(path).unwrap()
     }
@@ -1488,7 +1489,7 @@ mod tests {
         }];
 
         let options = ParquetWriteOptions::default();
-        create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))
+        create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options), None)
             .unwrap();
 
         // Baseline: classify with 1-shard index

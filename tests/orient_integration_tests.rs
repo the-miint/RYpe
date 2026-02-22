@@ -97,6 +97,7 @@ fn test_orient_flag_produces_valid_index() -> Result<()> {
         salt,
         None,
         Some(&options),
+        None,
     )?;
 
     // Verify index can be loaded
@@ -163,6 +164,7 @@ fn test_classification_with_oriented_index() -> Result<()> {
         salt,
         None,
         Some(&options),
+        None,
     )?;
 
     let sharded = ShardedInvertedIndex::open(&index_path)?;
@@ -208,7 +210,16 @@ fn test_orient_index_format_compatible() -> Result<()> {
 
     // Create index
     let options = ParquetWriteOptions::default();
-    rype::create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))?;
+    rype::create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        k,
+        w,
+        salt,
+        None,
+        Some(&options),
+        None,
+    )?;
 
     // Load and verify format
     let sharded = ShardedInvertedIndex::open(&index_path)?;

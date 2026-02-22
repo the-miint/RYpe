@@ -171,6 +171,19 @@ fn main() -> Result<()> {
                         println!("{}", source);
                     }
                 }
+
+                // Display file statistics if available
+                if let Some(ref all_stats) = metadata.bucket_file_stats {
+                    if let Some(stats) = all_stats.get(&bucket_id) {
+                        println!();
+                        println!("File statistics (per-file total sequence lengths):");
+                        println!("  Mean:   {:.1}", stats.mean);
+                        println!("  Median: {:.1}", stats.median);
+                        println!("  Stdev:  {:.1}", stats.stdev);
+                        println!("  Min:    {:.1}", stats.min);
+                        println!("  Max:    {:.1}", stats.max);
+                    }
+                }
             }
 
             IndexCommands::BucketAdd {
@@ -328,6 +341,28 @@ fn main() -> Result<()> {
                         "  Secondary: {} buckets, {} entries",
                         stats.secondary_buckets, stats.secondary_entries
                     );
+                }
+
+                // Warn only if stats were present in at least one input but the
+                // merged result may have partial coverage (one side lacked stats).
+                {
+                    use rype::ShardedInvertedIndex;
+                    let p = ShardedInvertedIndex::open(&index_primary)?;
+                    let s = ShardedInvertedIndex::open(&index_secondary)?;
+                    let p_has = p.manifest().bucket_file_stats.is_some();
+                    let s_has = s.manifest().bucket_file_stats.is_some();
+                    if p_has != s_has {
+                        eprintln!(
+                            "Warning: only one input index has file statistics. \
+                             The merged index will have partial file statistics \
+                             (missing for buckets from the index without stats)."
+                        );
+                    } else if !p_has && !s_has {
+                        eprintln!(
+                            "Warning: neither input index has file statistics. \
+                             The merged index will not contain per-bucket file length statistics."
+                        );
+                    }
                 }
             }
         },

@@ -156,7 +156,7 @@ fn main() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let index_path = temp_dir.path().join("example.ryxdi");
     let options = ParquetWriteOptions::default();
-    rype::create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))?;
+    rype::create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options), None)?;
 
     // Load and classify
     let index = ShardedInvertedIndex::open(&index_path)?;

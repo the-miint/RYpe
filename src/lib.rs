@@ -61,7 +61,7 @@ pub mod arrow;
 
 // Core types
 pub use error::{FirstErrorCapture, Result as RypeResult, RypeError};
-pub use types::{HitResult, IndexMetadata, QueryRecord};
+pub use types::{BucketFileStats, HitResult, IndexMetadata, QueryRecord};
 
 // Primary index types
 pub use indices::{InvertedIndex, ShardedInvertedIndex};

@@ -103,6 +103,8 @@ pub struct RemappedBuckets {
     pub primary_id_map: HashMap<u32, u32>,
     /// Mapping from secondary old bucket ID to new ID.
     pub secondary_id_map: HashMap<u32, u32>,
+    /// Combined file stats (new_id -> stats), if both indices have stats.
+    pub bucket_file_stats: Option<HashMap<u32, crate::types::BucketFileStats>>,
 }
 
 /// Compute bucket ID remapping for merging two indices.
@@ -168,11 +170,36 @@ pub fn compute_bucket_remapping(
         }
     }
 
+    // Propagate file stats from whichever side has them
+    let bucket_file_stats = {
+        let mut combined = HashMap::new();
+        if let Some(p_stats) = &primary.bucket_file_stats {
+            for (&old_id, &new_id) in &primary_id_map {
+                if let Some(stats) = p_stats.get(&old_id) {
+                    combined.insert(new_id, stats.clone());
+                }
+            }
+        }
+        if let Some(s_stats) = &secondary.bucket_file_stats {
+            for (&old_id, &new_id) in &secondary_id_map {
+                if let Some(stats) = s_stats.get(&old_id) {
+                    combined.insert(new_id, stats.clone());
+                }
+            }
+        }
+        if combined.is_empty() {
+            None
+        } else {
+            Some(combined)
+        }
+    };
+
     RemappedBuckets {
         bucket_names,
         bucket_sources,
         primary_id_map,
         secondary_id_map,
+        bucket_file_stats,
     }
 }
 
@@ -430,11 +457,12 @@ fn finish_merge(
     // Merged indices have overlapping shard ranges
     let has_overlapping_shards = true;
 
-    // Write buckets.parquet
+    // Write buckets.parquet (with file stats if both indices had them)
     write_buckets_parquet(
         output_path,
         &remapped.bucket_names,
         &remapped.bucket_sources,
+        remapped.bucket_file_stats.as_ref(),
     )?;
 
     // Compute source hash for the merged index
@@ -909,7 +937,7 @@ mod tests {
             minimizers,
         };
 
-        create_parquet_inverted_index(dir, vec![bucket], k, w, salt, None, None).unwrap();
+        create_parquet_inverted_index(dir, vec![bucket], k, w, salt, None, None, None).unwrap();
 
         ShardedInvertedIndex::open(dir).unwrap()
     }
@@ -1073,7 +1101,7 @@ mod tests {
             })
             .collect();
 
-        create_parquet_inverted_index(dir, bucket_data, k, w, salt, None, None).unwrap();
+        create_parquet_inverted_index(dir, bucket_data, k, w, salt, None, None, None).unwrap();
 
         ShardedInvertedIndex::open(dir).unwrap()
     }
@@ -1869,7 +1897,7 @@ mod tests {
 
     /// Helper to create an empty test index (0 buckets).
     fn create_empty_index(dir: &std::path::Path, k: usize, w: usize, salt: u64) {
-        create_parquet_inverted_index(dir, vec![], k, w, salt, None, None).unwrap();
+        create_parquet_inverted_index(dir, vec![], k, w, salt, None, None, None).unwrap();
     }
 
     #[test]
@@ -1996,7 +2024,7 @@ mod tests {
                 minimizers: mins_b.clone(),
             },
         ];
-        create_parquet_inverted_index(&primary_path, primary_buckets, k, w, salt, None, None)
+        create_parquet_inverted_index(&primary_path, primary_buckets, k, w, salt, None, None, None)
             .unwrap();
 
         // Create secondary index with buckets C and D
@@ -2014,8 +2042,17 @@ mod tests {
                 minimizers: mins_d.clone(),
             },
         ];
-        create_parquet_inverted_index(&secondary_path, secondary_buckets, k, w, salt, None, None)
-            .unwrap();
+        create_parquet_inverted_index(
+            &secondary_path,
+            secondary_buckets,
+            k,
+            w,
+            salt,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Merge the indices
         let merge_options = MergeOptions::default();
@@ -2441,7 +2478,7 @@ mod tests {
             sources: vec!["primary.fa".to_string()],
             minimizers: mins_primary.clone(),
         }];
-        create_parquet_inverted_index(&primary_path, primary_buckets, k, w, salt, None, None)
+        create_parquet_inverted_index(&primary_path, primary_buckets, k, w, salt, None, None, None)
             .unwrap();
 
         // Create secondary index
@@ -2451,8 +2488,17 @@ mod tests {
             sources: vec!["secondary.fa".to_string()],
             minimizers: mins_secondary.clone(),
         }];
-        create_parquet_inverted_index(&secondary_path, secondary_buckets, k, w, salt, None, None)
-            .unwrap();
+        create_parquet_inverted_index(
+            &secondary_path,
+            secondary_buckets,
+            k,
+            w,
+            salt,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Merge WITH subtraction
         let merge_options = MergeOptions {
@@ -2568,7 +2614,7 @@ mod tests {
             sources: vec!["primary.fa".to_string()],
             minimizers: mins_primary.clone(),
         }];
-        create_parquet_inverted_index(&primary_path, primary_buckets, k, w, salt, None, None)
+        create_parquet_inverted_index(&primary_path, primary_buckets, k, w, salt, None, None, None)
             .unwrap();
 
         // Create secondary index with two buckets:
@@ -2588,8 +2634,17 @@ mod tests {
                 minimizers: mins_secondary_unique.clone(),
             },
         ];
-        create_parquet_inverted_index(&secondary_path, secondary_buckets, k, w, salt, None, None)
-            .unwrap();
+        create_parquet_inverted_index(
+            &secondary_path,
+            secondary_buckets,
+            k,
+            w,
+            salt,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Merge using STREAMING function (not deprecated merge_indices)
         let merge_options = MergeOptions {

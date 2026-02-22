@@ -6,10 +6,11 @@
 
 use anyhow::Result;
 use rype::c_api::{
-    rype_bucket_name, rype_classify, rype_classify_best_hit, rype_classify_log_ratio,
-    rype_classify_with_negative, rype_get_last_error, rype_index_free, rype_index_is_sharded,
-    rype_index_k, rype_index_load, rype_index_num_buckets, rype_index_num_shards, rype_index_salt,
-    rype_index_w, rype_log_ratio_results_free, rype_negative_set_create, rype_negative_set_free,
+    rype_bucket_file_stats, rype_bucket_file_stats_free, rype_bucket_name, rype_classify,
+    rype_classify_best_hit, rype_classify_log_ratio, rype_classify_with_negative,
+    rype_get_last_error, rype_index_free, rype_index_is_sharded, rype_index_k, rype_index_load,
+    rype_index_num_buckets, rype_index_num_shards, rype_index_salt, rype_index_w,
+    rype_log_ratio_results_free, rype_negative_set_create, rype_negative_set_free,
     rype_negative_set_size, rype_results_free, rype_validate_log_ratio_indices, RypeQuery,
 };
 use rype::{
@@ -68,7 +69,16 @@ fn create_test_parquet_index(
     ];
 
     let options = ParquetWriteOptions::default();
-    rype::create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))?;
+    rype::create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        k,
+        w,
+        salt,
+        None,
+        Some(&options),
+        None,
+    )?;
 
     Ok(index_path)
 }
@@ -510,6 +520,7 @@ fn test_inverted_index_build_from_bucket_map() {
         bucket_sources: HashMap::new(),
         bucket_minimizer_counts: bucket_map.iter().map(|(&id, v)| (id, v.len())).collect(),
         largest_shard_entries: 0,
+        bucket_file_stats: None,
     };
 
     let inverted = InvertedIndex::build_from_bucket_map(32, 10, 0x12345, &bucket_map, &metadata);
@@ -842,7 +853,16 @@ fn create_overlapping_bucket_index(
     ];
 
     let options = ParquetWriteOptions::default();
-    rype::create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))?;
+    rype::create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        k,
+        w,
+        salt,
+        None,
+        Some(&options),
+        None,
+    )?;
 
     Ok(index_path)
 }
@@ -945,7 +965,16 @@ fn create_single_bucket_index(
     }];
 
     let options = ParquetWriteOptions::default();
-    rype::create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))?;
+    rype::create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        k,
+        w,
+        salt,
+        None,
+        Some(&options),
+        None,
+    )?;
 
     Ok(index_path)
 }
@@ -1174,5 +1203,137 @@ fn test_log_ratio_c_api_validation_multi_bucket_rejected() -> Result<()> {
 
     rype_index_free(multi_idx);
     rype_index_free(single_idx);
+    Ok(())
+}
+
+/// Test rype_bucket_file_stats returns stats when the index has them.
+#[test]
+fn test_rype_bucket_file_stats() -> Result<()> {
+    let dir = tempdir()?;
+    let index_path = dir.path().join("stats.ryxdi");
+
+    // Create an index with file stats
+    let k = 32;
+    let w = 10;
+    let salt = 0x5555555555555555u64;
+    let seq1 = generate_sequence(200, 0);
+    let seq2 = generate_sequence(300, 1);
+
+    let mut ws = MinimizerWorkspace::new();
+    extract_into(&seq1, k, w, salt, &mut ws);
+    let mins1: Vec<u64> = ws.buffer.drain(..).collect();
+    extract_into(&seq2, k, w, salt, &mut ws);
+    let mins2: Vec<u64> = ws.buffer.drain(..).collect();
+
+    let buckets = vec![
+        BucketData {
+            bucket_id: 1,
+            bucket_name: "BucketA".to_string(),
+            sources: vec!["src1::seq1".to_string()],
+            minimizers: mins1,
+        },
+        BucketData {
+            bucket_id: 2,
+            bucket_name: "BucketB".to_string(),
+            sources: vec!["src2::seq1".to_string()],
+            minimizers: mins2,
+        },
+    ];
+
+    // Create index WITH file stats
+    let mut file_stats = HashMap::new();
+    file_stats.insert(
+        1u32,
+        rype::BucketFileStats {
+            mean: 1000.0,
+            median: 900.0,
+            stdev: 100.0,
+            min: 800.0,
+            max: 1200.0,
+        },
+    );
+    file_stats.insert(
+        2u32,
+        rype::BucketFileStats {
+            mean: 2000.0,
+            median: 1800.0,
+            stdev: 200.0,
+            min: 1600.0,
+            max: 2400.0,
+        },
+    );
+
+    let options = ParquetWriteOptions::default();
+    rype::create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        k,
+        w,
+        salt,
+        None,
+        Some(&options),
+        Some(&file_stats),
+    )?;
+
+    // Load via C API
+    let path_cstr = CString::new(index_path.to_str().unwrap()).unwrap();
+    let idx = rype_index_load(path_cstr.as_ptr());
+    assert!(!idx.is_null(), "Index should load");
+
+    // Get file stats
+    let stats_ptr = rype_bucket_file_stats(idx);
+    assert!(
+        !stats_ptr.is_null(),
+        "Should return non-null stats for index with file stats"
+    );
+
+    unsafe {
+        let stats_array = &*stats_ptr;
+        assert_eq!(stats_array.count, 2, "Should have 2 bucket stats");
+
+        let entries = std::slice::from_raw_parts(stats_array.stats, stats_array.count);
+
+        // Entries are sorted by bucket_id
+        assert_eq!(entries[0].bucket_id, 1);
+        assert!((entries[0].mean - 1000.0).abs() < 1e-6);
+        assert!((entries[0].median - 900.0).abs() < 1e-6);
+        assert!((entries[0].stdev - 100.0).abs() < 1e-6);
+        assert!((entries[0].min - 800.0).abs() < 1e-6);
+        assert!((entries[0].max - 1200.0).abs() < 1e-6);
+
+        assert_eq!(entries[1].bucket_id, 2);
+        assert!((entries[1].mean - 2000.0).abs() < 1e-6);
+        assert!((entries[1].median - 1800.0).abs() < 1e-6);
+        assert!((entries[1].stdev - 200.0).abs() < 1e-6);
+        assert!((entries[1].min - 1600.0).abs() < 1e-6);
+        assert!((entries[1].max - 2400.0).abs() < 1e-6);
+    }
+
+    rype_bucket_file_stats_free(stats_ptr);
+    rype_index_free(idx);
+    Ok(())
+}
+
+/// Test rype_bucket_file_stats returns NULL for index without stats.
+#[test]
+fn test_rype_bucket_file_stats_returns_null_without_stats() -> Result<()> {
+    let dir = tempdir()?;
+    let index_path = create_test_parquet_index(dir.path(), 32, 10, 0x5555555555555555)?;
+
+    let path_cstr = CString::new(index_path.to_str().unwrap()).unwrap();
+    let idx = rype_index_load(path_cstr.as_ptr());
+    assert!(!idx.is_null());
+
+    // Index created without file stats should return NULL
+    let stats_ptr = rype_bucket_file_stats(idx);
+    assert!(
+        stats_ptr.is_null(),
+        "Should return NULL for index without file stats"
+    );
+
+    // Safe to call free with NULL
+    rype_bucket_file_stats_free(stats_ptr);
+
+    rype_index_free(idx);
     Ok(())
 }

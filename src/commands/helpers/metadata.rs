@@ -82,7 +82,8 @@ pub fn load_index_metadata(path: &Path) -> Result<IndexMetadata> {
     // Parquet format (directory with manifest.toml)
     if rype::is_parquet_index(path) {
         let manifest = rype::ParquetManifest::load(path)?;
-        let (bucket_names, bucket_sources) = rype::parquet_index::read_buckets_parquet(path)?;
+        let (bucket_names, bucket_sources, bucket_file_stats) =
+            rype::parquet_index::read_buckets_parquet(path)?;
         let largest_shard_entries = manifest
             .inverted
             .as_ref()
@@ -96,6 +97,7 @@ pub fn load_index_metadata(path: &Path) -> Result<IndexMetadata> {
             bucket_sources,
             bucket_minimizer_counts: HashMap::new(),
             largest_shard_entries,
+            bucket_file_stats,
         });
     }
 

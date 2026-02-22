@@ -93,7 +93,8 @@ pub fn create_parquet_index_from_refs(
     max_shard_bytes: Option<usize>,
     options: Option<&parquet_index::ParquetWriteOptions>,
 ) -> Result<()> {
-    use rype::{create_parquet_inverted_index, BucketData};
+    use rype::{create_parquet_inverted_index, BucketData, BucketFileStats};
+    use std::collections::HashMap;
 
     log::info!(
         "Creating Parquet inverted index at {:?} (K={}, W={}, salt={:#x})",
@@ -106,6 +107,8 @@ pub fn create_parquet_index_from_refs(
     let mut buckets: Vec<BucketData> = Vec::new();
     let mut next_id: u32 = 1;
     let mut ws = MinimizerWorkspace::new();
+    // Track per-file total sequence lengths for each bucket
+    let mut bucket_file_lengths: HashMap<u32, Vec<u64>> = HashMap::new();
 
     for ref_path in references {
         log::info!("Processing reference: {}", ref_path.display());
@@ -117,6 +120,7 @@ pub fn create_parquet_index_from_refs(
             .to_string();
 
         if separate_buckets {
+            // Each sequence = one bucket, one "file"
             while let Some(record) = reader.next() {
                 let rec = record.context("Invalid record")?;
                 let seq = rec.seq();
@@ -128,6 +132,9 @@ pub fn create_parquet_index_from_refs(
                 let mut minimizers = std::mem::take(&mut ws.buffer);
                 minimizers.sort_unstable();
                 minimizers.dedup();
+
+                // For separate_buckets, each sequence IS the file
+                bucket_file_lengths.insert(bucket_id, vec![seq.len() as u64]);
 
                 let source_label = format!("{}{}{}", filename, BUCKET_SOURCE_DELIM, name);
                 buckets.push(BucketData {
@@ -143,11 +150,15 @@ pub fn create_parquet_index_from_refs(
 
             let mut all_minimizers: Vec<u64> = Vec::new();
             let mut sources: Vec<String> = Vec::new();
+            // Track total sequence length for this file
+            let mut file_total_bases: u64 = 0;
 
             while let Some(record) = reader.next() {
                 let rec = record.context("Invalid record")?;
                 let seq = rec.seq();
                 let name = String::from_utf8_lossy(rec.id()).to_string();
+
+                file_total_bases += seq.len() as u64;
 
                 extract_into(&seq, k, w, salt, &mut ws);
                 all_minimizers.extend_from_slice(&ws.buffer);
@@ -155,6 +166,12 @@ pub fn create_parquet_index_from_refs(
                 let source_label = format!("{}{}{}", filename, BUCKET_SOURCE_DELIM, name);
                 sources.push(source_label);
             }
+
+            // Record this file's total length for the bucket
+            bucket_file_lengths
+                .entry(bucket_id)
+                .or_default()
+                .push(file_total_bases);
 
             all_minimizers.sort_unstable();
             all_minimizers.dedup();
@@ -175,11 +192,32 @@ pub fn create_parquet_index_from_refs(
         total_minimizers
     );
 
+    // Compute per-bucket file stats
+    let bucket_stats: HashMap<u32, BucketFileStats> = bucket_file_lengths
+        .iter()
+        .filter_map(|(&id, lengths)| {
+            BucketFileStats::from_file_lengths(lengths).map(|stats| (id, stats))
+        })
+        .collect();
+    let bucket_stats_opt = if bucket_stats.is_empty() {
+        None
+    } else {
+        Some(bucket_stats)
+    };
+
     // Validate bucket name uniqueness before creating index
     validate_unique_bucket_names(buckets.iter().map(|b| b.bucket_name.as_str()))?;
 
-    let manifest =
-        create_parquet_inverted_index(output, buckets, k, w, salt, max_shard_bytes, options)?;
+    let manifest = create_parquet_inverted_index(
+        output,
+        buckets,
+        k,
+        w,
+        salt,
+        max_shard_bytes,
+        options,
+        bucket_stats_opt.as_ref(),
+    )?;
 
     log::info!("Created Parquet inverted index:");
     log::info!("  Buckets: {}", manifest.num_buckets);
@@ -214,6 +252,8 @@ pub fn create_parquet_index_from_refs(
 /// - The first sequence uses forward strand (establishes baseline)
 /// - Subsequent sequences compare forward vs reverse-complement overlap with existing minimizers
 /// - The orientation with higher overlap is chosen
+///
+/// Returns a tuple of (sorted deduplicated minimizers, source labels, per-file total lengths).
 fn extract_bucket_minimizers(
     files: &[PathBuf],
     config_dir: &Path,
@@ -221,12 +261,13 @@ fn extract_bucket_minimizers(
     w: usize,
     salt: u64,
     orient_sequences: bool,
-) -> Result<(Vec<u64>, Vec<String>)> {
+) -> Result<(Vec<u64>, Vec<String>, Vec<u64>)> {
     use rype::config::resolve_path;
 
     let mut ws = MinimizerWorkspace::new();
     let mut bucket_mins: Vec<u64> = Vec::new(); // Kept sorted and deduped via merge_sorted_into
     let mut sources: Vec<String> = Vec::new();
+    let mut file_lengths: Vec<u64> = Vec::new();
     let mut is_first_sequence = true;
 
     for file_path in files {
@@ -240,6 +281,8 @@ fn extract_bucket_minimizers(
             .to_string_lossy()
             .to_string();
 
+        let mut file_total_bases: u64 = 0;
+
         while let Some(record) = reader.next() {
             let rec = record.context(format!("Invalid record in file {}", abs_path.display()))?;
             let seq_name = String::from_utf8_lossy(rec.id()).to_string();
@@ -247,6 +290,7 @@ fn extract_bucket_minimizers(
             sources.push(source_label);
 
             let seq = rec.seq();
+            file_total_bases += seq.len() as u64;
 
             if is_first_sequence || !orient_sequences {
                 // Forward-only: extract, sort, merge in-place
@@ -271,10 +315,12 @@ fn extract_bucket_minimizers(
                 merge_sorted_into(&mut bucket_mins, &chosen);
             }
         }
+
+        file_lengths.push(file_total_bases);
     }
 
     // bucket_mins is already sorted and deduped from merge_sorted_into
-    Ok((bucket_mins, sources))
+    Ok((bucket_mins, sources, file_lengths))
 }
 
 // ============================================================================
@@ -398,7 +444,7 @@ fn build_single_bucket_parallel_oriented(
     }
 
     // Phase 1: Process first file sequentially to establish baseline
-    let (baseline_mins, baseline_sources) =
+    let (baseline_mins, baseline_sources, _baseline_file_bases) =
         extract_baseline_from_first_file(&files[0], config_dir, k, w, salt)?;
 
     if files.len() == 1 {
@@ -480,7 +526,7 @@ fn extract_baseline_from_first_file(
     k: usize,
     w: usize,
     salt: u64,
-) -> Result<(Vec<u64>, Vec<String>)> {
+) -> Result<(Vec<u64>, Vec<String>, u64)> {
     use rype::config::resolve_path;
 
     let abs_path = resolve_path(config_dir, file_path);
@@ -496,6 +542,7 @@ fn extract_baseline_from_first_file(
     let mut ws = MinimizerWorkspace::new();
     let mut baseline_mins: Vec<u64> = Vec::new();
     let mut sources: Vec<String> = Vec::new();
+    let mut file_total_bases: u64 = 0;
 
     while let Some(record) = reader.next() {
         let rec = record.context(format!("Invalid record in {}", abs_path.display()))?;
@@ -503,13 +550,16 @@ fn extract_baseline_from_first_file(
         let source_label = format!("{}{}{}", filename, BUCKET_SOURCE_DELIM, seq_name);
         sources.push(source_label);
 
-        extract_into(&rec.seq(), k, w, salt, &mut ws);
+        let seq = rec.seq();
+        file_total_bases += seq.len() as u64;
+
+        extract_into(&seq, k, w, salt, &mut ws);
         let mut new_mins = std::mem::take(&mut ws.buffer);
         new_mins.sort_unstable();
         merge_sorted_into(&mut baseline_mins, &new_mins);
     }
 
-    Ok((baseline_mins, sources))
+    Ok((baseline_mins, sources, file_total_bases))
 }
 
 // ============================================================================
@@ -843,7 +893,7 @@ fn build_single_bucket_parallel_oriented_chunked(
     }
 
     // Phase 1: Process first file sequentially to establish baseline
-    let (baseline_mins, baseline_sources) =
+    let (baseline_mins, baseline_sources, _baseline_file_bases) =
         extract_baseline_from_first_file(&files[0], config_dir, k, w, salt)?;
 
     if files.len() == 1 {
@@ -953,6 +1003,8 @@ pub struct SingleBucketResult {
     pub shard_infos: Vec<rype::parquet_index::InvertedShardInfo>,
     /// Total minimizers written (may include duplicates across shards)
     pub total_minimizers: u64,
+    /// Total sequence bases per file (one entry per file, in file order)
+    pub file_lengths: Vec<u64>,
 }
 
 /// Build a single bucket using streaming shard creation.
@@ -1005,6 +1057,7 @@ fn build_single_bucket_streaming(
             sources: vec![],
             shard_infos: vec![],
             total_minimizers: 0,
+            file_lengths: vec![],
         });
     }
 
@@ -1037,6 +1090,8 @@ fn build_single_bucket_streaming(
     let mut all_sources: Vec<String> = Vec::new();
     let mut total_minimizers: u64 = 0;
     let mut total_excluded: u64 = 0;
+    let mut file_length_map: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
 
     let mut chunk_iter =
         SequenceChunkIterator::new(files, config_dir, chunk_config.target_chunk_bytes);
@@ -1052,8 +1107,14 @@ fn build_single_bucket_streaming(
             chunk_size
         );
 
-        // Collect sources before consuming chunk
-        all_sources.extend(chunk.iter().map(|(_, src)| src.clone()));
+        // Collect sources and track per-file sequence lengths
+        for (seq, src) in &chunk {
+            all_sources.push(src.clone());
+            if let Some(delim_pos) = src.find(BUCKET_SOURCE_DELIM) {
+                let filename = &src[..delim_pos];
+                *file_length_map.entry(filename.to_string()).or_insert(0) += seq.len() as u64;
+            }
+        }
 
         // Estimate workspace size from this chunk's sequences
         let avg_len = chunk_size / chunk.len().max(1);
@@ -1130,11 +1191,14 @@ fn build_single_bucket_streaming(
         chunk_count
     );
 
+    let file_lengths: Vec<u64> = file_length_map.into_values().collect();
+
     Ok(SingleBucketResult {
         bucket_name: bucket_name.to_string(),
         sources: all_sources,
         shard_infos,
         total_minimizers,
+        file_lengths,
     })
 }
 
@@ -1178,12 +1242,22 @@ fn build_single_bucket_streaming_oriented(
             sources: vec![],
             shard_infos: vec![],
             total_minimizers: 0,
+            file_lengths: vec![],
         });
     }
 
     // Phase 1: Extract baseline from first file
-    let (baseline_mins, baseline_sources) =
+    let (baseline_mins, baseline_sources, baseline_file_bases) =
         extract_baseline_from_first_file(&files[0], config_dir, k, w, salt)?;
+    let mut file_length_map: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    // Track baseline file length (extract filename from first source label)
+    if let Some(first_src) = baseline_sources.first() {
+        if let Some(delim_pos) = first_src.find(BUCKET_SOURCE_DELIM) {
+            let filename = &first_src[..delim_pos];
+            file_length_map.insert(filename.to_string(), baseline_file_bases);
+        }
+    }
 
     log::debug!(
         "Baseline established: {} minimizers from {} sources",
@@ -1257,7 +1331,14 @@ fn build_single_bucket_streaming_oriented(
                 chunk_size
             );
 
-            all_sources.extend(chunk.iter().map(|(_, src)| src.clone()));
+            // Collect sources and track per-file sequence lengths
+            for (seq, src) in &chunk {
+                all_sources.push(src.clone());
+                if let Some(delim_pos) = src.find(BUCKET_SOURCE_DELIM) {
+                    let filename = &src[..delim_pos];
+                    *file_length_map.entry(filename.to_string()).or_insert(0) += seq.len() as u64;
+                }
+            }
 
             let avg_len = chunk_size / chunk.len().max(1);
             let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
@@ -1340,11 +1421,14 @@ fn build_single_bucket_streaming_oriented(
         shard_infos.len()
     );
 
+    let file_lengths: Vec<u64> = file_length_map.into_values().collect();
+
     Ok(SingleBucketResult {
         bucket_name: bucket_name.to_string(),
         sources: all_sources,
         shard_infos,
         total_minimizers,
+        file_lengths,
     })
 }
 
@@ -1374,7 +1458,7 @@ fn build_single_bucket(
     );
 
     // Delegate to extract_bucket_minimizers for the actual work
-    let (minimizers, sources) =
+    let (minimizers, sources, _file_lengths) =
         extract_bucket_minimizers(files, config_dir, k, w, salt, orient_sequences)?;
 
     log::info!(
@@ -1576,7 +1660,21 @@ pub fn build_parquet_index_from_config(
     let mut bucket_sources_map = HashMap::new();
     bucket_names_map.insert(BUCKET_ID, sanitize_bucket_name(&result.bucket_name));
     bucket_sources_map.insert(BUCKET_ID, result.sources);
-    write_buckets_parquet(&output_path, &bucket_names_map, &bucket_sources_map)?;
+    let mut bucket_file_stats_map: HashMap<u32, rype::BucketFileStats> = HashMap::new();
+    if let Some(stats) = rype::BucketFileStats::from_file_lengths(&result.file_lengths) {
+        bucket_file_stats_map.insert(BUCKET_ID, stats);
+    }
+    let file_stats_opt = if bucket_file_stats_map.is_empty() {
+        None
+    } else {
+        Some(&bucket_file_stats_map)
+    };
+    write_buckets_parquet(
+        &output_path,
+        &bucket_names_map,
+        &bucket_sources_map,
+        file_stats_opt,
+    )?;
 
     // Compute source hash for index compatibility checking
     let mut bucket_min_counts = HashMap::new();
@@ -1734,6 +1832,8 @@ pub fn build_parquet_index_from_config_streaming(
     let mut bucket_minimizer_counts: std::collections::HashMap<u32, usize> =
         std::collections::HashMap::new();
     let mut total_minimizers: u64 = 0;
+    let mut all_file_stats: std::collections::HashMap<u32, rype::BucketFileStats> =
+        std::collections::HashMap::new();
 
     // Process buckets using channel-based parallelism for better CPU utilization.
     // Compared to batch-based processing:
@@ -1766,7 +1866,8 @@ pub fn build_parquet_index_from_config_streaming(
     }
 
     // Type alias for channel message clarity
-    type BucketResult = Result<(u32, String, Vec<u64>, Vec<String>)>;
+    // (bucket_id, bucket_name, minimizers, sources, file_lengths)
+    type BucketResult = Result<(u32, String, Vec<u64>, Vec<String>, Vec<u64>)>;
 
     // Track processed count for panic detection
     let processed_count = std::sync::atomic::AtomicUsize::new(0);
@@ -1809,7 +1910,7 @@ pub fn build_parquet_index_from_config_streaming(
                     );
 
                     let bucket_result: BucketResult = match result {
-                        Ok((minimizers, sources)) => {
+                        Ok((minimizers, sources, file_lengths)) => {
                             log::info!(
                                 "Completed bucket '{}': {} minimizers",
                                 bucket_name,
@@ -1820,6 +1921,7 @@ pub fn build_parquet_index_from_config_streaming(
                                 sanitize_bucket_name(bucket_name),
                                 minimizers,
                                 sources,
+                                file_lengths,
                             ))
                         }
                         Err(e) => Err(e.context(format!(
@@ -1838,7 +1940,7 @@ pub fn build_parquet_index_from_config_streaming(
         // Consumer: receive results as buckets complete and accumulate
         let mut total_excluded: u64 = 0;
         for result in rx {
-            let (bucket_id, bucket_name, minimizers, sources) = match result {
+            let (bucket_id, bucket_name, minimizers, sources, file_lengths) = match result {
                 Ok(data) => data,
                 Err(e) => {
                     // Signal producers to stop on error
@@ -1868,6 +1970,11 @@ pub fn build_parquet_index_from_config_streaming(
             bucket_names_map.insert(bucket_id, bucket_name);
             bucket_sources_map.insert(bucket_id, sources);
             bucket_minimizer_counts.insert(bucket_id, minimizers.len());
+
+            // Compute file stats for this bucket
+            if let Some(stats) = rype::BucketFileStats::from_file_lengths(&file_lengths) {
+                all_file_stats.insert(bucket_id, stats);
+            }
             total_minimizers += minimizers.len() as u64;
 
             // Add entries directly to accumulator without intermediate allocation
@@ -1920,8 +2027,18 @@ pub fn build_parquet_index_from_config_streaming(
     // Validate bucket name uniqueness directly from the map
     validate_unique_bucket_names(bucket_names_map.values().map(|s| s.as_str()))?;
 
-    // Write bucket metadata
-    write_buckets_parquet(&output_path, &bucket_names_map, &bucket_sources_map)?;
+    // Write bucket metadata with file stats
+    let file_stats_opt = if all_file_stats.is_empty() {
+        None
+    } else {
+        Some(&all_file_stats)
+    };
+    write_buckets_parquet(
+        &output_path,
+        &bucket_names_map,
+        &bucket_sources_map,
+        file_stats_opt,
+    )?;
 
     // Compute source hash
     let source_hash = compute_source_hash(&bucket_minimizer_counts);
@@ -2383,7 +2500,7 @@ output = "{}"
         let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
         let fasta_path = create_fasta_file(dir, "test.fa", seq);
 
-        let (minimizers, _sources) = extract_bucket_minimizers(
+        let (minimizers, _sources, _file_lengths) = extract_bucket_minimizers(
             &[fasta_path],
             dir,
             32,                 // k
@@ -2410,7 +2527,7 @@ output = "{}"
         let fasta1 = create_fasta_file(dir, "test1.fa", seq);
         let fasta2 = create_fasta_file(dir, "test2.fa", seq);
 
-        let (minimizers, _sources) = extract_bucket_minimizers(
+        let (minimizers, _sources, _file_lengths) = extract_bucket_minimizers(
             &[fasta1, fasta2],
             dir,
             32,
@@ -2442,7 +2559,7 @@ output = "{}"
             ],
         );
 
-        let (_minimizers, sources) = extract_bucket_minimizers(
+        let (_minimizers, sources, _file_lengths) = extract_bucket_minimizers(
             &[fasta_path],
             dir,
             32,
@@ -2489,7 +2606,7 @@ output = "{}"
         );
 
         // Extract without orientation
-        let (mins_no_orient, _) = extract_bucket_minimizers(
+        let (mins_no_orient, _, _) = extract_bucket_minimizers(
             &[fasta_path.clone()],
             dir,
             32,
@@ -2500,7 +2617,7 @@ output = "{}"
         .unwrap();
 
         // Extract with orientation
-        let (mins_with_orient, _) =
+        let (mins_with_orient, _, _) =
             extract_bucket_minimizers(&[fasta_path], dir, 32, 10, 0x5555555555555555, true)
                 .unwrap();
 
@@ -4335,7 +4452,7 @@ files = ["short.fa", "long.fa"]
         let mut bucket_sources = HashMap::new();
         bucket_names.insert(BUCKET_ID, sanitize_bucket_name(&result.bucket_name));
         bucket_sources.insert(BUCKET_ID, result.sources.clone());
-        write_buckets_parquet(output_dir, &bucket_names, &bucket_sources)?;
+        write_buckets_parquet(output_dir, &bucket_names, &bucket_sources, None)?;
 
         // Compute source hash
         let mut bucket_min_counts = HashMap::new();
@@ -4383,7 +4500,7 @@ files = ["short.fa", "long.fa"]
         let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
         // Build exclusion set from phiX174 minimizers
-        let (phix_mins, _) = extract_bucket_minimizers(
+        let (phix_mins, _, _) = extract_bucket_minimizers(
             &[phix_path.clone()],
             &project_root,
             32,
@@ -4473,7 +4590,7 @@ files = ["short.fa", "long.fa"]
         let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
         // Build exclusion set from phiX174 minimizers
-        let (phix_mins, _) = extract_bucket_minimizers(
+        let (phix_mins, _, _) = extract_bucket_minimizers(
             &[phix_path.clone()],
             &project_root,
             32,

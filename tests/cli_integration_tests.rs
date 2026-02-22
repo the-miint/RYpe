@@ -5840,3 +5840,234 @@ fn test_classify_rc_read_matches_forward() -> Result<()> {
 
     Ok(())
 }
+
+/// Test that `index create` with two FASTA files populates file stats in the index.
+#[test]
+fn test_index_create_includes_file_stats() -> Result<()> {
+    use rype::ShardedInvertedIndex;
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("stats-test.ryxdi");
+
+    // Create index from two reference files
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Load the index and check that file stats are present
+    let sharded = ShardedInvertedIndex::open(&index_path)?;
+    let manifest = sharded.manifest();
+    let stats = manifest
+        .bucket_file_stats
+        .as_ref()
+        .expect("bucket_file_stats should be Some after index create");
+
+    // index create creates one bucket per -r file:
+    // Bucket 1 = phiX174 (5386 bases, single file → mean=5386, stdev=0)
+    // Bucket 2 = pUC19 (2686 bases, single file → mean=2686, stdev=0)
+    assert_eq!(stats.len(), 2, "Should have stats for 2 buckets");
+
+    let bucket1_stats = stats.get(&1).expect("Should have stats for bucket 1");
+    assert!(
+        (bucket1_stats.mean - 5386.0).abs() < 1e-6,
+        "Bucket 1 mean should be 5386, got {}",
+        bucket1_stats.mean
+    );
+    assert!(
+        (bucket1_stats.stdev).abs() < 1e-6,
+        "Bucket 1 stdev should be 0 (single file), got {}",
+        bucket1_stats.stdev
+    );
+
+    let bucket2_stats = stats.get(&2).expect("Should have stats for bucket 2");
+    assert!(
+        (bucket2_stats.mean - 2686.0).abs() < 1e-6,
+        "Bucket 2 mean should be 2686, got {}",
+        bucket2_stats.mean
+    );
+    assert!(
+        (bucket2_stats.stdev).abs() < 1e-6,
+        "Bucket 2 stdev should be 0 (single file), got {}",
+        bucket2_stats.stdev
+    );
+
+    Ok(())
+}
+
+/// Test that `bucket-source-detail` shows file statistics when available.
+#[test]
+fn test_bucket_source_detail_shows_stats() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("stats-detail.ryxdi");
+
+    // Create index
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(output.status.success());
+
+    // Run bucket-source-detail
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "bucket-source-detail",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-b",
+            "1",
+        ])
+        .output()?;
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Mean:"),
+        "Output should contain 'Mean:', got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Median:"),
+        "Output should contain 'Median:'"
+    );
+    assert!(stdout.contains("Stdev:"), "Output should contain 'Stdev:'");
+    assert!(stdout.contains("Min:"), "Output should contain 'Min:'");
+    assert!(stdout.contains("Max:"), "Output should contain 'Max:'");
+
+    Ok(())
+}
+
+/// Test that `index merge` propagates file stats when both inputs have them,
+/// and warns when only one input has stats.
+#[test]
+fn test_merge_file_stats_propagation() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let idx1 = dir.path().join("idx1.ryxdi");
+    let idx2 = dir.path().join("idx2.ryxdi");
+    let merged = dir.path().join("merged.ryxdi");
+
+    // Create two indices (both will have file stats)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            idx1.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(output.status.success());
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            idx2.to_str().unwrap(),
+            "-r",
+            puc19_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(output.status.success());
+
+    // Merge the indices — both have stats, so no warning expected
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "merge",
+            "--index-primary",
+            idx1.to_str().unwrap(),
+            "--index-secondary",
+            idx2.to_str().unwrap(),
+            "-o",
+            merged.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Warning:"),
+        "No warning expected when both inputs have stats, got: {}",
+        stderr
+    );
+
+    // Verify merged index has stats for both buckets
+    use rype::ShardedInvertedIndex;
+    let sharded = ShardedInvertedIndex::open(&merged)?;
+    let manifest = sharded.manifest();
+    let stats = manifest
+        .bucket_file_stats
+        .as_ref()
+        .expect("Merged index should have file stats when both inputs have them");
+    assert_eq!(stats.len(), 2, "Should have stats for 2 buckets");
+
+    Ok(())
+}

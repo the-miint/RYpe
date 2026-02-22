@@ -182,6 +182,7 @@ fn build_inverted_from_buckets(
         bucket_sources,
         bucket_minimizer_counts,
         largest_shard_entries: 0,
+        bucket_file_stats: None,
     };
 
     InvertedIndex::build_from_bucket_map(k, w, salt, &bucket_map, &metadata)
@@ -221,6 +222,7 @@ fn test_parquet_index_classification() -> Result<()> {
         salt,
         None,
         Some(&options),
+        None,
     )?;
 
     // Load and classify
@@ -299,7 +301,16 @@ fn test_parquet_index_matches_inverted_index() -> Result<()> {
 
     // Create and load Parquet index
     let options = ParquetWriteOptions::default();
-    rype::create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))?;
+    rype::create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        k,
+        w,
+        salt,
+        None,
+        Some(&options),
+        None,
+    )?;
     let sharded = ShardedInvertedIndex::open(&index_path)?;
 
     let threshold = 0.1;
@@ -386,7 +397,16 @@ fn test_parquet_index_with_multiple_shards() -> Result<()> {
         row_group_size: 1000, // Small row groups
         ..Default::default()
     };
-    rype::create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))?;
+    rype::create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        k,
+        w,
+        salt,
+        None,
+        Some(&options),
+        None,
+    )?;
 
     // Load and verify
     let sharded = ShardedInvertedIndex::open(&index_path)?;
@@ -456,7 +476,16 @@ fn test_parquet_index_diagnostics() -> Result<()> {
 
     // Create Parquet index
     let options = ParquetWriteOptions::default();
-    rype::create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))?;
+    rype::create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        k,
+        w,
+        salt,
+        None,
+        Some(&options),
+        None,
+    )?;
 
     // Load and inspect
     let sharded = ShardedInvertedIndex::open(&index_path)?;
@@ -509,7 +538,16 @@ fn test_empty_query_results() -> Result<()> {
 
     // Create Parquet index
     let options = ParquetWriteOptions::default();
-    rype::create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))?;
+    rype::create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        k,
+        w,
+        salt,
+        None,
+        Some(&options),
+        None,
+    )?;
 
     let sharded = ShardedInvertedIndex::open(&index_path)?;
 
@@ -544,7 +582,16 @@ fn test_high_threshold_filters_results() -> Result<()> {
 
     // Create Parquet index
     let options = ParquetWriteOptions::default();
-    rype::create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, Some(&options))?;
+    rype::create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        k,
+        w,
+        salt,
+        None,
+        Some(&options),
+        None,
+    )?;
 
     let sharded = ShardedInvertedIndex::open(&index_path)?;
 
