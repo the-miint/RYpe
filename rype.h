@@ -464,6 +464,63 @@ size_t rype_parse_byte_suffix(const char* str);
 const char* rype_bucket_name(const RypeIndex* index, uint32_t bucket_id);
 
 // ============================================================================
+// BUCKET FILE STATISTICS API
+// ============================================================================
+
+/**
+ * Per-bucket file statistics.
+ *
+ * Statistics are computed over the total sequence lengths of each input file
+ * within a bucket. All values are in base pairs.
+ */
+typedef struct {
+    uint32_t bucket_id;  ///< Bucket ID this stats entry belongs to
+    double mean;         ///< Mean of per-file total sequence lengths
+    double median;       ///< Median of per-file total sequence lengths
+    double stdev;        ///< Population standard deviation of per-file total sequence lengths
+    double min;          ///< Minimum per-file total sequence length
+    double max;          ///< Maximum per-file total sequence length
+} RypeBucketFileStats;
+
+/**
+ * Array of per-bucket file statistics.
+ *
+ * Returned by rype_bucket_file_stats(). Free with rype_bucket_file_stats_free().
+ */
+typedef struct {
+    RypeBucketFileStats* stats;  ///< Pointer to array of stats entries
+    size_t count;                ///< Number of entries in the array
+} RypeBucketFileStatsArray;
+
+/**
+ * Get per-bucket file statistics for all buckets that have them
+ *
+ * @param index  Non-NULL RypeIndex pointer from rype_index_load()
+ * @return       Pointer to stats array, or NULL if no stats available
+ *
+ * Returns NULL if the index has no file statistics (e.g., old format indices
+ * or merged indices). Entries are sorted by bucket_id.
+ *
+ * ## Memory
+ *
+ * Caller takes ownership and MUST call rype_bucket_file_stats_free() when done.
+ *
+ * ## Thread Safety
+ *
+ * Thread-safe (read-only access).
+ */
+RypeBucketFileStatsArray* rype_bucket_file_stats(const RypeIndex* index);
+
+/**
+ * Free a bucket file stats array
+ *
+ * @param stats  Pointer from rype_bucket_file_stats(), or NULL (no-op)
+ *
+ * Do NOT call twice on the same pointer (undefined behavior).
+ */
+void rype_bucket_file_stats_free(RypeBucketFileStatsArray* stats);
+
+// ============================================================================
 // NEGATIVE FILTERING API
 // ============================================================================
 
@@ -1054,7 +1111,6 @@ struct ArrowArrayStream {
  * @param negative_set   Optional RypeNegativeSet for filtering (NULL to disable)
  * @param input_stream   Input ArrowArrayStream containing sequence batches
  * @param threshold      Classification threshold (0.0-1.0)
- * @param use_merge_join Non-zero for merge-join strategy, 0 for sequential
  * @param out_stream     Output ArrowArrayStream for results (caller-allocated)
  * @return               0 on success, -1 on error
  *
