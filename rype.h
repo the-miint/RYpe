@@ -435,6 +435,36 @@ size_t rype_detect_available_memory(void);
 size_t rype_parse_byte_suffix(const char* str);
 
 /**
+ * Recommend an optimal batch size for Arrow streaming classification
+ *
+ * The Arrow streaming C API (rype_classify_arrow) processes one RecordBatch at a
+ * time, and each batch triggers a full shard loop. If batches are too small, shard
+ * I/O dominates and performance suffers. This function computes the batch size that
+ * the CLI would use, given the index characteristics, read profile, and available
+ * memory.
+ *
+ * @param index            Non-NULL RypeIndex pointer from rype_index_load()
+ * @param avg_read_length  Average nucleotide length of individual reads (must be > 0)
+ * @param is_paired        Non-zero for paired-end, 0 for single-end
+ * @param max_memory       Maximum memory budget in bytes, or 0 to auto-detect
+ * @return                 Recommended number of rows per RecordBatch (>= 1000 on
+ *                         success), or 0 on error
+ *
+ * ## Error Handling
+ *
+ * Returns 0 on error. Call rype_get_last_error() for details.
+ *
+ * ## Thread Safety
+ *
+ * Thread-safe (read-only access to index).
+ */
+size_t rype_recommend_batch_size(
+    const RypeIndex* index,
+    size_t avg_read_length,
+    int is_paired,
+    size_t max_memory);
+
+/**
  * Get the name of a bucket by ID
  *
  * @param index      Non-NULL RypeIndex pointer
