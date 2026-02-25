@@ -11,7 +11,8 @@ use rype::c_api::{
     rype_get_last_error, rype_index_free, rype_index_is_sharded, rype_index_k, rype_index_load,
     rype_index_num_buckets, rype_index_num_shards, rype_index_salt, rype_index_w,
     rype_log_ratio_results_free, rype_negative_set_create, rype_negative_set_free,
-    rype_negative_set_size, rype_results_free, rype_validate_log_ratio_indices, RypeQuery,
+    rype_negative_set_size, rype_recommend_batch_size, rype_results_free,
+    rype_validate_log_ratio_indices, RypeQuery,
 };
 use rype::{
     extract_into, BucketData, IndexMetadata, InvertedIndex, MinimizerWorkspace, ParquetWriteOptions,
@@ -1335,5 +1336,171 @@ fn test_rype_bucket_file_stats_returns_null_without_stats() -> Result<()> {
     rype_bucket_file_stats_free(stats_ptr);
 
     rype_index_free(idx);
+    Ok(())
+}
+
+// =============================================================================
+// Batch Size Recommendation Tests
+// =============================================================================
+
+#[test]
+fn test_recommend_batch_size_basic() -> Result<()> {
+    let dir = tempdir()?;
+    let index_path = create_test_parquet_index(dir.path(), 32, 10, 0x12345)?;
+
+    let path_cstr = CString::new(index_path.to_str().unwrap())?;
+    let idx = rype_index_load(path_cstr.as_ptr());
+    assert!(!idx.is_null());
+
+    // Basic single-end recommendation with 150bp reads
+    let batch_se = rype_recommend_batch_size(idx, 150, 0, 4 * 1024 * 1024 * 1024);
+    assert!(
+        batch_se >= 1000,
+        "batch_size should be >= MIN_BATCH_SIZE (1000), got {}",
+        batch_se
+    );
+
+    // Auto-detect memory (max_memory=0) should return a reasonable value
+    let batch_auto = rype_recommend_batch_size(idx, 150, 0, 0);
+    assert!(
+        batch_auto >= 1000,
+        "auto-detect batch should be >= MIN_BATCH_SIZE, got {}",
+        batch_auto
+    );
+
+    rype_index_free(idx);
+    Ok(())
+}
+
+/// Use a tight memory budget so paired vs single-end and large vs small memory
+/// differences are actually observable (not both capped at MAX_BATCH_SIZE).
+#[test]
+fn test_recommend_batch_size_memory_constraints() -> Result<()> {
+    let dir = tempdir()?;
+    let index_path = create_test_parquet_index(dir.path(), 32, 10, 0x12345)?;
+
+    let path_cstr = CString::new(index_path.to_str().unwrap())?;
+    let idx = rype_index_load(path_cstr.as_ptr());
+    assert!(!idx.is_null());
+
+    // Use a tight memory budget (512MB) so the memory constraint actually bites
+    let tight_budget = 512 * 1024 * 1024;
+
+    let batch_se = rype_recommend_batch_size(idx, 150, 0, tight_budget);
+    assert!(
+        batch_se >= 1000,
+        "single-end batch should be >= MIN_BATCH_SIZE, got {}",
+        batch_se
+    );
+
+    // Paired-end should be <= single-end (paired uses more memory per row)
+    let batch_pe = rype_recommend_batch_size(idx, 150, 1, tight_budget);
+    assert!(
+        batch_pe >= 1000,
+        "paired batch_size should be >= MIN_BATCH_SIZE, got {}",
+        batch_pe
+    );
+    assert!(
+        batch_pe <= batch_se,
+        "paired batch_size ({}) should be <= single-end ({})",
+        batch_pe,
+        batch_se
+    );
+
+    // Smaller memory should give <= batch size
+    let smaller_budget = 300 * 1024 * 1024;
+    let batch_small = rype_recommend_batch_size(idx, 150, 0, smaller_budget);
+    assert!(
+        batch_small <= batch_se,
+        "smaller memory batch ({}) should be <= larger memory batch ({})",
+        batch_small,
+        batch_se
+    );
+
+    rype_index_free(idx);
+    Ok(())
+}
+
+/// When avg_read_length < k, minimizers_per_query is 0. Should still return
+/// a valid batch size (MIN_BATCH_SIZE at minimum), not panic.
+#[test]
+fn test_recommend_batch_size_read_shorter_than_k() -> Result<()> {
+    let dir = tempdir()?;
+    // k=32, so reads of length 10 produce zero minimizers
+    let index_path = create_test_parquet_index(dir.path(), 32, 10, 0x12345)?;
+
+    let path_cstr = CString::new(index_path.to_str().unwrap())?;
+    let idx = rype_index_load(path_cstr.as_ptr());
+    assert!(!idx.is_null());
+
+    let batch = rype_recommend_batch_size(idx, 10, 0, 4 * 1024 * 1024 * 1024);
+    assert!(
+        batch >= 1000,
+        "degenerate read length should still return >= MIN_BATCH_SIZE, got {}",
+        batch
+    );
+
+    rype_index_free(idx);
+    Ok(())
+}
+
+#[test]
+fn test_recommend_batch_size_error_cases() {
+    // Null index should return 0
+    let result = rype_recommend_batch_size(ptr::null(), 150, 0, 4 * 1024 * 1024 * 1024);
+    assert_eq!(result, 0, "null index should return 0");
+
+    let err = rype_get_last_error();
+    assert!(!err.is_null(), "error should be set for null index");
+
+    // Zero read length should return 0
+    let dir = tempdir().unwrap();
+    let index_path = create_test_parquet_index(dir.path(), 32, 10, 0x12345).unwrap();
+    let path_cstr = CString::new(index_path.to_str().unwrap()).unwrap();
+    let idx = rype_index_load(path_cstr.as_ptr());
+    assert!(!idx.is_null());
+
+    let result = rype_recommend_batch_size(idx, 0, 0, 4 * 1024 * 1024 * 1024);
+    assert_eq!(result, 0, "zero avg_read_length should return 0");
+
+    let err = rype_get_last_error();
+    assert!(!err.is_null(), "error should be set for zero read length");
+
+    rype_index_free(idx);
+}
+
+/// Verify that a zero-bucket index cannot even be loaded (caught at load time).
+/// The pre-flight `num_buckets == 0` check in `rype_recommend_batch_size` exists
+/// as defense-in-depth but cannot be triggered through normal API usage because
+/// `rype_index_load` rejects zero-bucket indices first.
+#[test]
+fn test_recommend_batch_size_zero_bucket_index_rejected_at_load() -> Result<()> {
+    let dir = tempdir()?;
+    let index_path = dir.path().join("empty.ryxdi");
+
+    // Build an index with no buckets
+    let buckets: Vec<BucketData> = vec![];
+    let options = ParquetWriteOptions::default();
+    rype::create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        32,
+        10,
+        0x12345,
+        None,
+        Some(&options),
+        None,
+    )?;
+
+    let path_cstr = CString::new(index_path.to_str().unwrap())?;
+    let idx = rype_index_load(path_cstr.as_ptr());
+    assert!(idx.is_null(), "zero-bucket index should fail to load");
+
+    let err = rype_get_last_error();
+    assert!(
+        !err.is_null(),
+        "error should be set for zero-bucket index load"
+    );
+
     Ok(())
 }
