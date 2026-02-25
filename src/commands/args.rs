@@ -552,27 +552,41 @@ THRESHOLD:
   Computes log10(numerator_score / denominator_score) for each read using
   two separate single-bucket indices.
 
-  Reads are first classified against the numerator index. If --numerator-skip-threshold
-  is set, reads exceeding that threshold are assigned +inf (fast path).
-  All other reads (including zero numerator score) are classified against the
-  denominator index to compute the exact log-ratio.
+  Reads are first classified against the numerator index. Reads with numerator
+  score >= --numerator-skip-threshold (default 0.5) are assigned +inf without
+  needing denominator classification. All other reads are classified against
+  the denominator index to compute the exact log-ratio.
 
 OUTPUT FORMAT:
   Tab-separated: read_id<TAB>log10([Num] / [Denom])<TAB>score<TAB>fast_path
 
   fast_path column: 'none' (exact), 'num_high' (+inf)
 
-EDGE CASES:
-  - numerator = 0, denominator > 0 → -inf (no numerator signal)
-  - numerator > 0, denominator = 0 → +inf
-  - both = 0 → NaN (no evidence for or against)
+SCORE INTERPRETATION:
+  positive    Read favors numerator
+  negative    Read favors denominator
+  +inf        Numerator signal with no denominator signal
+  -inf        Denominator signal with no numerator signal
+  NaN         No signal from either index (both scores zero)
+  0.0         Equal scores — no directional evidence
+
+SEQUENCE OUTPUT (--output-sequences):
+  By default, sequences with NEGATIVE log-ratio are written (favoring denominator).
+  With --passing-is-positive, sequences with POSITIVE log-ratio are written.
+  In both modes:
+  - Zero log-ratio (equal scores) is EXCLUDED — no directional evidence.
+  - NaN reads are INCLUDED — no matches means the sequence is unresolved.
 
 EXAMPLES:
   # Basic log-ratio with two indices
   rype classify log-ratio -n numerator.ryxdi -d denominator.ryxdi -1 reads.fq
 
-  # With fast-path skip threshold
-  rype classify log-ratio -n num.ryxdi -d denom.ryxdi -1 reads.fq --numerator-skip-threshold 0.01")]
+  # Disable fast-path (classify all reads against both indices)
+  rype classify log-ratio -n num.ryxdi -d denom.ryxdi -1 reads.fq --numerator-skip-threshold 1.0
+
+  # Output sequences favoring denominator
+  rype classify log-ratio -n num.ryxdi -d denom.ryxdi -1 reads.fq \\
+      --output-sequences filtered.fastq.gz")]
     LogRatio {
         /// Path to numerator index directory (.ryxdi). Must have exactly 1 bucket.
         #[arg(short = 'n', long)]
@@ -635,21 +649,28 @@ EXAMPLES:
         minimum_length: Option<usize>,
 
         /// Output passing sequences to gzipped FASTA/FASTQ.
+        /// By default, writes sequences with NEGATIVE log-ratio (favoring denominator).
+        /// Zero log-ratio (equal scores) is excluded — no directional evidence.
+        /// NaN reads (no matches in either index) are always included.
         /// For paired-end: foo.fastq.gz creates foo.R1.fastq.gz and foo.R2.fastq.gz.
-        /// Not supported with Parquet input or --trim-to.
+        /// Not supported with --trim-to.
         #[arg(long)]
         output_sequences: Option<PathBuf>,
 
-        /// Pass sequences with POSITIVE log-ratio; excludes zero (default: pass NEGATIVE/zero).
+        /// Pass sequences with POSITIVE log-ratio (default: pass NEGATIVE).
+        /// Zero log-ratio (equal scores) is excluded in both modes.
         /// Requires --output-sequences.
         #[arg(long, requires = "output_sequences")]
         passing_is_positive: bool,
 
         /// Skip denominator classification for reads with numerator score >= this value.
-        /// These reads are assigned +inf with fast_path=num_high.
+        /// These reads are assigned +inf with fast_path=num_high. A majority of
+        /// minimizers matching the numerator guarantees a positive log-ratio,
+        /// so the denominator classification can be skipped.
         /// Must be between 0.0 (exclusive) and 1.0 (inclusive).
-        #[arg(long)]
-        numerator_skip_threshold: Option<f64>,
+        /// Set to 1.0 to disable fast-path (classify all reads against both indices).
+        #[arg(long, default_value_t = 0.5)]
+        numerator_skip_threshold: f64,
     },
 }
 

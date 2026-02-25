@@ -497,11 +497,12 @@ pub struct ClassifyLogRatioArgs {
     pub minimum_length: Option<usize>,
     /// Output path for passing sequences (gzipped FASTA/FASTQ).
     pub output_sequences: Option<PathBuf>,
-    /// If true, pass sequences with POSITIVE log-ratio (default: pass NEGATIVE/zero).
+    /// If true, pass sequences with POSITIVE log-ratio (default: pass NEGATIVE).
+    /// Zero log-ratio (equal scores) is excluded in both modes (no evidence).
     pub passing_is_positive: bool,
-    /// If set, reads with numerator score >= this value skip denominator classification
-    /// and are assigned +inf (fast path).
-    pub numerator_skip_threshold: Option<f64>,
+    /// Reads with numerator score >= this value skip denominator classification
+    /// and are assigned +inf (fast path). Default 0.5. Set to 1.0 to disable.
+    pub numerator_skip_threshold: f64,
 }
 
 /// Validate sequence output configuration.
@@ -543,13 +544,11 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
     let input_is_parquet = is_parquet_input(&args.r1);
 
     // Validate numerator_skip_threshold range
-    if let Some(thresh) = args.numerator_skip_threshold {
-        if thresh <= 0.0 || thresh > 1.0 {
-            return Err(anyhow!(
-                "--numerator-skip-threshold must be between 0.0 (exclusive) and 1.0 (inclusive), got: {}",
-                thresh
-            ));
-        }
+    if args.numerator_skip_threshold <= 0.0 || args.numerator_skip_threshold > 1.0 {
+        return Err(anyhow!(
+            "--numerator-skip-threshold must be between 0.0 (exclusive) and 1.0 (inclusive), got: {}",
+            args.numerator_skip_threshold
+        ));
     }
 
     // Validate input configuration
@@ -885,6 +884,19 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
     Ok(())
 }
 
+/// Determine whether a log-ratio result passes the sequence output filter.
+///
+/// - Zero log-ratio (equal scores) is excluded: no directional evidence.
+/// - NaN (both scores zero) is always included: sequence is unresolved.
+/// - Positive mode passes `log_ratio > 0.0`; negative mode passes `log_ratio < 0.0`.
+fn log_ratio_passes(log_ratio: f64, passing_is_positive: bool) -> bool {
+    if passing_is_positive {
+        log_ratio > 0.0 || log_ratio.is_nan()
+    } else {
+        log_ratio < 0.0 || log_ratio.is_nan()
+    }
+}
+
 /// Result of `classify_numerator_and_partition`, including cached minimizers.
 pub struct NumeratorResult {
     pub partition: PartitionResult,
@@ -904,7 +916,7 @@ pub fn classify_numerator_and_partition(
     total_reads: usize,
     num_read_options: Option<&rype::ParquetReadOptions>,
     parallel_rg: bool,
-    numerator_skip_threshold: Option<f64>,
+    numerator_skip_threshold: f64,
 ) -> Result<NumeratorResult> {
     let manifest = num_sharded.manifest();
 
@@ -937,8 +949,10 @@ pub fn classify_numerator_and_partition(
     };
     log_timing("batch: classify_numerator", t_num.elapsed().as_millis());
 
+    // Convert to Option for the engine: 1.0 effectively disables fast-path
+    // (only exact-1.0 scores would trigger, which is rare and still correct).
     let partition =
-        partition_by_numerator_score(&num_results, total_reads, numerator_skip_threshold);
+        partition_by_numerator_score(&num_results, total_reads, Some(numerator_skip_threshold));
 
     log::debug!(
         "Partitioned {} reads: {} fast-path, {} need denominator",
@@ -1042,12 +1056,7 @@ pub fn flush_deferred_denom(
     // Mark passing reads in tracker for post-classification sequence output
     if let Some(tracker) = passing_tracker {
         for (i, lr) in results.iter().enumerate() {
-            let passes = if passing_is_positive {
-                lr.log_ratio > 0.0 || lr.log_ratio.is_nan()
-            } else {
-                lr.log_ratio <= 0.0 || lr.log_ratio.is_nan()
-            };
-            if passes {
+            if log_ratio_passes(lr.log_ratio, passing_is_positive) {
                 tracker.mark(metadata[i].global_index);
             }
         }
@@ -1081,7 +1090,7 @@ struct LogRatioContext<'a> {
     denom_sharded: &'a ShardedInvertedIndex,
     denom_read_options: Option<&'a rype::ParquetReadOptions>,
     parallel_rg: bool,
-    numerator_skip_threshold: Option<f64>,
+    numerator_skip_threshold: f64,
     passing_is_positive: bool,
     ratio_bucket_name: &'a str,
 }
@@ -1123,12 +1132,7 @@ fn process_log_ratio_batch<S: AsRef<str>>(
     // Mark passing fast-path reads in tracker
     if let Some(ref mut tracker) = passing_tracker {
         for lr in &partition.fast_path_results {
-            let passes = if ctx.passing_is_positive {
-                lr.log_ratio > 0.0 || lr.log_ratio.is_nan()
-            } else {
-                lr.log_ratio <= 0.0 || lr.log_ratio.is_nan()
-            };
-            if passes {
+            if log_ratio_passes(lr.log_ratio, ctx.passing_is_positive) {
                 tracker.mark(*global_read_offset + lr.query_id as usize);
             }
         }
@@ -1536,5 +1540,29 @@ mod tests {
         // No output_sequences is always valid
         let result = validate_seq_output(true, true, None);
         assert!(result.is_ok());
+    }
+
+    // -------------------------------------------------------------------------
+    // log_ratio_passes tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_log_ratio_passes_positive_mode() {
+        assert!(log_ratio_passes(1.0, true));
+        assert!(!log_ratio_passes(-1.0, true));
+        assert!(!log_ratio_passes(0.0, true)); // zero excluded: no directional evidence
+        assert!(log_ratio_passes(f64::NAN, true)); // NaN always passes
+        assert!(log_ratio_passes(f64::INFINITY, true));
+        assert!(!log_ratio_passes(f64::NEG_INFINITY, true));
+    }
+
+    #[test]
+    fn test_log_ratio_passes_negative_mode() {
+        assert!(log_ratio_passes(-1.0, false));
+        assert!(!log_ratio_passes(1.0, false));
+        assert!(!log_ratio_passes(0.0, false)); // zero excluded: no directional evidence
+        assert!(log_ratio_passes(f64::NAN, false)); // NaN always passes
+        assert!(log_ratio_passes(f64::NEG_INFINITY, false));
+        assert!(!log_ratio_passes(f64::INFINITY, false));
     }
 }
