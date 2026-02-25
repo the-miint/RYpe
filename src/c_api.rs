@@ -25,7 +25,10 @@
 
 use crate::classify_with_sharded_negative;
 use crate::constants::MAX_SEQUENCE_LENGTH;
-use crate::memory::{detect_available_memory, parse_byte_suffix};
+use crate::memory::{
+    calculate_batch_config, detect_available_memory, estimate_shard_reservation, parse_byte_suffix,
+    InputFormat, MemoryConfig, ReadMemoryProfile,
+};
 use crate::{QueryRecord, ShardedInvertedIndex};
 use libc::{c_char, c_double, c_int, size_t};
 use std::cell::RefCell;
@@ -89,6 +92,9 @@ impl RypeIndex {
         self.0.num_shards()
     }
 
+    /// Bytes per shard entry: u64 minimizer (8) + u32 bucket_id (4).
+    const BYTES_PER_SHARD_ENTRY: usize = 12;
+
     /// Estimate the memory footprint of all shards when loaded.
     ///
     /// Returns a **lower bound estimate** based on raw data size:
@@ -103,7 +109,7 @@ impl RypeIndex {
         manifest
             .shards
             .iter()
-            .map(|s| s.num_bucket_ids * 12) // 8 bytes minimizer + 4 bytes bucket_id per entry
+            .map(|s| s.num_bucket_ids * Self::BYTES_PER_SHARD_ENTRY)
             .sum()
     }
 
@@ -112,11 +118,18 @@ impl RypeIndex {
     /// Returns the estimated size of the largest shard in bytes.
     /// Use this for memory planning when classifying with limited RAM.
     pub fn largest_shard_bytes(&self) -> usize {
-        let manifest = self.0.manifest();
-        manifest
+        self.largest_shard_entries() as usize * Self::BYTES_PER_SHARD_ENTRY
+    }
+
+    /// Returns the entry count for the largest shard.
+    ///
+    /// This feeds directly into `estimate_shard_reservation()` for memory planning.
+    fn largest_shard_entries(&self) -> u64 {
+        self.0
+            .manifest()
             .shards
             .iter()
-            .map(|s| s.num_bucket_ids * 12) // 8 bytes minimizer + 4 bytes bucket_id per entry
+            .map(|s| s.num_bucket_ids as u64)
             .max()
             .unwrap_or(0)
     }
@@ -441,6 +454,100 @@ pub extern "C" fn rype_parse_byte_suffix(str_ptr: *const c_char) -> size_t {
             0
         }
     }
+}
+
+// --- Batch Size Recommendation ---
+
+/// Recommend an optimal batch size for Arrow streaming classification.
+///
+/// The Arrow streaming C API (`rype_classify_arrow`) processes one RecordBatch at a
+/// time, and each batch triggers a full shard loop. If batches are too small, shard
+/// I/O dominates and performance suffers. This function computes the batch size that
+/// the CLI would use, given the index characteristics, read profile, and available
+/// memory.
+///
+/// # Arguments
+/// * `index_ptr` - A loaded index (from `rype_index_load`)
+/// * `avg_read_length` - Average nucleotide length of individual reads
+/// * `is_paired` - Any non-zero value means paired-end, 0 means single-end
+/// * `max_memory` - Maximum memory budget in bytes, or 0 to auto-detect
+///
+/// # Returns
+/// The recommended number of rows per RecordBatch (always >= 1000 on success),
+/// or 0 on error. Call `rype_get_last_error()` for details when 0 is returned.
+#[no_mangle]
+pub extern "C" fn rype_recommend_batch_size(
+    index_ptr: *const RypeIndex,
+    avg_read_length: size_t,
+    is_paired: c_int,
+    max_memory: size_t,
+) -> size_t {
+    if !is_nonnull_aligned(index_ptr) {
+        set_last_error("index_ptr is NULL or misaligned".to_string());
+        return 0;
+    }
+
+    if avg_read_length == 0 {
+        set_last_error("avg_read_length must be > 0".to_string());
+        return 0;
+    }
+
+    let index = unsafe { &*index_ptr };
+
+    let k = index.k();
+    let w = index.w();
+    let num_buckets = index.num_buckets();
+
+    if num_buckets == 0 {
+        set_last_error("index has no buckets".to_string());
+        return 0;
+    }
+
+    let is_paired_bool = is_paired != 0;
+
+    // Determine memory budget
+    let memory_budget = if max_memory == 0 {
+        detect_available_memory().bytes
+    } else {
+        max_memory
+    };
+
+    // Snapshot thread count once for consistency across shard reservation and config
+    let num_threads = rayon::current_num_threads();
+
+    // Build read profile from caller-provided average read length
+    let read_profile = ReadMemoryProfile::new(avg_read_length, is_paired_bool, k, w);
+
+    // Estimate shard reservation for the largest shard
+    let shard_reservation = estimate_shard_reservation(index.largest_shard_entries(), num_threads);
+
+    // Build memory config:
+    // - index_memory: 0 (already loaded, shards on-demand)
+    // - InputFormat::Parquet (Arrow RecordBatches match the untrimmed Parquet columnar path)
+    // - is_log_ratio: false (standard Arrow classify)
+    let config = match MemoryConfig::new(
+        memory_budget,
+        num_threads,
+        0, // index_memory: shards load on-demand, manifest is tiny
+        shard_reservation,
+        read_profile,
+        num_buckets,
+        InputFormat::Parquet {
+            is_paired: is_paired_bool,
+            trimmed_in_reader: false,
+        },
+        false, // is_log_ratio
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            set_last_error(format!("Failed to build memory config: {}", e));
+            return 0;
+        }
+    };
+
+    let batch_config = calculate_batch_config(&config);
+    clear_last_error();
+    batch_config.batch_size
 }
 
 // --- Bucket Name Lookup ---
