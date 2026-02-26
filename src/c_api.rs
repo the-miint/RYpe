@@ -224,6 +224,25 @@ pub struct RypeResultArray {
     pub capacity: size_t,
 }
 
+// --- Batch Configuration Struct ---
+
+/// Full batch configuration returned by `rype_calculate_batch_config`.
+///
+/// On error, all fields are 0. Check `batch_size == 0` to detect errors,
+/// then call `rype_get_last_error()` for details.
+#[repr(C)]
+pub struct RypeBatchConfig {
+    /// Number of records per batch (>= 1000 on success, 0 on error).
+    pub batch_size: size_t,
+    /// Number of parallel batches. Reserved for forward-compatibility; always 1.
+    /// Do not write application logic that depends on this being > 1.
+    pub batch_count: size_t,
+    /// Estimated memory per batch in bytes.
+    pub per_batch_memory: size_t,
+    /// Estimated peak memory usage in bytes.
+    pub peak_memory: size_t,
+}
+
 // --- Log-Ratio C-Compatible Structs ---
 
 /// A single log-ratio classification result for one query.
@@ -460,17 +479,8 @@ pub extern "C" fn rype_parse_byte_suffix(str_ptr: *const c_char) -> size_t {
 
 /// Recommend an optimal batch size for Arrow streaming classification.
 ///
-/// The Arrow streaming C API (`rype_classify_arrow`) processes one RecordBatch at a
-/// time, and each batch triggers a full shard loop. If batches are too small, shard
-/// I/O dominates and performance suffers. This function computes the batch size that
-/// the CLI would use, given the index characteristics, read profile, and available
-/// memory.
-///
-/// # Arguments
-/// * `index_ptr` - A loaded index (from `rype_index_load`)
-/// * `avg_read_length` - Average nucleotide length of individual reads
-/// * `is_paired` - Any non-zero value means paired-end, 0 means single-end
-/// * `max_memory` - Maximum memory budget in bytes, or 0 to auto-detect
+/// Convenience wrapper around `rype_calculate_batch_config` that returns only
+/// the `batch_size` field. See that function for full documentation.
 ///
 /// # Returns
 /// The recommended number of rows per RecordBatch (always >= 1000 on success),
@@ -482,14 +492,50 @@ pub extern "C" fn rype_recommend_batch_size(
     is_paired: c_int,
     max_memory: size_t,
 ) -> size_t {
+    rype_calculate_batch_config(index_ptr, avg_read_length, is_paired, max_memory).batch_size
+}
+
+/// Calculate the full batch configuration for Arrow streaming classification.
+///
+/// Returns the same information that the CLI uses internally to size batches,
+/// including per-batch memory estimates and peak memory. This is a superset of
+/// `rype_recommend_batch_size` which returns only `batch_size`.
+///
+/// # Parameters
+///
+/// * `index_ptr` - A loaded index (from `rype_index_load`)
+/// * `avg_read_length` - Average nucleotide length of individual reads
+/// * `is_paired` - Any non-zero value means paired-end, 0 means single-end
+/// * `max_memory` - Maximum memory budget in bytes, or 0 to auto-detect
+///
+/// # Returns
+/// A `RypeBatchConfig` struct. On error, all fields are 0.
+/// Call `rype_get_last_error()` for details when `batch_size == 0`.
+///
+/// # Thread Safety
+/// Thread-safe (read-only access to index).
+#[no_mangle]
+pub extern "C" fn rype_calculate_batch_config(
+    index_ptr: *const RypeIndex,
+    avg_read_length: size_t,
+    is_paired: c_int,
+    max_memory: size_t,
+) -> RypeBatchConfig {
+    let error_result = RypeBatchConfig {
+        batch_size: 0,
+        batch_count: 0,
+        per_batch_memory: 0,
+        peak_memory: 0,
+    };
+
     if !is_nonnull_aligned(index_ptr) {
         set_last_error("index_ptr is NULL or misaligned".to_string());
-        return 0;
+        return error_result;
     }
 
     if avg_read_length == 0 {
         set_last_error("avg_read_length must be > 0".to_string());
-        return 0;
+        return error_result;
     }
 
     let index = unsafe { &*index_ptr };
@@ -500,25 +546,19 @@ pub extern "C" fn rype_recommend_batch_size(
 
     if num_buckets == 0 {
         set_last_error("index has no buckets".to_string());
-        return 0;
+        return error_result;
     }
 
     let is_paired_bool = is_paired != 0;
 
-    // Determine memory budget
     let memory_budget = if max_memory == 0 {
         detect_available_memory().bytes
     } else {
         max_memory
     };
 
-    // Snapshot thread count once for consistency across shard reservation and config
     let num_threads = rayon::current_num_threads();
-
-    // Build read profile from caller-provided average read length
     let read_profile = ReadMemoryProfile::new(avg_read_length, is_paired_bool, k, w);
-
-    // Estimate shard reservation for the largest shard
     let shard_reservation = estimate_shard_reservation(index.largest_shard_entries(), num_threads);
 
     // Build memory config:
@@ -541,13 +581,18 @@ pub extern "C" fn rype_recommend_batch_size(
         Ok(c) => c,
         Err(e) => {
             set_last_error(format!("Failed to build memory config: {}", e));
-            return 0;
+            return error_result;
         }
     };
 
     let batch_config = calculate_batch_config(&config);
     clear_last_error();
-    batch_config.batch_size
+    RypeBatchConfig {
+        batch_size: batch_config.batch_size,
+        batch_count: batch_config.batch_count,
+        per_batch_memory: batch_config.per_batch_memory,
+        peak_memory: batch_config.peak_memory,
+    }
 }
 
 // --- Bucket Name Lookup ---

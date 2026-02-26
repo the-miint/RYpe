@@ -465,6 +465,51 @@ size_t rype_recommend_batch_size(
     size_t max_memory);
 
 /**
+ * Full batch configuration returned by rype_calculate_batch_config()
+ *
+ * On error, all fields are 0. Check batch_size == 0 to detect errors,
+ * then call rype_get_last_error() for details.
+ */
+typedef struct {
+    size_t batch_size;       ///< Number of records per batch (>= 1000 on success)
+    size_t batch_count;      ///< Reserved for forward-compatibility; always 1.
+                             ///< Do not write application logic that depends on this being > 1.
+    size_t per_batch_memory; ///< Estimated memory per batch in bytes
+    size_t peak_memory;      ///< Estimated peak memory usage in bytes
+} RypeBatchConfig;
+
+/* Compile-time ABI safety check: catch Rust/C struct layout drift. */
+_Static_assert(sizeof(RypeBatchConfig) == 4 * sizeof(size_t),
+    "RypeBatchConfig layout mismatch - update rype.h if struct fields changed");
+
+/**
+ * Calculate the full batch configuration for Arrow streaming classification
+ *
+ * Returns the same information that the CLI uses internally to size batches,
+ * including per-batch memory estimates and peak memory. This is a superset of
+ * rype_recommend_batch_size() which returns only batch_size.
+ *
+ * @param index            Non-NULL RypeIndex pointer from rype_index_load()
+ * @param avg_read_length  Average nucleotide length of individual reads (must be > 0)
+ * @param is_paired        Non-zero for paired-end, 0 for single-end
+ * @param max_memory       Maximum memory budget in bytes, or 0 to auto-detect
+ * @return                 RypeBatchConfig struct. On error all fields are 0.
+ *
+ * ## Error Handling
+ *
+ * Check batch_size == 0 to detect errors. Call rype_get_last_error() for details.
+ *
+ * ## Thread Safety
+ *
+ * Thread-safe (read-only access to index).
+ */
+RypeBatchConfig rype_calculate_batch_config(
+    const RypeIndex* index,
+    size_t avg_read_length,
+    int is_paired,
+    size_t max_memory);
+
+/**
  * Get the name of a bucket by ID
  *
  * @param index      Non-NULL RypeIndex pointer

@@ -6,11 +6,11 @@
 
 use anyhow::Result;
 use rype::c_api::{
-    rype_bucket_file_stats, rype_bucket_file_stats_free, rype_bucket_name, rype_classify,
-    rype_classify_best_hit, rype_classify_log_ratio, rype_classify_with_negative,
-    rype_get_last_error, rype_index_free, rype_index_is_sharded, rype_index_k, rype_index_load,
-    rype_index_num_buckets, rype_index_num_shards, rype_index_salt, rype_index_w,
-    rype_log_ratio_results_free, rype_negative_set_create, rype_negative_set_free,
+    rype_bucket_file_stats, rype_bucket_file_stats_free, rype_bucket_name,
+    rype_calculate_batch_config, rype_classify, rype_classify_best_hit, rype_classify_log_ratio,
+    rype_classify_with_negative, rype_get_last_error, rype_index_free, rype_index_is_sharded,
+    rype_index_k, rype_index_load, rype_index_num_buckets, rype_index_num_shards, rype_index_salt,
+    rype_index_w, rype_log_ratio_results_free, rype_negative_set_create, rype_negative_set_free,
     rype_negative_set_size, rype_recommend_batch_size, rype_results_free,
     rype_validate_log_ratio_indices, RypeQuery,
 };
@@ -1502,5 +1502,137 @@ fn test_recommend_batch_size_zero_bucket_index_rejected_at_load() -> Result<()> 
         "error should be set for zero-bucket index load"
     );
 
+    Ok(())
+}
+
+// =============================================================================
+// Batch Config Calculation Tests
+// =============================================================================
+
+#[test]
+fn test_calculate_batch_config_basic() -> Result<()> {
+    let dir = tempdir()?;
+    let index_path = create_test_parquet_index(dir.path(), 32, 10, 0x12345)?;
+
+    let path_cstr = CString::new(index_path.to_str().unwrap())?;
+    let idx = rype_index_load(path_cstr.as_ptr());
+    assert!(!idx.is_null());
+
+    let config = rype_calculate_batch_config(idx, 150, 0, 4 * 1024 * 1024 * 1024);
+    assert!(
+        config.batch_size >= 1000,
+        "batch_size should be >= MIN_BATCH_SIZE (1000), got {}",
+        config.batch_size
+    );
+    assert!(
+        config.batch_count >= 1,
+        "batch_count should be >= 1, got {}",
+        config.batch_count
+    );
+    assert!(
+        config.per_batch_memory > 0,
+        "per_batch_memory should be > 0, got {}",
+        config.per_batch_memory
+    );
+    assert!(
+        config.peak_memory > 0,
+        "peak_memory should be > 0, got {}",
+        config.peak_memory
+    );
+    assert!(
+        config.peak_memory >= config.per_batch_memory,
+        "peak_memory ({}) should be >= per_batch_memory ({})",
+        config.peak_memory,
+        config.per_batch_memory
+    );
+
+    // batch_size should agree with rype_recommend_batch_size
+    let batch_size_only = rype_recommend_batch_size(idx, 150, 0, 4 * 1024 * 1024 * 1024);
+    assert_eq!(
+        config.batch_size, batch_size_only,
+        "calculate_batch_config and recommend_batch_size should agree"
+    );
+
+    rype_index_free(idx);
+    Ok(())
+}
+
+#[test]
+fn test_calculate_batch_config_error_cases() {
+    // Null index
+    let config = rype_calculate_batch_config(ptr::null(), 150, 0, 4 * 1024 * 1024 * 1024);
+    assert_eq!(
+        config.batch_size, 0,
+        "null index should return batch_size 0"
+    );
+    assert_eq!(config.batch_count, 0);
+    assert_eq!(config.per_batch_memory, 0);
+    assert_eq!(config.peak_memory, 0);
+
+    let err = rype_get_last_error();
+    assert!(!err.is_null(), "error should be set for null index");
+
+    // Zero read length
+    let dir = tempdir().unwrap();
+    let index_path = create_test_parquet_index(dir.path(), 32, 10, 0x12345).unwrap();
+    let path_cstr = CString::new(index_path.to_str().unwrap()).unwrap();
+    let idx = rype_index_load(path_cstr.as_ptr());
+    assert!(!idx.is_null());
+
+    let config = rype_calculate_batch_config(idx, 0, 0, 4 * 1024 * 1024 * 1024);
+    assert_eq!(
+        config.batch_size, 0,
+        "zero avg_read_length should return batch_size 0"
+    );
+
+    rype_index_free(idx);
+}
+
+/// Paired-end should use more memory per row, yielding a smaller batch_size
+/// under a tight budget. Also tests auto-detect memory (max_memory=0).
+#[test]
+fn test_calculate_batch_config_paired_and_memory() -> Result<()> {
+    let dir = tempdir()?;
+    let index_path = create_test_parquet_index(dir.path(), 32, 10, 0x12345)?;
+
+    let path_cstr = CString::new(index_path.to_str().unwrap())?;
+    let idx = rype_index_load(path_cstr.as_ptr());
+    assert!(!idx.is_null());
+
+    let tight_budget = 512 * 1024 * 1024; // 512 MB
+
+    let cfg_se = rype_calculate_batch_config(idx, 150, 0, tight_budget);
+    assert!(cfg_se.batch_size >= 1000);
+
+    // Paired-end should be <= single-end batch_size under same budget
+    let cfg_pe = rype_calculate_batch_config(idx, 150, 1, tight_budget);
+    assert!(cfg_pe.batch_size >= 1000);
+    assert!(
+        cfg_pe.batch_size <= cfg_se.batch_size,
+        "paired batch_size ({}) should be <= single-end ({})",
+        cfg_pe.batch_size,
+        cfg_se.batch_size
+    );
+
+    // Smaller budget should give <= batch_size
+    let smaller_budget = 300 * 1024 * 1024;
+    let cfg_small = rype_calculate_batch_config(idx, 150, 0, smaller_budget);
+    assert!(
+        cfg_small.batch_size <= cfg_se.batch_size,
+        "smaller memory batch ({}) should be <= larger memory batch ({})",
+        cfg_small.batch_size,
+        cfg_se.batch_size
+    );
+
+    // Auto-detect memory (max_memory=0) should return a valid config
+    let cfg_auto = rype_calculate_batch_config(idx, 150, 0, 0);
+    assert!(
+        cfg_auto.batch_size >= 1000,
+        "auto-detect should return >= MIN_BATCH_SIZE, got {}",
+        cfg_auto.batch_size
+    );
+    assert!(cfg_auto.peak_memory > 0);
+
+    rype_index_free(idx);
     Ok(())
 }
