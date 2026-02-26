@@ -1,9 +1,9 @@
 # Rype
 
-[![CI](https://github.com/YOUR_USERNAME/rype/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/rype/actions/workflows/ci.yml)
+[![CI](https://github.com/the-miint/rype/actions/workflows/ci.yml/badge.svg)](https://github.com/the-miint/rype/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/rype.svg)](https://crates.io/crates/rype)
 [![Documentation](https://docs.rs/rype/badge.svg)](https://docs.rs/rype)
-[![License](https://img.shields.io/crates/l/rype.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
 High-performance genomic sequence classification using minimizer-based k-mer sketching in RY (purine/pyrimidine) space.
 
@@ -41,8 +41,14 @@ cargo build
 # Create index from reference sequences
 rype index create -o index.ryxdi -r ref1.fasta -r ref2.fasta -k 64 -w 50
 
-# Or build from a TOML configuration file
+# Create index with one bucket per sequence
+rype index create -o genes.ryxdi -r genes.fasta --separate-buckets
+
+# Build from a TOML configuration file
 rype index from-config -c config.toml
+
+# Merge two indices
+rype index merge --index-primary idx1.ryxdi --index-secondary idx2.ryxdi -o merged.ryxdi
 ```
 
 ### Classify sequences
@@ -53,6 +59,21 @@ rype classify run -i index.ryxdi -1 reads.fastq -t 0.1
 
 # Paired-end reads
 rype classify run -i index.ryxdi -1 reads_R1.fastq -2 reads_R2.fastq -t 0.1
+
+# Best-hit-only classification
+rype classify run -i index.ryxdi -1 reads.fastq --best-hit
+
+# Trim reads to first N bases before classification
+rype classify run -i index.ryxdi -1 reads.fastq -t 0.1 --trim-to 100
+
+# Host depletion with a negative index
+rype classify run -i target.ryxdi -N host.ryxdi -1 reads.fastq -t 0.1
+
+# Sample-level aggregated classification
+rype classify aggregate -i index.ryxdi -1 reads.fastq -t 0.05
+
+# Log-ratio scoring with two single-bucket indices
+rype classify log-ratio -n numerator.ryxdi -d denominator.ryxdi -1 reads.fastq
 ```
 
 ### Index management
@@ -69,16 +90,19 @@ rype index stats -i index.ryxdi
 | Subcommand | Description |
 |------------|-------------|
 | `create` | Build index from FASTA/FASTQ files |
+| `from-config` | Build index from TOML configuration file |
+| `merge` | Merge two indices (with optional subtraction) |
 | `stats` | Show index statistics |
 | `bucket-source-detail` | Show source details for a specific bucket |
-| `from-config` | Build index from TOML configuration file |
+| `summarize` | Show detailed minimizer statistics (legacy non-Parquet indices only) |
 
 ### `rype classify`
 
 | Subcommand | Description |
 |------------|-------------|
 | `run` | Per-read classification |
-| `batch` | Batch classify (alias for run) |
+| `aggregate` | Sample-level aggregated classification (alias: `agg`) |
+| `log-ratio` | Log-ratio scoring using two single-bucket indices |
 
 ## Configuration File
 
@@ -87,16 +111,15 @@ Build complex indices using a TOML configuration file:
 ```toml
 [index]
 output = "output.ryxdi"
-k = 64
-w = 50
+window = 50
+salt = 0x5555555555555555    # XOR salt for hashing
+# k = 64                    # K-mer size (default: 64)
 
-[[buckets]]
-name = "species_a"
-sources = ["ref_a1.fasta", "ref_a2.fasta"]
+[buckets.species_a]
+files = ["ref_a1.fasta", "ref_a2.fasta"]
 
-[[buckets]]
-name = "species_b"
-sources = ["ref_b.fasta"]
+[buckets.species_b]
+files = ["ref_b.fasta"]
 ```
 
 ## Library Usage
@@ -322,12 +345,7 @@ The test suite includes automated verification that README examples compile and 
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+Licensed under the [BSD 3-Clause License](LICENSE).
 
 ## Contributing
 

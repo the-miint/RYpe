@@ -2,14 +2,14 @@
 name = "rype"
 version = "0.1.0"
 edition = "2021"
-authors = ["YOUR_NAME <YOUR_EMAIL>"]
+authors = ["The RYpe Development Team <damcdonald@ucsd.edu>"]
 description = "High-performance genomic sequence classification using minimizer-based k-mer sketching in RY space"
-repository = "https://github.com/YOUR_USERNAME/rype"
-homepage = "https://github.com/YOUR_USERNAME/rype"
+repository = "https://github.com/the-miint/rype"
+homepage = "https://github.com/the-miint/rype"
 documentation = "https://docs.rs/rype"
 readme = "README.md"
-license = "MIT OR Apache-2.0"
-keywords = ["bioinformatics", "genomics", "minimizer", "kmer", "classification"]
+license = "BSD-3-Clause"
+keywords = ["bioinformatics", "microbiome", "genomics", "minimizer", "kmer", "classification"]
 categories = ["science", "command-line-utilities"]
 rust-version = "1.70"
 
