@@ -19,7 +19,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-needletail = "0.6"
+needletail = { version = "0.6", default-features = false, features = ["flate2", "zstd"] }
 rayon = "1.8"
 libc = "0.2"  # New dependency for C types
 toml = "1.0"
