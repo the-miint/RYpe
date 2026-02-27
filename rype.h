@@ -479,8 +479,13 @@ typedef struct {
 } RypeBatchConfig;
 
 /* Compile-time ABI safety check: catch Rust/C struct layout drift. */
+#ifdef __cplusplus
+static_assert(sizeof(RypeBatchConfig) == 4 * sizeof(size_t),
+    "RypeBatchConfig layout mismatch - update rype.h if struct fields changed");
+#else
 _Static_assert(sizeof(RypeBatchConfig) == 4 * sizeof(size_t),
     "RypeBatchConfig layout mismatch - update rype.h if struct fields changed");
+#endif
 
 /**
  * Calculate the full batch configuration for Arrow streaming classification
