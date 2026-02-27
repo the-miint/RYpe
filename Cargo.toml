@@ -9,7 +9,7 @@ homepage = "https://github.com/the-miint/rype"
 documentation = "https://docs.rs/rype"
 readme = "README.md"
 license = "BSD-3-Clause"
-keywords = ["bioinformatics", "microbiome", "genomics", "minimizer", "kmer", "classification"]
+keywords = ["bioinformatics", "microbiome", "genomics", "minimizer", "classification"]
 categories = ["science", "command-line-utilities"]
 rust-version = "1.70"
 
