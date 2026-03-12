@@ -483,6 +483,12 @@ pub extern "C" fn rype_parse_byte_suffix(str_ptr: *const c_char) -> size_t {
 /// Convenience wrapper around `rype_calculate_batch_config` that returns only
 /// the `batch_size` field. See that function for full documentation.
 ///
+/// # Parameters
+///
+/// * `is_large_binary` - Non-zero if the caller will use Arrow LargeBinary (i64
+///   offsets) for the sequence column. When 0 (standard Binary / i32 offsets),
+///   batch size is capped so total sequence data stays under 2 GiB.
+///
 /// # Returns
 /// The recommended number of rows per RecordBatch (always >= 1000 on success),
 /// or 0 on error. Call `rype_get_last_error()` for details when 0 is returned.
@@ -492,8 +498,16 @@ pub extern "C" fn rype_recommend_batch_size(
     avg_read_length: size_t,
     is_paired: c_int,
     max_memory: size_t,
+    is_large_binary: c_int,
 ) -> size_t {
-    rype_calculate_batch_config(index_ptr, avg_read_length, is_paired, max_memory).batch_size
+    rype_calculate_batch_config(
+        index_ptr,
+        avg_read_length,
+        is_paired,
+        max_memory,
+        is_large_binary,
+    )
+    .batch_size
 }
 
 /// Calculate the full batch configuration for Arrow streaming classification.
@@ -508,6 +522,9 @@ pub extern "C" fn rype_recommend_batch_size(
 /// * `avg_read_length` - Average nucleotide length of individual reads
 /// * `is_paired` - Any non-zero value means paired-end, 0 means single-end
 /// * `max_memory` - Maximum memory budget in bytes, or 0 to auto-detect
+/// * `is_large_binary` - Non-zero if the caller will use Arrow LargeBinary (i64
+///   offsets) for the sequence column. When 0 (standard Binary / i32 offsets),
+///   batch size is capped so total sequence data stays under 2 GiB per array.
 ///
 /// # Returns
 /// A `RypeBatchConfig` struct. On error, all fields are 0.
@@ -521,6 +538,7 @@ pub extern "C" fn rype_calculate_batch_config(
     avg_read_length: size_t,
     is_paired: c_int,
     max_memory: size_t,
+    is_large_binary: c_int,
 ) -> RypeBatchConfig {
     let error_result = RypeBatchConfig {
         batch_size: 0,
@@ -593,8 +611,17 @@ pub extern "C" fn rype_calculate_batch_config(
     // i32::MAX bytes. Without this cap, large avg_read_length (e.g., HiFi reads
     // at ~4KB) combined with generous memory budgets can recommend batch sizes
     // whose total sequence data exceeds 2 GiB, causing panics in arrow-rs.
-    let arrow_binary_safe_max = MAX_ARROW_BINARY_BYTES / avg_read_length;
-    let capped_batch_size = batch_config.batch_size.min(arrow_binary_safe_max);
+    // Callers using LargeBinary (i64 offsets) can skip this cap.
+    debug_assert!(
+        avg_read_length > 0,
+        "avg_read_length == 0 should have been caught by the early return above"
+    );
+    let capped_batch_size = if is_large_binary != 0 {
+        batch_config.batch_size
+    } else {
+        let arrow_binary_safe_max = MAX_ARROW_BINARY_BYTES / avg_read_length;
+        batch_config.batch_size.min(arrow_binary_safe_max)
+    };
 
     clear_last_error();
     if capped_batch_size == batch_config.batch_size {
@@ -617,8 +644,13 @@ pub extern "C" fn rype_calculate_batch_config(
         .unwrap_or(batch_config.per_batch_memory);
         let io_buffer_memory = estimate_io_buffer_memory(capped_batch_size, &config).unwrap_or(0);
 
-        // Reconstruct peak_memory: base_reserved + per_batch + io_buffers
-        // Mirror calculate_batch_config: safety = max(10% of budget, 256 MiB)
+        // Reconstruct peak_memory: base_reserved + per_batch + io_buffers.
+        // Mirrors calculate_batch_config's formula:
+        //   base_reserved = index_memory + shard_reservation + safety_margin
+        // In the C API path, index_memory is always 0 (the index is already
+        // loaded and shards are on-demand), so we omit it here. If the
+        // MemoryConfig construction above ever passes a non-zero index_memory,
+        // this must be updated to include it.
         let safety_margin = (memory_budget as f64 * 0.10).round() as usize;
         let safety_margin = safety_margin.max(256 * 1024 * 1024);
         let base_reserved = shard_reservation.saturating_add(safety_margin);

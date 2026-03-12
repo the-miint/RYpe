@@ -447,8 +447,22 @@ size_t rype_parse_byte_suffix(const char* str);
  * @param avg_read_length  Average nucleotide length of individual reads (must be > 0)
  * @param is_paired        Non-zero for paired-end, 0 for single-end
  * @param max_memory       Maximum memory budget in bytes, or 0 to auto-detect
+ * @param is_large_binary  Non-zero if the caller will use Arrow LargeBinary (i64
+ *                         offsets) for the sequence column. When 0 (standard Binary
+ *                         / i32 offsets), batch size is capped so total sequence
+ *                         data stays under 2 GiB per array. Callers that do not use
+ *                         Arrow at all should pass 0 for a safe default.
  * @return                 Recommended number of rows per RecordBatch (>= 1000 on
  *                         success), or 0 on error
+ *
+ * ## Design Note
+ *
+ * An alternative API would expose the Arrow Binary row limit as a standalone
+ * helper (e.g. `rype_arrow_binary_max_rows(avg_read_length)`) that callers
+ * compose via min() with their own batch sizing. The current integrated
+ * parameter was chosen to keep the common case to a single call and to ensure
+ * the memory estimates in RypeBatchConfig remain self-consistent with the
+ * returned batch_size.
  *
  * ## Error Handling
  *
@@ -462,7 +476,8 @@ size_t rype_recommend_batch_size(
     const RypeIndex* index,
     size_t avg_read_length,
     int is_paired,
-    size_t max_memory);
+    size_t max_memory,
+    int is_large_binary);
 
 /**
  * Full batch configuration returned by rype_calculate_batch_config()
@@ -498,6 +513,11 @@ _Static_assert(sizeof(RypeBatchConfig) == 4 * sizeof(size_t),
  * @param avg_read_length  Average nucleotide length of individual reads (must be > 0)
  * @param is_paired        Non-zero for paired-end, 0 for single-end
  * @param max_memory       Maximum memory budget in bytes, or 0 to auto-detect
+ * @param is_large_binary  Non-zero if the caller will use Arrow LargeBinary (i64
+ *                         offsets) for the sequence column. When 0 (standard Binary
+ *                         / i32 offsets), batch size is capped so total sequence
+ *                         data stays under 2 GiB per array. Callers that do not use
+ *                         Arrow at all should pass 0 for a safe default.
  * @return                 RypeBatchConfig struct. On error all fields are 0.
  *
  * ## Error Handling
@@ -512,7 +532,8 @@ RypeBatchConfig rype_calculate_batch_config(
     const RypeIndex* index,
     size_t avg_read_length,
     int is_paired,
-    size_t max_memory);
+    size_t max_memory,
+    int is_large_binary);
 
 /**
  * Get the name of a bucket by ID

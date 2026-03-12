@@ -1353,7 +1353,7 @@ fn test_recommend_batch_size_basic() -> Result<()> {
     assert!(!idx.is_null());
 
     // Basic single-end recommendation with 150bp reads
-    let batch_se = rype_recommend_batch_size(idx, 150, 0, 4 * 1024 * 1024 * 1024);
+    let batch_se = rype_recommend_batch_size(idx, 150, 0, 4 * 1024 * 1024 * 1024, 0);
     assert!(
         batch_se >= 1000,
         "batch_size should be >= MIN_BATCH_SIZE (1000), got {}",
@@ -1361,7 +1361,7 @@ fn test_recommend_batch_size_basic() -> Result<()> {
     );
 
     // Auto-detect memory (max_memory=0) should return a reasonable value
-    let batch_auto = rype_recommend_batch_size(idx, 150, 0, 0);
+    let batch_auto = rype_recommend_batch_size(idx, 150, 0, 0, 0);
     assert!(
         batch_auto >= 1000,
         "auto-detect batch should be >= MIN_BATCH_SIZE, got {}",
@@ -1386,7 +1386,7 @@ fn test_recommend_batch_size_memory_constraints() -> Result<()> {
     // Use a tight memory budget (512MB) so the memory constraint actually bites
     let tight_budget = 512 * 1024 * 1024;
 
-    let batch_se = rype_recommend_batch_size(idx, 150, 0, tight_budget);
+    let batch_se = rype_recommend_batch_size(idx, 150, 0, tight_budget, 0);
     assert!(
         batch_se >= 1000,
         "single-end batch should be >= MIN_BATCH_SIZE, got {}",
@@ -1394,7 +1394,7 @@ fn test_recommend_batch_size_memory_constraints() -> Result<()> {
     );
 
     // Paired-end should be <= single-end (paired uses more memory per row)
-    let batch_pe = rype_recommend_batch_size(idx, 150, 1, tight_budget);
+    let batch_pe = rype_recommend_batch_size(idx, 150, 1, tight_budget, 0);
     assert!(
         batch_pe >= 1000,
         "paired batch_size should be >= MIN_BATCH_SIZE, got {}",
@@ -1409,7 +1409,7 @@ fn test_recommend_batch_size_memory_constraints() -> Result<()> {
 
     // Smaller memory should give <= batch size
     let smaller_budget = 300 * 1024 * 1024;
-    let batch_small = rype_recommend_batch_size(idx, 150, 0, smaller_budget);
+    let batch_small = rype_recommend_batch_size(idx, 150, 0, smaller_budget, 0);
     assert!(
         batch_small <= batch_se,
         "smaller memory batch ({}) should be <= larger memory batch ({})",
@@ -1433,7 +1433,7 @@ fn test_recommend_batch_size_read_shorter_than_k() -> Result<()> {
     let idx = rype_index_load(path_cstr.as_ptr());
     assert!(!idx.is_null());
 
-    let batch = rype_recommend_batch_size(idx, 10, 0, 4 * 1024 * 1024 * 1024);
+    let batch = rype_recommend_batch_size(idx, 10, 0, 4 * 1024 * 1024 * 1024, 0);
     assert!(
         batch >= 1000,
         "degenerate read length should still return >= MIN_BATCH_SIZE, got {}",
@@ -1447,7 +1447,7 @@ fn test_recommend_batch_size_read_shorter_than_k() -> Result<()> {
 #[test]
 fn test_recommend_batch_size_error_cases() {
     // Null index should return 0
-    let result = rype_recommend_batch_size(ptr::null(), 150, 0, 4 * 1024 * 1024 * 1024);
+    let result = rype_recommend_batch_size(ptr::null(), 150, 0, 4 * 1024 * 1024 * 1024, 0);
     assert_eq!(result, 0, "null index should return 0");
 
     let err = rype_get_last_error();
@@ -1460,7 +1460,7 @@ fn test_recommend_batch_size_error_cases() {
     let idx = rype_index_load(path_cstr.as_ptr());
     assert!(!idx.is_null());
 
-    let result = rype_recommend_batch_size(idx, 0, 0, 4 * 1024 * 1024 * 1024);
+    let result = rype_recommend_batch_size(idx, 0, 0, 4 * 1024 * 1024 * 1024, 0);
     assert_eq!(result, 0, "zero avg_read_length should return 0");
 
     let err = rype_get_last_error();
@@ -1518,21 +1518,23 @@ fn test_recommend_batch_size_respects_arrow_binary_offset_limit() -> Result<()> 
     assert!(!idx.is_null());
 
     let hifi_read_len: usize = 4252;
-    let generous_budget: usize = 16 * 1024 * 1024 * 1024; // 16 GiB
+    // Budget must be large enough that memory alone would permit more rows than
+    // the Arrow Binary cap (i32::MAX / 4252 ≈ 505K). At ~80KB per read overhead,
+    // we need > 40 GiB for the cap to be the binding constraint.
+    let generous_budget: usize = 64 * 1024 * 1024 * 1024; // 64 GiB
 
-    // Single-end: batch_size * avg_read_length must not exceed i32::MAX
-    let batch_se = rype_recommend_batch_size(idx, hifi_read_len, 0, generous_budget);
-    assert!(
-        batch_se as u64 * hifi_read_len as u64 <= i32::MAX as u64,
-        "single-end batch would overflow Arrow Binary: {} * {} = {} > i32::MAX ({})",
-        batch_se,
-        hifi_read_len,
-        batch_se as u64 * hifi_read_len as u64,
-        i32::MAX
+    let arrow_binary_cap = i32::MAX as usize / hifi_read_len;
+
+    // Single-end with Binary (i32): batch_size must equal the Arrow cap
+    let batch_se = rype_recommend_batch_size(idx, hifi_read_len, 0, generous_budget, 0);
+    assert_eq!(
+        batch_se, arrow_binary_cap,
+        "Binary batch ({}) should equal Arrow cap ({})",
+        batch_se, arrow_binary_cap
     );
 
-    // Paired-end: same constraint
-    let batch_pe = rype_recommend_batch_size(idx, hifi_read_len, 1, generous_budget);
+    // Paired-end with Binary (i32): same constraint
+    let batch_pe = rype_recommend_batch_size(idx, hifi_read_len, 1, generous_budget, 0);
     assert!(
         batch_pe as u64 * hifi_read_len as u64 <= i32::MAX as u64,
         "paired-end batch would overflow Arrow Binary: {} * {} = {} > i32::MAX ({})",
@@ -1542,9 +1544,19 @@ fn test_recommend_batch_size_respects_arrow_binary_offset_limit() -> Result<()> 
         i32::MAX
     );
 
-    // Short reads (150bp) should NOT be capped by Arrow limit — memory is the
-    // binding constraint. 150bp * 504K = ~75MB, well under 2GB.
-    let batch_short = rype_recommend_batch_size(idx, 150, 0, generous_budget);
+    // LargeBinary (i64): cap should NOT apply — batch can exceed the i32 limit.
+    let batch_large = rype_recommend_batch_size(idx, hifi_read_len, 0, generous_budget, 1);
+    assert!(
+        batch_large > arrow_binary_cap,
+        "LargeBinary batch ({}) should exceed Binary cap ({})",
+        batch_large,
+        arrow_binary_cap
+    );
+
+    // Short reads (150bp) with a moderate budget: memory should be the binding
+    // constraint, not the Arrow offset limit.
+    let moderate_budget: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
+    let batch_short = rype_recommend_batch_size(idx, 150, 0, moderate_budget, 0);
     let arrow_max_at_150 = i32::MAX as usize / 150;
     assert!(
         batch_short < arrow_max_at_150,
@@ -1570,7 +1582,7 @@ fn test_calculate_batch_config_basic() -> Result<()> {
     let idx = rype_index_load(path_cstr.as_ptr());
     assert!(!idx.is_null());
 
-    let config = rype_calculate_batch_config(idx, 150, 0, 4 * 1024 * 1024 * 1024);
+    let config = rype_calculate_batch_config(idx, 150, 0, 4 * 1024 * 1024 * 1024, 0);
     assert!(
         config.batch_size >= 1000,
         "batch_size should be >= MIN_BATCH_SIZE (1000), got {}",
@@ -1599,10 +1611,18 @@ fn test_calculate_batch_config_basic() -> Result<()> {
     );
 
     // batch_size should agree with rype_recommend_batch_size
-    let batch_size_only = rype_recommend_batch_size(idx, 150, 0, 4 * 1024 * 1024 * 1024);
+    let batch_size_only = rype_recommend_batch_size(idx, 150, 0, 4 * 1024 * 1024 * 1024, 0);
     assert_eq!(
         config.batch_size, batch_size_only,
-        "calculate_batch_config and recommend_batch_size should agree"
+        "calculate_batch_config and recommend_batch_size should agree (is_large_binary=0)"
+    );
+
+    // Same agreement check with is_large_binary=1
+    let config_lb = rype_calculate_batch_config(idx, 150, 0, 4 * 1024 * 1024 * 1024, 1);
+    let batch_size_lb = rype_recommend_batch_size(idx, 150, 0, 4 * 1024 * 1024 * 1024, 1);
+    assert_eq!(
+        config_lb.batch_size, batch_size_lb,
+        "calculate_batch_config and recommend_batch_size should agree (is_large_binary=1)"
     );
 
     rype_index_free(idx);
@@ -1612,7 +1632,7 @@ fn test_calculate_batch_config_basic() -> Result<()> {
 #[test]
 fn test_calculate_batch_config_error_cases() {
     // Null index
-    let config = rype_calculate_batch_config(ptr::null(), 150, 0, 4 * 1024 * 1024 * 1024);
+    let config = rype_calculate_batch_config(ptr::null(), 150, 0, 4 * 1024 * 1024 * 1024, 0);
     assert_eq!(
         config.batch_size, 0,
         "null index should return batch_size 0"
@@ -1631,7 +1651,7 @@ fn test_calculate_batch_config_error_cases() {
     let idx = rype_index_load(path_cstr.as_ptr());
     assert!(!idx.is_null());
 
-    let config = rype_calculate_batch_config(idx, 0, 0, 4 * 1024 * 1024 * 1024);
+    let config = rype_calculate_batch_config(idx, 0, 0, 4 * 1024 * 1024 * 1024, 0);
     assert_eq!(
         config.batch_size, 0,
         "zero avg_read_length should return batch_size 0"
@@ -1653,11 +1673,11 @@ fn test_calculate_batch_config_paired_and_memory() -> Result<()> {
 
     let tight_budget = 512 * 1024 * 1024; // 512 MB
 
-    let cfg_se = rype_calculate_batch_config(idx, 150, 0, tight_budget);
+    let cfg_se = rype_calculate_batch_config(idx, 150, 0, tight_budget, 0);
     assert!(cfg_se.batch_size >= 1000);
 
     // Paired-end should be <= single-end batch_size under same budget
-    let cfg_pe = rype_calculate_batch_config(idx, 150, 1, tight_budget);
+    let cfg_pe = rype_calculate_batch_config(idx, 150, 1, tight_budget, 0);
     assert!(cfg_pe.batch_size >= 1000);
     assert!(
         cfg_pe.batch_size <= cfg_se.batch_size,
@@ -1668,7 +1688,7 @@ fn test_calculate_batch_config_paired_and_memory() -> Result<()> {
 
     // Smaller budget should give <= batch_size
     let smaller_budget = 300 * 1024 * 1024;
-    let cfg_small = rype_calculate_batch_config(idx, 150, 0, smaller_budget);
+    let cfg_small = rype_calculate_batch_config(idx, 150, 0, smaller_budget, 0);
     assert!(
         cfg_small.batch_size <= cfg_se.batch_size,
         "smaller memory batch ({}) should be <= larger memory batch ({})",
@@ -1677,13 +1697,73 @@ fn test_calculate_batch_config_paired_and_memory() -> Result<()> {
     );
 
     // Auto-detect memory (max_memory=0) should return a valid config
-    let cfg_auto = rype_calculate_batch_config(idx, 150, 0, 0);
+    let cfg_auto = rype_calculate_batch_config(idx, 150, 0, 0, 0);
     assert!(
         cfg_auto.batch_size >= 1000,
         "auto-detect should return >= MIN_BATCH_SIZE, got {}",
         cfg_auto.batch_size
     );
     assert!(cfg_auto.peak_memory > 0);
+
+    rype_index_free(idx);
+    Ok(())
+}
+
+/// When batch_size is capped by the Arrow Binary i32 limit, the returned
+/// per_batch_memory and peak_memory must be recomputed for the smaller batch.
+#[test]
+fn test_calculate_batch_config_capped_path_memory_fields() -> Result<()> {
+    let dir = tempdir()?;
+    let index_path = create_test_parquet_index(dir.path(), 32, 10, 0x12345)?;
+
+    let path_cstr = CString::new(index_path.to_str().unwrap())?;
+    let idx = rype_index_load(path_cstr.as_ptr());
+    assert!(!idx.is_null());
+
+    let hifi_read_len: usize = 4252;
+    // Must be large enough that memory alone would permit more rows than the
+    // Arrow Binary cap, so the cap is the binding constraint.
+    let generous_budget: usize = 64 * 1024 * 1024 * 1024; // 64 GiB
+
+    // Binary (i32) — triggers the capped path
+    let cfg_capped = rype_calculate_batch_config(idx, hifi_read_len, 0, generous_budget, 0);
+    let arrow_binary_cap = i32::MAX as usize / hifi_read_len;
+    assert_eq!(
+        cfg_capped.batch_size, arrow_binary_cap,
+        "batch_size should be capped at {}",
+        arrow_binary_cap
+    );
+    assert!(
+        cfg_capped.per_batch_memory > 0,
+        "capped per_batch_memory should be > 0, got {}",
+        cfg_capped.per_batch_memory
+    );
+    assert!(
+        cfg_capped.peak_memory > 0,
+        "capped peak_memory should be > 0, got {}",
+        cfg_capped.peak_memory
+    );
+    assert!(
+        cfg_capped.peak_memory >= cfg_capped.per_batch_memory,
+        "capped peak_memory ({}) should be >= per_batch_memory ({})",
+        cfg_capped.peak_memory,
+        cfg_capped.per_batch_memory
+    );
+
+    // LargeBinary (i64) — uncapped, should have larger memory estimates
+    let cfg_uncapped = rype_calculate_batch_config(idx, hifi_read_len, 0, generous_budget, 1);
+    assert!(
+        cfg_uncapped.batch_size > cfg_capped.batch_size,
+        "uncapped batch ({}) should exceed capped ({})",
+        cfg_uncapped.batch_size,
+        cfg_capped.batch_size
+    );
+    assert!(
+        cfg_uncapped.per_batch_memory > cfg_capped.per_batch_memory,
+        "uncapped per_batch_memory ({}) should exceed capped ({})",
+        cfg_uncapped.per_batch_memory,
+        cfg_capped.per_batch_memory
+    );
 
     rype_index_free(idx);
     Ok(())
