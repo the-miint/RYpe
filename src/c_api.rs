@@ -24,10 +24,11 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::classify_with_sharded_negative;
-use crate::constants::MAX_SEQUENCE_LENGTH;
+use crate::constants::{MAX_ARROW_BINARY_BYTES, MAX_SEQUENCE_LENGTH};
 use crate::memory::{
-    calculate_batch_config, detect_available_memory, estimate_shard_reservation, parse_byte_suffix,
-    InputFormat, MemoryConfig, ReadMemoryProfile,
+    calculate_batch_config, detect_available_memory, estimate_batch_memory,
+    estimate_io_buffer_memory, estimate_shard_reservation, parse_byte_suffix, InputFormat,
+    MemoryConfig, ReadMemoryProfile,
 };
 use crate::{QueryRecord, ShardedInvertedIndex};
 use libc::{c_char, c_double, c_int, size_t};
@@ -570,7 +571,7 @@ pub extern "C" fn rype_calculate_batch_config(
         num_threads,
         0, // index_memory: shards load on-demand, manifest is tiny
         shard_reservation,
-        read_profile,
+        read_profile.clone(),
         num_buckets,
         InputFormat::Parquet {
             is_paired: is_paired_bool,
@@ -586,12 +587,51 @@ pub extern "C" fn rype_calculate_batch_config(
     };
 
     let batch_config = calculate_batch_config(&config);
+
+    // Cap batch size to prevent Arrow Binary (i32 offset) overflow.
+    // Arrow Binary arrays use i32 offsets, limiting total data per array to
+    // i32::MAX bytes. Without this cap, large avg_read_length (e.g., HiFi reads
+    // at ~4KB) combined with generous memory budgets can recommend batch sizes
+    // whose total sequence data exceeds 2 GiB, causing panics in arrow-rs.
+    let arrow_binary_safe_max = MAX_ARROW_BINARY_BYTES / avg_read_length;
+    let capped_batch_size = batch_config.batch_size.min(arrow_binary_safe_max);
+
     clear_last_error();
-    RypeBatchConfig {
-        batch_size: batch_config.batch_size,
-        batch_count: batch_config.batch_count,
-        per_batch_memory: batch_config.per_batch_memory,
-        peak_memory: batch_config.peak_memory,
+    if capped_batch_size == batch_config.batch_size {
+        // No capping needed — return as-is
+        RypeBatchConfig {
+            batch_size: batch_config.batch_size,
+            batch_count: batch_config.batch_count,
+            per_batch_memory: batch_config.per_batch_memory,
+            peak_memory: batch_config.peak_memory,
+        }
+    } else {
+        // Recompute memory estimates for the capped batch size so the struct
+        // is self-consistent
+        let per_batch_memory = estimate_batch_memory(
+            capped_batch_size,
+            &read_profile,
+            num_buckets,
+            false, // is_log_ratio
+        )
+        .unwrap_or(batch_config.per_batch_memory);
+        let io_buffer_memory = estimate_io_buffer_memory(capped_batch_size, &config).unwrap_or(0);
+
+        // Reconstruct peak_memory: base_reserved + per_batch + io_buffers
+        // Mirror calculate_batch_config: safety = max(10% of budget, 256 MiB)
+        let safety_margin = (memory_budget as f64 * 0.10).round() as usize;
+        let safety_margin = safety_margin.max(256 * 1024 * 1024);
+        let base_reserved = shard_reservation.saturating_add(safety_margin);
+        let peak_memory = base_reserved
+            .saturating_add(per_batch_memory)
+            .saturating_add(io_buffer_memory);
+
+        RypeBatchConfig {
+            batch_size: capped_batch_size,
+            batch_count: batch_config.batch_count,
+            per_batch_memory,
+            peak_memory,
+        }
     }
 }
 

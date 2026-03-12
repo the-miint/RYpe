@@ -975,7 +975,7 @@ pub fn estimate_batch_memory(
 /// RecordBatch construction.
 ///
 /// Returns None if arithmetic overflow occurs.
-fn estimate_io_buffer_memory(batch_size: usize, config: &MemoryConfig) -> Option<usize> {
+pub(crate) fn estimate_io_buffer_memory(batch_size: usize, config: &MemoryConfig) -> Option<usize> {
     let prefetch_slots = config.prefetch_buffer_slots();
     let bytes_per_row = config.buffer_bytes_per_row();
 

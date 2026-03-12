@@ -96,6 +96,11 @@ pub const BUCKET_SOURCE_DELIM: &str = "::";
 /// Maximum sequence length for C API (2GB on 64-bit systems).
 pub(crate) const MAX_SEQUENCE_LENGTH: usize = 2_000_000_000;
 
+/// Maximum total bytes in a single Arrow Binary column per batch.
+/// Arrow Binary uses i32 offsets, capping data at i32::MAX bytes.
+/// Used by the C API batch size recommendation to prevent offset overflow.
+pub(crate) const MAX_ARROW_BINARY_BYTES: usize = i32::MAX as usize;
+
 // ============================================================================
 // QueryInvertedIndex Bit-Packing
 // ============================================================================

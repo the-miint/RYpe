@@ -1505,6 +1505,58 @@ fn test_recommend_batch_size_zero_bucket_index_rejected_at_load() -> Result<()> 
     Ok(())
 }
 
+/// Arrow Binary uses i32 offsets, capping per-array data at i32::MAX bytes.
+/// With HiFi reads (~4252bp), an uncapped batch of 570K rows would overflow.
+/// The batch size recommendation must cap at i32::MAX / avg_read_length.
+#[test]
+fn test_recommend_batch_size_respects_arrow_binary_offset_limit() -> Result<()> {
+    let dir = tempdir()?;
+    let index_path = create_test_parquet_index(dir.path(), 32, 10, 0x12345)?;
+
+    let path_cstr = CString::new(index_path.to_str().unwrap())?;
+    let idx = rype_index_load(path_cstr.as_ptr());
+    assert!(!idx.is_null());
+
+    let hifi_read_len: usize = 4252;
+    let generous_budget: usize = 16 * 1024 * 1024 * 1024; // 16 GiB
+
+    // Single-end: batch_size * avg_read_length must not exceed i32::MAX
+    let batch_se = rype_recommend_batch_size(idx, hifi_read_len, 0, generous_budget);
+    assert!(
+        batch_se as u64 * hifi_read_len as u64 <= i32::MAX as u64,
+        "single-end batch would overflow Arrow Binary: {} * {} = {} > i32::MAX ({})",
+        batch_se,
+        hifi_read_len,
+        batch_se as u64 * hifi_read_len as u64,
+        i32::MAX
+    );
+
+    // Paired-end: same constraint
+    let batch_pe = rype_recommend_batch_size(idx, hifi_read_len, 1, generous_budget);
+    assert!(
+        batch_pe as u64 * hifi_read_len as u64 <= i32::MAX as u64,
+        "paired-end batch would overflow Arrow Binary: {} * {} = {} > i32::MAX ({})",
+        batch_pe,
+        hifi_read_len,
+        batch_pe as u64 * hifi_read_len as u64,
+        i32::MAX
+    );
+
+    // Short reads (150bp) should NOT be capped by Arrow limit — memory is the
+    // binding constraint. 150bp * 504K = ~75MB, well under 2GB.
+    let batch_short = rype_recommend_batch_size(idx, 150, 0, generous_budget);
+    let arrow_max_at_150 = i32::MAX as usize / 150;
+    assert!(
+        batch_short < arrow_max_at_150,
+        "short reads should be memory-bound, not Arrow-bound: {} >= {}",
+        batch_short,
+        arrow_max_at_150
+    );
+
+    rype_index_free(idx);
+    Ok(())
+}
+
 // =============================================================================
 // Batch Config Calculation Tests
 // =============================================================================
