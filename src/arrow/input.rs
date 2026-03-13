@@ -22,7 +22,8 @@
 //! ```
 
 use arrow::array::{
-    Array, BinaryArray, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+    Array, BinaryArray, BinaryViewArray, Int64Array, LargeBinaryArray, LargeStringArray,
+    StringArray, StringViewArray,
 };
 use arrow::record_batch::RecordBatch;
 
@@ -90,7 +91,31 @@ impl<'a> BinaryArrayAccess<'a> for &'a LargeStringArray {
     }
 }
 
-/// Abstraction over Binary, LargeBinary, String, and LargeString arrays for uniform access.
+impl<'a> BinaryArrayAccess<'a> for &'a BinaryViewArray {
+    #[inline]
+    fn value_at(&self, i: usize) -> &'a [u8] {
+        self.value(i)
+    }
+
+    #[inline]
+    fn is_null_at(&self, i: usize) -> bool {
+        self.is_null(i)
+    }
+}
+
+impl<'a> BinaryArrayAccess<'a> for &'a StringViewArray {
+    #[inline]
+    fn value_at(&self, i: usize) -> &'a [u8] {
+        self.value(i).as_bytes()
+    }
+
+    #[inline]
+    fn is_null_at(&self, i: usize) -> bool {
+        self.is_null(i)
+    }
+}
+
+/// Abstraction over binary and string array types for uniform access.
 ///
 /// Uses an enum internally but with `#[inline]` hints to allow the compiler
 /// to optimize away the match when processing uniform batches.
@@ -99,6 +124,8 @@ enum BinaryColumnRef<'a> {
     LargeBinary(&'a LargeBinaryArray),
     String(&'a StringArray),
     LargeString(&'a LargeStringArray),
+    BinaryView(&'a BinaryViewArray),
+    StringView(&'a StringViewArray),
 }
 
 impl<'a> BinaryColumnRef<'a> {
@@ -110,6 +137,8 @@ impl<'a> BinaryColumnRef<'a> {
             BinaryColumnRef::LargeBinary(arr) => arr.value_at(i),
             BinaryColumnRef::String(arr) => arr.value_at(i),
             BinaryColumnRef::LargeString(arr) => arr.value_at(i),
+            BinaryColumnRef::BinaryView(arr) => arr.value_at(i),
+            BinaryColumnRef::StringView(arr) => arr.value_at(i),
         }
     }
 
@@ -121,13 +150,15 @@ impl<'a> BinaryColumnRef<'a> {
             BinaryColumnRef::LargeBinary(arr) => arr.is_null_at(i),
             BinaryColumnRef::String(arr) => arr.is_null_at(i),
             BinaryColumnRef::LargeString(arr) => arr.is_null_at(i),
+            BinaryColumnRef::BinaryView(arr) => arr.is_null_at(i),
+            BinaryColumnRef::StringView(arr) => arr.is_null_at(i),
         }
     }
 }
 
 /// Extract a binary or string column from a RecordBatch by index.
 ///
-/// Supports Binary, LargeBinary, Utf8 (String), and LargeUtf8 (LargeString) arrays.
+/// Supports Binary, LargeBinary, BinaryView, Utf8, LargeUtf8, and Utf8View arrays.
 /// String arrays are converted to byte slices via `.as_bytes()` (valid for ASCII DNA sequences).
 fn get_binary_column(
     batch: &RecordBatch,
@@ -151,11 +182,19 @@ fn get_binary_column(
         return Ok(BinaryColumnRef::LargeString(arr));
     }
 
+    if let Some(arr) = column.as_any().downcast_ref::<BinaryViewArray>() {
+        return Ok(BinaryColumnRef::BinaryView(arr));
+    }
+
+    if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(BinaryColumnRef::StringView(arr));
+    }
+
     let schema = batch.schema();
     let field = schema.field(col_idx);
     Err(ArrowClassifyError::TypeError {
         column: field.name().clone(),
-        expected: "Binary, LargeBinary, Utf8, or LargeUtf8".into(),
+        expected: "Binary, LargeBinary, BinaryView, Utf8, LargeUtf8, or Utf8View".into(),
         actual: format!("{:?}", column.data_type()),
     })
 }
@@ -204,8 +243,8 @@ pub fn batch_to_records(batch: &RecordBatch) -> Result<Vec<QueryRecord<'_>>, Arr
 ///
 /// * `batch` - A RecordBatch containing the required columns
 /// * `id_col` - Name of the ID column (must be Int64)
-/// * `seq_col` - Name of the primary sequence column (must be Binary or LargeBinary)
-/// * `pair_col` - Optional name of the paired sequence column (must be Binary or LargeBinary if present)
+/// * `seq_col` - Name of the primary sequence column (Binary, LargeBinary, BinaryView, Utf8, LargeUtf8, or Utf8View)
+/// * `pair_col` - Optional name of the paired sequence column (same types as `seq_col`)
 ///
 /// # Returns
 ///
@@ -837,5 +876,186 @@ mod tests {
         let batch = RecordBatch::new_empty(schema);
         let result = batch_to_records(&batch);
         assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // BinaryView / StringView tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_batch_to_records_binary_view_array() {
+        use arrow::array::BinaryViewArray;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(COL_ID, DataType::Int64, false),
+            Field::new(COL_SEQUENCE, DataType::BinaryView, false),
+        ]));
+
+        let id_array = Int64Array::from(vec![1, 2, 3]);
+        let seq_array = BinaryViewArray::from_iter_values([b"ACGT" as &[u8], b"TGCA", b"GGCC"]);
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap();
+
+        let records = batch_to_records(&batch).unwrap();
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].0, 1);
+        assert_eq!(records[0].1, b"ACGT");
+        assert_eq!(records[1].0, 2);
+        assert_eq!(records[1].1, b"TGCA");
+        assert_eq!(records[2].0, 3);
+        assert_eq!(records[2].1, b"GGCC");
+    }
+
+    #[test]
+    fn test_batch_to_records_string_view_array() {
+        use arrow::array::StringViewArray;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(COL_ID, DataType::Int64, false),
+            Field::new(COL_SEQUENCE, DataType::Utf8View, false),
+        ]));
+
+        let id_array = Int64Array::from(vec![1, 2]);
+        let seq_array = StringViewArray::from(vec!["ACGT", "TGCA"]);
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap();
+
+        let records = batch_to_records(&batch).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0, 1);
+        assert_eq!(records[0].1, b"ACGT");
+        assert_eq!(records[1].0, 2);
+        assert_eq!(records[1].1, b"TGCA");
+    }
+
+    #[test]
+    fn test_batch_to_records_binary_view_zero_copy() {
+        // BinaryView uses two storage strategies:
+        // - Values <= 12 bytes are stored inline in the 128-bit view word
+        // - Values > 12 bytes are stored in a separate byte buffer with a pointer in the view
+        // In both cases, .value(i) returns a &[u8] without copying. We test the
+        // non-inline path (>12 bytes) since that's the common case for DNA sequences.
+        use arrow::array::BinaryViewArray;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("seq", DataType::BinaryView, false),
+        ]));
+
+        let id_array = Int64Array::from(vec![1]);
+        // 24 bytes — well above the 12-byte inline threshold
+        let seq_array = BinaryViewArray::from_iter_values([b"ACGTACGTACGTACGTACGTACGT" as &[u8]]);
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap();
+
+        let records = batch_to_records_with_columns(&batch, "id", "seq", None).unwrap();
+
+        let record_ptr = records[0].1.as_ptr();
+
+        let seq_col = batch.column(1);
+        let view_arr = seq_col.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+        let arrow_ptr = view_arr.value(0).as_ptr();
+
+        assert_eq!(
+            record_ptr, arrow_ptr,
+            "Record should point directly into Arrow buffer"
+        );
+    }
+
+    #[test]
+    fn test_batch_to_records_with_columns_binary_view() {
+        use arrow::array::BinaryViewArray;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("seq", DataType::BinaryView, false),
+            Field::new("pair", DataType::BinaryView, true),
+        ]));
+
+        let id_array = Int64Array::from(vec![1, 2]);
+        let seq_array = BinaryViewArray::from_iter_values([b"ACGT" as &[u8], b"TGCA"]);
+        let pair_array = BinaryViewArray::from_iter([Some(b"AAAA" as &[u8]), None]);
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(id_array),
+                Arc::new(seq_array),
+                Arc::new(pair_array),
+            ],
+        )
+        .unwrap();
+
+        let records = batch_to_records_with_columns(&batch, "id", "seq", Some("pair")).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].1, b"ACGT");
+        assert_eq!(records[0].2, Some(b"AAAA" as &[u8]));
+        assert_eq!(records[1].1, b"TGCA");
+        assert!(records[1].2.is_none());
+    }
+
+    #[test]
+    fn test_batch_to_records_with_columns_string_view() {
+        use arrow::array::StringViewArray;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("seq", DataType::Utf8View, false),
+        ]));
+
+        let id_array = Int64Array::from(vec![1, 2]);
+        let seq_array = StringViewArray::from(vec!["ACGT", "TGCA"]);
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(seq_array)]).unwrap();
+
+        let records = batch_to_records_with_columns(&batch, "id", "seq", None).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].1, b"ACGT");
+        assert_eq!(records[1].1, b"TGCA");
+    }
+
+    #[test]
+    fn test_batch_to_records_mixed_view_types() {
+        // DuckDB may export sequence as BinaryView (BLOB) and pair as Utf8View (VARCHAR).
+        // Verify mixed column types work correctly.
+        use arrow::array::{BinaryViewArray, StringViewArray};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("seq", DataType::BinaryView, false),
+            Field::new("pair", DataType::Utf8View, true),
+        ]));
+
+        let id_array = Int64Array::from(vec![1, 2]);
+        let seq_array = BinaryViewArray::from_iter_values([b"ACGT" as &[u8], b"TGCA"]);
+        let pair_array = StringViewArray::from(vec![Some("AAAA"), None]);
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(id_array),
+                Arc::new(seq_array),
+                Arc::new(pair_array),
+            ],
+        )
+        .unwrap();
+
+        let records = batch_to_records_with_columns(&batch, "id", "seq", Some("pair")).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0, 1);
+        assert_eq!(records[0].1, b"ACGT");
+        assert_eq!(records[0].2, Some(b"AAAA" as &[u8]));
+        assert_eq!(records[1].0, 2);
+        assert_eq!(records[1].1, b"TGCA");
+        assert!(records[1].2.is_none());
     }
 }

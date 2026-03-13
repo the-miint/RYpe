@@ -12,8 +12,8 @@
 //! | Column | Type | Nullable | Description |
 //! |--------|------|----------|-------------|
 //! | `id` | Int64 | No | Query identifier |
-//! | `sequence` | Binary or LargeBinary | No | DNA sequence bytes |
-//! | `pair_sequence` | Binary or LargeBinary | Yes | Optional paired-end sequence |
+//! | `sequence` | Binary/LargeBinary/BinaryView/Utf8/LargeUtf8/Utf8View | No | DNA sequence bytes |
+//! | `pair_sequence` | Binary/LargeBinary/BinaryView/Utf8/LargeUtf8/Utf8View | Yes | Optional paired-end sequence |
 //!
 //! ## Output Schema
 //!

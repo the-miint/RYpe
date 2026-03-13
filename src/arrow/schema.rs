@@ -5,8 +5,8 @@
 //! | Column | Arrow Type | Nullable | Description |
 //! |--------|-----------|----------|-------------|
 //! | `id` | Int64 | No | Query identifier |
-//! | `sequence` | Binary or LargeBinary | No | DNA sequence bytes |
-//! | `pair_sequence` | Binary or LargeBinary | Yes | Optional paired-end sequence |
+//! | `sequence` | Binary/LargeBinary/BinaryView/Utf8/LargeUtf8/Utf8View | No | DNA sequence bytes |
+//! | `pair_sequence` | Binary/LargeBinary/BinaryView/Utf8/LargeUtf8/Utf8View | Yes | Optional paired-end sequence |
 //!
 //! # Output Schema
 //!
@@ -68,9 +68,20 @@ pub fn log_ratio_result_schema() -> SchemaRef {
     ]))
 }
 
-/// Check if a DataType is a valid binary type (Binary or LargeBinary).
-fn is_binary_type(dt: &DataType) -> bool {
-    matches!(dt, DataType::Binary | DataType::LargeBinary)
+/// Check if a DataType is a valid sequence type for classification input.
+///
+/// Accepts all binary and string types that can provide byte-level access to sequence data:
+/// Binary, LargeBinary, BinaryView, Utf8, LargeUtf8, Utf8View.
+fn is_sequence_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+    )
 }
 
 /// Validate that a schema matches the expected input schema for classification.
@@ -78,8 +89,8 @@ fn is_binary_type(dt: &DataType) -> bool {
 /// # Requirements
 ///
 /// - Must have column `id` with type Int64
-/// - Must have column `sequence` with type Binary or LargeBinary
-/// - May optionally have column `pair_sequence` with type Binary or LargeBinary (nullable)
+/// - Must have column `sequence` with a sequence-compatible type (Binary, LargeBinary, BinaryView, Utf8, LargeUtf8, or Utf8View)
+/// - May optionally have column `pair_sequence` with a sequence-compatible type (nullable)
 ///
 /// # Errors
 ///
@@ -104,10 +115,11 @@ pub fn validate_input_schema(schema: &Schema) -> Result<(), ArrowClassifyError> 
     // Check for 'sequence' column
     match schema.column_with_name(COL_SEQUENCE) {
         Some((_, field)) => {
-            if !is_binary_type(field.data_type()) {
+            if !is_sequence_type(field.data_type()) {
                 return Err(ArrowClassifyError::TypeError {
                     column: COL_SEQUENCE.into(),
-                    expected: "Binary or LargeBinary".into(),
+                    expected: "Binary, LargeBinary, BinaryView, Utf8, LargeUtf8, or Utf8View"
+                        .into(),
                     actual: format!("{:?}", field.data_type()),
                 });
             }
@@ -119,10 +131,10 @@ pub fn validate_input_schema(schema: &Schema) -> Result<(), ArrowClassifyError> 
 
     // Check optional 'pair_sequence' column if present
     if let Some((_, field)) = schema.column_with_name(COL_PAIR_SEQUENCE) {
-        if !is_binary_type(field.data_type()) {
+        if !is_sequence_type(field.data_type()) {
             return Err(ArrowClassifyError::TypeError {
                 column: COL_PAIR_SEQUENCE.into(),
-                expected: "Binary or LargeBinary".into(),
+                expected: "Binary, LargeBinary, BinaryView, Utf8, LargeUtf8, or Utf8View".into(),
                 actual: format!("{:?}", field.data_type()),
             });
         }
@@ -167,6 +179,62 @@ mod tests {
     }
 
     #[test]
+    fn test_input_schema_valid_with_binary_view() {
+        let schema = Schema::new(vec![
+            Field::new(COL_ID, DataType::Int64, false),
+            Field::new(COL_SEQUENCE, DataType::BinaryView, false),
+        ]);
+        assert!(validate_input_schema(&schema).is_ok());
+    }
+
+    #[test]
+    fn test_input_schema_valid_with_utf8_view() {
+        let schema = Schema::new(vec![
+            Field::new(COL_ID, DataType::Int64, false),
+            Field::new(COL_SEQUENCE, DataType::Utf8View, false),
+        ]);
+        assert!(validate_input_schema(&schema).is_ok());
+    }
+
+    #[test]
+    fn test_input_schema_valid_with_utf8() {
+        let schema = Schema::new(vec![
+            Field::new(COL_ID, DataType::Int64, false),
+            Field::new(COL_SEQUENCE, DataType::Utf8, false),
+        ]);
+        assert!(validate_input_schema(&schema).is_ok());
+    }
+
+    #[test]
+    fn test_input_schema_valid_with_large_utf8() {
+        let schema = Schema::new(vec![
+            Field::new(COL_ID, DataType::Int64, false),
+            Field::new(COL_SEQUENCE, DataType::LargeUtf8, false),
+        ]);
+        assert!(validate_input_schema(&schema).is_ok());
+    }
+
+    #[test]
+    fn test_input_schema_with_optional_pair_binary_view() {
+        let schema = Schema::new(vec![
+            Field::new(COL_ID, DataType::Int64, false),
+            Field::new(COL_SEQUENCE, DataType::Binary, false),
+            Field::new(COL_PAIR_SEQUENCE, DataType::BinaryView, true),
+        ]);
+        assert!(validate_input_schema(&schema).is_ok());
+    }
+
+    #[test]
+    fn test_input_schema_with_optional_pair_utf8_view() {
+        let schema = Schema::new(vec![
+            Field::new(COL_ID, DataType::Int64, false),
+            Field::new(COL_SEQUENCE, DataType::Binary, false),
+            Field::new(COL_PAIR_SEQUENCE, DataType::Utf8View, true),
+        ]);
+        assert!(validate_input_schema(&schema).is_ok());
+    }
+
+    #[test]
     fn test_input_schema_missing_id_column() {
         let schema = Schema::new(vec![Field::new(COL_SEQUENCE, DataType::Binary, false)]);
         let result = validate_input_schema(&schema);
@@ -206,7 +274,7 @@ mod tests {
     fn test_input_schema_wrong_sequence_type() {
         let schema = Schema::new(vec![
             Field::new(COL_ID, DataType::Int64, false),
-            Field::new(COL_SEQUENCE, DataType::Utf8, false), // Wrong type
+            Field::new(COL_SEQUENCE, DataType::Float64, false), // Wrong type
         ]);
         let result = validate_input_schema(&schema);
         assert!(result.is_err());
@@ -237,7 +305,7 @@ mod tests {
         let schema = Schema::new(vec![
             Field::new(COL_ID, DataType::Int64, false),
             Field::new(COL_SEQUENCE, DataType::Binary, false),
-            Field::new(COL_PAIR_SEQUENCE, DataType::Utf8, true), // Wrong type
+            Field::new(COL_PAIR_SEQUENCE, DataType::Float64, true), // Wrong type
         ]);
         let result = validate_input_schema(&schema);
         assert!(result.is_err());
