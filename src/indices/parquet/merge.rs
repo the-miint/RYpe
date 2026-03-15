@@ -6,6 +6,7 @@
 
 use crate::error::{Result, RypeError};
 use crate::indices::sharded::{ShardManifest, ShardedInvertedIndex};
+use crate::memory::format_bytes;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -629,7 +630,7 @@ pub fn merge_indices_streaming(
 
     log::debug!(
         "Memory budget: {} ({:.1} MB for output shards)",
-        format_bytes(available),
+        format_bytes(available as u64),
         max_shard_bytes as f64 / (1024.0 * 1024.0)
     );
 
@@ -865,23 +866,6 @@ pub fn merge_indices_streaming(
         total_excluded,
         options,
     )
-}
-
-/// Format bytes as human-readable string.
-fn format_bytes(bytes: usize) -> String {
-    const KB: usize = 1024;
-    const MB: usize = KB * 1024;
-    const GB: usize = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} bytes", bytes)
-    }
 }
 
 /// Read (minimizer, bucket_id) pairs from a Parquet shard file.

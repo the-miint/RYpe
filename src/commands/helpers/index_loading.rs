@@ -107,7 +107,7 @@ pub fn load_index_for_classification(
         if advised > 0 {
             log::info!(
                 "Advised kernel to prefetch {} of index data",
-                format_bytes(advised)
+                format_bytes(advised as u64)
             );
         }
     }

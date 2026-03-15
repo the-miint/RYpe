@@ -123,7 +123,7 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
         } else {
             log::info!(
                 "Auto-detected available memory: {} (source: {:?})",
-                format_bytes(detected.bytes),
+                format_bytes(detected.bytes as u64),
                 detected.source
             );
         }

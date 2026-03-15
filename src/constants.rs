@@ -8,10 +8,18 @@
 // ============================================================================
 
 /// Maximum minimizers in inverted index (1 trillion).
-pub(crate) const MAX_INVERTED_MINIMIZERS: usize = 1_000_000_000_000;
+///
+/// Typed as `u64` rather than `usize` because 1 trillion exceeds `usize::MAX`
+/// on wasm32 targets (where `usize` is 32-bit). On x86_64, `u64` and `usize`
+/// are the same width, so codegen is identical.
+pub(crate) const MAX_INVERTED_MINIMIZERS: u64 = 1_000_000_000_000;
 
 /// Maximum total bucket ID entries in inverted index (4 billion).
-pub(crate) const MAX_INVERTED_BUCKET_IDS: usize = 4_000_000_000;
+///
+/// Typed as `u64` rather than `usize` for consistency with `MAX_INVERTED_MINIMIZERS`
+/// and to prevent silent overflow if this value is increased beyond `usize::MAX`
+/// on 32-bit targets in the future.
+pub(crate) const MAX_INVERTED_BUCKET_IDS: u64 = 4_000_000_000;
 
 // ============================================================================
 // Batch Processing

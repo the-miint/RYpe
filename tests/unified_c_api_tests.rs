@@ -1508,7 +1508,11 @@ fn test_recommend_batch_size_zero_bucket_index_rejected_at_load() -> Result<()> 
 /// Arrow Binary uses i32 offsets, capping per-array data at i32::MAX bytes.
 /// With HiFi reads (~4252bp), an uncapped batch of 570K rows would overflow.
 /// The batch size recommendation must cap at i32::MAX / avg_read_length.
+///
+/// Requires 64-bit: the 64 GiB budget used here exceeds usize::MAX on wasm32,
+/// and these tests verify the Arrow cap is the binding constraint (not memory).
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn test_recommend_batch_size_respects_arrow_binary_offset_limit() -> Result<()> {
     let dir = tempdir()?;
     let index_path = create_test_parquet_index(dir.path(), 32, 10, 0x12345)?;
@@ -1711,7 +1715,10 @@ fn test_calculate_batch_config_paired_and_memory() -> Result<()> {
 
 /// When batch_size is capped by the Arrow Binary i32 limit, the returned
 /// per_batch_memory and peak_memory must be recomputed for the smaller batch.
+///
+/// Requires 64-bit: the 64 GiB budget exceeds usize::MAX on wasm32.
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn test_calculate_batch_config_capped_path_memory_fields() -> Result<()> {
     let dir = tempdir()?;
     let index_path = create_test_parquet_index(dir.path(), 32, 10, 0x12345)?;

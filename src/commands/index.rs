@@ -582,7 +582,11 @@ const EXTRACTION_MEMORY_MULTIPLIER: f64 = 4.0;
 const MIN_CHUNK_BYTES: usize = 100 * 1024 * 1024;
 
 /// Maximum chunk size to avoid excessive memory on large-memory systems (4GB).
-const MAX_CHUNK_BYTES: usize = 4 * 1024 * 1024 * 1024;
+///
+/// Typed as `u64` rather than `usize` because 4 GiB exceeds `usize::MAX` on
+/// wasm32 targets (where `usize` is 32-bit). On x86_64, `u64` and `usize`
+/// are the same width, so codegen is identical.
+const MAX_CHUNK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Calculate chunk configuration based on available memory.
 ///
@@ -598,8 +602,9 @@ fn calculate_chunk_config(available_memory: usize) -> ChunkConfig {
     // Account for extraction overhead (4x raw sequence bytes)
     let target = (chunk_budget as f64 / EXTRACTION_MEMORY_MULTIPLIER) as usize;
 
-    // Clamp to reasonable bounds
-    let target_chunk_bytes = target.clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES);
+    // Clamp to reasonable bounds (cap MAX_CHUNK_BYTES to usize for wasm32 safety)
+    let max_chunk = MAX_CHUNK_BYTES.min(usize::MAX as u64) as usize;
+    let target_chunk_bytes = target.clamp(MIN_CHUNK_BYTES, max_chunk);
 
     ChunkConfig { target_chunk_bytes }
 }
@@ -1540,15 +1545,15 @@ pub fn build_parquet_index_from_config(
                  half of available memory (~{}). Use 'index merge --subtract-from-primary' \
                  for streaming subtraction of large indices, or increase --max-memory.",
                 excl.len(),
-                rype::memory::format_bytes(excl_bytes),
-                rype::memory::format_bytes(available),
+                rype::memory::format_bytes(excl_bytes as u64),
+                rype::memory::format_bytes(available as u64),
             ));
         }
 
         log::info!(
             "Loaded {} unique minimizers from subtraction index (~{})",
             excl.len(),
-            rype::memory::format_bytes(excl_bytes),
+            rype::memory::format_bytes(excl_bytes as u64),
         );
         Some(excl)
     } else {
@@ -1774,8 +1779,8 @@ pub fn build_parquet_index_from_config_streaming(
             let size = default_size.max(min_shard);
             log::info!(
                 "Using default max shard size: {} (80% of {} available from {:?})",
-                rype::memory::format_bytes(size),
-                rype::memory::format_bytes(available.bytes),
+                rype::memory::format_bytes(size as u64),
+                rype::memory::format_bytes(available.bytes as u64),
                 available.source
             );
             size
@@ -4031,11 +4036,12 @@ files = ["short.fa", "long.fa"]
             config_8gb.target_chunk_bytes,
             MIN_CHUNK_BYTES
         );
+        let max_chunk = MAX_CHUNK_BYTES.min(usize::MAX as u64) as usize;
         assert!(
-            config_8gb.target_chunk_bytes <= MAX_CHUNK_BYTES,
+            config_8gb.target_chunk_bytes <= max_chunk,
             "8GB: chunk size {} should be <= MAX_CHUNK_BYTES {}",
             config_8gb.target_chunk_bytes,
-            MAX_CHUNK_BYTES
+            max_chunk
         );
 
         // 32GB available → larger chunk size (but capped at MAX)
@@ -4045,7 +4051,7 @@ files = ["short.fa", "long.fa"]
             "32GB should have >= chunk size than 8GB"
         );
         assert!(
-            config_32gb.target_chunk_bytes <= MAX_CHUNK_BYTES,
+            config_32gb.target_chunk_bytes <= max_chunk,
             "32GB: chunk size should be capped at MAX_CHUNK_BYTES"
         );
 

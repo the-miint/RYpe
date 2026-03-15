@@ -300,17 +300,17 @@ impl InvertedIndex {
         }
 
         // Validation: size limits (same as legacy format)
-        if minimizers.len() > MAX_INVERTED_MINIMIZERS {
+        if minimizers.len() as u64 > MAX_INVERTED_MINIMIZERS {
             return Err(RypeError::overflow(
                 "Parquet shard minimizers",
-                MAX_INVERTED_MINIMIZERS,
+                MAX_INVERTED_MINIMIZERS.min(usize::MAX as u64) as usize,
                 minimizers.len(),
             ));
         }
-        if bucket_ids_out.len() > MAX_INVERTED_BUCKET_IDS {
+        if bucket_ids_out.len() as u64 > MAX_INVERTED_BUCKET_IDS {
             return Err(RypeError::overflow(
                 "Parquet shard bucket IDs",
-                MAX_INVERTED_BUCKET_IDS,
+                MAX_INVERTED_BUCKET_IDS.min(usize::MAX as u64) as usize,
                 bucket_ids_out.len(),
             ));
         }

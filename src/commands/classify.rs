@@ -114,8 +114,8 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
             "Adaptive batch sizing: batch_size={}, threads={}, estimated peak memory={}, shard_reservation={}, format={:?}",
             batch_result.batch_size,
             rayon::current_num_threads(),
-            format_bytes(batch_result.peak_memory),
-            format_bytes(batch_result.shard_reservation),
+            format_bytes(batch_result.peak_memory as u64),
+            format_bytes(batch_result.shard_reservation as u64),
             batch_result.input_format
         );
     }
@@ -596,8 +596,8 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
             "Adaptive batch sizing: batch_size={}, threads={}, estimated peak memory={}, shard_reservation={}, format={:?}",
             batch_result.batch_size,
             rayon::current_num_threads(),
-            format_bytes(batch_result.peak_memory),
-            format_bytes(batch_result.shard_reservation),
+            format_bytes(batch_result.peak_memory as u64),
+            format_bytes(batch_result.shard_reservation as u64),
             batch_result.input_format
         );
     }
@@ -834,7 +834,7 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
         log::info!(
             "Flushing {} remaining deferred reads (~{}) after final batch (batch {})",
             deferred_buffer.len(),
-            format_bytes(deferred_buffer.approx_bytes()),
+            format_bytes(deferred_buffer.approx_bytes() as u64),
             batch_num
         );
         let t_drain = std::time::Instant::now();
@@ -1178,7 +1178,7 @@ fn process_log_ratio_batch<S: AsRef<str>>(
         log::info!(
             "Deferred buffer reached threshold ({} reads, ~{}), flushing (triggered by batch {})",
             deferred_buffer.len(),
-            format_bytes(deferred_buffer.approx_bytes()),
+            format_bytes(deferred_buffer.approx_bytes() as u64),
             batch_num
         );
         let t_drain = std::time::Instant::now();

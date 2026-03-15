@@ -70,7 +70,10 @@ pub fn parse_byte_suffix(s: &str) -> Result<Option<usize>> {
     };
 
     let result = value * multiplier as f64;
-    if !result.is_finite() || result < 0.0 || result > usize::MAX as f64 {
+    // Use >= rather than > to avoid f64 rounding: on 64-bit, usize::MAX (2^64-1)
+    // rounds up to 2^64 in f64, so `> usize::MAX as f64` would miss values in
+    // [2^64-1, 2^64) that still overflow when cast to usize.
+    if !result.is_finite() || result < 0.0 || result >= (usize::MAX as f64) {
         return Err(RypeError::validation(format!(
             "Byte size overflow: '{}' exceeds maximum representable value",
             s
@@ -106,7 +109,12 @@ pub struct AvailableMemory {
 }
 
 /// Default fallback memory (8GB).
-pub const FALLBACK_MEMORY_BYTES: usize = 8 * 1024 * 1024 * 1024;
+///
+/// Typed as `u64` rather than `usize` because 8 GiB exceeds `usize::MAX` on
+/// wasm32 targets (where `usize` is 32-bit). On x86_64, `u64` and `usize`
+/// are the same width, so codegen is identical. Use `.min(usize::MAX as u64)
+/// as usize` at runtime boundaries where a `usize` is required.
+pub const FALLBACK_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Detect available system memory.
 ///
@@ -167,7 +175,7 @@ pub fn detect_available_memory() -> AvailableMemory {
 
     // Fallback
     AvailableMemory {
-        bytes: FALLBACK_MEMORY_BYTES,
+        bytes: FALLBACK_MEMORY_BYTES.min(usize::MAX as u64) as usize,
         source: MemorySource::Fallback,
     }
 }
@@ -225,9 +233,9 @@ fn read_cgroups_v1_limit() -> Option<usize> {
     let value: usize = content.trim().parse().ok()?;
 
     // Very large values mean "no limit" (usually 2^63 - page_size)
-    // Use 1TB as a reasonable threshold
-    const ONE_TB: usize = 1024 * 1024 * 1024 * 1024;
-    if value > ONE_TB {
+    // Use 1TB as a reasonable threshold (u64 to avoid overflow on 32-bit)
+    const ONE_TB: u64 = 1024 * 1024 * 1024 * 1024;
+    if value as u64 > ONE_TB {
         return None;
     }
 
@@ -280,10 +288,10 @@ fn parse_slurm_memory(s: &str) -> Option<usize> {
         return None;
     }
 
-    let numeric: usize = s[..numeric_end].parse().ok()?;
+    let numeric: u64 = s[..numeric_end].parse().ok()?;
     let suffix = &s[numeric_end..];
 
-    let multiplier: usize = match suffix.to_ascii_uppercase().as_str() {
+    let multiplier: u64 = match suffix.to_ascii_uppercase().as_str() {
         "" | "M" => 1024 * 1024, // Default is MB
         "G" => 1024 * 1024 * 1024,
         "T" => 1024 * 1024 * 1024 * 1024,
@@ -291,7 +299,12 @@ fn parse_slurm_memory(s: &str) -> Option<usize> {
         _ => return None,
     };
 
-    numeric.checked_mul(multiplier)
+    let result = numeric.checked_mul(multiplier)?;
+    // Cap to usize::MAX (handles 32-bit targets where TB values would overflow)
+    if result > usize::MAX as u64 {
+        return None;
+    }
+    Some(result as usize)
 }
 
 #[cfg(target_os = "linux")]
@@ -1210,11 +1223,15 @@ pub fn estimate_shard_reservation(largest_shard_entries: u64, num_threads: usize
 }
 
 /// Format bytes as human-readable string.
-pub fn format_bytes(bytes: usize) -> String {
-    const KB: usize = 1024;
-    const MB: usize = KB * 1024;
-    const GB: usize = MB * 1024;
-    const TB: usize = GB * 1024;
+///
+/// Accepts `u64` to correctly format byte quantities that may exceed
+/// `usize::MAX` on 32-bit targets (e.g., index sizes stored as `u64` in
+/// manifests). Display-only function, never on a hot path.
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
 
     if bytes >= TB {
         format!("{:.2} TB", bytes as f64 / TB as f64)
@@ -1275,6 +1292,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn test_parse_byte_suffix_terabytes() {
         assert_eq!(
             parse_byte_suffix("1T").unwrap(),
@@ -1284,6 +1302,13 @@ mod tests {
             parse_byte_suffix("1TB").unwrap(),
             Some(1024 * 1024 * 1024 * 1024)
         );
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "32")]
+    fn test_parse_byte_suffix_terabytes_overflow_on_32bit() {
+        // 1TB exceeds usize::MAX on 32-bit targets; parse_byte_suffix correctly returns Err
+        assert!(parse_byte_suffix("1T").is_err());
     }
 
     #[test]
@@ -1345,7 +1370,7 @@ mod tests {
 
     #[test]
     fn test_fallback_memory_is_8gb() {
-        assert_eq!(FALLBACK_MEMORY_BYTES, 8 * 1024 * 1024 * 1024);
+        assert_eq!(FALLBACK_MEMORY_BYTES, 8u64 * 1024 * 1024 * 1024);
     }
 
     // === Batch memory estimation tests ===
@@ -1622,11 +1647,11 @@ mod tests {
 
     #[test]
     fn test_format_bytes() {
-        assert_eq!(format_bytes(500), "500 B");
-        assert_eq!(format_bytes(1024), "1.00 KB");
-        assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
-        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
-        assert_eq!(format_bytes(1024 * 1024 * 1024 * 1024), "1.00 TB");
+        assert_eq!(format_bytes(500u64), "500 B");
+        assert_eq!(format_bytes(1024u64), "1.00 KB");
+        assert_eq!(format_bytes(1024u64 * 1024), "1.00 MB");
+        assert_eq!(format_bytes(1024u64 * 1024 * 1024), "1.00 GB");
+        assert_eq!(format_bytes(1024u64 * 1024 * 1024 * 1024), "1.00 TB");
     }
 
     // === File sampling tests ===

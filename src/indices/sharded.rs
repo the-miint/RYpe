@@ -161,8 +161,8 @@ impl ShardedInvertedIndex {
                 min_start: s.min_minimizer,
                 min_end: s.max_minimizer,
                 is_last_shard: s.shard_id == inverted.num_shards.saturating_sub(1),
-                num_minimizers: s.num_entries as usize,
-                num_bucket_ids: s.num_entries as usize, // In Parquet, each entry is a (minimizer, bucket_id) pair
+                num_minimizers: s.num_entries.min(usize::MAX as u64) as usize,
+                num_bucket_ids: s.num_entries.min(usize::MAX as u64) as usize, // In Parquet, each entry is a (minimizer, bucket_id) pair
             })
             .collect();
 
@@ -171,8 +171,8 @@ impl ShardedInvertedIndex {
             w: parquet_manifest.w,
             salt: parquet_manifest.salt,
             source_hash: parquet_manifest.source_hash,
-            total_minimizers: inverted.total_entries as usize,
-            total_bucket_ids: inverted.total_entries as usize,
+            total_minimizers: inverted.total_entries.min(usize::MAX as u64) as usize,
+            total_bucket_ids: inverted.total_entries.min(usize::MAX as u64) as usize,
             has_overlapping_shards: inverted.has_overlapping_shards,
             shards,
             bucket_names,
@@ -296,7 +296,10 @@ impl ShardedInvertedIndex {
     ///
     /// # Returns
     /// Number of bytes advised for prefetching, or 0 if prefetching is not available.
-    #[cfg(unix)]
+    // Note: wasm32-unknown-emscripten sets cfg(unix), so we need the explicit
+    // wasm32 exclusion. mmap/madvise are not available on wasm32 regardless
+    // of the OS cfg.
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
     pub fn advise_prefetch(&self, max_bytes: Option<usize>) -> usize {
         use std::os::unix::io::AsRawFd;
 
@@ -367,8 +370,8 @@ impl ShardedInvertedIndex {
         total_advised
     }
 
-    /// Non-unix stub - prefetching not available.
-    #[cfg(not(unix))]
+    /// Non-unix/wasm32 stub - prefetching not available.
+    #[cfg(any(not(unix), target_arch = "wasm32"))]
     pub fn advise_prefetch(&self, _max_bytes: Option<usize>) -> usize {
         0
     }
