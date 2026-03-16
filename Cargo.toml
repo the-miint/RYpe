@@ -19,7 +19,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-needletail = { version = "0.6", default-features = false, features = ["flate2", "zstd"] }
+needletail = { version = "0.6", default-features = false, features = ["flate2", "zstd"], optional = true }
 rayon = "1.8"
 libc = "0.2"  # New dependency for C types
 toml = "1.0"
@@ -40,9 +40,12 @@ name = "debug_inverted"
 path = "src/bin/debug_inverted.rs"
 
 [features]
-default = []
+default = ["fastx"]
 # The arrow-ffi feature enables the FFI module for exporting Arrow RecordBatches
 # The base arrow crate is always included as parquet code uses arrow types directly
 # When arrow-ffi is enabled, it activates arrow's ffi feature for FFI_ArrowSchema etc.
+# FASTX file reading (needletail). Disable for WASM builds where the C API
+# provides avg_read_length directly and no FASTA/FASTQ parsing is needed.
+fastx = ["dep:needletail"]
 arrow-ffi = ["arrow/ffi"]
 

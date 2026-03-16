@@ -407,6 +407,7 @@ impl ReadMemoryProfile {
     ///
     /// # Returns
     /// A `ReadMemoryProfile` based on sampled lengths, or None if sampling fails.
+    /// Also returns None for non-Parquet input when the `fastx` feature is disabled.
     pub fn from_files(
         r1_path: &std::path::Path,
         r2_path: Option<&std::path::Path>,
@@ -449,46 +450,51 @@ impl ReadMemoryProfile {
             });
         }
 
-        // FASTX input: sample R1
-        let (r1_total, r1_count) = sample_fastx_lengths(r1_path, sample_size)?;
-        if r1_count == 0 {
-            return None;
-        }
-        let avg_r1_length = r1_total / r1_count;
-
-        // Sample R2 if provided
-        let (avg_query_length, avg_read_length, is_paired) = if let Some(r2) = r2_path {
-            let (r2_total, r2_count) = sample_fastx_lengths(r2, sample_size)?;
-            if r2_count == 0 {
+        // FASTX input: requires the "fastx" feature (needletail)
+        #[cfg(feature = "fastx")]
+        {
+            let (r1_total, r1_count) = sample_fastx_lengths(r1_path, sample_size)?;
+            if r1_count == 0 {
                 return None;
             }
-            let avg_r2_length = r2_total / r2_count;
-            // For paired-end: avg_query_length = R1 avg + R2 avg
-            // avg_read_length = average of individual read lengths
-            let avg_read = (r1_total + r2_total) / (r1_count + r2_count);
-            (avg_r1_length + avg_r2_length, avg_read, true)
-        } else {
-            (avg_r1_length, avg_r1_length, false)
-        };
+            let avg_r1_length = r1_total / r1_count;
 
-        // Apply trim_to limit if specified
-        let (avg_read_length, avg_query_length) =
-            apply_trim_to_limit(avg_read_length, avg_query_length, is_paired, trim_to);
+            // Sample R2 if provided
+            let (avg_query_length, avg_read_length, is_paired) = if let Some(r2) = r2_path {
+                let (r2_total, r2_count) = sample_fastx_lengths(r2, sample_size)?;
+                if r2_count == 0 {
+                    return None;
+                }
+                let avg_r2_length = r2_total / r2_count;
+                let avg_read = (r1_total + r2_total) / (r1_count + r2_count);
+                (avg_r1_length + avg_r2_length, avg_read, true)
+            } else {
+                (avg_r1_length, avg_r1_length, false)
+            };
 
-        // Estimate minimizers: roughly (length - k + 1) / w for each strand
-        // Multiply by 2 for both strands, but many are duplicates
-        let minimizers_per_query = if avg_query_length > k {
-            ((avg_query_length - k + 1) / w).max(1) * 2
-        } else {
-            0
-        };
+            let (avg_read_length, avg_query_length) =
+                apply_trim_to_limit(avg_read_length, avg_query_length, is_paired, trim_to);
 
-        Some(ReadMemoryProfile {
-            avg_read_length,
-            avg_query_length,
-            minimizers_per_query,
-            is_paired,
-        })
+            let minimizers_per_query = if avg_query_length > k {
+                ((avg_query_length - k + 1) / w).max(1) * 2
+            } else {
+                0
+            };
+
+            Some(ReadMemoryProfile {
+                avg_read_length,
+                avg_query_length,
+                minimizers_per_query,
+                is_paired,
+            })
+        }
+
+        // Without the "fastx" feature, FASTX sampling is not available
+        #[cfg(not(feature = "fastx"))]
+        {
+            let _ = (r1_path, r2_path, sample_size, k, w, trim_to);
+            None
+        }
     }
 
     /// Estimate Arrow buffer bytes per row based on read lengths.
@@ -652,6 +658,7 @@ fn apply_trim_to_limit(
 
 /// Helper function to sample read lengths from a FASTX file.
 /// Returns (total_length, count) or None if the file cannot be read.
+#[cfg(feature = "fastx")]
 fn sample_fastx_lengths(path: &std::path::Path, sample_size: usize) -> Option<(usize, usize)> {
     use needletail::parse_fastx_file;
 
@@ -1657,6 +1664,7 @@ mod tests {
     // === File sampling tests ===
 
     #[test]
+    #[cfg(feature = "fastx")]
     fn test_read_memory_profile_from_files() {
         use std::io::Write;
         use tempfile::NamedTempFile;
@@ -1689,6 +1697,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fastx")]
     fn test_read_memory_profile_from_files_paired() {
         use std::io::Write;
         use tempfile::NamedTempFile;
@@ -1725,6 +1734,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fastx")]
     fn test_read_memory_profile_from_files_nonexistent() {
         let profile = ReadMemoryProfile::from_files(
             std::path::Path::new("/nonexistent/file.fq"),
@@ -1962,6 +1972,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fastx")]
     fn test_read_memory_profile_from_fastx_with_trim_to() {
         use std::io::Write;
         use tempfile::NamedTempFile;
@@ -2038,6 +2049,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fastx")]
     fn test_read_memory_profile_paired_fastx_with_trim_to() {
         use std::io::Write;
         use tempfile::NamedTempFile;

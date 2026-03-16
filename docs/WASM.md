@@ -12,10 +12,25 @@ WASM-based environments like DuckDB-WASM extensions.
 
 ```bash
 source /path/to/emsdk/emsdk_env.sh
-cargo build --target wasm32-unknown-emscripten --features arrow-ffi --lib --release
+cargo rustc --target wasm32-unknown-emscripten --no-default-features --features arrow-ffi \
+  --lib --crate-type=staticlib --release
 ```
 
 Static library output: `target/wasm32-unknown-emscripten/release/librype.a`
+
+### Why `--no-default-features` and `--crate-type=staticlib`?
+
+- **`--no-default-features`**: The default `fastx` feature enables the
+  `needletail` dependency for FASTA/FASTQ parsing. Needletail's
+  `crate-type = ["cdylib", "rlib"]` causes `emcc` to attempt standalone WASM
+  module linking, which fails with `undefined symbol: main`. The C API and
+  Arrow FFI do not need FASTX parsing — callers provide `avg_read_length`
+  directly.
+
+- **`--crate-type=staticlib`**: Rype's Cargo.toml includes `cdylib` in its
+  crate-type list (for the native shared library). On emscripten, building a
+  `cdylib` triggers the same standalone linker error. Overriding to `staticlib`
+  produces a `.a` archive without invoking `emcc` as a linker.
 
 ## What Works
 
@@ -48,6 +63,7 @@ on wasm32 — `advise_prefetch()` returns 0.
 ## Known Limitations
 
 - **No CLI binary**: Only the library crate compiles. The binary (main.rs) depends on terminal/process features unavailable in WASM.
+- **No FASTX parsing**: The `fastx` feature (needletail) is incompatible with emscripten due to needletail's cdylib crate-type. Use Parquet input or pass sequences via the C API.
 - **Index creation**: Impractical due to wasm32's 4 GB memory limit. Build indices on x86_64 and load them in WASM.
 - **Single-threaded**: Unless Emscripten pthreads are explicitly enabled.
 - **Memory constants**: `FALLBACK_MEMORY_BYTES` (8 GB) and `MAX_CHUNK_BYTES` (4 GB) are stored as `u64` and capped to `usize::MAX` at runtime on wasm32.
@@ -55,14 +71,11 @@ on wasm32 — `advise_prefetch()` returns 0.
 ## Verification
 
 ```bash
-# Library compilation
-cargo check --target wasm32-unknown-emscripten --features arrow-ffi --lib
+# Library compilation check (fast, no linking)
+cargo check --target wasm32-unknown-emscripten --no-default-features --features arrow-ffi --lib
 
-# Test compilation (verifies constants and type safety)
-cargo check --target wasm32-unknown-emscripten --features arrow-ffi --tests
+# Full staticlib build
+source /path/to/emsdk/emsdk_env.sh
+cargo rustc --target wasm32-unknown-emscripten --no-default-features --features arrow-ffi \
+  --lib --crate-type=staticlib --release
 ```
-
-Running `cargo test --target wasm32-unknown-emscripten` requires a full
-Emscripten toolchain with node.js and may have linker issues with some
-dependencies. Compilation checks are sufficient to prevent regressions (the
-original blockers were compile-time constant overflows).
