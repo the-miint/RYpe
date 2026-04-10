@@ -868,8 +868,11 @@ pub fn merge_indices_streaming(
     )
 }
 
-/// Read (minimizer, bucket_id) pairs from a Parquet shard file.
-fn read_shard_pairs(path: &Path) -> Result<Vec<(u64, u32)>> {
+/// Read all (minimizer, bucket_id) pairs from a Parquet shard file into memory.
+///
+/// Loads the entire shard at once — memory usage is O(shard entries × 12 bytes).
+/// Used internally by `consolidate_shards` and available for testing/inspection.
+pub fn read_shard_pairs(path: &Path) -> Result<Vec<(u64, u32)>> {
     use arrow::array::{UInt32Array, UInt64Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 

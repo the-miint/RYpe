@@ -6071,3 +6071,141 @@ fn test_merge_file_stats_propagation() -> Result<()> {
 
     Ok(())
 }
+
+/// Test that single-bucket `from-config` produces a deduplicated index with no
+/// overlapping shards. Uses many files with identical long sequences and --max-memory
+/// to force multiple chunks and intermediate shards, triggering cross-chunk duplication
+/// that consolidation should eliminate.
+#[test]
+fn test_from_config_single_bucket_no_duplicate_minimizers() -> Result<()> {
+    use arrow::array::UInt64Array;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+
+    // Generate a deterministic 5MB sequence
+    fn make_sequence(seed: u64, length: usize) -> Vec<u8> {
+        let mut state = seed;
+        (0..length)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                match (state >> 32) % 4 {
+                    0 => b'A',
+                    1 => b'C',
+                    2 => b'G',
+                    _ => b'T',
+                }
+            })
+            .collect()
+    }
+
+    // Create 30 files with IDENTICAL 5MB sequences = 150MB total.
+    // With --max-memory 4M this forces multiple chunks (MIN_CHUNK_BYTES=100MB
+    // is clamped down by the small memory budget), producing cross-chunk
+    // duplication that consolidation must eliminate.
+    let seq = make_sequence(42, 5_000_000);
+    let seq_str = std::str::from_utf8(&seq).unwrap();
+    let mut file_list = String::new();
+    for i in 0..30 {
+        let path = dir.path().join(format!("ref{}.fa", i));
+        fs::write(&path, format!(">seq1\n{}\n", seq_str))?;
+        if !file_list.is_empty() {
+            file_list.push_str(", ");
+        }
+        file_list.push_str(&format!("\"{}\"", path.to_str().unwrap()));
+    }
+
+    let config_path = dir.path().join("config.toml");
+    let config_content = format!(
+        r#"
+[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "test_dedup.ryxdi"
+
+[buckets.TestBucket]
+files = [{}]
+"#,
+        file_list,
+    );
+    fs::write(&config_path, &config_content)?;
+
+    // --max-memory 4M forces small chunks and multiple intermediate shards,
+    // exercising the multi-shard consolidation path (not just the len<=1 fast path)
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "from-config",
+            "-c",
+            config_path.to_str().unwrap(),
+            "--max-memory",
+            "4M",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let index_path = dir.path().join("test_dedup.ryxdi");
+
+    // Verify manifest
+    let sharded = rype::ShardedInvertedIndex::open(&index_path)?;
+    let manifest = sharded.manifest();
+    assert!(
+        !manifest.has_overlapping_shards,
+        "Single-bucket index should have has_overlapping_shards = false after consolidation"
+    );
+
+    // Read all shard files and verify no duplicate minimizers
+    let inverted_dir = index_path.join("inverted");
+    let mut all_minimizers: Vec<u64> = Vec::new();
+    let mut total_entries: u64 = 0;
+
+    for entry in fs::read_dir(&inverted_dir)? {
+        let entry = entry?;
+        if entry
+            .path()
+            .extension()
+            .map(|e| e == "parquet")
+            .unwrap_or(false)
+        {
+            let file = fs::File::open(entry.path())?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+            for batch in reader {
+                let batch = batch?;
+                let minimizers = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                total_entries += batch.num_rows() as u64;
+                for i in 0..batch.num_rows() {
+                    all_minimizers.push(minimizers.value(i));
+                }
+            }
+        }
+    }
+
+    all_minimizers.sort_unstable();
+    all_minimizers.dedup();
+    let unique_count = all_minimizers.len() as u64;
+
+    assert_eq!(
+        total_entries, unique_count,
+        "Total entries ({}) should equal unique minimizers ({}) — no duplicates",
+        total_entries, unique_count
+    );
+
+    // Verify manifest total_minimizers matches
+    assert_eq!(
+        manifest.total_minimizers as u64, unique_count,
+        "Manifest total_minimizers ({}) should match actual unique count ({})",
+        manifest.total_minimizers, unique_count
+    );
+
+    Ok(())
+}
