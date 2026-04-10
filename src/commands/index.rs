@@ -1012,15 +1012,37 @@ pub struct SingleBucketResult {
     pub file_lengths: Vec<u64>,
 }
 
-/// Build a single bucket using streaming shard creation.
+/// Consolidate intermediate shards from a single-bucket streaming build.
 ///
-/// Unlike `build_single_bucket_parallel_chunked`, this function streams
-/// minimizers to disk via ShardAccumulator, bounding BOTH input AND output memory.
+/// If there are multiple intermediate shards, merges them into final deduplicated,
+/// non-overlapping shards. With a single shard, returns it as-is (already deduped
+/// by flush_shard).
+fn consolidate_streaming_shards(
+    output_dir: &Path,
+    intermediate_shards: Vec<rype::parquet_index::InvertedShardInfo>,
+    bucket_id: u32,
+    shard_size: usize,
+    options: &rype::parquet_index::ParquetWriteOptions,
+) -> Result<(Vec<rype::parquet_index::InvertedShardInfo>, u64)> {
+    if intermediate_shards.len() <= 1 {
+        // Single shard: already deduped by flush_shard
+        let total = intermediate_shards.iter().map(|s| s.num_entries).sum();
+        return Ok((intermediate_shards, total));
+    }
+    Ok(rype::parquet_index::consolidate_shards(
+        output_dir,
+        &intermediate_shards,
+        bucket_id,
+        shard_size,
+        options,
+    )?)
+}
+
+/// Build a single bucket using streaming shard creation, then consolidate.
 ///
-/// # Memory Model
-/// - Input chunks: ~40% of available memory (via `calculate_chunk_config`)
-/// - Shard accumulator: ~40% of available memory (flushes to disk when full)
-/// - Workspace overhead: ~20%
+/// Processes files in memory-bounded chunks, streaming intermediate shards to disk
+/// via ShardAccumulator. After all chunks, consolidates intermediate shards into
+/// final deduplicated, non-overlapping shards.
 ///
 /// # Arguments
 /// * `output_dir` - Directory to write shards (must exist, including inverted/ subdir)
@@ -1032,6 +1054,7 @@ pub struct SingleBucketResult {
 /// * `salt` - Hash salt
 /// * `max_memory` - Available memory budget (None = auto-detect)
 /// * `options` - Parquet write options
+/// * `exclusion_set` - Optional set of minimizers to exclude (for subtraction)
 #[allow(clippy::too_many_arguments)]
 fn build_single_bucket_streaming(
     output_dir: &Path,
@@ -1093,7 +1116,6 @@ fn build_single_bucket_streaming(
 
     let mut accumulator = ShardAccumulator::with_output_dir(output_dir, shard_size, options);
     let mut all_sources: Vec<String> = Vec::new();
-    let mut total_minimizers: u64 = 0;
     let mut total_excluded: u64 = 0;
     let mut file_length_map: std::collections::HashMap<String, u64> =
         std::collections::HashMap::new();
@@ -1158,8 +1180,6 @@ fn build_single_bucket_streaming(
             chunk_merged
         };
 
-        total_minimizers += chunk_merged.len() as u64;
-
         // Stream to accumulator in batches, checking flush threshold between batches
         // This ensures shards don't exceed max_shard_bytes even with large chunks
         for batch in chunk_merged.chunks(add_batch_entries) {
@@ -1186,7 +1206,16 @@ fn build_single_bucket_streaming(
         );
     }
 
-    let shard_infos = accumulator.finish()?;
+    let intermediate_shards = accumulator.finish()?;
+
+    // Consolidate intermediate shards: merge-dedup across chunk boundaries
+    let (shard_infos, total_minimizers) = consolidate_streaming_shards(
+        output_dir,
+        intermediate_shards,
+        BUCKET_ID,
+        shard_size,
+        &options.cloned().unwrap_or_default(),
+    )?;
 
     log::info!(
         "Completed bucket '{}': {} minimizers, {} shards ({} chunks processed)",
@@ -1290,10 +1319,9 @@ fn build_single_bucket_streaming_oriented(
     // writing to accumulator. We don't count baseline exclusions in
     // total_excluded because the same minimizers may reappear in chunks
     // (where they'll be counted).
-    let baseline_for_orient = baseline_mins;
-    let baseline_to_write = if let Some(excl) = exclusion_set {
-        let original_len = baseline_for_orient.len();
-        let filtered: Vec<u64> = baseline_for_orient
+    let (baseline_for_orient, baseline_to_write) = if let Some(excl) = exclusion_set {
+        let original_len = baseline_mins.len();
+        let filtered: Vec<u64> = baseline_mins
             .iter()
             .copied()
             .filter(|m| !excl.contains(m))
@@ -1303,9 +1331,13 @@ fn build_single_bucket_streaming_oriented(
             original_len - filtered.len(),
             original_len
         );
-        filtered
+        // Need separate vecs: unfiltered for orientation, filtered for writing
+        (baseline_mins, filtered)
     } else {
-        baseline_for_orient.clone()
+        // No exclusion: same data for both orientation and writing.
+        // Clone once for the write path; original kept for orientation reference.
+        let write_copy = baseline_mins.clone();
+        (baseline_mins, write_copy)
     };
 
     // Add filtered baseline to accumulator in batches
@@ -1315,7 +1347,6 @@ fn build_single_bucket_streaming_oriented(
             accumulator.flush_shard()?;
         }
     }
-    let mut total_minimizers = baseline_to_write.len() as u64;
     let mut all_sources = baseline_sources;
 
     // Phase 2: Process remaining files with orientation against unfiltered baseline
@@ -1388,8 +1419,6 @@ fn build_single_bucket_streaming_oriented(
                 chunk_merged
             };
 
-            total_minimizers += chunk_merged.len() as u64;
-
             // Stream to accumulator in batches
             for batch in chunk_merged.chunks(add_batch_entries) {
                 accumulator.add_entries_from_minimizers(batch, BUCKET_ID);
@@ -1417,7 +1446,16 @@ fn build_single_bucket_streaming_oriented(
         );
     }
 
-    let shard_infos = accumulator.finish()?;
+    let intermediate_shards = accumulator.finish()?;
+
+    // Consolidate intermediate shards: merge-dedup across chunk boundaries
+    let (shard_infos, total_minimizers) = consolidate_streaming_shards(
+        output_dir,
+        intermediate_shards,
+        BUCKET_ID,
+        shard_size,
+        &options.cloned().unwrap_or_default(),
+    )?;
 
     log::info!(
         "Completed bucket '{}': {} minimizers, {} shards",
@@ -1701,7 +1739,9 @@ pub fn build_parquet_index_from_config(
             format: ParquetShardFormat::Parquet,
             num_shards: result.shard_infos.len() as u32,
             total_entries,
-            has_overlapping_shards: true,
+            // Shards are non-overlapping after consolidate_shards merges and
+            // redistributes all minimizers into range-partitioned final shards.
+            has_overlapping_shards: false,
             shards: result.shard_infos,
         }),
     };
@@ -4211,6 +4251,159 @@ files = ["short.fa", "long.fa"]
         assert_eq!(result.sources.len(), 50, "Should have all 50 sources");
     }
 
+    /// Test: Streaming single-bucket build deduplicates minimizers across chunks.
+    /// Uses identical large sequences across many files to exceed MIN_CHUNK_BYTES (100MB)
+    /// and force multiple chunks, which triggers cross-chunk duplication.
+    #[test]
+    fn test_streaming_single_bucket_deduplicates_across_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        fn make_sequence(seed: u64, length: usize) -> Vec<u8> {
+            let mut state = seed;
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match (state >> 32) % 4 {
+                        0 => b'A',
+                        1 => b'C',
+                        2 => b'G',
+                        _ => b'T',
+                    }
+                })
+                .collect()
+        }
+
+        // Create 30 files with IDENTICAL 5MB sequences = 150MB total
+        // This exceeds MIN_CHUNK_BYTES (100MB) forcing at least 2 chunks,
+        // which triggers cross-chunk minimizer duplication.
+        let seq = make_sequence(42, 5_000_000);
+        for i in 0..30 {
+            create_fasta_file(dir, &format!("ref{}.fa", i), &seq);
+        }
+
+        let files: Vec<PathBuf> = (0..30).map(|i| dir.join(format!("ref{}.fa", i))).collect();
+
+        let output_dir = dir.join("test_index.ryxdi");
+        rype::parquet_index::create_index_directory(&output_dir).unwrap();
+
+        let result = build_single_bucket_streaming(
+            &output_dir,
+            "DedupTest",
+            &files,
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(3 * 1024 * 1024),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Read back all shards and count actual unique minimizers
+        let mut all_minimizers: Vec<u64> = Vec::new();
+        for shard in &result.shard_infos {
+            let path = output_dir
+                .join("inverted")
+                .join(rype::parquet_index::files::inverted_shard(shard.shard_id));
+            let pairs = rype::parquet_index::merge::read_shard_pairs(&path).unwrap();
+            for (m, _) in pairs {
+                all_minimizers.push(m);
+            }
+        }
+        all_minimizers.sort_unstable();
+        all_minimizers.dedup();
+        let unique_count = all_minimizers.len() as u64;
+
+        // Total stored entries should equal unique count — no duplicates
+        let total_entries: u64 = result.shard_infos.iter().map(|s| s.num_entries).sum();
+        assert_eq!(
+            total_entries, unique_count,
+            "total stored entries ({}) should equal unique minimizers ({}) — no duplicates",
+            total_entries, unique_count
+        );
+        assert_eq!(
+            result.total_minimizers, unique_count,
+            "total_minimizers in result ({}) should equal actual unique count ({})",
+            result.total_minimizers, unique_count
+        );
+    }
+
+    /// Test: After consolidation, manifest has has_overlapping_shards = false
+    /// and shard ranges don't overlap.
+    #[test]
+    fn test_streaming_manifest_no_overlapping_shards() {
+        use rype::ShardedInvertedIndex;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        fn make_sequence(seed: u64, length: usize) -> Vec<u8> {
+            let mut state = seed;
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match (state >> 32) % 4 {
+                        0 => b'A',
+                        1 => b'C',
+                        2 => b'G',
+                        _ => b'T',
+                    }
+                })
+                .collect()
+        }
+
+        // Create a few files with different sequences to get multiple shards
+        for i in 0..5 {
+            let seq = make_sequence(i as u64 * 99999, 200_000);
+            create_fasta_file(dir, &format!("ref{}.fa", i), &seq);
+        }
+
+        let files: Vec<PathBuf> = (0..5).map(|i| dir.join(format!("ref{}.fa", i))).collect();
+
+        let output_dir = dir.join("test_index.ryxdi");
+        rype::parquet_index::create_index_directory(&output_dir).unwrap();
+
+        let result = build_single_bucket_streaming(
+            &output_dir,
+            "TestBucket",
+            &files,
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(3 * 1024 * 1024),
+            None,
+            None,
+        )
+        .unwrap();
+
+        write_streaming_manifest(&output_dir, &result, 32, 10, 0x5555555555555555).unwrap();
+
+        let index = ShardedInvertedIndex::open(&output_dir).unwrap();
+        let manifest = index.manifest();
+
+        assert!(
+            !manifest.has_overlapping_shards,
+            "After consolidation, has_overlapping_shards should be false"
+        );
+
+        // Verify shard ranges are strictly non-overlapping
+        if manifest.shards.len() > 1 {
+            for i in 1..manifest.shards.len() {
+                assert!(
+                    manifest.shards[i].min_start > manifest.shards[i - 1].min_end,
+                    "Shards {} and {} overlap: min_start {} should be > prev min_end {}",
+                    i - 1,
+                    i,
+                    manifest.shards[i].min_start,
+                    manifest.shards[i - 1].min_end,
+                );
+            }
+        }
+    }
+
     /// Test 3: Oriented streaming uses baseline correctly.
     #[test]
     fn test_streaming_single_bucket_oriented_matches_baseline() {
@@ -4480,7 +4673,8 @@ files = ["short.fa", "long.fa"]
                 format: ParquetShardFormat::Parquet,
                 num_shards: result.shard_infos.len() as u32,
                 total_entries,
-                has_overlapping_shards: true,
+                // Shards are non-overlapping after consolidation
+                has_overlapping_shards: false,
                 shards: result.shard_infos.clone(),
             }),
         };

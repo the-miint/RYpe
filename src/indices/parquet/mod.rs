@@ -47,6 +47,7 @@ pub use manifest::{
     InvertedShardInfo, ParquetManifest, ParquetShardFormat,
 };
 pub use options::{hex_u64, ParquetCompression, ParquetReadOptions, ParquetWriteOptions};
+pub use streaming::consolidate_shards;
 pub use streaming::{
     compute_source_hash, create_parquet_inverted_index, ShardAccumulator, MIN_SHARD_BYTES,
 };
