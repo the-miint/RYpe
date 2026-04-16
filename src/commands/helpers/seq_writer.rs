@@ -267,10 +267,7 @@ fn rewalk_fastx(
     let mut global_index = 0usize;
     let mut written = 0usize;
 
-    loop {
-        let Some(rec1_result) = reader1.next() else {
-            break;
-        };
+    while let Some(rec1_result) = reader1.next() {
         let rec1 = rec1_result.map_err(|e| anyhow!("Error reading R1 record: {}", e))?;
 
         let rec2 = if let Some(ref mut r2) = reader2 {
