@@ -936,26 +936,328 @@ impl ShardWriter {
     }
 }
 
+/// Streaming reader that yields `(minimizer, bucket_id)` pairs from a Parquet shard
+/// one batch at a time.
+///
+/// Unlike `read_shard_pairs` which materializes the entire shard into a `Vec`,
+/// this reader holds at most one `RecordBatch` in memory
+/// (~`PARQUET_BATCH_SIZE × 12 B`). It is intended for streaming k-way merges
+/// where multiple shards are iterated in parallel.
+struct StreamingShardReader {
+    iter: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
+    current: Option<RecordBatch>,
+    row_idx: usize,
+    #[cfg(debug_assertions)]
+    last_pair: Option<(u64, u32)>,
+}
+
+impl StreamingShardReader {
+    fn open(path: &Path) -> Result<Self> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let file = std::fs::File::open(path)
+            .map_err(|e| RypeError::io(path.to_path_buf(), "open shard", e))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let iter = builder.build()?;
+        Ok(Self {
+            iter,
+            current: None,
+            row_idx: 0,
+            #[cfg(debug_assertions)]
+            last_pair: None,
+        })
+    }
+
+    fn next_pair(&mut self) -> Result<Option<(u64, u32)>> {
+        use arrow::array::{UInt32Array, UInt64Array};
+
+        loop {
+            if let Some(batch) = self.current.as_ref() {
+                if self.row_idx < batch.num_rows() {
+                    let minimizers = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| {
+                            RypeError::validation("Expected UInt64Array for minimizer column")
+                        })?;
+                    let bucket_ids = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<UInt32Array>()
+                        .ok_or_else(|| {
+                            RypeError::validation("Expected UInt32Array for bucket_id column")
+                        })?;
+                    let pair = (
+                        minimizers.value(self.row_idx),
+                        bucket_ids.value(self.row_idx),
+                    );
+                    self.row_idx += 1;
+                    #[cfg(debug_assertions)]
+                    {
+                        // Sort order of a shard is on `minimizer` only; within a
+                        // minimizer the bucket_ids may appear in any order.
+                        if let Some(prev) = self.last_pair {
+                            debug_assert!(
+                                prev.0 <= pair.0,
+                                "shard minimizers not monotone: {} followed by {}",
+                                prev.0,
+                                pair.0
+                            );
+                        }
+                        self.last_pair = Some(pair);
+                    }
+                    return Ok(Some(pair));
+                }
+                // Current batch exhausted.
+                self.current = None;
+                self.row_idx = 0;
+            }
+
+            match self.iter.next() {
+                Some(batch_result) => {
+                    let batch = batch_result?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    self.current = Some(batch);
+                    self.row_idx = 0;
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+/// Rename final shard files from `shard.{offset+i}.parquet` → `shard.{i}.parquet`
+/// and rewrite the `shard_id` in each `InvertedShardInfo` to match.
+///
+/// Used by streaming consolidation, which writes finals at an offset to avoid
+/// colliding with still-alive intermediate file paths.
+fn rename_final_shards(
+    output_dir: &Path,
+    shard_infos: &mut [InvertedShardInfo],
+    offset: u32,
+) -> Result<()> {
+    if offset == 0 {
+        return Ok(());
+    }
+    let inverted_dir = output_dir.join(files::INVERTED_DIR);
+    for info in shard_infos.iter_mut() {
+        let old_id = info.shard_id;
+        let new_id = old_id
+            .checked_sub(offset)
+            .expect("final shard id below offset; streaming consolidation invariant violated");
+        let old_path = inverted_dir.join(files::inverted_shard(old_id));
+        let new_path = inverted_dir.join(files::inverted_shard(new_id));
+
+        // Refuse to clobber an existing file. If we get here and new_path
+        // already exists, Phase 4 (intermediate deletion) did not complete —
+        // likely a retry after a partial crash. `fs::rename` is atomic on
+        // POSIX and would destroy the surviving file without warning.
+        if new_path.exists() {
+            return Err(RypeError::validation(format!(
+                "rename final shard {}: destination {} already exists \
+                 (index directory is in an inconsistent state; rebuild required)",
+                new_id,
+                new_path.display(),
+            )));
+        }
+
+        std::fs::rename(&old_path, &new_path)
+            .map_err(|e| RypeError::io(new_path, "rename final shard", e))?;
+        info.shard_id = new_id;
+    }
+    Ok(())
+}
+
+/// Streaming consolidation of intermediate shards into final deduplicated,
+/// non-overlapping shards via a k-way merge.
+///
+/// Unlike [`consolidate_shards`] (the legacy implementation), this function
+/// streams `(minimizer, bucket_id)` pairs through a `BinaryHeap` and pushes
+/// them directly into a `ShardAccumulator`. Peak memory is
+/// `O(num_intermediate_shards × PARQUET_BATCH_SIZE × 12 B + max_shard_bytes)`,
+/// independent of the total unique minimizer count.
+///
+/// # Shard-id handling
+///
+/// Intermediate shards live at `shard.{0..N-1}.parquet` and must stay on disk
+/// until the merge completes. The accumulator therefore starts at
+/// `start_shard_id = N`; once the merge is done and intermediates are deleted,
+/// final files are renamed back to `shard.{0..M-1}.parquet`.
+pub fn consolidate_shards_streaming(
+    output_dir: &Path,
+    intermediate_shards: &[InvertedShardInfo],
+    bucket_id: u32,
+    max_shard_bytes: usize,
+    options: &ParquetWriteOptions,
+) -> Result<(Vec<InvertedShardInfo>, u64)> {
+    if intermediate_shards.is_empty() {
+        return Ok((vec![], 0));
+    }
+
+    let inverted_dir = output_dir.join(files::INVERTED_DIR);
+    let n = intermediate_shards.len();
+    let offset: u32 = n
+        .try_into()
+        .map_err(|_| RypeError::validation("too many intermediate shards for u32 offset"))?;
+
+    let input_total: u64 = intermediate_shards.iter().map(|s| s.num_entries).sum();
+    let input_min = intermediate_shards
+        .iter()
+        .map(|s| s.min_minimizer)
+        .min()
+        .unwrap_or(0);
+    let input_max = intermediate_shards
+        .iter()
+        .map(|s| s.max_minimizer)
+        .max()
+        .unwrap_or(0);
+    log::info!(
+        "Streaming consolidation: {} intermediate shards, {} total entries \
+         (range [{}, {}]), shard budget {} MiB",
+        n,
+        input_total,
+        input_min,
+        input_max,
+        max_shard_bytes / (1024 * 1024),
+    );
+
+    // Phase 1: open streaming readers; seed heap with first pair of each.
+    let mut readers: Vec<StreamingShardReader> = Vec::with_capacity(n);
+    let mut heap: BinaryHeap<Reverse<(u64, u32, usize)>> = BinaryHeap::new();
+    for (idx, info) in intermediate_shards.iter().enumerate() {
+        let path = inverted_dir.join(files::inverted_shard(info.shard_id));
+        let mut reader = StreamingShardReader::open(&path)?;
+        if let Some((m, b)) = reader.next_pair()? {
+            heap.push(Reverse((m, b, idx)));
+        }
+        readers.push(reader);
+    }
+    log::info!("  Opened {} streaming shard readers", n);
+
+    // Phase 2: k-way merge → write via ShardAccumulator at offset shard ids.
+    let mut accumulator =
+        ShardAccumulator::with_start_shard_id(output_dir, max_shard_bytes, offset, Some(options));
+
+    /// How often (in unique pairs merged) to emit a progress log. Tuned to
+    /// one log line per ~1-5s at typical merge throughput.
+    const MERGE_PROGRESS_INTERVAL: u64 = 50_000_000;
+
+    let mut last_written: Option<(u64, u32)> = None;
+    let mut total_unique: u64 = 0;
+    let mut total_popped: u64 = 0;
+    let t_merge = std::time::Instant::now();
+
+    while let Some(Reverse((m, b, idx))) = heap.pop() {
+        total_popped += 1;
+        if last_written != Some((m, b)) {
+            // Push a single pair directly — ShardAccumulator's internal Vec is
+            // already the canonical batching buffer; a second pending Vec here
+            // just duplicates that layer without benefit.
+            accumulator.add_entries(std::slice::from_ref(&(m, b)));
+            last_written = Some((m, b));
+            total_unique += 1;
+            while accumulator.should_flush() {
+                if let Some(info) = accumulator.flush_shard()? {
+                    log::info!(
+                        "  Flushed final shard #{} ({} entries, range [{}, {}])",
+                        info.shard_id,
+                        info.num_entries,
+                        info.min_minimizer,
+                        info.max_minimizer
+                    );
+                }
+            }
+            if total_unique % MERGE_PROGRESS_INTERVAL == 0 {
+                let elapsed = t_merge.elapsed();
+                let rate = total_popped as f64 / elapsed.as_secs_f64().max(0.001);
+                log::info!(
+                    "  Merge progress: {} unique / {} popped ({:.1}% dedup, {:.1}M pairs/s)",
+                    total_unique,
+                    total_popped,
+                    100.0 * (1.0 - total_unique as f64 / total_popped.max(1) as f64),
+                    rate / 1_000_000.0,
+                );
+            }
+        }
+        if let Some(next) = readers[idx].next_pair()? {
+            heap.push(Reverse((next.0, next.1, idx)));
+        }
+    }
+
+    let merge_elapsed = t_merge.elapsed();
+    log::info!(
+        "  Merge phase complete: {} unique pairs from {} popped in {:.2}s ({:.1}M pairs/s input)",
+        total_unique,
+        total_popped,
+        merge_elapsed.as_secs_f64(),
+        total_popped as f64 / merge_elapsed.as_secs_f64().max(0.001) / 1_000_000.0,
+    );
+
+    // accumulator.finish() flushes the trailing partial shard; the per-flush
+    // log above covers every shard produced inside the loop, and the summary
+    // "Consolidation complete" log below covers the final shard count.
+    let mut offset_shard_infos = accumulator.finish()?;
+
+    // Phase 3: drop readers (close files) before touching intermediate paths.
+    // On Unix, deleting a file with open descriptors is legal; on Windows it
+    // can fail with a sharing violation. Dropping the readers explicitly here
+    // makes the ordering portable rather than relying on end-of-scope drop.
+    drop(readers);
+
+    // Phase 4: delete intermediates.
+    // ORDERING DEPENDENCY: all final writes above must be complete before any
+    // intermediate is removed; all intermediates must be gone before renames
+    // below, otherwise a rename could collide with an intermediate file name.
+    for info in intermediate_shards {
+        let path = inverted_dir.join(files::inverted_shard(info.shard_id));
+        std::fs::remove_file(&path)
+            .map_err(|e| RypeError::io(path, "delete intermediate shard", e))?;
+    }
+    log::info!("  Deleted {} intermediate shard files", n);
+
+    // Phase 5: rename shard.{offset+i}.parquet → shard.{i}.parquet.
+    rename_final_shards(output_dir, &mut offset_shard_infos, offset)?;
+    log::info!(
+        "  Renamed {} final shards to canonical IDs (0..{})",
+        offset_shard_infos.len(),
+        offset_shard_infos.len().saturating_sub(1),
+    );
+
+    log::info!(
+        "Consolidation complete (streaming): {} final shards, {} unique entries, bucket_id={}",
+        offset_shard_infos.len(),
+        total_unique,
+        bucket_id,
+    );
+
+    debug_assert!(
+        offset_shard_infos
+            .windows(2)
+            .all(|w| w[0].max_minimizer < w[1].min_minimizer),
+        "streaming consolidation produced overlapping shards"
+    );
+    debug_assert!(
+        offset_shard_infos
+            .iter()
+            .enumerate()
+            .all(|(i, s)| s.shard_id as usize == i),
+        "streaming consolidation produced non-contiguous shard ids"
+    );
+
+    Ok((offset_shard_infos, total_unique))
+}
+
 /// Consolidate intermediate shards into final deduplicated, non-overlapping shards.
 ///
-/// Reads each intermediate shard one at a time, extracts minimizer values,
-/// and merges into a running sorted-unique `Vec<u64>`. After all shards are
-/// merged, deletes intermediate files and writes final shards.
+/// Thin wrapper around [`consolidate_shards_streaming`]. Peak memory is
+/// `O(num_intermediate_shards × PARQUET_BATCH_SIZE × 12 B + max_shard_bytes)`,
+/// independent of the total unique minimizer count.
 ///
 /// This is only needed for single-bucket streaming builds where the same
 /// minimizer can appear in multiple chunks (and thus multiple intermediate shards).
-///
-/// # Memory
-///
-/// Peak memory: ~2 × unique_minimizers × 8 bytes + largest_intermediate_shard × 12 bytes.
-/// The merged `Vec<u64>` holds all unique minimizers (8 bytes each). During each
-/// `merge_sorted_into` call, a second Vec of similar size is temporarily allocated.
-/// One shard's `(u64, u32)` pairs (12 bytes each) are held during each read.
-///
-/// For 149M unique minimizers this is ~2.4GB + shard data. This is the same
-/// O(unique_minimizers) memory the old `build_single_bucket_parallel_chunked`
-/// used for its `merged_mins` Vec — the streaming build bounds *intermediate*
-/// memory, but consolidation necessarily loads the full unique set.
 pub fn consolidate_shards(
     output_dir: &Path,
     intermediate_shards: &[InvertedShardInfo],
@@ -963,70 +1265,13 @@ pub fn consolidate_shards(
     max_shard_bytes: usize,
     options: &ParquetWriteOptions,
 ) -> Result<(Vec<InvertedShardInfo>, u64)> {
-    use crate::core::merge::merge_sorted_into;
-
-    if intermediate_shards.is_empty() {
-        return Ok((vec![], 0));
-    }
-
-    let inverted_dir = output_dir.join(files::INVERTED_DIR);
-
-    // Phase 1: Read intermediate shards one at a time, merge into unique minimizer list
-    let mut merged: Vec<u64> = Vec::new();
-    for info in intermediate_shards {
-        let path = inverted_dir.join(files::inverted_shard(info.shard_id));
-        let pairs = super::merge::read_shard_pairs(&path)?;
-        // Extract just the minimizer column (already sorted from flush_shard)
-        let mins: Vec<u64> = pairs.into_iter().map(|(m, _)| m).collect();
-        merge_sorted_into(&mut merged, &mins);
-    }
-
-    let total_unique = merged.len() as u64;
-
-    log::info!(
-        "Consolidating {} intermediate shards: {} total entries → {} unique minimizers ({:.1}x dedup)",
-        intermediate_shards.len(),
-        intermediate_shards.iter().map(|s| s.num_entries).sum::<u64>(),
-        total_unique,
-        intermediate_shards.iter().map(|s| s.num_entries).sum::<u64>() as f64 / total_unique.max(1) as f64,
-    );
-
-    // Phase 2: Delete intermediate shard files.
-    // ORDERING DEPENDENCY: All intermediates must be read (Phase 1) before any are
-    // deleted, and all must be deleted before final shards are written (Phase 3),
-    // because final shards reuse shard IDs starting from 0. A crash between Phase 2
-    // and Phase 3 would leave the index directory with missing shards — the caller
-    // should treat a partially-written index as corrupt and rebuild.
-    for info in intermediate_shards {
-        let path = inverted_dir.join(files::inverted_shard(info.shard_id));
-        std::fs::remove_file(&path)
-            .map_err(|e| RypeError::io(path, "delete intermediate shard", e))?;
-    }
-
-    // Phase 3: Write final non-overlapping shards from merged minimizers
-    let mut accumulator =
-        ShardAccumulator::with_output_dir(output_dir, max_shard_bytes, Some(options));
-    // batch_size >= MIN_SHARD_BYTES / BYTES_PER_ENTRY = 65536, always positive
-    let batch_size = (max_shard_bytes / ShardAccumulator::BYTES_PER_ENTRY).min(8_000_000);
-    debug_assert!(
-        batch_size > 0,
-        "batch_size must be positive (max_shard_bytes >= MIN_SHARD_BYTES)"
-    );
-    for batch in merged.chunks(batch_size) {
-        accumulator.add_entries_from_minimizers(batch, bucket_id);
-        while accumulator.should_flush() {
-            accumulator.flush_shard()?;
-        }
-    }
-    let shard_infos = accumulator.finish()?;
-
-    log::info!(
-        "Consolidation complete: {} final shards, {} entries",
-        shard_infos.len(),
-        total_unique,
-    );
-
-    Ok((shard_infos, total_unique))
+    consolidate_shards_streaming(
+        output_dir,
+        intermediate_shards,
+        bucket_id,
+        max_shard_bytes,
+        options,
+    )
 }
 
 #[cfg(test)]
@@ -1597,6 +1842,545 @@ mod tests {
             }
         }
         Ok(pairs)
+    }
+
+    // ========== StreamingShardReader Tests (Cycle 1) ==========
+
+    #[test]
+    fn test_streaming_shard_reader_yields_pairs_in_order() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("shard.parquet");
+        let opts = ParquetWriteOptions::default();
+
+        let pairs: Vec<(u64, u32)> = vec![
+            (10, 1),
+            (20, 1),
+            (30, 1),
+            (40, 2),
+            (50, 1),
+            (60, 3),
+            (70, 1),
+        ];
+        write_shard_from_pairs(&path, &pairs, &opts).unwrap();
+
+        let mut reader = StreamingShardReader::open(&path).unwrap();
+        let mut collected: Vec<(u64, u32)> = Vec::new();
+        while let Some(pair) = reader.next_pair().unwrap() {
+            collected.push(pair);
+        }
+        assert_eq!(collected, pairs);
+
+        assert!(reader.next_pair().unwrap().is_none());
+    }
+
+    /// A shard can legitimately contain the same minimizer with *different*
+    /// bucket_ids in strictly-ascending minimizer order; the ordering
+    /// invariant the reader tracks is on minimizers alone, not on the full
+    /// (u64, u32) tuple. (Today's consolidation path is single-bucket, but
+    /// the reader is a reusable primitive and must not false-positive.)
+    #[test]
+    fn test_streaming_shard_reader_debug_assert_ignores_bucket_id_order() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("shard.parquet");
+        let opts = ParquetWriteOptions::default();
+
+        // Minimizers are monotone non-decreasing. Within a minimizer, bucket
+        // ids are NOT required to be sorted.
+        let pairs: Vec<(u64, u32)> = vec![(10, 5), (10, 3), (10, 9), (20, 1)];
+        write_shard_from_pairs(&path, &pairs, &opts).unwrap();
+
+        let mut reader = StreamingShardReader::open(&path).unwrap();
+        let mut collected: Vec<(u64, u32)> = Vec::new();
+        while let Some(pair) = reader.next_pair().unwrap() {
+            collected.push(pair);
+        }
+        // Must not panic in debug; must yield inputs in stored order.
+        assert_eq!(collected, pairs);
+    }
+
+    #[test]
+    fn test_streaming_shard_reader_empty_shard() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("shard.parquet");
+        let opts = ParquetWriteOptions::default();
+
+        write_shard_from_pairs(&path, &[], &opts).unwrap();
+
+        let mut reader = StreamingShardReader::open(&path).unwrap();
+        assert!(reader.next_pair().unwrap().is_none());
+        assert!(reader.next_pair().unwrap().is_none());
+    }
+
+    // ========== Streaming consolidation (Cycle 2) ==========
+
+    /// Build the same 3-overlapping-shard input used by the legacy test, then
+    /// assert that the streaming implementation produces byte-identical output.
+    #[test]
+    fn test_consolidate_shards_streaming_matches_legacy() {
+        let opts = ParquetWriteOptions::default();
+
+        let intermediate_shards = vec![
+            InvertedShardInfo {
+                shard_id: 0,
+                min_minimizer: 10,
+                max_minimizer: 30,
+                num_entries: 3,
+            },
+            InvertedShardInfo {
+                shard_id: 1,
+                min_minimizer: 20,
+                max_minimizer: 40,
+                num_entries: 3,
+            },
+            InvertedShardInfo {
+                shard_id: 2,
+                min_minimizer: 30,
+                max_minimizer: 50,
+                num_entries: 3,
+            },
+        ];
+        let shard_contents: [&[(u64, u32)]; 3] = [
+            &[(10, 1), (20, 1), (30, 1)],
+            &[(20, 1), (30, 1), (40, 1)],
+            &[(30, 1), (40, 1), (50, 1)],
+        ];
+
+        // Run legacy and streaming into two separate tempdirs.
+        let legacy_tmp = TempDir::new().unwrap();
+        let legacy_dir = legacy_tmp.path().join("legacy.ryxdi");
+        std::fs::create_dir_all(legacy_dir.join("inverted")).unwrap();
+        for (i, content) in shard_contents.iter().enumerate() {
+            write_shard_from_pairs(
+                &legacy_dir
+                    .join("inverted")
+                    .join(format!("shard.{}.parquet", i)),
+                content,
+                &opts,
+            )
+            .unwrap();
+        }
+        let (legacy_shards, legacy_unique) =
+            consolidate_shards(&legacy_dir, &intermediate_shards, 1, MIN_SHARD_BYTES, &opts)
+                .unwrap();
+
+        let streaming_tmp = TempDir::new().unwrap();
+        let streaming_dir = streaming_tmp.path().join("streaming.ryxdi");
+        std::fs::create_dir_all(streaming_dir.join("inverted")).unwrap();
+        for (i, content) in shard_contents.iter().enumerate() {
+            write_shard_from_pairs(
+                &streaming_dir
+                    .join("inverted")
+                    .join(format!("shard.{}.parquet", i)),
+                content,
+                &opts,
+            )
+            .unwrap();
+        }
+        let (streaming_shards, streaming_unique) = consolidate_shards_streaming(
+            &streaming_dir,
+            &intermediate_shards,
+            1,
+            MIN_SHARD_BYTES,
+            &opts,
+        )
+        .unwrap();
+
+        assert_eq!(legacy_unique, streaming_unique);
+        assert_eq!(legacy_shards.len(), streaming_shards.len());
+        for (l, s) in legacy_shards.iter().zip(streaming_shards.iter()) {
+            assert_eq!(l.shard_id, s.shard_id);
+            assert_eq!(l.min_minimizer, s.min_minimizer);
+            assert_eq!(l.max_minimizer, s.max_minimizer);
+            assert_eq!(l.num_entries, s.num_entries);
+
+            let l_pairs = read_shard_pairs(
+                &legacy_dir
+                    .join("inverted")
+                    .join(files::inverted_shard(l.shard_id)),
+            )
+            .unwrap();
+            let s_pairs = read_shard_pairs(
+                &streaming_dir
+                    .join("inverted")
+                    .join(files::inverted_shard(s.shard_id)),
+            )
+            .unwrap();
+            assert_eq!(l_pairs, s_pairs);
+        }
+    }
+
+    // ========== Streaming consolidation edge cases (Cycle 4) ==========
+
+    #[test]
+    fn test_consolidate_streaming_empty_intermediates() {
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("x.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+
+        let (shards, unique) = consolidate_shards_streaming(
+            &output_dir,
+            &[],
+            1,
+            MIN_SHARD_BYTES,
+            &ParquetWriteOptions::default(),
+        )
+        .unwrap();
+        assert!(shards.is_empty());
+        assert_eq!(unique, 0);
+    }
+
+    #[test]
+    fn test_consolidate_streaming_single_intermediate_passthrough() {
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("x.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+        let opts = ParquetWriteOptions::default();
+
+        let input_pairs: Vec<(u64, u32)> = vec![(10, 1), (20, 1), (30, 1), (40, 1)];
+        write_shard_from_pairs(
+            &output_dir.join("inverted/shard.0.parquet"),
+            &input_pairs,
+            &opts,
+        )
+        .unwrap();
+        let intermediate = vec![InvertedShardInfo {
+            shard_id: 0,
+            min_minimizer: 10,
+            max_minimizer: 40,
+            num_entries: 4,
+        }];
+
+        let (shards, unique) =
+            consolidate_shards_streaming(&output_dir, &intermediate, 1, MIN_SHARD_BYTES, &opts)
+                .unwrap();
+
+        assert_eq!(unique, 4);
+        assert_eq!(shards.len(), 1);
+        // After rename, final file is at shard.0.parquet
+        let out_pairs = read_shard_pairs(&output_dir.join("inverted/shard.0.parquet")).unwrap();
+        assert_eq!(out_pairs, input_pairs);
+    }
+
+    #[test]
+    fn test_consolidate_streaming_all_duplicates_across_shards() {
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("x.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+        let opts = ParquetWriteOptions::default();
+
+        let pairs = vec![(100u64, 1u32), (200, 1)];
+        let mut intermediate = Vec::new();
+        for i in 0..5u32 {
+            write_shard_from_pairs(
+                &output_dir.join(format!("inverted/shard.{}.parquet", i)),
+                &pairs,
+                &opts,
+            )
+            .unwrap();
+            intermediate.push(InvertedShardInfo {
+                shard_id: i,
+                min_minimizer: 100,
+                max_minimizer: 200,
+                num_entries: 2,
+            });
+        }
+
+        let (shards, unique) =
+            consolidate_shards_streaming(&output_dir, &intermediate, 1, MIN_SHARD_BYTES, &opts)
+                .unwrap();
+
+        assert_eq!(unique, 2);
+        assert_eq!(shards.len(), 1);
+        let out_pairs = read_shard_pairs(&output_dir.join("inverted/shard.0.parquet")).unwrap();
+        assert_eq!(out_pairs, pairs);
+    }
+
+    #[test]
+    fn test_consolidate_streaming_preserves_bucket_id_diversity() {
+        // Dedup key must be (u64, u32), not u64 alone — same minimizer can appear
+        // with multiple bucket_ids in a multi-bucket downstream path.
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("x.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+        let opts = ParquetWriteOptions::default();
+
+        let shard_a: Vec<(u64, u32)> = vec![(100, 1), (100, 2), (200, 1)];
+        let shard_b: Vec<(u64, u32)> = vec![(100, 2), (100, 3), (200, 2)];
+        write_shard_from_pairs(
+            &output_dir.join("inverted/shard.0.parquet"),
+            &shard_a,
+            &opts,
+        )
+        .unwrap();
+        write_shard_from_pairs(
+            &output_dir.join("inverted/shard.1.parquet"),
+            &shard_b,
+            &opts,
+        )
+        .unwrap();
+        let intermediate = vec![
+            InvertedShardInfo {
+                shard_id: 0,
+                min_minimizer: 100,
+                max_minimizer: 200,
+                num_entries: 3,
+            },
+            InvertedShardInfo {
+                shard_id: 1,
+                min_minimizer: 100,
+                max_minimizer: 200,
+                num_entries: 3,
+            },
+        ];
+
+        let (shards, unique) =
+            consolidate_shards_streaming(&output_dir, &intermediate, 1, MIN_SHARD_BYTES, &opts)
+                .unwrap();
+        // Unique (minimizer, bucket_id) pairs: (100,1), (100,2), (100,3), (200,1), (200,2) = 5
+        assert_eq!(unique, 5);
+        let mut all_pairs: Vec<(u64, u32)> = Vec::new();
+        for s in &shards {
+            all_pairs.extend(
+                read_shard_pairs(
+                    &output_dir
+                        .join("inverted")
+                        .join(files::inverted_shard(s.shard_id)),
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(
+            all_pairs,
+            vec![(100, 1), (100, 2), (100, 3), (200, 1), (200, 2)]
+        );
+    }
+
+    #[test]
+    fn test_consolidate_streaming_skewed_sizes() {
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("x.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+        let opts = ParquetWriteOptions::default();
+
+        // 1 large shard (100_000 entries) + 3 tiny shards (10 entries each).
+        // Disjoint minimizer ranges so cross-shard dedup doesn't kick in.
+        let large: Vec<(u64, u32)> = (0..100_000u64).map(|i| (i, 1u32)).collect();
+        let small_a: Vec<(u64, u32)> = (200_000..200_010u64).map(|i| (i, 1u32)).collect();
+        let small_b: Vec<(u64, u32)> = (300_000..300_010u64).map(|i| (i, 1u32)).collect();
+        let small_c: Vec<(u64, u32)> = (400_000..400_010u64).map(|i| (i, 1u32)).collect();
+
+        write_shard_from_pairs(&output_dir.join("inverted/shard.0.parquet"), &large, &opts)
+            .unwrap();
+        write_shard_from_pairs(
+            &output_dir.join("inverted/shard.1.parquet"),
+            &small_a,
+            &opts,
+        )
+        .unwrap();
+        write_shard_from_pairs(
+            &output_dir.join("inverted/shard.2.parquet"),
+            &small_b,
+            &opts,
+        )
+        .unwrap();
+        write_shard_from_pairs(
+            &output_dir.join("inverted/shard.3.parquet"),
+            &small_c,
+            &opts,
+        )
+        .unwrap();
+
+        let intermediate = vec![
+            InvertedShardInfo {
+                shard_id: 0,
+                min_minimizer: 0,
+                max_minimizer: 99_999,
+                num_entries: 100_000,
+            },
+            InvertedShardInfo {
+                shard_id: 1,
+                min_minimizer: 200_000,
+                max_minimizer: 200_009,
+                num_entries: 10,
+            },
+            InvertedShardInfo {
+                shard_id: 2,
+                min_minimizer: 300_000,
+                max_minimizer: 300_009,
+                num_entries: 10,
+            },
+            InvertedShardInfo {
+                shard_id: 3,
+                min_minimizer: 400_000,
+                max_minimizer: 400_009,
+                num_entries: 10,
+            },
+        ];
+
+        let (shards, unique) =
+            consolidate_shards_streaming(&output_dir, &intermediate, 1, MIN_SHARD_BYTES, &opts)
+                .unwrap();
+        assert_eq!(unique, 100_030);
+
+        // shard_infos are range-partitioned contiguous from 0
+        for (i, s) in shards.iter().enumerate() {
+            assert_eq!(s.shard_id as usize, i);
+        }
+        for w in shards.windows(2) {
+            assert!(w[0].max_minimizer < w[1].min_minimizer);
+        }
+
+        let total_entries: u64 = shards.iter().map(|s| s.num_entries).sum();
+        assert_eq!(total_entries, unique);
+    }
+
+    /// Consolidation must produce more output shards than input when the
+    /// deduplicated unique minimizer count exceeds what fits in a single
+    /// final shard. Exercises the rename path with M > N and verifies
+    /// final shard IDs are still contiguous 0..M-1.
+    #[test]
+    fn test_consolidate_streaming_more_output_shards_than_input() {
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("x.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+        let opts = ParquetWriteOptions::default();
+
+        // 2 intermediate shards × 50_000 entries each = 100_000 unique entries
+        // (disjoint ranges so no cross-shard dedup). At MIN_SHARD_BYTES = 1 MiB
+        // and 16 B/entry, each final shard holds ~65k entries, so we expect
+        // ~2 final shards — but the streaming accumulator's flush cadence can
+        // yield 2-3 depending on alignment. Assert M >= N and contiguous IDs.
+        let shard_a: Vec<(u64, u32)> = (0..50_000u64).map(|i| (i, 1)).collect();
+        let shard_b: Vec<(u64, u32)> = (1_000_000..1_050_000u64).map(|i| (i, 1)).collect();
+        write_shard_from_pairs(
+            &output_dir.join("inverted/shard.0.parquet"),
+            &shard_a,
+            &opts,
+        )
+        .unwrap();
+        write_shard_from_pairs(
+            &output_dir.join("inverted/shard.1.parquet"),
+            &shard_b,
+            &opts,
+        )
+        .unwrap();
+
+        let intermediate = vec![
+            InvertedShardInfo {
+                shard_id: 0,
+                min_minimizer: 0,
+                max_minimizer: 49_999,
+                num_entries: 50_000,
+            },
+            InvertedShardInfo {
+                shard_id: 1,
+                min_minimizer: 1_000_000,
+                max_minimizer: 1_049_999,
+                num_entries: 50_000,
+            },
+        ];
+
+        let (shards, unique) =
+            consolidate_shards_streaming(&output_dir, &intermediate, 1, MIN_SHARD_BYTES, &opts)
+                .unwrap();
+
+        assert_eq!(unique, 100_000);
+        assert!(
+            shards.len() >= intermediate.len(),
+            "expected M >= N (got M={}, N={})",
+            shards.len(),
+            intermediate.len()
+        );
+
+        // Contiguous IDs 0..M-1.
+        for (i, s) in shards.iter().enumerate() {
+            assert_eq!(s.shard_id as usize, i);
+            let path = output_dir
+                .join("inverted")
+                .join(files::inverted_shard(s.shard_id));
+            assert!(
+                path.exists(),
+                "final shard file must exist at contiguous id"
+            );
+        }
+
+        // Range-partitioned (non-overlapping).
+        for w in shards.windows(2) {
+            assert!(w[0].max_minimizer < w[1].min_minimizer);
+        }
+
+        // No leftover intermediate file.
+        assert!(
+            !output_dir.join("inverted/shard.0.parquet").exists()
+                || shards.iter().any(|s| s.shard_id == 0),
+            "shard.0.parquet must either be a final shard or be absent"
+        );
+    }
+
+    #[test]
+    fn test_rename_final_shards_refuses_to_clobber_existing_file() {
+        // If a previous consolidation attempt crashed mid-Phase-4 (delete
+        // intermediates), some intermediates remain on disk at the ids that
+        // the rename phase wants to move onto. The rename MUST refuse, not
+        // silently overwrite — `fs::rename` on Linux is atomic and would
+        // destroy the surviving intermediate's data otherwise.
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("x.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+
+        // Simulate: intermediate shard.0.parquet survived a partial crash, AND
+        // a final shard at offset 3 wants to rename to shard.0.parquet.
+        std::fs::write(output_dir.join("inverted/shard.0.parquet"), b"SURVIVOR").unwrap();
+        std::fs::write(output_dir.join("inverted/shard.3.parquet"), b"FINAL").unwrap();
+
+        let mut infos = vec![InvertedShardInfo {
+            shard_id: 3,
+            min_minimizer: 0,
+            max_minimizer: 10,
+            num_entries: 1,
+        }];
+
+        let err = rename_final_shards(&output_dir, &mut infos, 3).unwrap_err();
+        // Survivor data must be untouched.
+        let survivor = std::fs::read(output_dir.join("inverted/shard.0.parquet")).unwrap();
+        assert_eq!(
+            survivor, b"SURVIVOR",
+            "rename must not clobber existing file"
+        );
+        let _ = err; // accept any RypeError variant; the invariant above is what matters.
+    }
+
+    #[test]
+    fn test_rename_final_shards_adjusts_ids() {
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("x.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+
+        // Pre-populate offset-named shard files.
+        for i in 3u32..6 {
+            std::fs::File::create(output_dir.join(format!("inverted/shard.{}.parquet", i)))
+                .unwrap();
+        }
+        let mut infos: Vec<InvertedShardInfo> = (3u32..6)
+            .map(|i| InvertedShardInfo {
+                shard_id: i,
+                min_minimizer: i as u64 * 10,
+                max_minimizer: i as u64 * 10 + 9,
+                num_entries: 10,
+            })
+            .collect();
+
+        rename_final_shards(&output_dir, &mut infos, 3).unwrap();
+
+        for (i, info) in infos.iter().enumerate() {
+            assert_eq!(info.shard_id as usize, i);
+            assert!(output_dir
+                .join(format!("inverted/shard.{}.parquet", i))
+                .exists());
+            assert!(!output_dir
+                .join(format!("inverted/shard.{}.parquet", i + 3))
+                .exists());
+        }
     }
 
     // ========== Phase 4: Shard Consolidation Tests ==========

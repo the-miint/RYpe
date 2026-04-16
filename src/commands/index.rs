@@ -1025,7 +1025,10 @@ fn consolidate_streaming_shards(
     options: &rype::parquet_index::ParquetWriteOptions,
 ) -> Result<(Vec<rype::parquet_index::InvertedShardInfo>, u64)> {
     if intermediate_shards.len() <= 1 {
-        // Single shard: already deduped by flush_shard
+        // Zero or one intermediate shard: nothing to merge across shards.
+        // A single intermediate is sorted+deduped by ShardAccumulator::flush_shard
+        // at write time, so it satisfies the non-overlapping / deduplicated
+        // output contract without further work.
         let total = intermediate_shards.iter().map(|s| s.num_entries).sum();
         return Ok((intermediate_shards, total));
     }
@@ -1066,7 +1069,7 @@ fn build_single_bucket_streaming(
     salt: u64,
     max_memory: Option<usize>,
     options: Option<&rype::parquet_index::ParquetWriteOptions>,
-    exclusion_set: Option<&HashSet<u64>>,
+    exclusion_set: Option<HashSet<u64>>,
 ) -> Result<SingleBucketResult> {
     use rype::memory::detect_available_memory;
     use rype::parquet_index::ShardAccumulator;
@@ -1080,6 +1083,7 @@ fn build_single_bucket_streaming(
     );
 
     if files.is_empty() {
+        drop(exclusion_set);
         return Ok(SingleBucketResult {
             bucket_name: bucket_name.to_string(),
             sources: vec![],
@@ -1127,11 +1131,12 @@ fn build_single_bucket_streaming(
     while let Some(chunk) = chunk_iter.next_chunk()? {
         chunk_count += 1;
         let chunk_size: usize = chunk.iter().map(|(seq, _)| seq.len()).sum();
-        log::debug!(
-            "Processing chunk {} ({} sequences, {} bytes)",
+        let t_chunk = std::time::Instant::now();
+        log::info!(
+            "Chunk {}: {} sequences, {:.1} MiB of input",
             chunk_count,
             chunk.len(),
-            chunk_size
+            chunk_size as f64 / (1024.0 * 1024.0)
         );
 
         // Collect sources and track per-file sequence lengths
@@ -1163,9 +1168,10 @@ fn build_single_bucket_streaming(
 
         // K-way merge this chunk's results
         let chunk_merged = kway_merge_dedup(chunk_mins);
+        let chunk_unique_before_filter = chunk_merged.len();
 
         // Filter out excluded minimizers if subtraction is active
-        let chunk_merged = if let Some(excl) = exclusion_set {
+        let chunk_merged = if let Some(excl) = exclusion_set.as_ref() {
             let original_len = chunk_merged.len();
             let filtered: Vec<u64> = chunk_merged
                 .into_iter()
@@ -1180,22 +1186,36 @@ fn build_single_bucket_streaming(
             chunk_merged
         };
 
-        // Stream to accumulator in batches, checking flush threshold between batches
-        // This ensures shards don't exceed max_shard_bytes even with large chunks
+        // Stream to accumulator in batches, checking flush threshold between batches.
+        // This ensures shards don't exceed max_shard_bytes even with large chunks.
+        let mut chunk_flushes = 0usize;
         for batch in chunk_merged.chunks(add_batch_entries) {
             accumulator.add_entries_from_minimizers(batch, BUCKET_ID);
-
-            // Flush shards as needed to bound memory
             while accumulator.should_flush() {
                 if let Some(shard_info) = accumulator.flush_shard()? {
+                    chunk_flushes += 1;
+                    // Debug-only: intermediate flushes can fire many times per
+                    // chunk. The per-chunk summary below reports the count at
+                    // info level.
                     log::debug!(
-                        "Flushed shard {} ({} entries)",
+                        "Flushed intermediate shard {} ({} entries) during chunk {}",
                         shard_info.shard_id,
-                        shard_info.num_entries
+                        shard_info.num_entries,
+                        chunk_count
                     );
                 }
             }
         }
+        let chunk_elapsed = t_chunk.elapsed();
+        log::info!(
+            "  Chunk {} done in {:.2}s: {} unique → {} written ({} excluded), {} flush(es)",
+            chunk_count,
+            chunk_elapsed.as_secs_f64(),
+            chunk_unique_before_filter,
+            chunk_merged.len(),
+            chunk_unique_before_filter - chunk_merged.len(),
+            chunk_flushes,
+        );
     }
 
     if total_excluded > 0 {
@@ -1206,9 +1226,34 @@ fn build_single_bucket_streaming(
         );
     }
 
+    // Release the exclusion set before consolidation: it is no longer used,
+    // and consolidation allocates significant transient memory — freeing this
+    // (~24 B per entry) keeps peak RSS bounded for large subtraction indices.
+    let excl_size = exclusion_set.as_ref().map(|s| s.len()).unwrap_or(0);
+    drop(exclusion_set);
+    if excl_size > 0 {
+        log::info!(
+            "Released exclusion set before consolidation ({} entries, ~{:.1} MiB freed)",
+            excl_size,
+            (excl_size as f64 * 24.0) / (1024.0 * 1024.0),
+        );
+    }
+
     let intermediate_shards = accumulator.finish()?;
+    log::info!(
+        "Streaming phase complete for '{}': {} intermediate shards from {} chunks \
+         ({} total entries pre-consolidation)",
+        bucket_name,
+        intermediate_shards.len(),
+        chunk_count,
+        intermediate_shards
+            .iter()
+            .map(|s| s.num_entries)
+            .sum::<u64>(),
+    );
 
     // Consolidate intermediate shards: merge-dedup across chunk boundaries
+    let t_consolidate = std::time::Instant::now();
     let (shard_infos, total_minimizers) = consolidate_streaming_shards(
         output_dir,
         intermediate_shards,
@@ -1216,6 +1261,10 @@ fn build_single_bucket_streaming(
         shard_size,
         &options.cloned().unwrap_or_default(),
     )?;
+    log::info!(
+        "Consolidation took {:.2}s",
+        t_consolidate.elapsed().as_secs_f64()
+    );
 
     log::info!(
         "Completed bucket '{}': {} minimizers, {} shards ({} chunks processed)",
@@ -1257,7 +1306,7 @@ fn build_single_bucket_streaming_oriented(
     salt: u64,
     max_memory: Option<usize>,
     options: Option<&rype::parquet_index::ParquetWriteOptions>,
-    exclusion_set: Option<&HashSet<u64>>,
+    exclusion_set: Option<HashSet<u64>>,
 ) -> Result<SingleBucketResult> {
     use rype::memory::detect_available_memory;
     use rype::parquet_index::ShardAccumulator;
@@ -1271,6 +1320,7 @@ fn build_single_bucket_streaming_oriented(
     );
 
     if files.is_empty() {
+        drop(exclusion_set);
         return Ok(SingleBucketResult {
             bucket_name: bucket_name.to_string(),
             sources: vec![],
@@ -1319,7 +1369,7 @@ fn build_single_bucket_streaming_oriented(
     // writing to accumulator. We don't count baseline exclusions in
     // total_excluded because the same minimizers may reappear in chunks
     // (where they'll be counted).
-    let (baseline_for_orient, baseline_to_write) = if let Some(excl) = exclusion_set {
+    let (baseline_for_orient, baseline_to_write) = if let Some(excl) = exclusion_set.as_ref() {
         let original_len = baseline_mins.len();
         let filtered: Vec<u64> = baseline_mins
             .iter()
@@ -1360,11 +1410,12 @@ fn build_single_bucket_streaming_oriented(
         while let Some(chunk) = chunk_iter.next_chunk()? {
             chunk_count += 1;
             let chunk_size: usize = chunk.iter().map(|(seq, _)| seq.len()).sum();
-            log::debug!(
-                "Processing chunk {} ({} sequences, {} bytes)",
+            let t_chunk = std::time::Instant::now();
+            log::info!(
+                "Chunk {}: {} sequences, {:.1} MiB of input (oriented)",
                 chunk_count,
                 chunk.len(),
-                chunk_size
+                chunk_size as f64 / (1024.0 * 1024.0)
             );
 
             // Collect sources and track per-file sequence lengths
@@ -1402,9 +1453,10 @@ fn build_single_bucket_streaming_oriented(
 
             // K-way merge this chunk's results
             let chunk_merged = kway_merge_dedup(chunk_mins);
+            let chunk_unique_before_filter = chunk_merged.len();
 
             // Filter out excluded minimizers if subtraction is active
-            let chunk_merged = if let Some(excl) = exclusion_set {
+            let chunk_merged = if let Some(excl) = exclusion_set.as_ref() {
                 let original_len = chunk_merged.len();
                 let filtered: Vec<u64> = chunk_merged
                     .into_iter()
@@ -1419,23 +1471,36 @@ fn build_single_bucket_streaming_oriented(
                 chunk_merged
             };
 
-            // Stream to accumulator in batches
+            // Stream to accumulator in batches.
+            let mut chunk_flushes = 0usize;
             for batch in chunk_merged.chunks(add_batch_entries) {
                 accumulator.add_entries_from_minimizers(batch, BUCKET_ID);
-
                 while accumulator.should_flush() {
                     if let Some(shard_info) = accumulator.flush_shard()? {
+                        chunk_flushes += 1;
+                        // Debug-only: see non-oriented variant for rationale.
                         log::debug!(
-                            "Flushed shard {} ({} entries)",
+                            "Flushed intermediate shard {} ({} entries) during chunk {}",
                             shard_info.shard_id,
-                            shard_info.num_entries
+                            shard_info.num_entries,
+                            chunk_count
                         );
                     }
                 }
             }
+            let chunk_elapsed = t_chunk.elapsed();
+            log::info!(
+                "  Chunk {} done in {:.2}s: {} unique → {} written ({} excluded), {} flush(es)",
+                chunk_count,
+                chunk_elapsed.as_secs_f64(),
+                chunk_unique_before_filter,
+                chunk_merged.len(),
+                chunk_unique_before_filter - chunk_merged.len(),
+                chunk_flushes,
+            );
         }
 
-        log::debug!("Processed {} additional chunks", chunk_count);
+        log::info!("Processed {} additional chunks (oriented)", chunk_count);
     }
 
     if total_excluded > 0 {
@@ -1446,9 +1511,32 @@ fn build_single_bucket_streaming_oriented(
         );
     }
 
+    // Release the exclusion set before consolidation (see non-oriented variant
+    // for rationale).
+    let excl_size = exclusion_set.as_ref().map(|s| s.len()).unwrap_or(0);
+    drop(exclusion_set);
+    if excl_size > 0 {
+        log::info!(
+            "Released exclusion set before consolidation ({} entries, ~{:.1} MiB freed)",
+            excl_size,
+            (excl_size as f64 * 24.0) / (1024.0 * 1024.0),
+        );
+    }
+
     let intermediate_shards = accumulator.finish()?;
+    log::info!(
+        "Streaming phase complete for '{}': {} intermediate shards \
+         ({} total entries pre-consolidation)",
+        bucket_name,
+        intermediate_shards.len(),
+        intermediate_shards
+            .iter()
+            .map(|s| s.num_entries)
+            .sum::<u64>(),
+    );
 
     // Consolidate intermediate shards: merge-dedup across chunk boundaries
+    let t_consolidate = std::time::Instant::now();
     let (shard_infos, total_minimizers) = consolidate_streaming_shards(
         output_dir,
         intermediate_shards,
@@ -1456,6 +1544,10 @@ fn build_single_bucket_streaming_oriented(
         shard_size,
         &options.cloned().unwrap_or_default(),
     )?;
+    log::info!(
+        "Consolidation took {:.2}s",
+        t_consolidate.elapsed().as_secs_f64()
+    );
 
     log::info!(
         "Completed bucket '{}': {} minimizers, {} shards",
@@ -1666,6 +1758,10 @@ pub fn build_parquet_index_from_config(
     create_index_directory(&output_path)?;
 
     let t_build = Instant::now();
+    // Move `exclusion_set` into the single-bucket builder: it is freed before
+    // consolidation, which significantly reduces peak RSS when the subtraction
+    // index is large. The multi-bucket branch above returns early, so neither
+    // path observes the set after this point.
     let result = if orient_sequences {
         build_single_bucket_streaming_oriented(
             &output_path,
@@ -1677,7 +1773,7 @@ pub fn build_parquet_index_from_config(
             cfg.index.salt,
             cli_max_memory,
             options,
-            exclusion_set.as_ref(),
+            exclusion_set,
         )?
     } else {
         build_single_bucket_streaming(
@@ -1690,7 +1786,7 @@ pub fn build_parquet_index_from_config(
             cfg.index.salt,
             cli_max_memory,
             options,
-            exclusion_set.as_ref(),
+            exclusion_set,
         )?
     };
     log_timing(
@@ -4760,7 +4856,7 @@ files = ["short.fa", "long.fa"]
             0x5555555555555555,
             Some(100 * 1024 * 1024),
             None,
-            Some(&exclusion_set),
+            Some(exclusion_set),
         )
         .unwrap();
 
@@ -4844,7 +4940,7 @@ files = ["short.fa", "long.fa"]
             0x5555555555555555,
             Some(100 * 1024 * 1024),
             None,
-            Some(&exclusion_set),
+            Some(exclusion_set),
         )
         .unwrap();
 
@@ -4858,5 +4954,236 @@ files = ["short.fa", "long.fa"]
             result_with_excl.total_minimizers > 0,
             "Should retain pUC19-unique minimizers"
         );
+    }
+
+    /// Exercises the owned-`HashSet` signature introduced in Cycle 5.
+    /// The `exclusion_set` is moved by value into the function and explicitly
+    /// dropped before consolidation. This test verifies that behavior is
+    /// preserved end-to-end (correctness) with the new signature.
+    #[test]
+    fn test_single_bucket_streaming_owned_exclusion_set_is_consumed() {
+        use std::collections::HashSet;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let phix_path = PathBuf::from("examples/phiX174.fasta");
+        let puc19_path = PathBuf::from("examples/pUC19.fasta");
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let (phix_mins, _, _) = extract_bucket_minimizers(
+            &[phix_path.clone()],
+            &project_root,
+            32,
+            10,
+            0x5555555555555555,
+            false,
+        )
+        .unwrap();
+        let exclusion_set: HashSet<u64> = phix_mins.into_iter().collect();
+        let expected_len = exclusion_set.len();
+        assert!(expected_len > 0);
+
+        let combined_path = dir.join("combined.fa");
+        {
+            use std::io::Read as _;
+            let mut combined = Vec::new();
+            let mut f1 = std::fs::File::open(project_root.join(&phix_path)).unwrap();
+            f1.read_to_end(&mut combined).unwrap();
+            let mut f2 = std::fs::File::open(project_root.join(&puc19_path)).unwrap();
+            f2.read_to_end(&mut combined).unwrap();
+            std::fs::write(&combined_path, &combined).unwrap();
+        }
+
+        let output_dir = dir.join("owned_excl.ryxdi");
+        rype::parquet_index::create_index_directory(&output_dir).unwrap();
+
+        // Pass by value — the function takes ownership and must drop before consolidation.
+        let result = build_single_bucket_streaming(
+            &output_dir,
+            "TestBucket",
+            &[combined_path],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(100 * 1024 * 1024),
+            None,
+            Some(exclusion_set),
+        )
+        .unwrap();
+
+        assert!(result.total_minimizers > 0);
+        // The HashSet is moved — attempting to use `exclusion_set` below would fail to compile.
+        // This ensures ownership transfer at the type level.
+        let _ = expected_len; // kept for future-proofing; the invariant is enforced by the move above.
+    }
+
+    /// Full end-to-end regression: building a single-bucket streaming index
+    /// with subtraction produces final shards that do NOT contain any of the
+    /// excluded minimizers, the manifest is non-overlapping, and total
+    /// minimizers matches expected.
+    #[test]
+    fn test_streaming_single_bucket_with_subtraction_final_shards_exclude_set() {
+        use rype::parquet_index::{files, merge::read_shard_pairs};
+        use rype::ShardedInvertedIndex;
+        use std::collections::HashSet;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let phix_path = PathBuf::from("examples/phiX174.fasta");
+        let puc19_path = PathBuf::from("examples/pUC19.fasta");
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        // Exclusion set from phiX174 minimizers.
+        let (phix_mins, _, _) = extract_bucket_minimizers(
+            &[phix_path.clone()],
+            &project_root,
+            32,
+            10,
+            0x5555555555555555,
+            false,
+        )
+        .unwrap();
+        let exclusion_set: HashSet<u64> = phix_mins.into_iter().collect();
+        let exclusion_for_verify = exclusion_set.clone();
+
+        // Combined phiX + pUC19 input.
+        let combined_path = dir.join("combined.fa");
+        {
+            use std::io::Read as _;
+            let mut combined = Vec::new();
+            let mut f1 = std::fs::File::open(project_root.join(&phix_path)).unwrap();
+            f1.read_to_end(&mut combined).unwrap();
+            let mut f2 = std::fs::File::open(project_root.join(&puc19_path)).unwrap();
+            f2.read_to_end(&mut combined).unwrap();
+            std::fs::write(&combined_path, &combined).unwrap();
+        }
+
+        let output_dir = dir.join("sub_e2e.ryxdi");
+        rype::parquet_index::create_index_directory(&output_dir).unwrap();
+
+        let result = build_single_bucket_streaming_oriented(
+            &output_dir,
+            "TestBucket",
+            &[combined_path],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(100 * 1024 * 1024),
+            None,
+            Some(exclusion_set),
+        )
+        .unwrap();
+
+        // Write manifest so the index is loadable.
+        write_streaming_manifest(&output_dir, &result, 32, 10, 0x5555555555555555).unwrap();
+
+        // 1. Manifest invariants.
+        let index = ShardedInvertedIndex::open(&output_dir).unwrap();
+        let manifest = index.manifest();
+        assert!(
+            !manifest.has_overlapping_shards,
+            "streaming consolidation must produce non-overlapping shards"
+        );
+        for w in manifest.shards.windows(2) {
+            assert!(
+                w[0].min_end <= w[1].min_start,
+                "shards must be range-partitioned: {:?} → {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        for (i, s) in manifest.shards.iter().enumerate() {
+            assert_eq!(
+                s.shard_id as usize, i,
+                "shard ids must be contiguous from 0"
+            );
+        }
+
+        // 2. No excluded minimizer appears in any final shard.
+        let mut total_entries: u64 = 0;
+        for s in &manifest.shards {
+            let path = output_dir
+                .join("inverted")
+                .join(files::inverted_shard(s.shard_id));
+            let pairs = read_shard_pairs(&path).unwrap();
+            total_entries += pairs.len() as u64;
+            for (m, _) in &pairs {
+                assert!(
+                    !exclusion_for_verify.contains(m),
+                    "minimizer {} was excluded but appears in shard {}",
+                    m,
+                    s.shard_id
+                );
+            }
+        }
+
+        // 3. total_minimizers matches on-disk entry count.
+        assert_eq!(
+            total_entries, result.total_minimizers,
+            "reported total_minimizers must match on-disk entries"
+        );
+
+        assert!(
+            result.total_minimizers > 0,
+            "pUC19-unique minimizers must remain"
+        );
+    }
+
+    #[test]
+    fn test_single_bucket_streaming_oriented_owned_exclusion_set_is_consumed() {
+        use std::collections::HashSet;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let phix_path = PathBuf::from("examples/phiX174.fasta");
+        let puc19_path = PathBuf::from("examples/pUC19.fasta");
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let (phix_mins, _, _) = extract_bucket_minimizers(
+            &[phix_path.clone()],
+            &project_root,
+            32,
+            10,
+            0x5555555555555555,
+            false,
+        )
+        .unwrap();
+        let exclusion_set: HashSet<u64> = phix_mins.into_iter().collect();
+        assert!(!exclusion_set.is_empty());
+
+        let combined_path = dir.join("combined.fa");
+        {
+            use std::io::Read as _;
+            let mut combined = Vec::new();
+            let mut f1 = std::fs::File::open(project_root.join(&phix_path)).unwrap();
+            f1.read_to_end(&mut combined).unwrap();
+            let mut f2 = std::fs::File::open(project_root.join(&puc19_path)).unwrap();
+            f2.read_to_end(&mut combined).unwrap();
+            std::fs::write(&combined_path, &combined).unwrap();
+        }
+
+        let output_dir = dir.join("oriented_owned_excl.ryxdi");
+        rype::parquet_index::create_index_directory(&output_dir).unwrap();
+
+        let result = build_single_bucket_streaming_oriented(
+            &output_dir,
+            "TestBucket",
+            &[combined_path],
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            Some(100 * 1024 * 1024),
+            None,
+            Some(exclusion_set),
+        )
+        .unwrap();
+
+        assert!(result.total_minimizers > 0);
     }
 }
