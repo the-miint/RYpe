@@ -7,8 +7,9 @@ use anyhow::Result;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::constants::{
     COO_MERGE_JOIN_MAX_BUCKETS, DENSE_ACCUMULATOR_MAX_BUCKETS, ESTIMATED_MINIMIZERS_PER_SEQUENCE,
@@ -39,6 +40,33 @@ use super::merge_join::{
 enum LoadedShard {
     Coo(Vec<(u64, u32)>),
     Csr(InvertedIndex),
+}
+
+/// RAII guard that flips a stop flag when dropped — ensures the progress
+/// reporter thread exits even on error paths inside `thread::scope`.
+struct StopGuard<'a>(&'a AtomicBool);
+impl Drop for StopGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Format a duration in seconds as a human-readable string ("Hh Mm Ss" or "Mm Ss").
+fn fmt_duration_secs(secs: f64) -> String {
+    if !secs.is_finite() || secs < 0.0 {
+        return "?".to_string();
+    }
+    let total = secs.round() as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{}h{:02}m{:02}s", h, m, s)
+    } else if m > 0 {
+        format!("{}m{:02}s", m, s)
+    } else {
+        format!("{}s", s)
+    }
 }
 
 /// Estimate minimizers per query from the first record in a batch.
@@ -247,9 +275,18 @@ fn classify_shard_loop<A: HitAccumulator>(
         // per-shard allocation after the first shard.
         let mut seen: Vec<(u64, u32)> = Vec::new();
         let mut merge_buf: Vec<(u64, u32)> = Vec::new();
+        let total_shards = manifest.shards.len();
+        let mut shard_idx = 0usize;
+        let mut total_pairs_processed: u64 = 0;
         for received in rx {
             let (shard, load_ms) = received?;
             total_shard_load_ms += load_ms;
+            shard_idx += 1;
+
+            let pairs_in_shard: u64 = match &shard {
+                LoadedShard::Coo(p) => p.len() as u64,
+                LoadedShard::Csr(idx) => idx.num_bucket_entries() as u64,
+            };
 
             let t_merge = Instant::now();
             match shard {
@@ -270,7 +307,28 @@ fn classify_shard_loop<A: HitAccumulator>(
                     merge_join_csr(query_idx, idx, &mut accumulator, &query_minimizers);
                 }
             }
-            total_merge_join_ms += t_merge.elapsed().as_millis();
+            let merge_ms = t_merge.elapsed().as_millis();
+            total_merge_join_ms += merge_ms;
+            total_pairs_processed += pairs_in_shard;
+
+            let elapsed = t_start.elapsed().as_secs_f64();
+            let eta = if shard_idx < total_shards && shard_idx > 0 {
+                let per_shard = elapsed / shard_idx as f64;
+                fmt_duration_secs((total_shards - shard_idx) as f64 * per_shard)
+            } else {
+                "0s".to_string()
+            };
+            log::info!(
+                "Classification progress: shard {}/{} done (load {}ms, merge {}ms, {} pairs), {} total pairs, elapsed {}, ETA {}",
+                shard_idx,
+                total_shards,
+                load_ms,
+                merge_ms,
+                pairs_in_shard,
+                total_pairs_processed,
+                fmt_duration_secs(elapsed),
+                eta,
+            );
         }
 
         // Join the loader thread (propagates panics)
@@ -463,46 +521,107 @@ where
     const FOLD_REDUCE_MAX_READS: usize = 500_000;
 
     let t_parallel = Instant::now();
-    let final_accumulator = if num_reads <= FOLD_REDUCE_MAX_READS {
-        // Fold/reduce: efficient for small batches (long reads).
-        // Each thread merges hits into a local accumulator immediately.
-        work_items
-            .into_par_iter()
-            .try_fold(&make_acc, |mut acc, (shard_path, rg_idx)| -> Result<A> {
-                let pairs = load_row_group_pairs(&shard_path, rg_idx, query_minimizers)?;
-                if !pairs.is_empty() {
-                    let hits = merge_join_pairs_sparse(query_idx, &pairs);
-                    for (read_idx, bucket_id, fwd, rc) in hits {
-                        acc.record_hit_counts(read_idx as usize, bucket_id, fwd, rc);
-                    }
+    let total_rgs = filtered_rg_count;
+    let rgs_done = AtomicUsize::new(0);
+    let pairs_processed = AtomicU64::new(0);
+    let stop_reporter = AtomicBool::new(false);
+
+    let final_accumulator = std::thread::scope(|scope| -> Result<A> {
+        // Background reporter: every 30s while parallel work runs, log progress.
+        // The StopGuard guarantees the reporter exits even if the parallel work
+        // returns an error early — otherwise thread::scope would deadlock.
+        let rgs_done_ref = &rgs_done;
+        let pairs_ref = &pairs_processed;
+        let stop_ref = &stop_reporter;
+        let _stop_guard = StopGuard(stop_ref);
+        let report_start = Instant::now();
+        let reporter = scope.spawn(move || {
+            let report_interval = Duration::from_secs(30);
+            let mut next_wake = report_start + report_interval;
+            while !stop_ref.load(Ordering::Relaxed) {
+                let now = Instant::now();
+                if now >= next_wake {
+                    let done = rgs_done_ref.load(Ordering::Relaxed);
+                    let pairs = pairs_ref.load(Ordering::Relaxed);
+                    let elapsed = report_start.elapsed().as_secs_f64();
+                    let pct = if total_rgs > 0 {
+                        (done as f64 / total_rgs as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    let eta = if done > 0 && total_rgs > done {
+                        let per_rg = elapsed / done as f64;
+                        fmt_duration_secs((total_rgs - done) as f64 * per_rg)
+                    } else {
+                        "?".to_string()
+                    };
+                    log::info!(
+                        "Classification progress: {}/{} row groups ({:.1}%), {} ref minimizers processed, elapsed {}, ETA {}",
+                        done,
+                        total_rgs,
+                        pct,
+                        pairs,
+                        fmt_duration_secs(elapsed),
+                        eta,
+                    );
+                    next_wake = now + report_interval;
                 }
-                Ok(acc)
-            })
-            .try_reduce(&make_acc, |mut a, b| {
-                a.merge(b);
-                Ok(a)
-            })?
-    } else {
-        // Collect+merge: efficient for large batches (millions of short reads).
-        // SparseHits are small per-read, so materializing all at once is fine.
-        let results: Result<Vec<Vec<SparseHit>>> = work_items
-            .into_par_iter()
-            .map(|(shard_path, rg_idx)| {
-                let pairs = load_row_group_pairs(&shard_path, rg_idx, query_minimizers)?;
-                Ok(merge_join_pairs_sparse(query_idx, &pairs))
-            })
-            .collect();
-        let mut acc = make_acc();
-        for rg_hits in results? {
-            if rg_hits.is_empty() {
-                continue;
+                std::thread::sleep(Duration::from_millis(500));
             }
-            for (read_idx, bucket_id, fwd, rc) in rg_hits {
-                acc.record_hit_counts(read_idx as usize, bucket_id, fwd, rc);
+        });
+
+        let acc = if num_reads <= FOLD_REDUCE_MAX_READS {
+            // Fold/reduce: efficient for small batches (long reads).
+            // Each thread merges hits into a local accumulator immediately.
+            work_items
+                .into_par_iter()
+                .try_fold(&make_acc, |mut acc, (shard_path, rg_idx)| -> Result<A> {
+                    let pairs = load_row_group_pairs(&shard_path, rg_idx, query_minimizers)?;
+                    let pair_count = pairs.len();
+                    if !pairs.is_empty() {
+                        let hits = merge_join_pairs_sparse(query_idx, &pairs);
+                        for (read_idx, bucket_id, fwd, rc) in hits {
+                            acc.record_hit_counts(read_idx as usize, bucket_id, fwd, rc);
+                        }
+                    }
+                    pairs_ref.fetch_add(pair_count as u64, Ordering::Relaxed);
+                    rgs_done_ref.fetch_add(1, Ordering::Relaxed);
+                    Ok(acc)
+                })
+                .try_reduce(&make_acc, |mut a, b| {
+                    a.merge(b);
+                    Ok(a)
+                })?
+        } else {
+            // Collect+merge: efficient for large batches (millions of short reads).
+            // SparseHits are small per-read, so materializing all at once is fine.
+            let results: Result<Vec<Vec<SparseHit>>> = work_items
+                .into_par_iter()
+                .map(|(shard_path, rg_idx)| {
+                    let pairs = load_row_group_pairs(&shard_path, rg_idx, query_minimizers)?;
+                    let pair_count = pairs.len();
+                    let hits = merge_join_pairs_sparse(query_idx, &pairs);
+                    pairs_ref.fetch_add(pair_count as u64, Ordering::Relaxed);
+                    rgs_done_ref.fetch_add(1, Ordering::Relaxed);
+                    Ok(hits)
+                })
+                .collect();
+            let mut acc = make_acc();
+            for rg_hits in results? {
+                if rg_hits.is_empty() {
+                    continue;
+                }
+                for (read_idx, bucket_id, fwd, rc) in rg_hits {
+                    acc.record_hit_counts(read_idx as usize, bucket_id, fwd, rc);
+                }
             }
-        }
-        acc
-    };
+            acc
+        };
+
+        stop_ref.store(true, Ordering::Relaxed);
+        reporter.join().expect("progress reporter thread panicked");
+        Ok(acc)
+    })?;
     log_timing(
         "parallel_rg: rg_process_total",
         t_parallel.elapsed().as_millis(),
