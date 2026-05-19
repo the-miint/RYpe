@@ -31,6 +31,7 @@ flate2 = "1.1.8"  # Gzip compression for output
 parquet = { version = "57", default-features = false, features = ["zstd", "snap", "arrow"] }
 bytes = "1.5"
 arrow = { version = "57", default-features = false }
+tempfile = "3.24.0"
 
 [dev-dependencies]
 tempfile = "3.24.0"
