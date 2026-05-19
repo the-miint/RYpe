@@ -5,3 +5,7 @@
 //! containment and length-sorted greedy clustering.
 
 pub mod containment;
+pub mod greedy;
+pub mod types;
+
+pub use types::{ClusterEdge, ClusterResult, ClusterRow, ContigInfo, ContigInput};
