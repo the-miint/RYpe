@@ -5,6 +5,7 @@
 //! containment and length-sorted greedy clustering.
 
 pub mod containment;
+pub mod edges;
 pub mod greedy;
 pub mod types;
 
