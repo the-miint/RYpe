@@ -30,6 +30,7 @@ mod types;
 
 // Public modules
 pub mod c_api;
+pub mod cluster;
 pub mod config;
 pub mod memory;
 
