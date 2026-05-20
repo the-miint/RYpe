@@ -412,3 +412,160 @@ fn test_arrow_hits_to_batch_roundtrip() -> Result<()> {
 
     Ok(())
 }
+
+// =============================================================================
+// Cluster Arrow C API roundtrip tests
+// =============================================================================
+
+use arrow::array::{RecordBatchReader, StringArray, StringBuilder};
+use arrow::ffi::FFI_ArrowSchema;
+use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow::record_batch::RecordBatchIterator;
+use rype::arrow::{cluster_result_schema, COL_CLUSTER_SEQUENCE, COL_CONTIG_ID, COL_SOURCE_MAG};
+use rype::c_api::{rype_arrow_cluster_result_schema, rype_cluster_arrow, RypeClusterConfig};
+
+fn cluster_seed_seq(len: usize, seed: u64) -> Vec<u8> {
+    let bases = [b'A', b'C', b'G', b'T'];
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (0..len)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            bases[((s >> 56) & 0b11) as usize]
+        })
+        .collect()
+}
+
+fn build_cluster_input_batch(ids: &[&str], mags: &[Option<&str>], seqs: &[Vec<u8>]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(COL_CONTIG_ID, DataType::Utf8, false),
+        Field::new(COL_SOURCE_MAG, DataType::Utf8, true),
+        Field::new(COL_CLUSTER_SEQUENCE, DataType::Binary, false),
+    ]));
+    let id_arr = StringArray::from_iter_values(ids.iter().copied());
+    let mut mag_b = StringBuilder::new();
+    for m in mags {
+        match m {
+            Some(s) => mag_b.append_value(*s),
+            None => mag_b.append_null(),
+        }
+    }
+    let seq_arr = BinaryArray::from_iter_values(seqs.iter().map(|v| v.as_slice()));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(id_arr),
+            Arc::new(mag_b.finish()),
+            Arc::new(seq_arr),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn rype_cluster_arrow_roundtrip_fragment_clusters_with_parent() -> Result<()> {
+    let a = cluster_seed_seq(20_000, 1);
+    let b = a[2_000..10_000].to_vec();
+    let c = cluster_seed_seq(20_000, 2);
+
+    let batch = build_cluster_input_batch(
+        &["A", "B", "C"],
+        &[Some("mag1"), Some("mag2"), None],
+        &[a, b, c],
+    );
+
+    // Export as FFI_ArrowArrayStream
+    let input_schema = batch.schema();
+    let batches: Vec<Result<RecordBatch, arrow::error::ArrowError>> = vec![Ok(batch)];
+    let reader = RecordBatchIterator::new(batches.into_iter(), input_schema);
+    let input_stream = Box::new(FFI_ArrowArrayStream::new(Box::new(reader)));
+    let input_stream_ptr = Box::into_raw(input_stream);
+
+    let mut out_stream = FFI_ArrowArrayStream::empty();
+    let cfg = RypeClusterConfig {
+        k: 32,
+        w: 20,
+        salt: 0x5555_5555_5555_5555,
+        min_length: 1_000,
+        threshold: 0.80,
+        min_shared: 50,
+    };
+
+    let rc = unsafe { rype_cluster_arrow(input_stream_ptr, &cfg, &mut out_stream) };
+    assert_eq!(rc, 0, "rype_cluster_arrow returned {}", rc);
+
+    // Read result batch
+    let result_reader = unsafe { ArrowArrayStreamReader::from_raw(&mut out_stream) }
+        .expect("Failed to read output stream");
+    let result_schema = result_reader.schema();
+    assert_eq!(result_schema, cluster_result_schema());
+    let batches: Vec<RecordBatch> = result_reader.collect::<Result<_, _>>()?;
+    assert_eq!(batches.len(), 1, "expected exactly one output batch");
+    let out_batch = &batches[0];
+    assert_eq!(out_batch.num_rows(), 3);
+
+    let rep = out_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let member = out_batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mag = out_batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    let mut b_absorbed_by_a = false;
+    let mut c_self_rep = false;
+    for i in 0..out_batch.num_rows() {
+        if member.value(i) == "B" {
+            assert_eq!(rep.value(i), "A");
+            b_absorbed_by_a = true;
+        }
+        if member.value(i) == "C" {
+            assert_eq!(rep.value(i), "C");
+            assert!(mag.is_null(i), "C's source_mag should be NULL");
+            c_self_rep = true;
+        }
+    }
+    assert!(b_absorbed_by_a);
+    assert!(c_self_rep);
+
+    Ok(())
+}
+
+#[test]
+fn rype_arrow_cluster_result_schema_matches_native() {
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    let rc = unsafe { rype_arrow_cluster_result_schema(&mut ffi_schema) };
+    assert_eq!(rc, 0);
+    let schema = arrow::datatypes::Schema::try_from(&ffi_schema).unwrap();
+    let expected = cluster_result_schema();
+    assert_eq!(schema.fields().len(), expected.fields().len());
+    for (a, b) in schema.fields().iter().zip(expected.fields().iter()) {
+        assert_eq!(a.name(), b.name());
+        assert_eq!(a.data_type(), b.data_type());
+        assert_eq!(a.is_nullable(), b.is_nullable());
+    }
+}
+
+#[test]
+fn rype_cluster_arrow_null_input_returns_error() {
+    let cfg = RypeClusterConfig {
+        k: 32,
+        w: 20,
+        salt: 0,
+        min_length: 1_000,
+        threshold: 0.85,
+        min_shared: 50,
+    };
+    let mut out_stream = FFI_ArrowArrayStream::empty();
+    let rc = unsafe { rype_cluster_arrow(std::ptr::null_mut(), &cfg, &mut out_stream) };
+    assert_eq!(rc, -1);
+}

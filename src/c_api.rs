@@ -2923,6 +2923,172 @@ mod arrow_ffi {
             }
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Cluster Arrow API (collect-then-emit, not streaming)
+    // -------------------------------------------------------------------------
+    //
+    // Clustering is inherently two-pass: every contig must be present before
+    // any cluster decisions can be made. `rype_cluster_arrow` therefore drains
+    // its input stream fully, concatenates into one RecordBatch, runs
+    // `cluster_arrow_batch`, and emits the result as a one-batch output stream.
+    // Memory usage is proportional to total input size — this is NOT a
+    // streaming function despite the FFI surface.
+
+    /// Single-batch RecordBatchReader used to wrap the cluster result for FFI.
+    struct SingleBatchReader {
+        schema: SchemaRef,
+        batch: Option<RecordBatch>,
+    }
+
+    impl Iterator for SingleBatchReader {
+        type Item = Result<RecordBatch, arrow::error::ArrowError>;
+        fn next(&mut self) -> Option<Self::Item> {
+            self.batch.take().map(Ok)
+        }
+    }
+
+    impl RecordBatchReader for SingleBatchReader {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+    }
+
+    /// Returns the schema for cluster result batches as an FFI_ArrowSchema.
+    ///
+    /// # Safety
+    /// `out_schema` must be a valid, non-null pointer to writable memory for
+    /// an uninitialized `FFI_ArrowSchema`. Caller is responsible for releasing
+    /// the schema per the Arrow C Data Interface.
+    ///
+    /// # Returns
+    /// 0 on success, -1 on error.
+    #[no_mangle]
+    pub unsafe extern "C" fn rype_arrow_cluster_result_schema(
+        out_schema: *mut FFI_ArrowSchema,
+    ) -> i32 {
+        if out_schema.is_null() {
+            set_last_error("out_schema is NULL".to_string());
+            return -1;
+        }
+        let schema = crate::arrow::cluster_result_schema();
+        match FFI_ArrowSchema::try_from(schema.as_ref()) {
+            Ok(ffi_schema) => {
+                std::ptr::write(out_schema, ffi_schema);
+                clear_last_error();
+                0
+            }
+            Err(e) => {
+                set_last_error(format!("Failed to export schema: {}", e));
+                -1
+            }
+        }
+    }
+
+    /// Cluster contigs from an Arrow input stream.
+    ///
+    /// COLLECT-THEN-EMIT, NOT STREAMING. The input stream is consumed in
+    /// full, concatenated, and clustered as a single batch. The output
+    /// stream emits exactly one `RecordBatch` containing all cluster rows,
+    /// then ends. Memory usage is proportional to total input size; see
+    /// `cluster_arrow_batch` for the breakdown.
+    ///
+    /// # Arguments
+    /// - `input_stream`: Arrow input stream with `contig_id` (Utf8 non-nullable),
+    ///   `sequence` (Binary/etc. non-nullable), and optional `source_mag`
+    ///   (Utf8 nullable). See `validate_cluster_input_schema` for the full
+    ///   contract.
+    /// - `config`: pointer to `RypeClusterConfig`; same validation as
+    ///   `rype_cluster`.
+    /// - `out_stream`: output stream pointer to receive results.
+    ///
+    /// # Output Schema
+    /// `rep_contig` (Utf8), `member_contig` (Utf8), `source_mag` (Utf8 nullable),
+    /// `containment` (Float64).
+    ///
+    /// # Safety
+    /// - `input_stream` ownership is transferred (it will be released).
+    /// - Caller owns `out_stream` and must release it.
+    /// - `config` must point to a valid `RypeClusterConfig`.
+    ///
+    /// # Returns
+    /// 0 on success, -1 on error. Call `rype_get_last_error()` for details.
+    #[no_mangle]
+    pub unsafe extern "C" fn rype_cluster_arrow(
+        input_stream: *mut FFI_ArrowArrayStream,
+        config: *const RypeClusterConfig,
+        out_stream: *mut FFI_ArrowArrayStream,
+    ) -> i32 {
+        if input_stream.is_null() {
+            set_last_error("input_stream is NULL".to_string());
+            return -1;
+        }
+        if out_stream.is_null() {
+            set_last_error("out_stream is NULL".to_string());
+            return -1;
+        }
+        if !is_nonnull_aligned(config) {
+            set_last_error("config is NULL or misaligned".to_string());
+            return -1;
+        }
+
+        let cfg_ref = &*config;
+        let cluster_cfg = match cluster_config_from_c(cfg_ref) {
+            Ok(c) => c,
+            Err(e) => {
+                set_last_error(format!("Invalid config: {}", e));
+                return -1;
+            }
+        };
+
+        // Drain the input stream — clustering needs all contigs at once.
+        let input_reader = match ArrowArrayStreamReader::from_raw(input_stream) {
+            Ok(r) => r,
+            Err(e) => {
+                set_last_error(format!("Failed to create stream reader: {}", e));
+                return -1;
+            }
+        };
+
+        let input_schema = input_reader.schema();
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        for batch_res in input_reader {
+            match batch_res {
+                Ok(b) => batches.push(b),
+                Err(e) => {
+                    set_last_error(format!("Failed to read input batch: {}", e));
+                    return -1;
+                }
+            }
+        }
+
+        let combined = match arrow::compute::concat_batches(&input_schema, &batches) {
+            Ok(b) => b,
+            Err(e) => {
+                set_last_error(format!("Failed to concatenate input batches: {}", e));
+                return -1;
+            }
+        };
+        drop(batches);
+
+        let result_batch = match crate::arrow::cluster_arrow_batch(&combined, &cluster_cfg) {
+            Ok(b) => b,
+            Err(e) => {
+                set_last_error(format!("Clustering failed: {}", e));
+                return -1;
+            }
+        };
+
+        let reader = SingleBatchReader {
+            schema: crate::arrow::cluster_result_schema(),
+            batch: Some(result_batch),
+        };
+        let export_stream = FFI_ArrowArrayStream::new(Box::new(reader));
+        std::ptr::write(out_stream, export_stream);
+
+        clear_last_error();
+        0
+    }
 }
 
 // Re-export Arrow FFI functions at module level when feature is enabled
