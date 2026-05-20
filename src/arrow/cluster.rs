@@ -17,10 +17,13 @@
 //! | `source_mag` | Utf8/LargeUtf8 | Yes  | MAG/assembly id the contig came from |
 //! | `sequence`   | Binary/LargeBinary/BinaryView/Utf8/LargeUtf8/Utf8View | No | DNA bytes |
 
+use arrow::array::{Float64Array, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
 use super::error::ArrowClassifyError;
+use crate::cluster::ClusterResult;
 
 /// Column name for representative contig id in cluster output.
 pub const COL_REP_CONTIG: &str = "rep_contig";
@@ -44,6 +47,55 @@ pub fn cluster_result_schema() -> SchemaRef {
         Field::new(COL_SOURCE_MAG, DataType::Utf8, true),
         Field::new(COL_CONTAINMENT, DataType::Float64, false),
     ]))
+}
+
+/// Convert a [`ClusterResult`] into an Arrow `RecordBatch` with
+/// [`cluster_result_schema`].
+///
+/// The conversion copies all strings into Arrow buffers (unavoidable —
+/// `ClusterRow` owns `String`s). For typical dereplication runs (one row per
+/// input contig) this is bounded by the input size, not the all-vs-all space.
+pub fn cluster_result_to_record_batch(
+    result: &ClusterResult,
+) -> Result<RecordBatch, ArrowClassifyError> {
+    let schema = cluster_result_schema();
+
+    if result.rows.is_empty() {
+        return Ok(RecordBatch::new_empty(schema));
+    }
+
+    let n = result.rows.len();
+    let mut rep = StringBuilder::with_capacity(n, n * 16);
+    let mut member = StringBuilder::with_capacity(n, n * 16);
+    let mut mag = StringBuilder::with_capacity(n, n * 16);
+    let mut containment = Vec::with_capacity(n);
+
+    for row in &result.rows {
+        rep.append_value(&row.rep_contig);
+        member.append_value(&row.member_contig);
+        match &row.source_mag {
+            Some(m) => mag.append_value(m),
+            None => mag.append_null(),
+        }
+        containment.push(row.containment);
+    }
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(rep.finish()) as Arc<dyn arrow::array::Array>,
+            Arc::new(member.finish()),
+            Arc::new(mag.finish()),
+            Arc::new(Float64Array::from(containment)),
+        ],
+    )
+    .map_err(ArrowClassifyError::from)
+}
+
+/// Helper so callers can construct an empty result batch with the correct
+/// schema without going through a `ClusterResult`.
+pub fn empty_cluster_result_batch() -> RecordBatch {
+    RecordBatch::new_empty(cluster_result_schema())
 }
 
 /// Check if a DataType is a valid string type for contig ids / source MAGs.
@@ -219,5 +271,85 @@ mod tests {
             Field::new("ignored_extra", DataType::Int64, true),
         ]);
         assert!(validate_cluster_input_schema(&schema).is_ok());
+    }
+
+    use crate::cluster::ClusterRow;
+    use arrow::array::Array;
+
+    fn row(rep: &str, member: &str, mag: Option<&str>, c: f64) -> ClusterRow {
+        ClusterRow {
+            rep_contig: rep.to_string(),
+            member_contig: member.to_string(),
+            source_mag: mag.map(|s| s.to_string()),
+            containment: c,
+        }
+    }
+
+    #[test]
+    fn round_trip_three_row_result() {
+        let result = ClusterResult {
+            rows: vec![
+                row("A", "A", Some("mag1"), 1.0),
+                row("A", "B", Some("mag2"), 0.93),
+                row("C", "C", None, 1.0),
+            ],
+        };
+
+        let batch = cluster_result_to_record_batch(&result).unwrap();
+
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.schema(), cluster_result_schema());
+
+        let rep = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let member = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let mag = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let containment = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+
+        assert_eq!(rep.value(0), "A");
+        assert_eq!(member.value(0), "A");
+        assert_eq!(mag.value(0), "mag1");
+        assert!(!mag.is_null(0));
+        assert_eq!(containment.value(0), 1.0);
+
+        assert_eq!(rep.value(1), "A");
+        assert_eq!(member.value(1), "B");
+        assert_eq!(mag.value(1), "mag2");
+        assert!((containment.value(1) - 0.93).abs() < 1e-12);
+
+        assert_eq!(rep.value(2), "C");
+        assert_eq!(member.value(2), "C");
+        assert!(mag.is_null(2), "source_mag should be NULL when None");
+        assert_eq!(containment.value(2), 1.0);
+    }
+
+    #[test]
+    fn empty_result_produces_zero_row_batch_with_correct_schema() {
+        let batch = cluster_result_to_record_batch(&ClusterResult::default()).unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.schema(), cluster_result_schema());
+    }
+
+    #[test]
+    fn empty_helper_matches_conversion_of_empty_result() {
+        let from_helper = empty_cluster_result_batch();
+        let from_conversion = cluster_result_to_record_batch(&ClusterResult::default()).unwrap();
+        assert_eq!(from_helper.schema(), from_conversion.schema());
+        assert_eq!(from_helper.num_rows(), from_conversion.num_rows());
     }
 }

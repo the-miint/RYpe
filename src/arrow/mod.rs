@@ -83,8 +83,9 @@ mod stream;
 
 // Re-export public API
 pub use cluster::{
-    cluster_result_schema, validate_cluster_input_schema, COL_CLUSTER_SEQUENCE, COL_CONTAINMENT,
-    COL_CONTIG_ID, COL_MEMBER_CONTIG, COL_REP_CONTIG, COL_SOURCE_MAG,
+    cluster_result_schema, cluster_result_to_record_batch, empty_cluster_result_batch,
+    validate_cluster_input_schema, COL_CLUSTER_SEQUENCE, COL_CONTAINMENT, COL_CONTIG_ID,
+    COL_MEMBER_CONTIG, COL_REP_CONTIG, COL_SOURCE_MAG,
 };
 pub use error::ArrowClassifyError;
 pub use extraction::{
