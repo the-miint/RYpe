@@ -1775,3 +1775,209 @@ fn test_calculate_batch_config_capped_path_memory_fields() -> Result<()> {
     rype_index_free(idx);
     Ok(())
 }
+
+// =============================================================================
+// Cluster API tests
+// =============================================================================
+
+use rype::c_api::{rype_cluster, rype_cluster_results_free, RypeClusterConfig, RypeClusterInput};
+
+/// Deterministic pseudo-random DNA, seeded so tests are reproducible.
+fn cluster_seq_from_seed(len: usize, seed: u64) -> Vec<u8> {
+    let bases = [b'A', b'C', b'G', b'T'];
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (0..len)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            bases[((s >> 56) & 0b11) as usize]
+        })
+        .collect()
+}
+
+fn relaxed_c_cluster_cfg() -> RypeClusterConfig {
+    RypeClusterConfig {
+        k: 32,
+        w: 20,
+        salt: 0x5555_5555_5555_5555,
+        min_length: 1_000,
+        threshold: 0.80,
+        min_shared: 50,
+    }
+}
+
+#[test]
+fn cluster_c_api_fragment_of_genome_clusters_with_parent() -> Result<()> {
+    let a = cluster_seq_from_seed(20_000, 1);
+    let b = a[2_000..10_000].to_vec();
+    let c = cluster_seq_from_seed(20_000, 2);
+
+    let id_a = CString::new("A").unwrap();
+    let id_b = CString::new("B").unwrap();
+    let id_c = CString::new("C").unwrap();
+    let mag_1 = CString::new("mag1").unwrap();
+    let mag_2 = CString::new("mag2").unwrap();
+
+    let inputs = vec![
+        RypeClusterInput {
+            id: id_a.as_ptr(),
+            source_mag: mag_1.as_ptr(),
+            sequence: a.as_ptr() as *const i8,
+            sequence_len: a.len(),
+        },
+        RypeClusterInput {
+            id: id_b.as_ptr(),
+            source_mag: mag_2.as_ptr(),
+            sequence: b.as_ptr() as *const i8,
+            sequence_len: b.len(),
+        },
+        RypeClusterInput {
+            id: id_c.as_ptr(),
+            source_mag: ptr::null(),
+            sequence: c.as_ptr() as *const i8,
+            sequence_len: c.len(),
+        },
+    ];
+
+    let cfg = relaxed_c_cluster_cfg();
+    let result_ptr = rype_cluster(inputs.as_ptr(), inputs.len(), &cfg);
+    assert!(!result_ptr.is_null(), "rype_cluster returned NULL");
+
+    let result = unsafe { &*result_ptr };
+    assert_eq!(result.len, 3, "expected 3 rows, got {}", result.len);
+
+    let rows = unsafe { std::slice::from_raw_parts(result.data, result.len) };
+
+    let mut found_a_rep = false;
+    let mut b_absorbed_by_a = false;
+    let mut c_self_rep = false;
+
+    for row in rows {
+        let rep = unsafe { std::ffi::CStr::from_ptr(row.rep_contig) }
+            .to_str()
+            .unwrap();
+        let member = unsafe { std::ffi::CStr::from_ptr(row.member_contig) }
+            .to_str()
+            .unwrap();
+        let mag = if row.source_mag.is_null() {
+            None
+        } else {
+            Some(
+                unsafe { std::ffi::CStr::from_ptr(row.source_mag) }
+                    .to_str()
+                    .unwrap(),
+            )
+        };
+        if rep == "A" && member == "A" {
+            found_a_rep = true;
+            assert!((row.containment - 1.0).abs() < 1e-12);
+            assert_eq!(mag, Some("mag1"));
+        }
+        if rep == "A" && member == "B" {
+            b_absorbed_by_a = true;
+            assert!(row.containment >= 0.80);
+            assert_eq!(mag, Some("mag2"));
+        }
+        if rep == "C" && member == "C" {
+            c_self_rep = true;
+            assert!((row.containment - 1.0).abs() < 1e-12);
+            assert!(mag.is_none(), "C's source_mag should be NULL");
+        }
+    }
+
+    assert!(found_a_rep, "A should be a representative");
+    assert!(b_absorbed_by_a, "B should be absorbed by A");
+    assert!(c_self_rep, "C should be its own representative");
+
+    rype_cluster_results_free(result_ptr);
+    Ok(())
+}
+
+#[test]
+fn cluster_c_api_empty_input_returns_empty_array() {
+    let cfg = relaxed_c_cluster_cfg();
+    let result_ptr = rype_cluster(ptr::null(), 0, &cfg);
+    assert!(!result_ptr.is_null());
+    let result = unsafe { &*result_ptr };
+    assert_eq!(result.len, 0);
+    assert!(result.data.is_null());
+    rype_cluster_results_free(result_ptr);
+}
+
+#[test]
+fn cluster_c_api_null_config_returns_null_and_sets_error() {
+    let result_ptr = rype_cluster(ptr::null(), 0, ptr::null());
+    assert!(result_ptr.is_null());
+    let err = unsafe { std::ffi::CStr::from_ptr(rype_get_last_error()) }
+        .to_str()
+        .unwrap();
+    assert!(
+        err.contains("config"),
+        "expected config error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn cluster_c_api_invalid_k_returns_null() {
+    let cfg = RypeClusterConfig {
+        k: 17, // invalid; must be 16/32/64
+        w: 20,
+        salt: 0,
+        min_length: 1_000,
+        threshold: 0.85,
+        min_shared: 50,
+    };
+    let result_ptr = rype_cluster(ptr::null(), 0, &cfg);
+    assert!(result_ptr.is_null());
+    let err = unsafe { std::ffi::CStr::from_ptr(rype_get_last_error()) }
+        .to_str()
+        .unwrap();
+    assert!(err.contains("k must be"), "expected k error, got: {}", err);
+}
+
+#[test]
+fn cluster_c_api_invalid_threshold_returns_null() {
+    let cfg = RypeClusterConfig {
+        k: 32,
+        w: 20,
+        salt: 0,
+        min_length: 1_000,
+        threshold: 1.5, // invalid; must be in (0, 1]
+        min_shared: 50,
+    };
+    let result_ptr = rype_cluster(ptr::null(), 0, &cfg);
+    assert!(result_ptr.is_null());
+    let err = unsafe { std::ffi::CStr::from_ptr(rype_get_last_error()) }
+        .to_str()
+        .unwrap();
+    assert!(
+        err.contains("threshold"),
+        "expected threshold error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn cluster_c_api_null_id_returns_null() {
+    let seq = cluster_seq_from_seed(5_000, 1);
+    let input = RypeClusterInput {
+        id: ptr::null(),
+        source_mag: ptr::null(),
+        sequence: seq.as_ptr() as *const i8,
+        sequence_len: seq.len(),
+    };
+    let cfg = relaxed_c_cluster_cfg();
+    let result_ptr = rype_cluster(&input, 1, &cfg);
+    assert!(result_ptr.is_null());
+    let err = unsafe { std::ffi::CStr::from_ptr(rype_get_last_error()) }
+        .to_str()
+        .unwrap();
+    assert!(err.contains("id"), "expected id error, got: {}", err);
+}
+
+#[test]
+fn cluster_c_api_free_handles_null() {
+    rype_cluster_results_free(ptr::null_mut());
+}

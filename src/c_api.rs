@@ -266,6 +266,65 @@ pub struct RypeLogRatioResultArray {
     pub capacity: size_t,
 }
 
+// --- Cluster C-Compatible Structs ---
+
+/// Parameters for a single clustering run.
+///
+/// `salt` is a u64 XOR mask for the k-mer hash (see manifest format).
+/// `threshold` must be in `(0.0, 1.0]`; `k` must be 16, 32, or 64.
+/// Match the semantics of `rype::cluster::ClusterConfig`.
+#[repr(C)]
+pub struct RypeClusterConfig {
+    pub k: size_t,
+    pub w: size_t,
+    pub salt: u64,
+    pub min_length: u64,
+    pub threshold: c_double,
+    pub min_shared: u64,
+}
+
+/// One contig to be clustered.
+///
+/// Caller owns all three pointers; rype borrows them only for the duration
+/// of the `rype_cluster` call.
+///
+/// - `id`: null-terminated UTF-8 contig identifier. Must be non-NULL and unique
+///   across the input set.
+/// - `source_mag`: null-terminated UTF-8 source MAG name, or NULL for "none".
+/// - `sequence`: raw DNA bytes (not null-terminated). `sequence_len` gives
+///   the length in bytes (max 2 GB).
+#[repr(C)]
+pub struct RypeClusterInput {
+    pub id: *const c_char,
+    pub source_mag: *const c_char,
+    pub sequence: *const c_char,
+    pub sequence_len: size_t,
+}
+
+/// One row of clustering output.
+///
+/// `rep_contig` and `member_contig` are owned by rype (allocated as CStrings)
+/// and freed by `rype_cluster_results_free`. `source_mag` is NULL when the
+/// member contig had no source MAG; otherwise it is owned by rype too.
+/// `containment` is in `[0.0, 1.0]`; 1.0 for representatives' self-rows.
+#[repr(C)]
+pub struct RypeClusterRow {
+    pub rep_contig: *mut c_char,
+    pub member_contig: *mut c_char,
+    pub source_mag: *mut c_char,
+    pub containment: c_double,
+}
+
+/// Array of cluster rows returned by `rype_cluster`.
+///
+/// Free with `rype_cluster_results_free`. Do NOT call twice on the same pointer.
+#[repr(C)]
+pub struct RypeClusterRowArray {
+    pub data: *mut RypeClusterRow,
+    pub len: size_t,
+    pub capacity: size_t,
+}
+
 // --- API Functions ---
 
 /// Loads an index from disk.
@@ -1337,6 +1396,261 @@ pub extern "C" fn rype_classify_log_ratio(
 pub extern "C" fn rype_log_ratio_results_free(ptr: *mut RypeLogRatioResultArray) {
     // SAFETY: RypeLogRatioResultArray has identical layout to ResultArrayRepr<RypeLogRatioHit>.
     unsafe { free_result_array_inner(ptr as *mut ResultArrayRepr<RypeLogRatioHit>) }
+}
+
+// =============================================================================
+// Cluster API
+// =============================================================================
+//
+// Contig-level dereplication: see `rype::cluster::cluster_contigs`. No index
+// is required — buckets are built on the fly inside a temp directory and
+// torn down before this function returns.
+
+/// Validate a RypeClusterConfig and convert it to the internal form.
+fn cluster_config_from_c(cfg: &RypeClusterConfig) -> Result<crate::cluster::ClusterConfig, String> {
+    if !matches!(cfg.k, 16 | 32 | 64) {
+        return Err(format!("k must be 16, 32, or 64 (got {})", cfg.k));
+    }
+    if cfg.w == 0 {
+        return Err("w must be > 0".to_string());
+    }
+    if !cfg.threshold.is_finite() || cfg.threshold <= 0.0 || cfg.threshold > 1.0 {
+        return Err(format!(
+            "threshold must be finite in (0.0, 1.0] (got {})",
+            cfg.threshold
+        ));
+    }
+    Ok(crate::cluster::ClusterConfig {
+        k: cfg.k,
+        w: cfg.w,
+        salt: cfg.salt,
+        min_length: cfg.min_length,
+        threshold: cfg.threshold,
+        min_shared: cfg.min_shared,
+    })
+}
+
+fn c_str_to_owned(ptr: *const c_char, field: &str, idx: usize) -> Result<String, String> {
+    if ptr.is_null() {
+        return Err(format!("contig[{}].{} is NULL", idx, field));
+    }
+    let cstr = unsafe { CStr::from_ptr(ptr) };
+    cstr.to_str()
+        .map(|s| s.to_string())
+        .map_err(|e| format!("contig[{}].{} is not valid UTF-8: {}", idx, field, e))
+}
+
+/// Cluster a set of contigs.
+///
+/// # Arguments
+/// - `contigs`: pointer to an array of `num_contigs` `RypeClusterInput` structs.
+///   Caller retains ownership of all pointers.
+/// - `num_contigs`: number of entries in the array. Zero is permitted and
+///   returns an empty result.
+/// - `config`: pointer to a `RypeClusterConfig`. Must be non-NULL.
+///
+/// # Returns
+/// Pointer to an owned `RypeClusterRowArray` on success — caller must call
+/// `rype_cluster_results_free` to release it. Returns NULL on error; call
+/// `rype_get_last_error()` for the message.
+///
+/// # Safety
+/// - `contigs` must point to a valid array of `num_contigs` `RypeClusterInput`
+///   structs (or be NULL only if `num_contigs == 0`).
+/// - For each input, `id` and `sequence` must be non-NULL; `source_mag` may
+///   be NULL (treated as "no source MAG").
+/// - `sequence_len` must be the true byte length of the data at `sequence`,
+///   and no more than 2 GB.
+#[no_mangle]
+pub extern "C" fn rype_cluster(
+    contigs: *const RypeClusterInput,
+    num_contigs: size_t,
+    config: *const RypeClusterConfig,
+) -> *mut RypeClusterRowArray {
+    if !is_nonnull_aligned(config) {
+        set_last_error("config is NULL or misaligned".to_string());
+        return std::ptr::null_mut();
+    }
+    if num_contigs > 0 && !is_nonnull_aligned(contigs) {
+        set_last_error("contigs is NULL or misaligned but num_contigs > 0".to_string());
+        return std::ptr::null_mut();
+    }
+    if num_contigs > isize::MAX as size_t {
+        set_last_error("num_contigs exceeds maximum".to_string());
+        return std::ptr::null_mut();
+    }
+
+    let cfg_ref = unsafe { &*config };
+    let cluster_cfg = match cluster_config_from_c(cfg_ref) {
+        Ok(c) => c,
+        Err(e) => {
+            set_last_error(format!("Invalid config: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Convert C inputs to owned ContigInput (validates strings + length).
+    let c_inputs: &[RypeClusterInput] = if num_contigs == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(contigs, num_contigs) }
+    };
+
+    let mut inputs: Vec<crate::cluster::ContigInput> = Vec::with_capacity(num_contigs);
+    for (idx, c) in c_inputs.iter().enumerate() {
+        let id = match c_str_to_owned(c.id, "id", idx) {
+            Ok(s) => s,
+            Err(e) => {
+                set_last_error(e);
+                return std::ptr::null_mut();
+            }
+        };
+        let source_mag = if c.source_mag.is_null() {
+            None
+        } else {
+            match c_str_to_owned(c.source_mag, "source_mag", idx) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    set_last_error(e);
+                    return std::ptr::null_mut();
+                }
+            }
+        };
+        if c.sequence.is_null() {
+            set_last_error(format!("contig[{}].sequence is NULL", idx));
+            return std::ptr::null_mut();
+        }
+        if c.sequence_len == 0 {
+            set_last_error(format!("contig[{}].sequence_len is zero", idx));
+            return std::ptr::null_mut();
+        }
+        if c.sequence_len > MAX_SEQUENCE_LENGTH {
+            set_last_error(format!(
+                "contig[{}].sequence_len {} exceeds maximum {} (2GB)",
+                idx, c.sequence_len, MAX_SEQUENCE_LENGTH
+            ));
+            return std::ptr::null_mut();
+        }
+        let seq_slice = unsafe { slice::from_raw_parts(c.sequence as *const u8, c.sequence_len) };
+        inputs.push(crate::cluster::ContigInput {
+            id,
+            source_mag,
+            sequence: seq_slice.to_vec(),
+        });
+    }
+
+    let result =
+        std::panic::catch_unwind(|| crate::cluster::cluster_contigs(&inputs, &cluster_cfg));
+    let cluster_result = match result {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            set_last_error(format!("Clustering failed: {}", e));
+            return std::ptr::null_mut();
+        }
+        Err(panic_err) => {
+            let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "Unknown panic during clustering".to_string()
+            };
+            set_last_error(format!("Clustering panicked: {}", msg));
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Convert ClusterResult rows into C-owned RypeClusterRows. Each string is
+    // allocated as a CString and handed out as a raw pointer; rype_cluster_results_free
+    // reconstructs them with CString::from_raw to release.
+    let mut c_rows: Vec<RypeClusterRow> = Vec::with_capacity(cluster_result.rows.len());
+    for row in cluster_result.rows {
+        let rep = match CString::new(row.rep_contig) {
+            Ok(c) => c.into_raw(),
+            Err(e) => {
+                set_last_error(format!("rep_contig contains NUL byte: {}", e));
+                free_c_rows(c_rows);
+                return std::ptr::null_mut();
+            }
+        };
+        let member = match CString::new(row.member_contig) {
+            Ok(c) => c.into_raw(),
+            Err(e) => {
+                set_last_error(format!("member_contig contains NUL byte: {}", e));
+                unsafe { drop(CString::from_raw(rep)) };
+                free_c_rows(c_rows);
+                return std::ptr::null_mut();
+            }
+        };
+        let mag = match row.source_mag {
+            None => std::ptr::null_mut(),
+            Some(s) => match CString::new(s) {
+                Ok(c) => c.into_raw(),
+                Err(e) => {
+                    set_last_error(format!("source_mag contains NUL byte: {}", e));
+                    unsafe { drop(CString::from_raw(rep)) };
+                    unsafe { drop(CString::from_raw(member)) };
+                    free_c_rows(c_rows);
+                    return std::ptr::null_mut();
+                }
+            },
+        };
+        c_rows.push(RypeClusterRow {
+            rep_contig: rep,
+            member_contig: member,
+            source_mag: mag,
+            containment: row.containment,
+        });
+    }
+
+    let len = c_rows.len();
+    let capacity = c_rows.capacity();
+    let data = if c_rows.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        let ptr = c_rows.as_mut_ptr();
+        std::mem::forget(c_rows);
+        ptr
+    };
+
+    clear_last_error();
+    Box::into_raw(Box::new(RypeClusterRowArray {
+        data,
+        len,
+        capacity,
+    }))
+}
+
+/// Free the owned strings inside a partially-built Vec<RypeClusterRow>.
+/// Used only on the failure path inside `rype_cluster`.
+fn free_c_rows(rows: Vec<RypeClusterRow>) {
+    for r in rows {
+        if !r.rep_contig.is_null() {
+            unsafe { drop(CString::from_raw(r.rep_contig)) };
+        }
+        if !r.member_contig.is_null() {
+            unsafe { drop(CString::from_raw(r.member_contig)) };
+        }
+        if !r.source_mag.is_null() {
+            unsafe { drop(CString::from_raw(r.source_mag)) };
+        }
+    }
+}
+
+/// Free a cluster result array. NULL is safe to pass.
+/// Do NOT call twice on the same pointer (undefined behavior).
+#[no_mangle]
+pub extern "C" fn rype_cluster_results_free(ptr: *mut RypeClusterRowArray) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let array = Box::from_raw(ptr);
+        if !array.data.is_null() {
+            let rows = Vec::from_raw_parts(array.data, array.len, array.capacity);
+            free_c_rows(rows);
+        }
+    }
 }
 
 #[no_mangle]
