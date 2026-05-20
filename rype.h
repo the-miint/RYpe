@@ -1581,8 +1581,13 @@ int rype_extract_strand_minimizers_arrow(
 //
 // rype_cluster_arrow() consumes its input stream IN FULL, concatenates all
 // batches into a single RecordBatch, runs cluster_arrow_batch, and emits a
-// one-batch output stream. Memory usage is proportional to total input size
-// (see rype_cluster's documentation for the 3-4x peak breakdown).
+// one-batch output stream. Memory usage is proportional to total input size,
+// with a slightly higher peak than rype_cluster (~4-5x of total input
+// sequence size): concat_batches transiently holds both the per-batch Vec
+// and the concatenated output before the per-batch Vec can be released,
+// on top of the same 3-4x copy chain rype_cluster pays. Ownership of
+// input_stream is transferred to rype on EVERY code path (success or
+// error); the caller must not release input_stream itself.
 //
 // ## Input Schema
 //

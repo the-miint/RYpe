@@ -3027,25 +3027,28 @@ mod arrow_ffi {
             set_last_error("out_stream is NULL".to_string());
             return -1;
         }
+
+        // IMPORTANT: take ownership of input_stream BEFORE validating config
+        // so that on any subsequent error path the reader's Drop releases
+        // the FFI stream. This honors the documented contract that ownership
+        // of `input_stream` is transferred regardless of success/failure.
+        let input_reader = match ArrowArrayStreamReader::from_raw(input_stream) {
+            Ok(r) => r,
+            Err(e) => {
+                set_last_error(format!("Failed to create stream reader: {}", e));
+                return -1;
+            }
+        };
+
         if !is_nonnull_aligned(config) {
             set_last_error("config is NULL or misaligned".to_string());
             return -1;
         }
-
         let cfg_ref = &*config;
         let cluster_cfg = match cluster_config_from_c(cfg_ref) {
             Ok(c) => c,
             Err(e) => {
                 set_last_error(format!("Invalid config: {}", e));
-                return -1;
-            }
-        };
-
-        // Drain the input stream — clustering needs all contigs at once.
-        let input_reader = match ArrowArrayStreamReader::from_raw(input_stream) {
-            Ok(r) => r,
-            Err(e) => {
-                set_last_error(format!("Failed to create stream reader: {}", e));
                 return -1;
             }
         };
@@ -3071,10 +3074,25 @@ mod arrow_ffi {
         };
         drop(batches);
 
-        let result_batch = match crate::arrow::cluster_arrow_batch(&combined, &cluster_cfg) {
-            Ok(b) => b,
-            Err(e) => {
+        // Wrap cluster_arrow_batch in catch_unwind: it calls cluster_contigs
+        // which can panic. Unwinding through an extern "C" boundary is UB.
+        let result_batch = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::arrow::cluster_arrow_batch(&combined, &cluster_cfg)
+        })) {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
                 set_last_error(format!("Clustering failed: {}", e));
+                return -1;
+            }
+            Err(panic_err) => {
+                let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Unknown panic during clustering".to_string()
+                };
+                set_last_error(format!("Clustering panicked: {}", msg));
                 return -1;
             }
         };

@@ -1981,3 +1981,26 @@ fn cluster_c_api_null_id_returns_null() {
 fn cluster_c_api_free_handles_null() {
     rype_cluster_results_free(ptr::null_mut());
 }
+
+#[test]
+fn cluster_c_api_zero_sequence_len_returns_null() {
+    let seq = cluster_seq_from_seed(5_000, 1);
+    let id = CString::new("zerolen").unwrap();
+    let input = RypeClusterInput {
+        id: id.as_ptr(),
+        source_mag: ptr::null(),
+        sequence: seq.as_ptr() as *const i8,
+        sequence_len: 0,
+    };
+    let cfg = relaxed_c_cluster_cfg();
+    let result_ptr = rype_cluster(&input, 1, &cfg);
+    assert!(result_ptr.is_null());
+    let err = unsafe { std::ffi::CStr::from_ptr(rype_get_last_error()) }
+        .to_str()
+        .unwrap();
+    assert!(
+        err.contains("sequence_len is zero"),
+        "expected zero-length error, got: {}",
+        err
+    );
+}
