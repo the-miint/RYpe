@@ -17,13 +17,16 @@
 //! | `source_mag` | Utf8/LargeUtf8 | Yes  | MAG/assembly id the contig came from |
 //! | `sequence`   | Binary/LargeBinary/BinaryView/Utf8/LargeUtf8/Utf8View | No | DNA bytes |
 
-use arrow::array::{Float64Array, StringBuilder};
+use arrow::array::{
+    Array, BinaryArray, BinaryViewArray, Float64Array, LargeBinaryArray, LargeStringArray,
+    StringArray, StringBuilder, StringViewArray,
+};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
 use super::error::ArrowClassifyError;
-use crate::cluster::ClusterResult;
+use crate::cluster::{cluster_contigs, ClusterConfig, ClusterResult, ContigInput};
 
 /// Column name for representative contig id in cluster output.
 pub const COL_REP_CONTIG: &str = "rep_contig";
@@ -96,6 +99,158 @@ pub fn cluster_result_to_record_batch(
 /// schema without going through a `ClusterResult`.
 pub fn empty_cluster_result_batch() -> RecordBatch {
     RecordBatch::new_empty(cluster_result_schema())
+}
+
+/// Convert a cluster-input `RecordBatch` into the owned `ContigInput` form.
+///
+/// String and byte slices are copied out of Arrow buffers because
+/// [`ContigInput`] owns its data. For clustering this is fine — the
+/// orchestrator holds all input data in memory anyway. Returns an error if
+/// `contig_id` or `sequence` is null in any row.
+fn batch_to_contig_inputs(batch: &RecordBatch) -> Result<Vec<ContigInput>, ArrowClassifyError> {
+    validate_cluster_input_schema(batch.schema().as_ref())?;
+
+    let num_rows = batch.num_rows();
+    if num_rows == 0 {
+        return Ok(Vec::new());
+    }
+
+    let id_idx = batch
+        .schema()
+        .index_of(COL_CONTIG_ID)
+        .map_err(|_| ArrowClassifyError::ColumnNotFound(COL_CONTIG_ID.into()))?;
+    let seq_idx = batch
+        .schema()
+        .index_of(COL_CLUSTER_SEQUENCE)
+        .map_err(|_| ArrowClassifyError::ColumnNotFound(COL_CLUSTER_SEQUENCE.into()))?;
+    let mag_idx = batch.schema().index_of(COL_SOURCE_MAG).ok();
+
+    let id_col = batch.column(id_idx);
+    let seq_col = batch.column(seq_idx);
+    let mag_col = mag_idx.map(|i| batch.column(i).clone());
+
+    let mut out = Vec::with_capacity(num_rows);
+    for i in 0..num_rows {
+        let id_bytes = string_value_at(id_col, i, COL_CONTIG_ID)?;
+        let id = std::str::from_utf8(id_bytes)
+            .map_err(|e| {
+                ArrowClassifyError::Classification(format!(
+                    "{} row {} is not valid UTF-8: {}",
+                    COL_CONTIG_ID, i, e
+                ))
+            })?
+            .to_string();
+
+        let source_mag = match &mag_col {
+            Some(col) => {
+                if col.is_null(i) {
+                    None
+                } else {
+                    let bytes = string_value_at(col.as_ref(), i, COL_SOURCE_MAG)?;
+                    let s = std::str::from_utf8(bytes)
+                        .map_err(|e| {
+                            ArrowClassifyError::Classification(format!(
+                                "{} row {} is not valid UTF-8: {}",
+                                COL_SOURCE_MAG, i, e
+                            ))
+                        })?
+                        .to_string();
+                    Some(s)
+                }
+            }
+            None => None,
+        };
+
+        if seq_col.is_null(i) {
+            return Err(ArrowClassifyError::Classification(format!(
+                "{} is null in row {}",
+                COL_CLUSTER_SEQUENCE, i
+            )));
+        }
+        let sequence = bytes_value_at(seq_col.as_ref(), i, COL_CLUSTER_SEQUENCE)?.to_vec();
+
+        out.push(ContigInput {
+            id,
+            source_mag,
+            sequence,
+        });
+    }
+
+    Ok(out)
+}
+
+fn string_value_at<'a>(
+    col: &'a dyn Array,
+    i: usize,
+    col_name: &str,
+) -> Result<&'a [u8], ArrowClassifyError> {
+    if col.is_null(i) {
+        return Err(ArrowClassifyError::Classification(format!(
+            "{} is null in row {}",
+            col_name, i
+        )));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+        return Ok(a.value(i).as_bytes());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(a.value(i).as_bytes());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(a.value(i).as_bytes());
+    }
+    Err(ArrowClassifyError::TypeError {
+        column: col_name.into(),
+        expected: "Utf8, LargeUtf8, or Utf8View".into(),
+        actual: format!("{:?}", col.data_type()),
+    })
+}
+
+fn bytes_value_at<'a>(
+    col: &'a dyn Array,
+    i: usize,
+    col_name: &str,
+) -> Result<&'a [u8], ArrowClassifyError> {
+    if let Some(a) = col.as_any().downcast_ref::<BinaryArray>() {
+        return Ok(a.value(i));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<LargeBinaryArray>() {
+        return Ok(a.value(i));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<BinaryViewArray>() {
+        return Ok(a.value(i));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+        return Ok(a.value(i).as_bytes());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(a.value(i).as_bytes());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(a.value(i).as_bytes());
+    }
+    Err(ArrowClassifyError::TypeError {
+        column: col_name.into(),
+        expected: "Binary, LargeBinary, BinaryView, Utf8, LargeUtf8, or Utf8View".into(),
+        actual: format!("{:?}", col.data_type()),
+    })
+}
+
+/// Cluster a batch of contigs presented as an Arrow `RecordBatch`.
+///
+/// Input schema: see [`validate_cluster_input_schema`].
+/// Output schema: see [`cluster_result_schema`].
+///
+/// This is the Arrow-facing entry point. It owns the workspace lifecycle
+/// (tempdir creation + cleanup) via `cluster_contigs`.
+pub fn cluster_arrow_batch(
+    batch: &RecordBatch,
+    cfg: &ClusterConfig,
+) -> Result<RecordBatch, ArrowClassifyError> {
+    let inputs = batch_to_contig_inputs(batch)?;
+    let result = cluster_contigs(&inputs, cfg)
+        .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
+    cluster_result_to_record_batch(&result)
 }
 
 /// Check if a DataType is a valid string type for contig ids / source MAGs.
@@ -351,5 +506,190 @@ mod tests {
         let from_conversion = cluster_result_to_record_batch(&ClusterResult::default()).unwrap();
         assert_eq!(from_helper.schema(), from_conversion.schema());
         assert_eq!(from_helper.num_rows(), from_conversion.num_rows());
+    }
+
+    use arrow::array::BinaryArray;
+
+    fn seq_from_seed(len: usize, seed: u64) -> Vec<u8> {
+        let bases = [b'A', b'C', b'G', b'T'];
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..len)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                bases[((s >> 56) & 0b11) as usize]
+            })
+            .collect()
+    }
+
+    fn relaxed_cfg() -> ClusterConfig {
+        ClusterConfig {
+            k: 32,
+            w: 20,
+            salt: 0x5555_5555_5555_5555,
+            min_length: 1_000,
+            threshold: 0.80,
+            min_shared: 50,
+        }
+    }
+
+    fn build_input_batch(ids: &[&str], mags: &[Option<&str>], seqs: &[Vec<u8>]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(COL_CONTIG_ID, DataType::Utf8, false),
+            Field::new(COL_SOURCE_MAG, DataType::Utf8, true),
+            Field::new(COL_CLUSTER_SEQUENCE, DataType::Binary, false),
+        ]));
+        let id_arr = StringArray::from_iter_values(ids.iter().copied());
+        let mut mag_b = StringBuilder::new();
+        for m in mags {
+            match m {
+                Some(s) => mag_b.append_value(*s),
+                None => mag_b.append_null(),
+            }
+        }
+        let seq_arr = BinaryArray::from_iter_values(seqs.iter().map(|v| v.as_slice()));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(id_arr),
+                Arc::new(mag_b.finish()),
+                Arc::new(seq_arr),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cluster_arrow_batch_matches_native_orchestrator() {
+        let a = seq_from_seed(20_000, 1);
+        let b = a[2_000..10_000].to_vec();
+        let c = seq_from_seed(20_000, 2);
+
+        let batch = build_input_batch(
+            &["A", "B", "C"],
+            &[Some("mag1"), Some("mag2"), None],
+            &[a.clone(), b.clone(), c.clone()],
+        );
+        let cfg = relaxed_cfg();
+
+        let arrow_result = cluster_arrow_batch(&batch, &cfg).unwrap();
+
+        let native = cluster_contigs(
+            &[
+                ContigInput {
+                    id: "A".to_string(),
+                    source_mag: Some("mag1".to_string()),
+                    sequence: a,
+                },
+                ContigInput {
+                    id: "B".to_string(),
+                    source_mag: Some("mag2".to_string()),
+                    sequence: b,
+                },
+                ContigInput {
+                    id: "C".to_string(),
+                    source_mag: None,
+                    sequence: c,
+                },
+            ],
+            &cfg,
+        )
+        .unwrap();
+        let native_batch = cluster_result_to_record_batch(&native).unwrap();
+
+        // Same schema, same row count, same content.
+        assert_eq!(arrow_result.schema(), native_batch.schema());
+        assert_eq!(arrow_result.num_rows(), native_batch.num_rows());
+        assert_eq!(arrow_result.num_rows(), 3);
+        for col in 0..4 {
+            assert_eq!(
+                arrow_result.column(col).len(),
+                native_batch.column(col).len(),
+                "column {} length differs",
+                col
+            );
+        }
+
+        // Sanity check the output: A should be the rep for both A and B,
+        // C is its own rep, source_mag for C is null.
+        let rep = arrow_result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let member = arrow_result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mag = arrow_result
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..arrow_result.num_rows() {
+            let m = member.value(i);
+            if m == "B" {
+                assert_eq!(rep.value(i), "A");
+            } else if m == "C" {
+                assert_eq!(rep.value(i), "C");
+                assert!(mag.is_null(i), "C's source_mag should be NULL");
+            }
+        }
+    }
+
+    #[test]
+    fn cluster_arrow_batch_works_without_source_mag_column() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(COL_CONTIG_ID, DataType::Utf8, false),
+            Field::new(COL_CLUSTER_SEQUENCE, DataType::Binary, false),
+        ]));
+        let seq = seq_from_seed(5_000, 42);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["solo"])),
+                Arc::new(BinaryArray::from_iter_values([seq.as_slice()])),
+            ],
+        )
+        .unwrap();
+
+        let out = cluster_arrow_batch(&batch, &relaxed_cfg()).unwrap();
+        assert_eq!(out.num_rows(), 1);
+        let mag = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(mag.is_null(0), "missing source_mag column -> all NULL");
+    }
+
+    #[test]
+    fn cluster_arrow_batch_rejects_missing_contig_id_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            COL_CLUSTER_SEQUENCE,
+            DataType::Binary,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(BinaryArray::from_iter_values([&b"ACGT"[..]]))],
+        )
+        .unwrap();
+        let err = cluster_arrow_batch(&batch, &relaxed_cfg()).unwrap_err();
+        assert!(matches!(err, ArrowClassifyError::ColumnNotFound(c) if c == COL_CONTIG_ID));
+    }
+
+    #[test]
+    fn cluster_arrow_batch_empty_input_yields_empty_output() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(COL_CONTIG_ID, DataType::Utf8, false),
+            Field::new(COL_CLUSTER_SEQUENCE, DataType::Binary, false),
+        ]));
+        let batch = RecordBatch::new_empty(schema);
+        let out = cluster_arrow_batch(&batch, &relaxed_cfg()).unwrap();
+        assert_eq!(out.num_rows(), 0);
+        assert_eq!(out.schema(), cluster_result_schema());
     }
 }
