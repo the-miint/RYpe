@@ -20,18 +20,19 @@ pub struct ContigInfo {
     pub id: String,
     pub source_mag: Option<String>,
     pub length: u64,
-    pub mins_count: u64,
 }
 
 /// A sparse containment edge between two contigs.
 ///
 /// Indices reference positions in the contigs slice passed alongside the
-/// edges to the greedy step. `shared` is the count of minimizers shared
-/// between query and target (recovered from rype's score after classify).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// edges to the greedy step. `score` is the containment of the query in the
+/// target (rype's classify score: `max(C(q.fwd, t), C(q.rc, t))`), and
+/// `shared` is the absolute count of shared minimizers on the winning strand.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClusterEdge {
     pub query_idx: u32,
     pub target_idx: u32,
+    pub score: f64,
     pub shared: u64,
 }
 

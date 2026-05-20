@@ -34,7 +34,6 @@ arrow = { version = "57", default-features = false }
 tempfile = "3.24.0"
 
 [dev-dependencies]
-tempfile = "3.24.0"
 
 [[bin]]
 name = "debug_inverted"

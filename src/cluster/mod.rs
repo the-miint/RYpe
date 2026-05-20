@@ -77,6 +77,7 @@ pub fn cluster_contigs(inputs: &[ContigInput], cfg: &ClusterConfig) -> Result<Cl
         cfg.w,
         cfg.salt,
         cfg.threshold,
+        cfg.min_shared,
         workdir.path(),
     )?;
 
