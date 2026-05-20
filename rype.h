@@ -954,6 +954,155 @@ RypeLogRatioResultArray* rype_classify_log_ratio(
 void rype_log_ratio_results_free(RypeLogRatioResultArray* results);
 
 // ============================================================================
+// CLUSTER API
+// ============================================================================
+//
+// Contig-level dereplication using minimizer-based containment and length-
+// sorted greedy clustering. Builds a temporary on-disk inverted index per
+// call (cleaned up on return); no separate index file is required.
+//
+// ## Pipeline
+// 1. Filter contigs with length < config.min_length.
+// 2. Build a temp Parquet inverted index with one bucket per surviving contig.
+// 3. Query each contig and materialize sparse (query, target, score, shared)
+//    edges using rype's standard fwd/rc classify scoring.
+// 4. Run length-sorted greedy: longest seed wins, absorbs every unprocessed
+//    candidate whose containment score >= threshold AND whose absolute shared
+//    minimizer count >= min_shared.
+// 5. Emit one row per surviving input contig — representatives self-row at
+//    containment 1.0, members reference their rep.
+//
+// ## Thread Safety
+//
+// All cluster API functions are thread-safe (each call owns its temp
+// workdir and Rust-side workspaces). The returned RypeClusterRowArray is
+// NOT thread-safe — do not share across threads without external synchronisation.
+//
+// ## Output Semantics
+//
+// `source_mag` on each output row is the MEMBER's source MAG (not the
+// representative's), preserved from the input. NULL on output if the member
+// had no source_mag on input.
+
+/**
+ * Parameters for a single clustering run.
+ *
+ * - k:           K-mer size (must be 16, 32, or 64). Strain-level default: 64.
+ * - w:           Window size (must be > 0). Strain-level default: 50.
+ * - salt:        XOR mask for k-mer hashes. Use the same salt across related
+ *                clustering runs to keep results comparable.
+ * - min_length:  Contigs shorter than this many bytes are dropped before any
+ *                work is done; they do NOT appear in the output.
+ * - threshold:   Containment threshold in (0.0, 1.0]; a candidate is absorbed
+ *                only if its containment in the seed >= threshold. Strain-
+ *                level starting value: 0.85.
+ * - min_shared:  Absolute minimum shared-minimizer count to absorb. The
+ *                defense against tiny contigs riding on a single mobile
+ *                element. Strain-level starting value: 500.
+ */
+typedef struct {
+    size_t k;
+    size_t w;
+    uint64_t salt;
+    uint64_t min_length;
+    double threshold;
+    uint64_t min_shared;
+} RypeClusterConfig;
+
+/**
+ * One contig to be clustered. Caller owns all three string/byte pointers;
+ * rype borrows them only for the duration of the rype_cluster() call.
+ *
+ * - id:           Null-terminated UTF-8 contig identifier. Must be non-NULL
+ *                 and unique across the input set.
+ * - source_mag:   Null-terminated UTF-8 source MAG name, or NULL for "no MAG".
+ * - sequence:     Raw DNA bytes (not null-terminated). May contain any byte;
+ *                 non-DNA bases reset the k-mer window per rype's encoding.
+ * - sequence_len: Length of sequence in bytes (max 2 GB).
+ */
+typedef struct {
+    const char* id;
+    const char* source_mag;
+    const char* sequence;
+    size_t sequence_len;
+} RypeClusterInput;
+
+/**
+ * One row of clustering output.
+ *
+ * - rep_contig:    Owned by rype (CString); freed by rype_cluster_results_free.
+ * - member_contig: Owned by rype. For representatives, equals rep_contig.
+ * - source_mag:    Owned by rype, or NULL if the member had no source MAG.
+ * - containment:   Containment of the member in the representative. 1.0 for
+ *                  representatives' self-rows.
+ */
+typedef struct {
+    char* rep_contig;
+    char* member_contig;
+    char* source_mag;
+    double containment;
+} RypeClusterRow;
+
+/**
+ * Array of cluster rows returned by rype_cluster().
+ *
+ * Owned by caller after rype_cluster() returns. MUST be freed with
+ * rype_cluster_results_free() exactly once. Do NOT free individual rows
+ * or strings; do NOT call the free function twice on the same pointer.
+ */
+typedef struct {
+    RypeClusterRow* data;
+    size_t len;
+    size_t capacity;
+} RypeClusterRowArray;
+
+/**
+ * Cluster a set of contigs.
+ *
+ * @param contigs       Array of RypeClusterInput structs (may be NULL if
+ *                      num_contigs == 0).
+ * @param num_contigs   Number of entries in `contigs`.
+ * @param config        Pointer to RypeClusterConfig (must be non-NULL).
+ *
+ * @return  Non-NULL RypeClusterRowArray on success (must be freed with
+ *          rype_cluster_results_free). Returns NULL on error; call
+ *          rype_get_last_error() for details.
+ *
+ * ## Errors
+ *
+ * - config is NULL, or any field is invalid (k not in {16,32,64}, w==0,
+ *   threshold outside (0,1])
+ * - Any input has NULL id or NULL sequence
+ * - Any input.sequence_len exceeds 2 GB
+ * - id is not valid UTF-8
+ *
+ * ## Memory
+ *
+ * Peak memory during clustering is roughly 3-4x the total input sequence
+ * size (input copy + filtered clone + per-contig single-strand bucket
+ * minimizers + per-contig dual-strand query minimizers). Size inputs
+ * accordingly.
+ */
+RypeClusterRowArray* rype_cluster(
+    const RypeClusterInput* contigs,
+    size_t num_contigs,
+    const RypeClusterConfig* config
+);
+
+/**
+ * Free a cluster result array (and all the strings it owns).
+ *
+ * @param results  RypeClusterRowArray pointer, or NULL (no-op)
+ *
+ * ## Warning
+ *
+ * - Do NOT call twice on the same pointer (undefined behavior)
+ * - Do NOT access results->data after calling this function
+ * - Do NOT free individual strings — this function frees them all
+ */
+void rype_cluster_results_free(RypeClusterRowArray* results);
+
+// ============================================================================
 // ERROR HANDLING
 // ============================================================================
 
@@ -1421,6 +1570,74 @@ int rype_extract_strand_minimizers_arrow(
     size_t k,
     size_t w,
     uint64_t salt,
+    struct ArrowArrayStream* out_stream
+);
+
+// ----------------------------------------------------------------------------
+// Cluster Arrow API
+// ----------------------------------------------------------------------------
+//
+// COLLECT-THEN-EMIT, NOT STREAMING.
+//
+// rype_cluster_arrow() consumes its input stream IN FULL, concatenates all
+// batches into a single RecordBatch, runs cluster_arrow_batch, and emits a
+// one-batch output stream. Memory usage is proportional to total input size
+// (see rype_cluster's documentation for the 3-4x peak breakdown).
+//
+// ## Input Schema
+//
+// - contig_id   (Utf8/LargeUtf8/Utf8View, non-nullable) — unique contig id
+// - source_mag  (Utf8/LargeUtf8/Utf8View, nullable, optional)
+// - sequence    (Binary/LargeBinary/BinaryView/Utf8/LargeUtf8/Utf8View,
+//                non-nullable) — DNA bytes
+//
+// ## Output Schema
+//
+// - rep_contig    (Utf8, non-nullable)
+// - member_contig (Utf8, non-nullable)
+// - source_mag    (Utf8, nullable)
+// - containment   (Float64, non-nullable)
+//
+// Use rype_arrow_cluster_result_schema() to retrieve this schema as an
+// FFI_ArrowSchema for pre-allocation or validation.
+
+/**
+ * Get the output schema for Arrow cluster results.
+ *
+ * Schema: rep_contig (Utf8), member_contig (Utf8), source_mag (Utf8 nullable),
+ * containment (Float64).
+ *
+ * @param out_schema  Pointer to uninitialized ArrowSchema (caller-allocated).
+ *                    Caller is responsible for releasing it per the Arrow C
+ *                    Data Interface (call out_schema->release(out_schema)).
+ *
+ * @return  0 on success, -1 on error (call rype_get_last_error() for details).
+ */
+int rype_arrow_cluster_result_schema(struct ArrowSchema* out_schema);
+
+/**
+ * Cluster contigs from an Arrow input stream.
+ *
+ * @param input_stream  Input ArrowArrayStream with cluster-input schema.
+ *                      Ownership is transferred; the stream is released
+ *                      after consumption.
+ * @param config        Pointer to RypeClusterConfig (must be non-NULL).
+ * @param out_stream    Output ArrowArrayStream pointer (caller-allocated)
+ *                      to receive a single result batch. Caller releases.
+ *
+ * @return  0 on success, -1 on error (call rype_get_last_error() for details).
+ *
+ * ## Errors
+ *
+ * - input_stream / out_stream / config is NULL
+ * - config validation fails (see RypeClusterConfig docs)
+ * - input batch schema validation fails (nullability, types, contig_id
+ *   uniqueness, sequence length > 2 GB, null id/sequence values)
+ * - Failure to read or concatenate input batches
+ */
+int rype_cluster_arrow(
+    struct ArrowArrayStream* input_stream,
+    const RypeClusterConfig* config,
     struct ArrowArrayStream* out_stream
 );
 
