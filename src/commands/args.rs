@@ -69,9 +69,60 @@ pub enum Commands {
     #[command(subcommand)]
     Classify(ClassifyCommands),
 
+    /// Cluster contigs: minimizer-based dereplication of microbial assemblies
+    Cluster(ClusterArgs),
+
     /// Inspect minimizer details and matches (debugging)
     #[command(subcommand)]
     Inspect(InspectCommands),
+}
+
+/// Arguments for `rype cluster`.
+///
+/// Defaults target strain-level (~99% ANI) dereplication of long-read MAGs;
+/// see ClusterConfig::strain_default() in the library for the same values.
+#[derive(clap::Args, Debug, Clone)]
+pub struct ClusterArgs {
+    /// Input FASTA/FASTQ files (one per assembly/MAG). Each file is treated
+    /// as one "source MAG"; every sequence in the file becomes one contig
+    /// to be clustered. Repeat the flag to pass multiple files.
+    #[arg(short = 'r', long = "input", required = true)]
+    pub inputs: Vec<PathBuf>,
+
+    /// Output TSV path. Columns: rep_contig, member_contig, source_mag, containment.
+    #[arg(short, long)]
+    pub output: PathBuf,
+
+    /// K-mer size (must be 16, 32, or 64). Strain-level default: 64.
+    #[arg(short = 'k', long, default_value_t = 64)]
+    pub kmer_size: usize,
+
+    /// Minimizer window size. Smaller w = denser sketch = better fragment
+    /// recall. Strain-level default: 50.
+    #[arg(short = 'w', long, default_value_t = 50)]
+    pub window: usize,
+
+    /// XOR salt for hash randomization. Default matches the library preset.
+    #[arg(long, default_value_t = 0x5555_5555_5555_5555)]
+    pub salt: u64,
+
+    /// Minimum contig length in bytes. Contigs shorter than this are
+    /// silently dropped from the input.
+    #[arg(long, default_value_t = 10_000)]
+    pub min_length: u64,
+
+    /// Containment threshold in (0.0, 1.0]. A candidate contig is absorbed
+    /// into a longer seed only if its containment in the seed is at least
+    /// this value. Strain-level starting point: 0.85 — calibrate on your
+    /// data.
+    #[arg(short = 't', long, default_value_t = 0.85)]
+    pub threshold: f64,
+
+    /// Minimum number of shared minimizers (winning strand) to absorb. The
+    /// absolute defense against tiny contigs being absorbed via a single
+    /// shared mobile element. Strain-level starting point: 500.
+    #[arg(long, default_value_t = 500)]
+    pub min_shared: u64,
 }
 
 #[derive(Subcommand)]

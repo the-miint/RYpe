@@ -10,9 +10,9 @@ mod logging;
 
 use commands::{
     build_parquet_index_from_config, create_parquet_index_from_refs, inspect_matches,
-    load_index_metadata, resolve_bucket_id, run_aggregate, run_classify, run_log_ratio,
-    ClassifyAggregateArgs, ClassifyCommands, ClassifyLogRatioArgs, ClassifyRunArgs, Cli, Commands,
-    CommonClassifyArgs, IndexCommands, InspectCommands,
+    load_index_metadata, resolve_bucket_id, run_aggregate, run_classify, run_cluster,
+    run_log_ratio, ClassifyAggregateArgs, ClassifyCommands, ClassifyLogRatioArgs, ClassifyRunArgs,
+    Cli, Commands, CommonClassifyArgs, IndexCommands, InspectCommands,
 };
 
 // CLI argument definitions moved to commands/args.rs
@@ -476,6 +476,10 @@ fn main() -> Result<()> {
                 })?;
             }
         },
+
+        Commands::Cluster(cluster_args) => {
+            run_cluster(cluster_args)?;
+        }
 
         Commands::Inspect(inspect_cmd) => match inspect_cmd {
             InspectCommands::Matches {

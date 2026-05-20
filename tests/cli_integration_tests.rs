@@ -6209,3 +6209,210 @@ files = [{}]
 
     Ok(())
 }
+
+// =============================================================================
+// rype cluster CLI integration tests
+// =============================================================================
+
+/// Deterministic pseudo-random DNA for fixtures.
+fn cluster_cli_seq(len: usize, seed: u64) -> Vec<u8> {
+    let bases = [b'A', b'C', b'G', b'T'];
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (0..len)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            bases[((s >> 56) & 0b11) as usize]
+        })
+        .collect()
+}
+
+/// Write a FASTA file with the given (id, seq) entries.
+fn write_fasta(path: &Path, entries: &[(&str, &[u8])]) {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path).unwrap();
+    for (id, seq) in entries {
+        writeln!(f, ">{}", id).unwrap();
+        // Single-line sequences are simpler for needletail to handle.
+        f.write_all(seq).unwrap();
+        writeln!(f).unwrap();
+    }
+}
+
+#[test]
+fn test_cli_cluster_basic_fragment_clusters_with_parent() -> Result<()> {
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+
+    // mag_a: contains A (full 20kb genome) and B (8kb fragment of A)
+    // mag_c: contains C (independent 20kb sequence)
+    let a = cluster_cli_seq(20_000, 1);
+    let b = a[2_000..10_000].to_vec();
+    let c = cluster_cli_seq(20_000, 2);
+
+    let mag_a_path = dir.path().join("mag_a.fasta");
+    let mag_c_path = dir.path().join("mag_c.fasta");
+    write_fasta(&mag_a_path, &[("A", &a), ("B", &b)]);
+    write_fasta(&mag_c_path, &[("C", &c)]);
+
+    let output_tsv = dir.path().join("clusters.tsv");
+
+    let status = Command::new(&binary)
+        .arg("cluster")
+        .arg("--input")
+        .arg(&mag_a_path)
+        .arg("--input")
+        .arg(&mag_c_path)
+        .arg("--output")
+        .arg(&output_tsv)
+        .arg("-k")
+        .arg("32")
+        .arg("-w")
+        .arg("20")
+        .arg("--min-length")
+        .arg("1000")
+        .arg("--threshold")
+        .arg("0.80")
+        .arg("--min-shared")
+        .arg("50")
+        .status()?;
+    assert!(status.success(), "rype cluster exited with {:?}", status);
+
+    let content = std::fs::read_to_string(&output_tsv)?;
+    let lines: Vec<&str> = content.lines().collect();
+    assert!(!lines.is_empty(), "output is empty");
+    assert_eq!(
+        lines[0],
+        "rep_contig\tmember_contig\tsource_mag\tcontainment"
+    );
+
+    // Three input contigs => three data rows
+    let data_rows: Vec<&str> = lines[1..].to_vec();
+    assert_eq!(
+        data_rows.len(),
+        3,
+        "expected 3 data rows, got {}: {:?}",
+        data_rows.len(),
+        data_rows
+    );
+
+    // Verify structure: A is a rep, B is absorbed by A, C is its own rep.
+    let mut a_is_rep = false;
+    let mut b_absorbed_by_a = false;
+    let mut c_self_rep = false;
+    for row in &data_rows {
+        let cols: Vec<&str> = row.split('\t').collect();
+        assert_eq!(cols.len(), 4, "row has wrong column count: {:?}", row);
+        let rep = cols[0];
+        let member = cols[1];
+        let mag = cols[2];
+        let containment: f64 = cols[3].parse().unwrap();
+
+        if member == "mag_a::A" && rep == "mag_a::A" {
+            assert!((containment - 1.0).abs() < 1e-6);
+            assert_eq!(mag, "mag_a");
+            a_is_rep = true;
+        }
+        if member == "mag_a::B" && rep == "mag_a::A" {
+            assert!(containment >= 0.80);
+            assert_eq!(mag, "mag_a");
+            b_absorbed_by_a = true;
+        }
+        if member == "mag_c::C" && rep == "mag_c::C" {
+            assert!((containment - 1.0).abs() < 1e-6);
+            assert_eq!(mag, "mag_c");
+            c_self_rep = true;
+        }
+    }
+    assert!(a_is_rep, "A should be its own rep");
+    assert!(b_absorbed_by_a, "B should be absorbed by A");
+    assert!(c_self_rep, "C should be its own rep");
+
+    Ok(())
+}
+
+#[test]
+fn test_cli_cluster_length_filter_excludes_short_contigs() -> Result<()> {
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+
+    let long_seq = cluster_cli_seq(15_000, 1);
+    let short_seq = cluster_cli_seq(500, 2);
+
+    let fasta = dir.path().join("input.fasta");
+    write_fasta(&fasta, &[("long", &long_seq), ("short", &short_seq)]);
+
+    let output_tsv = dir.path().join("clusters.tsv");
+
+    let status = Command::new(&binary)
+        .arg("cluster")
+        .arg("--input")
+        .arg(&fasta)
+        .arg("--output")
+        .arg(&output_tsv)
+        .arg("-k")
+        .arg("32")
+        .arg("-w")
+        .arg("20")
+        .arg("--min-length")
+        .arg("1000") // 500-byte contig is below this floor
+        .arg("--threshold")
+        .arg("0.80")
+        .arg("--min-shared")
+        .arg("50")
+        .status()?;
+    assert!(status.success(), "rype cluster exited with {:?}", status);
+
+    let content = std::fs::read_to_string(&output_tsv)?;
+    let data_rows: Vec<&str> = content.lines().skip(1).collect();
+    assert_eq!(data_rows.len(), 1, "expected 1 data row (short filtered)");
+    assert!(data_rows[0].starts_with("input::long\tinput::long\t"));
+    Ok(())
+}
+
+#[test]
+fn test_cli_cluster_invalid_k_returns_error() -> Result<()> {
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+
+    let fasta = dir.path().join("x.fasta");
+    write_fasta(&fasta, &[("x", b"ACGT")]);
+
+    let output_tsv = dir.path().join("out.tsv");
+    let output = Command::new(&binary)
+        .arg("cluster")
+        .arg("--input")
+        .arg(&fasta)
+        .arg("--output")
+        .arg(&output_tsv)
+        .arg("-k")
+        .arg("17") // invalid; must be 16/32/64
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for invalid k"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("K must be"),
+        "expected K error, got: {}",
+        stderr
+    );
+    Ok(())
+}
+
+#[test]
+fn test_cli_cluster_missing_input_arg_returns_error() -> Result<()> {
+    let binary = get_binary_path();
+    let output = Command::new(&binary)
+        .arg("cluster")
+        .arg("--output")
+        .arg("/tmp/out.tsv")
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit when --input is missing"
+    );
+    Ok(())
+}
