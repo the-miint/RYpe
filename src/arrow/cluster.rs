@@ -25,8 +25,9 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
-use super::error::ArrowClassifyError;
+use super::error::{ArrowClassifyError, MAX_SEQUENCE_LENGTH};
 use crate::cluster::{cluster_contigs, ClusterConfig, ClusterResult, ContigInput};
+use std::collections::HashSet;
 
 /// Column name for representative contig id in cluster output.
 pub const COL_REP_CONTIG: &str = "rep_contig";
@@ -104,9 +105,13 @@ pub fn empty_cluster_result_batch() -> RecordBatch {
 /// Convert a cluster-input `RecordBatch` into the owned `ContigInput` form.
 ///
 /// String and byte slices are copied out of Arrow buffers because
-/// [`ContigInput`] owns its data. For clustering this is fine — the
-/// orchestrator holds all input data in memory anyway. Returns an error if
-/// `contig_id` or `sequence` is null in any row.
+/// [`ContigInput`] owns its data.
+///
+/// # Errors
+/// * `NullError` if `contig_id` or `sequence` is null in any row (and the
+///   columns are declared non-nullable per the schema validator).
+/// * `SchemaError` if two rows share the same `contig_id`.
+/// * `SequenceTooLong` if any `sequence` exceeds [`MAX_SEQUENCE_LENGTH`].
 fn batch_to_contig_inputs(batch: &RecordBatch) -> Result<Vec<ContigInput>, ArrowClassifyError> {
     validate_cluster_input_schema(batch.schema().as_ref())?;
 
@@ -127,19 +132,34 @@ fn batch_to_contig_inputs(batch: &RecordBatch) -> Result<Vec<ContigInput>, Arrow
 
     let id_col = batch.column(id_idx);
     let seq_col = batch.column(seq_idx);
-    let mag_col = mag_idx.map(|i| batch.column(i).clone());
+    let mag_col = mag_idx.map(|i| Arc::clone(batch.column(i)));
 
     let mut out = Vec::with_capacity(num_rows);
+    let mut seen: HashSet<String> = HashSet::with_capacity(num_rows);
+
     for i in 0..num_rows {
+        if id_col.is_null(i) {
+            return Err(ArrowClassifyError::NullError {
+                column: COL_CONTIG_ID.into(),
+                row: i,
+            });
+        }
         let id_bytes = string_value_at(id_col, i, COL_CONTIG_ID)?;
         let id = std::str::from_utf8(id_bytes)
             .map_err(|e| {
-                ArrowClassifyError::Classification(format!(
+                ArrowClassifyError::SchemaError(format!(
                     "{} row {} is not valid UTF-8: {}",
                     COL_CONTIG_ID, i, e
                 ))
             })?
             .to_string();
+
+        if !seen.insert(id.clone()) {
+            return Err(ArrowClassifyError::SchemaError(format!(
+                "duplicate {} '{}' at row {}",
+                COL_CONTIG_ID, id, i
+            )));
+        }
 
         let source_mag = match &mag_col {
             Some(col) => {
@@ -149,7 +169,7 @@ fn batch_to_contig_inputs(batch: &RecordBatch) -> Result<Vec<ContigInput>, Arrow
                     let bytes = string_value_at(col.as_ref(), i, COL_SOURCE_MAG)?;
                     let s = std::str::from_utf8(bytes)
                         .map_err(|e| {
-                            ArrowClassifyError::Classification(format!(
+                            ArrowClassifyError::SchemaError(format!(
                                 "{} row {} is not valid UTF-8: {}",
                                 COL_SOURCE_MAG, i, e
                             ))
@@ -162,12 +182,20 @@ fn batch_to_contig_inputs(batch: &RecordBatch) -> Result<Vec<ContigInput>, Arrow
         };
 
         if seq_col.is_null(i) {
-            return Err(ArrowClassifyError::Classification(format!(
-                "{} is null in row {}",
-                COL_CLUSTER_SEQUENCE, i
-            )));
+            return Err(ArrowClassifyError::NullError {
+                column: COL_CLUSTER_SEQUENCE.into(),
+                row: i,
+            });
         }
-        let sequence = bytes_value_at(seq_col.as_ref(), i, COL_CLUSTER_SEQUENCE)?.to_vec();
+        let seq_bytes = bytes_value_at(seq_col.as_ref(), i, COL_CLUSTER_SEQUENCE)?;
+        if seq_bytes.len() > MAX_SEQUENCE_LENGTH {
+            return Err(ArrowClassifyError::SequenceTooLong {
+                row: i,
+                length: seq_bytes.len(),
+                max_length: MAX_SEQUENCE_LENGTH,
+            });
+        }
+        let sequence = seq_bytes.to_vec();
 
         out.push(ContigInput {
             id,
@@ -243,6 +271,20 @@ fn bytes_value_at<'a>(
 ///
 /// This is the Arrow-facing entry point. It owns the workspace lifecycle
 /// (tempdir creation + cleanup) via `cluster_contigs`.
+///
+/// # Memory
+///
+/// Peak resident memory during this call is roughly **3–4× the input batch
+/// size** before the on-disk index is written, because the pipeline holds:
+/// (1) the input batch, (2) a copy of every sequence in `Vec<ContigInput>`,
+/// (3) the `filtered` clone inside `cluster_contigs`, and (4) per-contig
+/// single-strand bucket minimizers plus per-contig dual-strand query
+/// minimizers (roughly 24 bytes per minimizer, ~one minimizer per `w` bases).
+/// A 2 GB input batch can therefore peak at ~7–8 GB of live allocations.
+/// Size inputs accordingly when calling from a C-API consumer.
+///
+/// Contigs shorter than `cfg.min_length` are dropped silently — they appear
+/// in neither the cluster computation nor the output.
 pub fn cluster_arrow_batch(
     batch: &RecordBatch,
     cfg: &ClusterConfig,
@@ -277,9 +319,16 @@ fn is_sequence_type(dt: &DataType) -> bool {
 /// Validate that a schema matches the expected cluster-input schema.
 ///
 /// # Requirements
-/// - `contig_id`: Utf8 / LargeUtf8 / Utf8View, non-nullable
-/// - `source_mag`: Utf8 / LargeUtf8 / Utf8View, nullable (optional column)
-/// - `sequence`: any binary or string type, non-nullable
+/// - `contig_id`: Utf8 / LargeUtf8 / Utf8View, **non-nullable** (declared so
+///   in the schema; a row-level null would later raise `NullError`).
+/// - `sequence`: any binary or string type, **non-nullable**.
+/// - `source_mag`: Utf8 / LargeUtf8 / Utf8View, **nullable** (optional column;
+///   if declared non-nullable the schema is rejected so callers don't pass
+///   in something they can't represent).
+///
+/// Pre-validating nullability here lets a C-API consumer trust this function
+/// to fully describe the schema contract — there is no row-level surprise
+/// from a column that was declared nullable.
 pub fn validate_cluster_input_schema(schema: &Schema) -> Result<(), ArrowClassifyError> {
     match schema.column_with_name(COL_CONTIG_ID) {
         Some((_, field)) => {
@@ -289,6 +338,12 @@ pub fn validate_cluster_input_schema(schema: &Schema) -> Result<(), ArrowClassif
                     expected: "Utf8, LargeUtf8, or Utf8View".into(),
                     actual: format!("{:?}", field.data_type()),
                 });
+            }
+            if field.is_nullable() {
+                return Err(ArrowClassifyError::SchemaError(format!(
+                    "column '{}' must be declared non-nullable",
+                    COL_CONTIG_ID
+                )));
             }
         }
         None => return Err(ArrowClassifyError::ColumnNotFound(COL_CONTIG_ID.into())),
@@ -302,6 +357,12 @@ pub fn validate_cluster_input_schema(schema: &Schema) -> Result<(), ArrowClassif
                 actual: format!("{:?}", field.data_type()),
             });
         }
+        if !field.is_nullable() {
+            return Err(ArrowClassifyError::SchemaError(format!(
+                "column '{}' must be declared nullable",
+                COL_SOURCE_MAG
+            )));
+        }
     }
 
     match schema.column_with_name(COL_CLUSTER_SEQUENCE) {
@@ -313,6 +374,12 @@ pub fn validate_cluster_input_schema(schema: &Schema) -> Result<(), ArrowClassif
                         .into(),
                     actual: format!("{:?}", field.data_type()),
                 });
+            }
+            if field.is_nullable() {
+                return Err(ArrowClassifyError::SchemaError(format!(
+                    "column '{}' must be declared non-nullable",
+                    COL_CLUSTER_SEQUENCE
+                )));
             }
         }
         None => {
@@ -691,5 +758,84 @@ mod tests {
         let out = cluster_arrow_batch(&batch, &relaxed_cfg()).unwrap();
         assert_eq!(out.num_rows(), 0);
         assert_eq!(out.schema(), cluster_result_schema());
+    }
+
+    #[test]
+    fn validator_rejects_nullable_contig_id() {
+        let schema = Schema::new(vec![
+            Field::new(COL_CONTIG_ID, DataType::Utf8, true),
+            Field::new(COL_CLUSTER_SEQUENCE, DataType::Binary, false),
+        ]);
+        let err = validate_cluster_input_schema(&schema).unwrap_err();
+        assert!(matches!(err, ArrowClassifyError::SchemaError(msg) if msg.contains(COL_CONTIG_ID)));
+    }
+
+    #[test]
+    fn validator_rejects_nullable_sequence() {
+        let schema = Schema::new(vec![
+            Field::new(COL_CONTIG_ID, DataType::Utf8, false),
+            Field::new(COL_CLUSTER_SEQUENCE, DataType::Binary, true),
+        ]);
+        let err = validate_cluster_input_schema(&schema).unwrap_err();
+        assert!(
+            matches!(err, ArrowClassifyError::SchemaError(msg) if msg.contains(COL_CLUSTER_SEQUENCE))
+        );
+    }
+
+    #[test]
+    fn validator_rejects_non_nullable_source_mag() {
+        let schema = Schema::new(vec![
+            Field::new(COL_CONTIG_ID, DataType::Utf8, false),
+            Field::new(COL_SOURCE_MAG, DataType::Utf8, false),
+            Field::new(COL_CLUSTER_SEQUENCE, DataType::Binary, false),
+        ]);
+        let err = validate_cluster_input_schema(&schema).unwrap_err();
+        assert!(
+            matches!(err, ArrowClassifyError::SchemaError(msg) if msg.contains(COL_SOURCE_MAG))
+        );
+    }
+
+    #[test]
+    fn cluster_arrow_batch_rejects_duplicate_contig_id() {
+        let seq = seq_from_seed(2_000, 1);
+        let batch = build_input_batch(&["dup", "dup"], &[None, None], &[seq.clone(), seq.clone()]);
+        let err = cluster_arrow_batch(&batch, &relaxed_cfg()).unwrap_err();
+        match err {
+            ArrowClassifyError::SchemaError(msg) => {
+                assert!(
+                    msg.contains("duplicate"),
+                    "expected duplicate error, got {}",
+                    msg
+                );
+                assert!(msg.contains("dup"), "expected id in message, got {}", msg);
+            }
+            other => panic!("expected SchemaError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn all_inputs_below_min_length_yields_empty_output() {
+        // min_length is 1000 in relaxed_cfg; all sequences are 100 bytes.
+        let inputs = vec![seq_from_seed(100, 1), seq_from_seed(100, 2)];
+        let batch = build_input_batch(&["short1", "short2"], &[None, None], &inputs);
+        let out = cluster_arrow_batch(&batch, &relaxed_cfg()).unwrap();
+        assert_eq!(out.num_rows(), 0);
+        assert_eq!(out.schema(), cluster_result_schema());
+    }
+
+    #[test]
+    fn source_mag_column_present_but_all_null_emits_all_null_mags() {
+        let inputs = vec![seq_from_seed(5_000, 1), seq_from_seed(5_000, 2)];
+        let batch = build_input_batch(&["a", "b"], &[None, None], &inputs);
+        let out = cluster_arrow_batch(&batch, &relaxed_cfg()).unwrap();
+        let mag = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(out.num_rows() >= 1);
+        for i in 0..out.num_rows() {
+            assert!(mag.is_null(i), "expected null source_mag at row {}", i);
+        }
     }
 }
