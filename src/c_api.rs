@@ -1539,8 +1539,7 @@ pub extern "C" fn rype_cluster(
         });
     }
 
-    let result =
-        std::panic::catch_unwind(|| crate::cluster::cluster_contigs(&inputs, &cluster_cfg));
+    let result = std::panic::catch_unwind(|| crate::cluster::cluster_contigs(inputs, &cluster_cfg));
     let cluster_result = match result {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
@@ -2924,18 +2923,10 @@ mod arrow_ffi {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Cluster Arrow API (collect-then-emit, not streaming)
-    // -------------------------------------------------------------------------
-    //
-    // Clustering is inherently two-pass: every contig must be present before
-    // any cluster decisions can be made. `rype_cluster_arrow` therefore drains
-    // its input stream fully, concatenates into one RecordBatch, runs
-    // `cluster_arrow_batch`, and emits the result as a one-batch output stream.
-    // Memory usage is proportional to total input size — this is NOT a
-    // streaming function despite the FFI surface.
+    // Cluster Arrow API: clustering is inherently two-pass, so the input
+    // stream is drained fully before any cluster decision is made. Memory
+    // usage is proportional to total input size — not a streaming function.
 
-    /// Single-batch RecordBatchReader used to wrap the cluster result for FFI.
     struct SingleBatchReader {
         schema: SchemaRef,
         batch: Option<RecordBatch>,
@@ -3053,35 +3044,37 @@ mod arrow_ffi {
             }
         };
 
-        let input_schema = input_reader.schema();
-        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut all_inputs: Vec<crate::cluster::ContigInput> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for batch_res in input_reader {
-            match batch_res {
-                Ok(b) => batches.push(b),
+            let batch = match batch_res {
+                Ok(b) => b,
                 Err(e) => {
                     set_last_error(format!("Failed to read input batch: {}", e));
                     return -1;
                 }
-            }
-        }
-
-        let combined = match arrow::compute::concat_batches(&input_schema, &batches) {
-            Ok(b) => b,
-            Err(e) => {
-                set_last_error(format!("Failed to concatenate input batches: {}", e));
+            };
+            if let Err(e) = crate::arrow::cluster::append_batch_to_contig_inputs(
+                &batch,
+                &mut all_inputs,
+                &mut seen,
+            ) {
+                set_last_error(format!("Invalid input batch: {}", e));
                 return -1;
             }
-        };
-        drop(batches);
+        }
+        drop(seen);
 
-        // Wrap cluster_arrow_batch in catch_unwind: it calls cluster_contigs
-        // which can panic. Unwinding through an extern "C" boundary is UB.
+        // catch_unwind: cluster_contigs can panic; unwinding through extern "C" is UB.
         let result_batch = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::arrow::cluster_arrow_batch(&combined, &cluster_cfg)
+            let result = crate::cluster::cluster_contigs(all_inputs, &cluster_cfg)
+                .map_err(|e| format!("Clustering failed: {}", e))?;
+            crate::arrow::cluster_result_to_record_batch(&result)
+                .map_err(|e| format!("Result conversion failed: {}", e))
         })) {
             Ok(Ok(b)) => b,
             Ok(Err(e)) => {
-                set_last_error(format!("Clustering failed: {}", e));
+                set_last_error(e);
                 return -1;
             }
             Err(panic_err) => {

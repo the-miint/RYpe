@@ -8,6 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use needletail::parse_fastx_file;
 
 use rype::cluster::{cluster_contigs, ClusterConfig, ClusterResult, ContigInput};
+use rype::BUCKET_SOURCE_DELIM;
 
 use super::args::ClusterArgs;
 
@@ -49,9 +50,9 @@ pub fn run_cluster(args: ClusterArgs) -> Result<()> {
 
     log::info!(
         "Building cluster index and computing edges (this is the heavy phase; \
-         expect to hold ~4x total sequence size in RAM at peak)..."
+         expect to hold ~3x total sequence size in RAM at peak)..."
     );
-    let result = cluster_contigs(&inputs, &cfg).context("clustering failed")?;
+    let result = cluster_contigs(inputs, &cfg).context("clustering failed")?;
     let rep_count = result
         .rows
         .iter()
@@ -109,7 +110,7 @@ fn load_contigs_from_fastx(files: &[std::path::PathBuf]) -> Result<Vec<ContigInp
                     path.display()
                 ));
             }
-            let id = format!("{}::{}", mag, header_token);
+            let id = format!("{}{}{}", mag, BUCKET_SOURCE_DELIM, header_token);
             let sequence = rec.seq().into_owned();
             out.push(ContigInput {
                 id,

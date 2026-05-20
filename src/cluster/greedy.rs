@@ -1,36 +1,19 @@
 //! Length-sorted greedy dereplication.
 //!
-//! Pure function over a precomputed edge list and per-contig metadata.
-//! Does not allocate workspaces or perform I/O.
-//!
-//! Each input edge already carries its own `score` (containment of query in
-//! target, as computed by classify) and `shared` (absolute shared-minimizer
-//! count on the winning strand). The greedy step here just applies the two
-//! thresholds and decides who absorbs whom.
-
-use std::collections::HashMap;
+//! Pure function over a precomputed edge list and per-contig metadata; no
+//! allocation of workspaces and no I/O.
 
 use super::types::{ClusterEdge, ClusterRow, ContigInfo};
 
 /// Run length-sorted greedy dereplication.
 ///
-/// # Arguments
-/// * `edges` - Sparse `(query, target, score, shared)` edges. Self-edges are
-///   tolerated but ignored. Caller is expected to deduplicate
-///   `(query, target)` pairs; if duplicates appear, the first occurrence in
-///   internal iteration order wins.
-/// * `contigs` - All contigs participating in clustering. Indices into this
-///   slice are referenced by [`ClusterEdge`].
-/// * `threshold` - Minimum `edge.score` to absorb (containment of candidate
-///   in seed).
-/// * `min_shared` - Minimum `edge.shared` to absorb (absolute defense
-///   against tiny-contig promiscuity).
+/// One [`ClusterRow`] is emitted per input contig (complete partition).
+/// Representatives appear with `rep_contig == member_contig` and
+/// `containment == 1.0`. Within each representative, absorbed members are
+/// sorted by their original `contigs` index for deterministic output.
 ///
-/// # Output
-/// One [`ClusterRow`] per input contig (complete partition). Representatives
-/// appear with `rep_contig == member_contig` and `containment == 1.0`.
-/// Within each representative, absorbed members are sorted by their original
-/// `contigs` index for deterministic output.
+/// Self-edges in `edges` are ignored. Duplicate `(query, target)` pairs
+/// resolve to the first occurrence in iteration order.
 pub fn greedy_dereplicate(
     edges: &[ClusterEdge],
     contigs: &[ContigInfo],
@@ -42,15 +25,15 @@ pub fn greedy_dereplicate(
         return Vec::new();
     }
 
-    let mut edges_by_target: HashMap<u32, Vec<(u32, f64, u64)>> = HashMap::new();
+    let mut edges_by_target: Vec<Vec<(u32, f64, u64)>> = (0..n).map(|_| Vec::new()).collect();
     for e in edges {
         if e.query_idx == e.target_idx {
             continue;
         }
-        edges_by_target
-            .entry(e.target_idx)
-            .or_default()
-            .push((e.query_idx, e.score, e.shared));
+        let ti = e.target_idx as usize;
+        if ti < n {
+            edges_by_target[ti].push((e.query_idx, e.score, e.shared));
+        }
     }
 
     let mut order: Vec<u32> = (0..n as u32).collect();
@@ -78,9 +61,10 @@ pub fn greedy_dereplicate(
             containment: 1.0,
         });
 
-        let Some(candidates) = edges_by_target.get(&seed_idx) else {
+        let candidates = &edges_by_target[si];
+        if candidates.is_empty() {
             continue;
-        };
+        }
 
         let mut absorbed: Vec<(u32, f64)> = candidates
             .iter()

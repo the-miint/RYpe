@@ -1,34 +1,27 @@
 //! Build sparse containment edges between contigs via the existing classify
 //! pipeline.
 //!
-//! Pattern mirrors the rest of rype: each bucket stores ONE strand's
-//! minimizer set (extracted with [`extract_into`]), and each query is
-//! presented as `(fwd_mins, rc_mins)` so classify's `max(fwd_score, rc_score)`
-//! gives orientation-independent containment.
+//! Each bucket stores the single-strand minimizer set of one contig; each
+//! query is presented as `(fwd_mins, rc_mins)` so classify's
+//! `max(fwd_score, rc_score)` gives orientation-independent containment.
 //!
-//! For each `HitResult` we recover:
-//! * `score` — containment of query in target (= rype's classify score).
-//! * `shared` — absolute count of shared minimizers on the winning strand.
-//!   Because the score is `max(fwd_hits/fwd_total, rc_hits/rc_total)` and
-//!   `|fwd|` ≈ `|rc|` for non-palindromic sequences, we approximate the
-//!   winning hit count as `round(score * |fwd_mins|)`. This is exact when
-//!   fwd wins and within ~1% when rc wins.
+//! `score` is rype's classify score (containment of query in target).
+//! `shared` is approximated as `round(score * |fwd_mins|)` — exact when fwd
+//! wins, within ~1% when rc wins (for non-palindromic sequences).
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 
 use crate::{
     classify_from_extracted_minimizers, create_parquet_inverted_index, extract_dual_strand_into,
-    extract_into, BucketData, MinimizerWorkspace, ShardedInvertedIndex,
+    BucketData, MinimizerWorkspace, ShardedInvertedIndex,
 };
 
 use super::types::{ClusterEdge, ContigInfo, ContigInput};
+use super::ClusterConfig;
 
-/// Output of the edge-build step: contig metadata + sparse edges.
-///
-/// Order of `contigs` matches the input order; edge indices refer to this
-/// same ordering.
 #[derive(Debug, Clone)]
 pub struct EdgeBuildOutput {
     pub contigs: Vec<ContigInfo>,
@@ -38,71 +31,56 @@ pub struct EdgeBuildOutput {
 /// Build containment edges for a set of contigs.
 ///
 /// `workdir` must exist and be writable. A Parquet index named
-/// `cluster_index.ryxdi` is created inside it (and left behind on success
-/// for caller-managed cleanup — typically via a `tempfile::TempDir`).
-///
-/// `min_shared` is applied at edge materialization to drop tiny-shared-count
-/// edges before they reach the greedy step.
-#[allow(clippy::too_many_arguments)]
+/// `cluster_index.ryxdi` is created inside it.
 pub fn build_edges(
     inputs: &[ContigInput],
-    k: usize,
-    w: usize,
-    salt: u64,
-    threshold: f64,
-    min_shared: u64,
+    cfg: &ClusterConfig,
     workdir: &Path,
 ) -> Result<EdgeBuildOutput> {
-    let mut ws = MinimizerWorkspace::new();
-
-    // Single-strand bucket minimizers (sorted + deduplicated, ready to be
-    // handed to BucketData). Parallel dual-strand query minimizers (sorted +
-    // deduplicated per strand, ready for classify_from_extracted_minimizers).
-    let mut contigs: Vec<ContigInfo> = Vec::with_capacity(inputs.len());
-    let mut bucket_mins: Vec<Vec<u64>> = Vec::with_capacity(inputs.len());
-    let mut query_mins: Vec<(Vec<u64>, Vec<u64>)> = Vec::with_capacity(inputs.len());
-
-    for input in inputs {
-        contigs.push(ContigInfo {
-            id: input.id.clone(),
-            source_mag: input.source_mag.clone(),
-            length: input.sequence.len() as u64,
-        });
-
-        extract_into(&input.sequence, k, w, salt, &mut ws);
-        let mut bucket: Vec<u64> = std::mem::take(&mut ws.buffer);
-        bucket.sort_unstable();
-        bucket.dedup();
-        bucket_mins.push(bucket);
-
-        let (mut fwd, mut rc) = extract_dual_strand_into(&input.sequence, k, w, salt, &mut ws);
-        fwd.sort_unstable();
-        fwd.dedup();
-        rc.sort_unstable();
-        rc.dedup();
-        query_mins.push((fwd, rc));
-    }
-
     if inputs.is_empty() {
         return Ok(EdgeBuildOutput {
-            contigs,
+            contigs: Vec::new(),
             edges: Vec::new(),
         });
     }
 
-    // Build buckets. The original input index is preserved in bucket_id so
-    // bucket_id_to_idx() can recover it; contigs with no minimizers are
-    // skipped (their bucket would be invalid and they cannot be hit anyway).
-    //
+    type Extracted = (ContigInfo, Vec<u64>, Vec<u64>);
+    let extracted: Vec<Extracted> = inputs
+        .par_iter()
+        .map_init(MinimizerWorkspace::new, |ws, input| {
+            let (mut fwd, mut rc) =
+                extract_dual_strand_into(&input.sequence, cfg.k, cfg.w, cfg.salt, ws);
+            fwd.sort_unstable();
+            fwd.dedup();
+            rc.sort_unstable();
+            rc.dedup();
+            (
+                ContigInfo {
+                    id: input.id.clone(),
+                    source_mag: input.source_mag.clone(),
+                    length: input.sequence.len() as u64,
+                },
+                fwd,
+                rc,
+            )
+        })
+        .collect();
+
+    let mut contigs: Vec<ContigInfo> = Vec::with_capacity(extracted.len());
+    let mut query_mins: Vec<(Vec<u64>, Vec<u64>)> = Vec::with_capacity(extracted.len());
+    for (info, fwd, rc) in extracted {
+        contigs.push(info);
+        query_mins.push((fwd, rc));
+    }
+
     // INVARIANT: `bucket_id == idx + 1` where `idx` is the position in the
-    // `inputs` slice. `bucket_id_to_idx` relies on this; any change to bucket
-    // numbering must update both.
-    let buckets: Vec<BucketData> = bucket_mins
+    // `inputs` slice. `bucket_id_to_idx` relies on this.
+    let buckets: Vec<BucketData> = query_mins
         .iter()
         .zip(inputs.iter())
         .enumerate()
-        .filter(|(_, (mins, _))| !mins.is_empty())
-        .map(|(idx, (mins, input))| BucketData {
+        .filter(|(_, ((fwd, _), _))| !fwd.is_empty())
+        .map(|(idx, ((fwd, _), input))| BucketData {
             bucket_id: bucket_id_for(idx),
             bucket_name: input.id.clone(),
             sources: input
@@ -110,7 +88,7 @@ pub fn build_edges(
                 .clone()
                 .map(|m| vec![m])
                 .unwrap_or_default(),
-            minimizers: mins.clone(),
+            minimizers: fwd.clone(),
         })
         .collect();
 
@@ -122,18 +100,24 @@ pub fn build_edges(
     }
 
     let index_path = workdir.join("cluster_index.ryxdi");
-    create_parquet_inverted_index(&index_path, buckets, k, w, salt, None, None, None)
-        .context("creating clustering index")?;
-    // `buckets` is moved into create_parquet_inverted_index above and dropped
-    // before the index is opened; bucket_mins is also freed now since the
-    // classify step uses query_mins, not bucket_mins.
-    drop(bucket_mins);
+    create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        cfg.k,
+        cfg.w,
+        cfg.salt,
+        None,
+        None,
+        None,
+    )
+    .context("creating clustering index")?;
 
     let index = ShardedInvertedIndex::open(&index_path).context("opening clustering index")?;
 
     let query_ids: Vec<i64> = (0..inputs.len() as i64).collect();
-    let hits = classify_from_extracted_minimizers(&index, &query_mins, &query_ids, threshold, None)
-        .context("classifying contigs against clustering index")?;
+    let hits =
+        classify_from_extracted_minimizers(&index, &query_mins, &query_ids, cfg.threshold, None)
+            .context("classifying contigs against clustering index")?;
 
     let mut edges = Vec::with_capacity(hits.len());
     for hit in hits {
@@ -159,11 +143,9 @@ pub fn build_edges(
             continue;
         }
 
-        // Approximate shared as round(score * |fwd|) — exact when fwd wins,
-        // within ~1% for non-palindromic sequences when rc wins.
         let fwd_total = query_mins[query_idx as usize].0.len() as f64;
         let shared = (hit.score * fwd_total).round() as u64;
-        if shared < min_shared {
+        if shared < cfg.min_shared {
             continue;
         }
         edges.push(ClusterEdge {
@@ -208,6 +190,17 @@ mod tests {
             .collect()
     }
 
+    fn test_cfg(threshold: f64, min_shared: u64) -> ClusterConfig {
+        ClusterConfig {
+            k: 32,
+            w: 20,
+            salt: 0x5555_5555_5555_5555,
+            min_length: 0,
+            threshold,
+            min_shared,
+        }
+    }
+
     #[test]
     fn build_edges_produces_edge_for_fragment_of_full_genome() {
         let dir = tempdir().unwrap();
@@ -234,7 +227,7 @@ mod tests {
             },
         ];
 
-        let out = build_edges(&inputs, 32, 20, 0x5555_5555_5555_5555, 0.5, 1, dir.path()).unwrap();
+        let out = build_edges(&inputs, &test_cfg(0.5, 1), dir.path()).unwrap();
 
         assert_eq!(out.contigs.len(), 3);
         assert_eq!(out.contigs[0].id, "A");
@@ -276,7 +269,9 @@ mod tests {
             source_mag: None,
             sequence: seq_from_seed(5000, 42),
         }];
-        let out = build_edges(&inputs, 32, 20, 0x12345, 0.5, 1, dir.path()).unwrap();
+        let mut cfg = test_cfg(0.5, 1);
+        cfg.salt = 0x12345;
+        let out = build_edges(&inputs, &cfg, dir.path()).unwrap();
         for e in &out.edges {
             assert_ne!(
                 e.query_idx, e.target_idx,
@@ -303,17 +298,7 @@ mod tests {
             },
         ];
 
-        // Set min_shared absurdly high — no edges should pass the floor.
-        let out = build_edges(
-            &inputs,
-            32,
-            20,
-            0x5555_5555_5555_5555,
-            0.5,
-            1_000_000,
-            dir.path(),
-        )
-        .unwrap();
+        let out = build_edges(&inputs, &test_cfg(0.5, 1_000_000), dir.path()).unwrap();
         assert!(
             out.edges.is_empty(),
             "min_shared=1e6 should filter all edges, got {} edges",
@@ -324,7 +309,9 @@ mod tests {
     #[test]
     fn build_edges_empty_input_returns_empty() {
         let dir = tempdir().unwrap();
-        let out = build_edges(&[], 32, 20, 0x12345, 0.5, 1, dir.path()).unwrap();
+        let mut cfg = test_cfg(0.5, 1);
+        cfg.salt = 0x12345;
+        let out = build_edges(&[], &cfg, dir.path()).unwrap();
         assert!(out.contigs.is_empty());
         assert!(out.edges.is_empty());
     }

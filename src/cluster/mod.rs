@@ -15,12 +15,6 @@ use anyhow::{Context, Result};
 
 pub use types::{ClusterEdge, ClusterResult, ClusterRow, ContigInfo, ContigInput};
 
-/// Parameters for a single clustering run.
-///
-/// `min_length` filters contigs from the input before any work is done;
-/// `threshold` and `min_shared` control absorption in the greedy step (and
-/// `threshold` is also used as the classify threshold to prune low-containment
-/// edges at query time).
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
     pub k: usize,
@@ -49,20 +43,14 @@ impl ClusterConfig {
 
 /// Cluster a set of contigs end-to-end.
 ///
-/// Steps:
-/// 1. Filter inputs to those with `sequence.len() >= cfg.min_length`.
-/// 2. Build a temp Parquet inverted index (one bucket per surviving contig),
-///    extract per-contig minimizers, and classify each contig as a query to
-///    materialize sparse containment edges.
-/// 3. Run length-sorted greedy dereplication on the edges.
-///
-/// The temp index directory is created via [`tempfile::TempDir`] and
-/// cleaned up when this function returns.
-pub fn cluster_contigs(inputs: &[ContigInput], cfg: &ClusterConfig) -> Result<ClusterResult> {
+/// Filters inputs to `sequence.len() >= cfg.min_length`, builds a temp
+/// Parquet inverted index for sparse containment-edge computation, and
+/// runs length-sorted greedy dereplication. The temp index is cleaned up
+/// when this function returns.
+pub fn cluster_contigs(inputs: Vec<ContigInput>, cfg: &ClusterConfig) -> Result<ClusterResult> {
     let filtered: Vec<ContigInput> = inputs
-        .iter()
+        .into_iter()
         .filter(|c| (c.sequence.len() as u64) >= cfg.min_length)
-        .cloned()
         .collect();
 
     if filtered.is_empty() {
@@ -71,15 +59,8 @@ pub fn cluster_contigs(inputs: &[ContigInput], cfg: &ClusterConfig) -> Result<Cl
 
     let workdir = tempfile::tempdir().context("creating clustering workdir")?;
 
-    let edge_out = edges::build_edges(
-        &filtered,
-        cfg.k,
-        cfg.w,
-        cfg.salt,
-        cfg.threshold,
-        cfg.min_shared,
-        workdir.path(),
-    )?;
+    let edge_out = edges::build_edges(&filtered, cfg, workdir.path())?;
+    drop(filtered);
 
     let rows = greedy::greedy_dereplicate(
         &edge_out.edges,

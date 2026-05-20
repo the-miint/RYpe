@@ -61,7 +61,7 @@ fn one_full_genome_plus_two_fragments_plus_one_unrelated() {
         },
     ];
 
-    let result = cluster_contigs(&inputs, &cfg_relaxed()).unwrap();
+    let result = cluster_contigs(inputs, &cfg_relaxed()).unwrap();
 
     // Complete partition: one row per input
     assert_eq!(result.rows.len(), 4);
@@ -108,7 +108,7 @@ fn all_unrelated_become_singleton_clusters() {
         })
         .collect();
 
-    let result = cluster_contigs(&inputs, &cfg_relaxed()).unwrap();
+    let result = cluster_contigs(inputs, &cfg_relaxed()).unwrap();
 
     assert_eq!(result.rows.len(), 4);
     for row in &result.rows {
@@ -132,7 +132,7 @@ fn length_floor_excludes_short_contigs_entirely() {
         },
     ];
 
-    let result = cluster_contigs(&inputs, &cfg_relaxed()).unwrap();
+    let result = cluster_contigs(inputs, &cfg_relaxed()).unwrap();
 
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0].rep_contig, "long");
@@ -140,7 +140,7 @@ fn length_floor_excludes_short_contigs_entirely() {
 
 #[test]
 fn empty_input_returns_empty_result() {
-    let result = cluster_contigs(&[], &cfg_relaxed()).unwrap();
+    let result = cluster_contigs(Vec::new(), &cfg_relaxed()).unwrap();
     assert!(result.rows.is_empty());
 }
 

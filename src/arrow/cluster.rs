@@ -69,9 +69,9 @@ pub fn cluster_result_to_record_batch(
     }
 
     let n = result.rows.len();
-    let mut rep = StringBuilder::with_capacity(n, n * 16);
-    let mut member = StringBuilder::with_capacity(n, n * 16);
-    let mut mag = StringBuilder::with_capacity(n, n * 16);
+    let mut rep = StringBuilder::new();
+    let mut member = StringBuilder::new();
+    let mut mag = StringBuilder::new();
     let mut containment = Vec::with_capacity(n);
 
     for row in &result.rows {
@@ -104,20 +104,30 @@ pub fn empty_cluster_result_batch() -> RecordBatch {
 
 /// Convert a cluster-input `RecordBatch` into the owned `ContigInput` form.
 ///
-/// String and byte slices are copied out of Arrow buffers because
-/// [`ContigInput`] owns its data.
-///
 /// # Errors
-/// * `NullError` if `contig_id` or `sequence` is null in any row (and the
-///   columns are declared non-nullable per the schema validator).
+/// * `NullError` if `contig_id` or `sequence` is null in any row.
 /// * `SchemaError` if two rows share the same `contig_id`.
 /// * `SequenceTooLong` if any `sequence` exceeds [`MAX_SEQUENCE_LENGTH`].
 fn batch_to_contig_inputs(batch: &RecordBatch) -> Result<Vec<ContigInput>, ArrowClassifyError> {
+    let mut out = Vec::with_capacity(batch.num_rows());
+    let mut seen: HashSet<String> = HashSet::with_capacity(batch.num_rows());
+    append_batch_to_contig_inputs(batch, &mut out, &mut seen)?;
+    Ok(out)
+}
+
+/// Append rows from `batch` to `out`, using `seen` for cross-batch duplicate
+/// detection. Lets the FFI streaming path avoid concatenating every input
+/// batch into one giant RecordBatch before conversion.
+pub(crate) fn append_batch_to_contig_inputs(
+    batch: &RecordBatch,
+    out: &mut Vec<ContigInput>,
+    seen: &mut HashSet<String>,
+) -> Result<(), ArrowClassifyError> {
     validate_cluster_input_schema(batch.schema().as_ref())?;
 
     let num_rows = batch.num_rows();
     if num_rows == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     let id_idx = batch
@@ -134,8 +144,7 @@ fn batch_to_contig_inputs(batch: &RecordBatch) -> Result<Vec<ContigInput>, Arrow
     let seq_col = batch.column(seq_idx);
     let mag_col = mag_idx.map(|i| Arc::clone(batch.column(i)));
 
-    let mut out = Vec::with_capacity(num_rows);
-    let mut seen: HashSet<String> = HashSet::with_capacity(num_rows);
+    out.reserve(num_rows);
 
     for i in 0..num_rows {
         if id_col.is_null(i) {
@@ -204,7 +213,7 @@ fn batch_to_contig_inputs(batch: &RecordBatch) -> Result<Vec<ContigInput>, Arrow
         });
     }
 
-    Ok(out)
+    Ok(())
 }
 
 fn string_value_at<'a>(
@@ -269,28 +278,16 @@ fn bytes_value_at<'a>(
 /// Input schema: see [`validate_cluster_input_schema`].
 /// Output schema: see [`cluster_result_schema`].
 ///
-/// This is the Arrow-facing entry point. It owns the workspace lifecycle
-/// (tempdir creation + cleanup) via `cluster_contigs`.
-///
-/// # Memory
-///
-/// Peak resident memory during this call is roughly **3–4× the input batch
-/// size** before the on-disk index is written, because the pipeline holds:
-/// (1) the input batch, (2) a copy of every sequence in `Vec<ContigInput>`,
-/// (3) the `filtered` clone inside `cluster_contigs`, and (4) per-contig
-/// single-strand bucket minimizers plus per-contig dual-strand query
-/// minimizers (roughly 24 bytes per minimizer, ~one minimizer per `w` bases).
-/// A 2 GB input batch can therefore peak at ~7–8 GB of live allocations.
-/// Size inputs accordingly when calling from a C-API consumer.
-///
-/// Contigs shorter than `cfg.min_length` are dropped silently — they appear
-/// in neither the cluster computation nor the output.
+/// Peak resident memory is roughly **2–3× the input batch size**: input
+/// batch + owned `ContigInput` copy + per-contig minimizers (~24 bytes per
+/// minimizer at ~one minimizer per `w` bases). Contigs shorter than
+/// `cfg.min_length` are dropped silently.
 pub fn cluster_arrow_batch(
     batch: &RecordBatch,
     cfg: &ClusterConfig,
 ) -> Result<RecordBatch, ArrowClassifyError> {
     let inputs = batch_to_contig_inputs(batch)?;
-    let result = cluster_contigs(&inputs, cfg)
+    let result = cluster_contigs(inputs, cfg)
         .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
     cluster_result_to_record_batch(&result)
 }
@@ -643,7 +640,7 @@ mod tests {
         let arrow_result = cluster_arrow_batch(&batch, &cfg).unwrap();
 
         let native = cluster_contigs(
-            &[
+            vec![
                 ContigInput {
                     id: "A".to_string(),
                     source_mag: Some("mag1".to_string()),
