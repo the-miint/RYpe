@@ -1,7 +1,7 @@
 //! CLI handler for `rype cluster`.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
@@ -26,11 +26,16 @@ pub fn run_cluster(args: ClusterArgs) -> Result<()> {
         ));
     }
 
-    let inputs = load_contigs_from_fastx(&args.inputs)?;
     log::info!(
-        "Loaded {} contig(s) from {} input file(s) (before length filter)",
+        "Loading contigs from {} input file(s)...",
+        args.inputs.len()
+    );
+    let inputs = load_contigs_from_fastx(&args.inputs)?;
+    let total_bytes: u64 = inputs.iter().map(|c| c.sequence.len() as u64).sum();
+    log::info!(
+        "Loaded {} contig(s), {:.2} MB total sequence",
         inputs.len(),
-        args.inputs.len(),
+        total_bytes as f64 / 1_048_576.0,
     );
 
     let cfg = ClusterConfig {
@@ -42,19 +47,32 @@ pub fn run_cluster(args: ClusterArgs) -> Result<()> {
         min_shared: args.min_shared,
     };
 
-    let result = cluster_contigs(&inputs, &cfg).context("clustering failed")?;
     log::info!(
-        "Clustering complete: {} output rows ({} representatives)",
+        "Building cluster index and computing edges (this is the heavy phase; \
+         expect to hold ~4x total sequence size in RAM at peak)..."
+    );
+    let result = cluster_contigs(&inputs, &cfg).context("clustering failed")?;
+    let rep_count = result
+        .rows
+        .iter()
+        .filter(|r| r.rep_contig == r.member_contig)
+        .count();
+    log::info!(
+        "Clustering complete: {} output rows ({} representatives, {} absorbed)",
         result.rows.len(),
-        result
-            .rows
-            .iter()
-            .filter(|r| r.rep_contig == r.member_contig)
-            .count(),
+        rep_count,
+        result.rows.len().saturating_sub(rep_count),
     );
 
-    write_tsv(&args.output, &result)
-        .with_context(|| format!("writing cluster TSV to {}", args.output.display()))?;
+    write_cluster_output(args.output.as_deref(), &result).with_context(|| {
+        format!(
+            "writing cluster TSV to {}",
+            args.output
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<stdout>".to_string())
+        )
+    })?;
 
     Ok(())
 }
@@ -66,11 +84,17 @@ pub fn run_cluster(args: ClusterArgs) -> Result<()> {
 /// duplicate sequence names across files don't collide.
 fn load_contigs_from_fastx(files: &[std::path::PathBuf]) -> Result<Vec<ContigInput>> {
     let mut out = Vec::new();
-    for path in files {
-        let mag = mag_name_from_path(path);
+    for (i, path) in files.iter().enumerate() {
+        let mag = mag_name_from_path(path).ok_or_else(|| {
+            anyhow!(
+                "cannot derive MAG name from path {} (try renaming the file)",
+                path.display()
+            )
+        })?;
         let mut reader = parse_fastx_file(path)
             .with_context(|| format!("opening FASTA/FASTQ file {}", path.display()))?;
 
+        let mut seqs_in_file = 0usize;
         while let Some(rec_res) = reader.next() {
             let rec = rec_res.with_context(|| format!("reading record from {}", path.display()))?;
             let header_full = String::from_utf8_lossy(rec.id()).to_string();
@@ -92,6 +116,17 @@ fn load_contigs_from_fastx(files: &[std::path::PathBuf]) -> Result<Vec<ContigInp
                 source_mag: Some(mag.clone()),
                 sequence,
             });
+            seqs_in_file += 1;
+        }
+
+        if (i + 1) % 100 == 0 || i + 1 == files.len() {
+            log::info!(
+                "  loaded {}/{} files ({} contigs so far; last file: {} seqs)",
+                i + 1,
+                files.len(),
+                out.len(),
+                seqs_in_file,
+            );
         }
     }
     Ok(out)
@@ -100,21 +135,14 @@ fn load_contigs_from_fastx(files: &[std::path::PathBuf]) -> Result<Vec<ContigInp
 /// Strip common FASTA/FASTQ extensions to derive the MAG name.
 ///
 /// Handles `.gz` stacked on top of `.fasta` / `.fa` / `.fna` / `.fq` /
-/// `.fastq`. Anything else falls through to the raw file_stem.
-fn mag_name_from_path(p: &Path) -> String {
-    let name = p
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
+/// `.fastq`. Anything else falls through to the raw file_stem. Returns
+/// `None` if the path has no usable file_name (e.g. `/`, `.`, `..`).
+fn mag_name_from_path(p: &Path) -> Option<String> {
+    let name = p.file_name()?.to_str()?.to_string();
+    if name.is_empty() {
+        return None;
+    }
     let lowered = name.to_ascii_lowercase();
-    let strip = |suf: &str| -> Option<String> {
-        if lowered.ends_with(suf) {
-            Some(name[..name.len() - suf.len()].to_string())
-        } else {
-            None
-        }
-    };
     for suf in [
         ".fasta.gz",
         ".fa.gz",
@@ -127,19 +155,28 @@ fn mag_name_from_path(p: &Path) -> String {
         ".fastq",
         ".fq",
     ] {
-        if let Some(s) = strip(suf) {
-            return s;
+        if lowered.ends_with(suf) {
+            return Some(name[..name.len() - suf.len()].to_string());
         }
     }
-    p.file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string()
+    p.file_stem()?.to_str().map(|s| s.to_string())
 }
 
-fn write_tsv(path: &Path, result: &ClusterResult) -> Result<()> {
-    let file = File::create(path)?;
-    let mut w = BufWriter::new(file);
+/// Write the TSV to the given path (or stdout if `None` or `"-"`).
+fn write_cluster_output(path: Option<&Path>, result: &ClusterResult) -> Result<()> {
+    match path {
+        Some(p) if p.as_os_str() == "-" => {
+            write_tsv(&mut BufWriter::new(io::stdout().lock()), result)
+        }
+        None => write_tsv(&mut BufWriter::new(io::stdout().lock()), result),
+        Some(p) => {
+            let file = File::create(p)?;
+            write_tsv(&mut BufWriter::new(file), result)
+        }
+    }
+}
+
+fn write_tsv<W: Write>(w: &mut W, result: &ClusterResult) -> Result<()> {
     writeln!(w, "rep_contig\tmember_contig\tsource_mag\tcontainment")?;
     for row in &result.rows {
         let mag = row.source_mag.as_deref().unwrap_or("");
@@ -159,18 +196,56 @@ mod tests {
 
     #[test]
     fn mag_name_strips_common_extensions() {
-        assert_eq!(mag_name_from_path(Path::new("foo.fasta")), "foo");
-        assert_eq!(mag_name_from_path(Path::new("foo.fa")), "foo");
-        assert_eq!(mag_name_from_path(Path::new("foo.fna")), "foo");
-        assert_eq!(mag_name_from_path(Path::new("foo.fq")), "foo");
-        assert_eq!(mag_name_from_path(Path::new("foo.fastq")), "foo");
-        assert_eq!(mag_name_from_path(Path::new("foo.fasta.gz")), "foo");
-        assert_eq!(mag_name_from_path(Path::new("foo.fa.gz")), "foo");
-        assert_eq!(mag_name_from_path(Path::new("foo.fq.gz")), "foo");
-        assert_eq!(mag_name_from_path(Path::new("foo.FASTA")), "foo");
-        assert_eq!(mag_name_from_path(Path::new("/path/to/bar.fasta")), "bar");
-        // Unknown extension falls through to file_stem
-        assert_eq!(mag_name_from_path(Path::new("foo.txt")), "foo");
-        assert_eq!(mag_name_from_path(Path::new("foo")), "foo");
+        assert_eq!(
+            mag_name_from_path(Path::new("foo.fasta")).as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            mag_name_from_path(Path::new("foo.fa")).as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            mag_name_from_path(Path::new("foo.fna")).as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            mag_name_from_path(Path::new("foo.fq")).as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            mag_name_from_path(Path::new("foo.fastq")).as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            mag_name_from_path(Path::new("foo.fasta.gz")).as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            mag_name_from_path(Path::new("foo.fa.gz")).as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            mag_name_from_path(Path::new("foo.fq.gz")).as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            mag_name_from_path(Path::new("foo.FASTA")).as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            mag_name_from_path(Path::new("/path/to/bar.fasta")).as_deref(),
+            Some("bar")
+        );
+        assert_eq!(
+            mag_name_from_path(Path::new("foo.txt")).as_deref(),
+            Some("foo")
+        );
+        assert_eq!(mag_name_from_path(Path::new("foo")).as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn mag_name_returns_none_for_paths_without_filename() {
+        assert!(mag_name_from_path(Path::new("/")).is_none());
+        assert!(mag_name_from_path(Path::new("..")).is_none()); // file_stem of ".." is ""
     }
 }

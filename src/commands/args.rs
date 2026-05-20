@@ -81,6 +81,14 @@ pub enum Commands {
 ///
 /// Defaults target strain-level (~99% ANI) dereplication of long-read MAGs;
 /// see ClusterConfig::strain_default() in the library for the same values.
+///
+/// ## Memory
+/// Peak resident memory is roughly **4x the total uncompressed sequence
+/// size of the inputs**: one copy in the loaded `Vec<ContigInput>`, one
+/// clone inside the orchestrator's length filter, plus per-contig
+/// single-strand bucket minimizers and dual-strand query minimizers.
+/// For 10K MAGs averaging 200 KB each that's ~8 GB peak. Size your
+/// inputs (or your host) accordingly.
 #[derive(clap::Args, Debug, Clone)]
 pub struct ClusterArgs {
     /// Input FASTA/FASTQ files (one per assembly/MAG). Each file is treated
@@ -90,8 +98,9 @@ pub struct ClusterArgs {
     pub inputs: Vec<PathBuf>,
 
     /// Output TSV path. Columns: rep_contig, member_contig, source_mag, containment.
+    /// Pass `-` (or omit) to write to stdout.
     #[arg(short, long)]
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
 
     /// K-mer size (must be 16, 32, or 64). Strain-level default: 64.
     #[arg(short = 'k', long, default_value_t = 64)]

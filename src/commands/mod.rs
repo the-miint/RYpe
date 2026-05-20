@@ -7,8 +7,9 @@ pub mod helpers;
 pub mod index;
 pub mod inspect;
 
-#[allow(unused_imports)]
-pub use args::{ClassifyCommands, Cli, ClusterArgs, Commands, IndexCommands, InspectCommands};
+pub use args::{ClassifyCommands, Cli, Commands, IndexCommands, InspectCommands};
+// ClusterArgs is reachable through Commands::Cluster; kept private to avoid
+// dead-code warnings since main.rs doesn't name the type directly.
 pub use classify::{
     run_aggregate, run_classify, run_log_ratio, ClassifyAggregateArgs, ClassifyLogRatioArgs,
     ClassifyRunArgs, CommonClassifyArgs,

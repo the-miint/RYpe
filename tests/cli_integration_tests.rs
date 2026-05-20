@@ -6404,15 +6404,160 @@ fn test_cli_cluster_invalid_k_returns_error() -> Result<()> {
 
 #[test]
 fn test_cli_cluster_missing_input_arg_returns_error() -> Result<()> {
+    let dir = tempdir()?;
     let binary = get_binary_path();
     let output = Command::new(&binary)
         .arg("cluster")
         .arg("--output")
-        .arg("/tmp/out.tsv")
+        .arg(dir.path().join("out.tsv"))
         .output()?;
     assert!(
         !output.status.success(),
         "expected non-zero exit when --input is missing"
     );
+    Ok(())
+}
+
+#[test]
+fn test_cli_cluster_dash_output_writes_to_stdout() -> Result<()> {
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+    let seq = cluster_cli_seq(5_000, 42);
+    let fasta = dir.path().join("solo.fasta");
+    write_fasta(&fasta, &[("solo", &seq)]);
+
+    let output = Command::new(&binary)
+        .arg("cluster")
+        .arg("--input")
+        .arg(&fasta)
+        .arg("--output")
+        .arg("-")
+        .arg("-k")
+        .arg("32")
+        .arg("-w")
+        .arg("20")
+        .arg("--min-length")
+        .arg("1000")
+        .arg("--min-shared")
+        .arg("10")
+        .output()?;
+    assert!(output.status.success(), "rype cluster exited non-zero");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0],
+        "rep_contig\tmember_contig\tsource_mag\tcontainment"
+    );
+    assert!(
+        lines.len() >= 2,
+        "expected at least one data row, got: {:?}",
+        lines
+    );
+    assert!(lines[1].starts_with("solo::solo\tsolo::solo\tsolo\t1.0"));
+
+    // No file should have been created in the working dir named '-'
+    assert!(
+        !std::path::Path::new("-").exists(),
+        "rype cluster -o - should not create a file named '-'"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_cli_cluster_omitted_output_writes_to_stdout() -> Result<()> {
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+    let seq = cluster_cli_seq(5_000, 43);
+    let fasta = dir.path().join("solo.fasta");
+    write_fasta(&fasta, &[("solo", &seq)]);
+
+    let output = Command::new(&binary)
+        .arg("cluster")
+        .arg("--input")
+        .arg(&fasta)
+        .arg("-k")
+        .arg("32")
+        .arg("-w")
+        .arg("20")
+        .arg("--min-length")
+        .arg("1000")
+        .arg("--min-shared")
+        .arg("10")
+        .output()?;
+    assert!(output.status.success(), "rype cluster exited non-zero");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("rep_contig\tmember_contig\t"));
+    Ok(())
+}
+
+/// Smoke test against the local WoL2 genomes (a subset of ~16K compressed
+/// FASTAs). This test is `#[ignore]` because the data is local-only per
+/// CLAUDE.md — invoke explicitly with `cargo test --release --test
+/// cli_integration_tests cluster_wol2_subset -- --ignored --nocapture`.
+///
+/// Expects the first 50 files under `perf-data/wol2-genomes/` to exist;
+/// skips with a panic message if not, so it's safe to run on CI hosts
+/// that won't have the data.
+#[test]
+#[ignore]
+fn test_cli_cluster_wol2_subset_smoke() -> Result<()> {
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+
+    let genomes_dir = Path::new("perf-data/wol2-genomes");
+    if !genomes_dir.exists() {
+        panic!(
+            "skipping: {} does not exist (data is local-only per CLAUDE.md)",
+            genomes_dir.display()
+        );
+    }
+
+    // Collect the first 50 genome files (any extension).
+    let mut files: Vec<PathBuf> = fs::read_dir(genomes_dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+    files.truncate(50);
+    assert!(
+        !files.is_empty(),
+        "no genome files found under {}",
+        genomes_dir.display()
+    );
+
+    let output_tsv = dir.path().join("wol2_50.tsv");
+
+    let mut cmd = Command::new(&binary);
+    cmd.arg("--verbose").arg("cluster");
+    for f in &files {
+        cmd.arg("--input").arg(f);
+    }
+    cmd.arg("--output")
+        .arg(&output_tsv)
+        // Use strain defaults — these are real microbial genomes.
+        .arg("-k")
+        .arg("64")
+        .arg("-w")
+        .arg("50")
+        .arg("--min-length")
+        .arg("10000")
+        .arg("--threshold")
+        .arg("0.85")
+        .arg("--min-shared")
+        .arg("500");
+
+    let status = cmd.status()?;
+    assert!(status.success(), "rype cluster failed on WoL2 subset");
+
+    // Verify output exists and has at least the header line.
+    let content = fs::read_to_string(&output_tsv)?;
+    assert!(content.starts_with("rep_contig\tmember_contig\t"));
+    let row_count = content.lines().count() - 1; // minus header
+    eprintln!("WoL2 subset clustering produced {} rows", row_count);
+    assert!(row_count > 0, "expected at least one cluster row");
+
     Ok(())
 }
