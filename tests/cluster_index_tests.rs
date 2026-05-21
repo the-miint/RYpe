@@ -6,10 +6,11 @@
 use arrow::array::{Array, UInt32Array, UInt64Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rype::parquet_cluster_index::{
-    create_cluster_index_directory, create_cluster_parquet_index, files as cluster_files,
-    is_cluster_parquet_index, ClusterBucketData, ClusterParquetManifest,
+    create_cluster_index_directory, create_cluster_parquet_index,
+    create_cluster_parquet_index_with_options, files as cluster_files, is_cluster_parquet_index,
+    ClusterBucketData, ClusterParquetManifest, ClusterParquetWriteOptions,
 };
-use rype::{is_parquet_index, ParquetManifest, ShardedInvertedIndex};
+use rype::{is_parquet_index, ParquetCompression, ParquetManifest, ShardedInvertedIndex};
 use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
@@ -209,7 +210,9 @@ fn create_cluster_index_multi_bucket_round_trip() {
 }
 
 /// WHY: a contig that yielded no minimizers (e.g. shorter than k) is legal upstream.
-/// The writer must accept an entirely empty input rather than panicking on min/max.
+/// The writer must accept an entirely empty input rather than panicking on min/max,
+/// AND must still produce a readable zero-row shard file (so the Phase 4 reader has
+/// something to open).
 #[test]
 fn create_cluster_index_empty_input_succeeds() {
     let tmp = TempDir::new().unwrap();
@@ -221,7 +224,18 @@ fn create_cluster_index_empty_input_succeeds() {
     assert_eq!(manifest.total_minimizers, 0);
     let inv = manifest.inverted.as_ref().unwrap();
     assert_eq!(inv.total_entries, 0);
-    // Empty input is allowed; matches .ryxdi's single-empty-shard convention.
+    // Empty-range sentinel: min > max signals "this shard covers no minimizers",
+    // distinguishable from a shard that legitimately holds minimizer 0.
+    assert_eq!(inv.shards[0].min_minimizer, u64::MAX);
+    assert_eq!(inv.shards[0].max_minimizer, 0);
+
+    // The shard file must exist and be a readable zero-row Parquet file.
+    let shard_path = dir
+        .join(cluster_files::INVERTED_DIR)
+        .join(cluster_files::inverted_shard(0));
+    assert!(shard_path.exists(), "empty shard file must be on disk");
+    let triples = read_shard_triples(&shard_path);
+    assert!(triples.is_empty(), "empty shard must have zero rows");
 }
 
 /// WHY: positions are u32 and minimap2/skani conventions allow positions in long contigs
@@ -280,4 +294,78 @@ fn create_cluster_index_rejects_duplicate_minimizers_within_bucket() {
         "error should mention duplicate (caught by ClusterBucketData::validate): {}",
         msg
     );
+}
+
+/// WHY: two `ClusterBucketData` with the same `bucket_id` would silently overwrite
+/// each other in the bucket-metadata HashMap while every triple from the overwritten
+/// bucket still reaches the shard — the shard would reference a `bucket_id` whose
+/// name lives in the manifest pointing at the *wrong* bucket's sources. The writer
+/// must reject this loudly at the boundary.
+#[test]
+fn create_cluster_index_rejects_duplicate_bucket_id_across_inputs() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("dup-bid.ryci");
+
+    let b0 = ClusterBucketData {
+        bucket_id: 7,
+        bucket_name: "alpha".to_string(),
+        sources: vec!["alpha.fa".to_string()],
+        minimizers: vec![1, 2],
+        positions: vec![0, 0],
+    };
+    let b1 = ClusterBucketData {
+        bucket_id: 7, // same id, different name/sources — must be rejected.
+        bucket_name: "beta".to_string(),
+        sources: vec!["beta.fa".to_string()],
+        minimizers: vec![3, 4],
+        positions: vec![0, 0],
+    };
+
+    let err = create_cluster_parquet_index(&dir, vec![b0, b1], 64, 50, 0)
+        .expect_err("duplicate bucket_id must be rejected");
+    let msg = format!("{}", err);
+    assert!(
+        msg.contains("duplicate bucket_id"),
+        "error should mention duplicate bucket_id: {}",
+        msg
+    );
+}
+
+/// WHY: the `_with_options` path is a separate entry point. A bug that silently
+/// drops options (e.g. forgot to thread them into the writer) would be invisible
+/// from the no-options path because defaults happen to work. Pass Zstd through
+/// end-to-end and verify the index still round-trips correctly.
+#[test]
+fn create_cluster_index_with_zstd_options_round_trips() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("zstd.ryci");
+
+    let bucket = ClusterBucketData {
+        bucket_id: 0,
+        bucket_name: "g".to_string(),
+        sources: vec!["g.fa".to_string()],
+        minimizers: vec![10, 20, 30],
+        positions: vec![100, 200, 300],
+    };
+
+    let opts = ClusterParquetWriteOptions {
+        compression: ParquetCompression::Zstd,
+        ..Default::default()
+    };
+
+    let manifest =
+        create_cluster_parquet_index_with_options(&dir, vec![bucket], 64, 50, 0, Some(&opts))
+            .expect("create cluster index with options");
+    assert_eq!(manifest.total_minimizers, 3);
+
+    let shard_path = dir
+        .join(cluster_files::INVERTED_DIR)
+        .join(cluster_files::inverted_shard(0));
+    let triples = read_shard_triples(&shard_path);
+    let actual: std::collections::HashSet<(u64, u32, u32)> = triples.iter().copied().collect();
+    let mut expected = std::collections::HashSet::new();
+    expected.insert((10u64, 0u32, 100u32));
+    expected.insert((20u64, 0u32, 200u32));
+    expected.insert((30u64, 0u32, 300u32));
+    assert_eq!(actual, expected);
 }

@@ -90,6 +90,21 @@ pub fn create_cluster_parquet_index_with_options(
         })?;
     }
 
+    // Reject duplicate bucket_id across input. Without this, a HashMap insert
+    // below silently overwrites bucket metadata while every triple from the
+    // overwritten bucket still reaches the shard — total_minimizers would no
+    // longer match num_buckets * mean-bucket-size, and the bucket_id column in
+    // the shard would refer to a name the manifest doesn't have.
+    let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for bucket in &buckets {
+        if !seen_ids.insert(bucket.bucket_id) {
+            return Err(RypeError::validation(format!(
+                "duplicate bucket_id {} in input (bucket name '{}')",
+                bucket.bucket_id, bucket.bucket_name
+            )));
+        }
+    }
+
     create_cluster_index_directory(output_dir)?;
 
     // Collect bucket metadata (same layout as .ryxdi — reuses write_buckets_parquet).
@@ -150,9 +165,12 @@ fn write_single_shard(
         // Empty input still gets a shard file so the reader has something to open.
         let writer = ClusterShardWriter::new(&shard_path, options)?;
         writer.finish()?;
+        // Empty-range sentinel: max < min. Lets a future range-skip
+        // optimization treat an empty shard as covering nothing rather than
+        // as covering minimizer 0 (which is a valid value).
         return Ok(ClusterInvertedShardInfo {
             shard_id: 0,
-            min_minimizer: 0,
+            min_minimizer: u64::MAX,
             max_minimizer: 0,
             num_entries: 0,
         });

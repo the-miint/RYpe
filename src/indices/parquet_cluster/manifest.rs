@@ -117,6 +117,21 @@ impl ClusterParquetManifest {
                 ),
             ));
         }
+        // Invariant: every minimizer becomes exactly one (minimizer, bucket_id,
+        // position) triple, so the two totals must agree when the inverted
+        // section is populated. Catching a mismatch here means downstream code
+        // can pick either field without worrying about which is canonical.
+        if let Some(inv) = &manifest.inverted {
+            if inv.total_entries != manifest.total_minimizers {
+                return Err(RypeError::format(
+                    path,
+                    format!(
+                        "cluster manifest invariant violated: total_minimizers={} != inverted.total_entries={}",
+                        manifest.total_minimizers, inv.total_entries
+                    ),
+                ));
+            }
+        }
         Ok(manifest)
     }
 }
@@ -278,6 +293,48 @@ total_minimizers = 0
         assert!(
             msg.contains("invalid cluster manifest magic"),
             "expected magic-rejection error, got: {}",
+            msg
+        );
+    }
+
+    // WHY: total_minimizers and inverted.total_entries must agree — every minimizer
+    // becomes exactly one triple. A mismatch on disk would mean either the writer
+    // disagreed with itself or a manifest was hand-edited; either way the file
+    // is unsafe to use without flagging.
+    #[test]
+    fn manifest_load_rejects_total_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("mismatch.ryci");
+        create_cluster_index_directory(&dir).unwrap();
+
+        let bad_toml = r#"
+magic = "RYPE_CLUSTER_V1"
+format_version = 1
+k = 64
+w = 50
+salt = "0x0"
+source_hash = "0x0"
+num_buckets = 1
+total_minimizers = 100
+
+[inverted]
+num_shards = 1
+total_entries = 99
+has_overlapping_shards = false
+
+[[inverted.shards]]
+shard_id = 0
+min_minimizer = "0x1"
+max_minimizer = "0xff"
+num_entries = 99
+"#;
+        fs::write(dir.join(files::MANIFEST), bad_toml).unwrap();
+
+        let err = ClusterParquetManifest::load(&dir).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("invariant violated"),
+            "expected invariant-violation error, got: {}",
             msg
         );
     }
