@@ -735,6 +735,54 @@ pub fn count_hits(mins: &[u64], bucket: &[u64]) -> f64 {
     hits as f64
 }
 
+/// Reshape extractor output into the `(sorted-ascending, deduplicated)` layout
+/// that downstream bucket-style indices require.
+///
+/// `extract_into_with_positions` and `extract_dual_strand_into_with_positions`
+/// emit `(hash, position)` pairs in sequence order — positions are
+/// non-decreasing but hashes are arbitrary, and the same hash may appear at
+/// non-consecutive positions if it was displaced from the window and came back.
+/// This helper sorts both arrays in lockstep by `(hash, position)` ascending,
+/// then drops adjacent duplicate hashes keeping the SMALLEST position for each
+/// hash (= the first occurrence, since the sort key is `(hash, position)`).
+///
+/// After this helper, the two arrays satisfy:
+/// - same length;
+/// - `hashes` strictly ascending (no duplicates);
+/// - `positions[i]` is the smallest position at which `hashes[i]` occurred
+///   in the original extractor output.
+///
+/// One downstream caller is Plan 1.1's `ClusterBucketData::validate`, which
+/// requires exactly these invariants. The helper is independent of that —
+/// any caller that wants hash-unique sorted output for a bucket can use it.
+///
+/// # Panics
+///
+/// In debug builds, panics via `debug_assert_eq!` if `hashes.len() !=
+/// positions.len()`. The two arrays are an index-parallel pair; a length
+/// mismatch indicates caller error that would silently truncate via zip
+/// in a release build.
+pub fn pairs_into_cluster_bucket_arrays(hashes: &mut Vec<u64>, positions: &mut Vec<u32>) {
+    debug_assert_eq!(
+        hashes.len(),
+        positions.len(),
+        "hashes and positions must be index-parallel"
+    );
+
+    let mut pairs: Vec<(u64, u32)> = hashes.drain(..).zip(positions.drain(..)).collect();
+    // Sort by (hash, position) — the position tiebreaker ensures that after
+    // dedup_by_key the kept position is the smallest among ties.
+    pairs.sort_unstable();
+    pairs.dedup_by_key(|&mut (h, _)| h);
+
+    hashes.reserve(pairs.len());
+    positions.reserve(pairs.len());
+    for (h, p) in pairs {
+        hashes.push(h);
+        positions.push(p);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1466,5 +1514,64 @@ mod tests {
                 msg
             );
         }
+    }
+
+    // ---- Plan 1.2 phase 3: pairs_into_cluster_bucket_arrays ----
+
+    // WHY: the extractor emits in sequence order (positions non-decreasing,
+    // hashes arbitrary). ClusterBucketData::validate requires hashes sorted
+    // ascending. This helper must reorder both arrays in lockstep — a sort
+    // that scrambled the index-parallel pairing would associate every
+    // minimizer with a wrong position.
+    #[test]
+    fn pairs_into_cluster_bucket_arrays_sorts_by_hash() {
+        let mut hashes = vec![5u64, 1, 9, 3];
+        let mut positions = vec![100u32, 200, 300, 400];
+        pairs_into_cluster_bucket_arrays(&mut hashes, &mut positions);
+        assert_eq!(hashes, vec![1, 3, 5, 9]);
+        // Each position must travel with its original hash.
+        assert_eq!(positions, vec![200, 400, 100, 300]);
+    }
+
+    // WHY: extract_into_with_positions only dedups CONSECUTIVE duplicates per
+    // window. Non-consecutive duplicates (same hash reappearing in a later
+    // window after being displaced by a smaller hash) survive extraction.
+    // For ClusterBucketData::validate to accept the output, the helper must
+    // collapse those — and per skani's anchor convention, it keeps the
+    // SMALLEST position for each hash.
+    #[test]
+    fn pairs_into_cluster_bucket_arrays_dedups_keep_smallest_position() {
+        // hash=5 appears at positions 100 and 50; hash=3 at 200, 200, 75.
+        let mut hashes = vec![5u64, 3, 5, 3, 3];
+        let mut positions = vec![100u32, 200, 50, 200, 75];
+        pairs_into_cluster_bucket_arrays(&mut hashes, &mut positions);
+        assert_eq!(hashes, vec![3, 5]);
+        // Smallest position kept for each hash.
+        assert_eq!(positions, vec![75, 50]);
+    }
+
+    // WHY: a contig that produced no minimizers (e.g. shorter than k) is
+    // legal upstream. The helper must accept empty input and produce
+    // empty output without panicking on the underlying drain/dedup ops.
+    #[test]
+    fn pairs_into_cluster_bucket_arrays_empty_input() {
+        let mut hashes: Vec<u64> = vec![];
+        let mut positions: Vec<u32> = vec![];
+        pairs_into_cluster_bucket_arrays(&mut hashes, &mut positions);
+        assert!(hashes.is_empty());
+        assert!(positions.is_empty());
+    }
+
+    // WHY: hashes and positions are an index-parallel pair. A length
+    // mismatch at the helper boundary means caller code wrote them out of
+    // sync — silent zip-and-truncate would associate every later minimizer
+    // with a wrong position. debug_assert_eq fires loudly in debug/test
+    // builds and is compiled out in release (where the hot path is).
+    #[test]
+    #[should_panic(expected = "index-parallel")]
+    fn pairs_into_cluster_bucket_arrays_length_mismatch_panics_in_debug() {
+        let mut hashes = vec![1u64, 2, 3];
+        let mut positions = vec![10u32, 20];
+        pairs_into_cluster_bucket_arrays(&mut hashes, &mut positions);
     }
 }

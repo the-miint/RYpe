@@ -19,7 +19,7 @@ pub use encoding::base_to_bit;
 pub use extraction::{
     count_hits, extract_dual_strand_into, extract_dual_strand_into_with_positions, extract_into,
     extract_into_with_positions, extract_minimizer_set, extract_strand_minimizers,
-    get_paired_minimizers_into, Strand, StrandMinimizers,
+    get_paired_minimizers_into, pairs_into_cluster_bucket_arrays, Strand, StrandMinimizers,
 };
 pub use workspace::MinimizerWorkspace;
 
