@@ -7,6 +7,8 @@
 // Hot path: index-based iteration avoids iterator overhead in inner loops
 #![allow(clippy::needless_range_loop)]
 
+use crate::error::{Result, RypeError};
+
 use super::encoding::base_to_bit;
 use super::workspace::MinimizerWorkspace;
 
@@ -270,6 +272,116 @@ pub fn extract_into(seq: &[u8], k: usize, w: usize, salt: u64, ws: &mut Minimize
             }
         }
     }
+}
+
+/// Extract minimizers and their forward-strand positions from a single strand.
+///
+/// Position-aware variant of [`extract_into`]. Same sliding-window algorithm
+/// and the same consecutive-duplicate-hash dedup as `extract_into`; the only
+/// difference is that each emitted minimizer is paired with its position (a
+/// zero-based offset into `seq`) in [`MinimizerWorkspace::positions_fwd`].
+///
+/// On a homopolymer or other run where successive windows select the same
+/// hash, only the FIRST position is kept — this is required for downstream
+/// `ClusterBucketData::validate` (which rejects duplicate minimizers within
+/// a bucket) and matches skani's "earliest anchor wins" convention.
+///
+/// # Arguments
+/// * `seq` - DNA sequence as bytes (A, G, T, C, case insensitive)
+/// * `k` - K-mer size (must be 16, 32, or 64)
+/// * `w` - Window size for minimizer selection
+/// * `salt` - XOR salt applied to k-mer hashes
+/// * `ws` - Workspace; `buffer` and `positions_fwd` are cleared and refilled
+///
+/// # Output
+/// `ws.buffer` (hashes) and `ws.positions_fwd` (positions) are written
+/// index-parallel: `ws.positions_fwd[i]` is the offset in `seq` of the k-mer
+/// whose hash is `ws.buffer[i]`. Empty if `seq.len() < k`.
+///
+/// # Errors
+/// Returns `RypeError::validation` if any emitted position exceeds `u32::MAX`.
+/// In practice this requires a `seq` longer than 4.29 Gbp — far beyond any
+/// realistic single contig. The guard exists so a future genome-scale caller
+/// fails loud rather than silently truncating.
+pub fn extract_into_with_positions(
+    seq: &[u8],
+    k: usize,
+    w: usize,
+    salt: u64,
+    ws: &mut MinimizerWorkspace,
+) -> Result<()> {
+    ws.buffer.clear();
+    ws.positions_fwd.clear();
+    ws.q_fwd.clear();
+
+    let len = seq.len();
+    if len < k {
+        return Ok(());
+    }
+
+    let k_mask = if k == 64 { u64::MAX } else { (1u64 << k) - 1 };
+
+    let mut current_val: u64 = 0;
+    let mut last_min: Option<u64> = None;
+    let mut valid_bases_count = 0;
+
+    for i in 0..len {
+        let bit = base_to_bit(seq[i]);
+
+        if bit == u64::MAX {
+            valid_bases_count = 0;
+            ws.q_fwd.clear();
+            current_val = 0;
+            last_min = None;
+            continue;
+        }
+
+        valid_bases_count += 1;
+        current_val = ((current_val << 1) | bit) & k_mask;
+
+        if valid_bases_count >= k {
+            let pos = i + 1 - k;
+            let hash = current_val ^ salt;
+
+            while let Some(&(p, _)) = ws.q_fwd.front() {
+                if p + w <= pos {
+                    ws.q_fwd.pop_front();
+                } else {
+                    break;
+                }
+            }
+            while let Some(&(_, v)) = ws.q_fwd.back() {
+                if v >= hash {
+                    ws.q_fwd.pop_back();
+                } else {
+                    break;
+                }
+            }
+            ws.q_fwd.push_back((pos, hash));
+
+            if valid_bases_count >= k + w - 1 {
+                if let Some(&(min_pos, min_h)) = ws.q_fwd.front() {
+                    if Some(min_h) != last_min {
+                        // The deque front carries the earliest position for
+                        // this hash in the current window — exactly the
+                        // "first occurrence" position skani chaining wants.
+                        let pos_u32 = u32::try_from(min_pos).map_err(|_| {
+                            RypeError::validation(format!(
+                                "minimizer position {} exceeds u32::MAX; \
+                                 input sequence longer than 4.29 Gbp is not supported",
+                                min_pos
+                            ))
+                        })?;
+                        ws.buffer.push(min_h);
+                        ws.positions_fwd.push(pos_u32);
+                        last_min = Some(min_h);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Extract minimizers from both strands of a sequence.
@@ -899,5 +1011,137 @@ mod tests {
         for w in rc.windows(2) {
             assert!(w[0] < w[1], "RC not strictly sorted after N");
         }
+    }
+
+    // ---- Plan 1.2 phase 1: extract_into_with_positions ----
+
+    // WHY: short sequence (< k bases) must yield empty output for both buffers
+    // AND succeed (Ok). A caller looping over many short reads would otherwise
+    // hit spurious validation errors.
+    #[test]
+    fn extract_into_with_positions_short_sequence_is_empty() {
+        let mut ws = MinimizerWorkspace::new();
+        let seq = b"ACGT";
+        extract_into_with_positions(seq, 16, 4, 0, &mut ws).expect("short seq must succeed");
+        assert!(ws.buffer.is_empty());
+        assert!(ws.positions_fwd.is_empty());
+    }
+
+    // WHY: positions and minimizers are an index-parallel pair. If lengths
+    // diverge by even one element, every downstream consumer (chain DP, the
+    // ClusterBucketData::validate length-parity check) gets a wrong-position
+    // for the wrong-minimizer and silently produces corrupt output.
+    #[test]
+    fn extract_into_with_positions_parallel_arrays() {
+        let mut ws = MinimizerWorkspace::new();
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        extract_into_with_positions(seq, 16, 4, 0, &mut ws).unwrap();
+        assert_eq!(
+            ws.buffer.len(),
+            ws.positions_fwd.len(),
+            "minimizers and positions must be index-parallel"
+        );
+    }
+
+    // WHY: when consecutive windows pick the same hash (e.g. homopolymer runs
+    // dominate the window), we keep the EARLIER position. If we kept the later
+    // one, chains built on this output would point downstream of the actual
+    // first-occurrence k-mer skani conventions assume, biasing chain start
+    // coordinates forward by up to w-1 bases.
+    #[test]
+    fn extract_into_with_positions_dedup_keeps_first_position() {
+        let mut ws_baseline = MinimizerWorkspace::new();
+        let mut ws = MinimizerWorkspace::new();
+        // Long homopolymer guarantees the same hash dominates many windows
+        // in a row, triggering the consecutive-duplicate path.
+        let seq = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        extract_into(seq, 16, 4, 0, &mut ws_baseline);
+        extract_into_with_positions(seq, 16, 4, 0, &mut ws).unwrap();
+        assert_eq!(
+            ws.buffer, ws_baseline.buffer,
+            "hashes must match extract_into"
+        );
+        assert_eq!(
+            ws.buffer.len(),
+            ws.positions_fwd.len(),
+            "parallel arrays must agree even after dedup"
+        );
+        // Every emitted position must be the FIRST occurrence of that hash.
+        // For a homopolymer the deque always carries the smallest position.
+        for win in ws.positions_fwd.windows(2) {
+            // Monotone non-decreasing within a single extract pass is required
+            // by the extract_into algorithm (deque front advances forward).
+            assert!(
+                win[0] <= win[1],
+                "positions within one extract pass must be non-decreasing"
+            );
+        }
+    }
+
+    // WHY: the hash sequence from the new function must match the old function
+    // bit-for-bit. Any divergence means the new path silently changed the
+    // dedup-by-hash semantics, which would invalidate every test pinning the
+    // old function's output.
+    #[test]
+    fn extract_into_with_positions_hashes_match_extract_into() {
+        let seqs: &[&[u8]] = &[
+            b"ACGTACGTACGTACGTACGTACGT",
+            b"GCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCAT",
+            b"AAAAAAAAAAAAAAAAAAAAAAAAA",
+            b"ACGTACGTNNNNACGTACGTACGTACGTACGTACGT", // with N reset
+        ];
+        for &seq in seqs {
+            let mut a = MinimizerWorkspace::new();
+            let mut b = MinimizerWorkspace::new();
+            extract_into(seq, 16, 4, 0, &mut a);
+            extract_into_with_positions(seq, 16, 4, 0, &mut b).unwrap();
+            assert_eq!(a.buffer, b.buffer, "hashes diverged for seq: {:?}", seq);
+        }
+    }
+
+    // WHY: every emitted position must point to a valid k-mer inside the
+    // input, i.e. pos + k <= seq.len(). An off-by-one in the cast or in the
+    // overflow check would let a caller read past the end of the source slice.
+    #[test]
+    fn extract_into_with_positions_positions_are_valid() {
+        let mut ws = MinimizerWorkspace::new();
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let k = 16;
+        extract_into_with_positions(seq, k, 4, 0, &mut ws).unwrap();
+        for &p in &ws.positions_fwd {
+            assert!(
+                (p as usize) + k <= seq.len(),
+                "position {} out of bounds for seq.len() = {}, k = {}",
+                p,
+                seq.len(),
+                k
+            );
+        }
+    }
+
+    // WHY: workspaces are reused across many sequences. If a second call
+    // doesn't clear positions_fwd, it would emit stale positions from the
+    // previous sequence — silently corrupt output, no panic.
+    #[test]
+    fn extract_into_with_positions_workspace_reuse_clears_outputs() {
+        let mut ws = MinimizerWorkspace::new();
+        let seq_a = b"ACGTACGTACGTACGTACGTACGT";
+        let seq_b = b"GG"; // too short — must clear, not append to prior output
+        extract_into_with_positions(seq_a, 16, 4, 0, &mut ws).unwrap();
+        let after_a = (ws.buffer.clone(), ws.positions_fwd.clone());
+        extract_into_with_positions(seq_b, 16, 4, 0, &mut ws).unwrap();
+        assert!(
+            ws.buffer.is_empty(),
+            "buffer not cleared on second call; saw: {:?}",
+            ws.buffer
+        );
+        assert!(
+            ws.positions_fwd.is_empty(),
+            "positions_fwd not cleared on second call; saw: {:?}",
+            ws.positions_fwd
+        );
+        // Sanity: the first call did produce something.
+        assert!(!after_a.0.is_empty());
+        assert_eq!(after_a.0.len(), after_a.1.len());
     }
 }

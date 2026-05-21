@@ -68,7 +68,10 @@ pub use types::{BucketFileStats, HitResult, IndexMetadata, QueryRecord};
 pub use indices::{InvertedIndex, ShardedInvertedIndex};
 
 // Minimizer extraction
-pub use core::{extract_into, get_paired_minimizers_into, MinimizerWorkspace, Strand};
+pub use core::{
+    extract_into, extract_into_with_positions, get_paired_minimizers_into, MinimizerWorkspace,
+    Strand,
+};
 
 // Classification functions
 pub use classify::{

@@ -17,8 +17,9 @@ pub mod workspace;
 // Re-export commonly used items at the core module level
 pub use encoding::base_to_bit;
 pub use extraction::{
-    count_hits, extract_dual_strand_into, extract_into, extract_minimizer_set,
-    extract_strand_minimizers, get_paired_minimizers_into, Strand, StrandMinimizers,
+    count_hits, extract_dual_strand_into, extract_into, extract_into_with_positions,
+    extract_minimizer_set, extract_strand_minimizers, get_paired_minimizers_into, Strand,
+    StrandMinimizers,
 };
 pub use workspace::MinimizerWorkspace;
 
