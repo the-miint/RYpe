@@ -138,6 +138,16 @@ impl ShardedInvertedIndex {
             ));
         }
 
+        // Reject .ryci (cluster index) — different format, different reader.
+        if super::parquet_cluster::is_cluster_parquet_index(base_path) {
+            return Err(RypeError::format(
+                base_path,
+                "This is a .ryci cluster index, not a .ryxdi classify index. \
+                 Use the cluster-index reader (Plan 1.1: ClusterParquetIndex::open) \
+                 instead of ShardedInvertedIndex::open.",
+            ));
+        }
+
         // Load Parquet manifest
         let parquet_manifest = ParquetManifest::load(base_path)
             .map_err(|e| RypeError::format(base_path, e.to_string()))?;

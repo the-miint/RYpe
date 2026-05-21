@@ -7,6 +7,7 @@
 
 mod inverted;
 pub mod parquet;
+pub mod parquet_cluster;
 pub mod sharded;
 
 // Re-export primary types at the indices module level

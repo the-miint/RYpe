@@ -127,3 +127,6 @@ pub use indices::parquet::merge::{
 
 // Re-export parquet module for qualified access
 pub use indices::parquet as parquet_index;
+
+// Re-export parquet_cluster module for qualified access (cluster-index format, .ryci)
+pub use indices::parquet_cluster as parquet_cluster_index;
