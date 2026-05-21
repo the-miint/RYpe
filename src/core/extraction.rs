@@ -12,6 +12,23 @@ use crate::error::{Result, RypeError};
 use super::encoding::base_to_bit;
 use super::workspace::MinimizerWorkspace;
 
+/// Cast a `usize` minimizer position to `u32` for the `.ryci` position column,
+/// failing loud on overflow.
+///
+/// Used by every `*_with_positions` extractor. Pulled into a helper so the
+/// overflow contract is testable in isolation: no realistic test sequence can
+/// trigger `len > u32::MAX`, but if a future change quietly removes the guard
+/// the unit test catches it immediately.
+fn cast_pos(p: usize) -> Result<u32> {
+    u32::try_from(p).map_err(|_| {
+        RypeError::validation(format!(
+            "minimizer position {} exceeds u32::MAX; \
+             input sequence longer than 4.29 Gbp is not supported",
+            p
+        ))
+    })
+}
+
 /// Strand indicator for minimizer origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strand {
@@ -365,15 +382,8 @@ pub fn extract_into_with_positions(
                         // The deque front carries the earliest position for
                         // this hash in the current window — exactly the
                         // "first occurrence" position skani chaining wants.
-                        let pos_u32 = u32::try_from(min_pos).map_err(|_| {
-                            RypeError::validation(format!(
-                                "minimizer position {} exceeds u32::MAX; \
-                                 input sequence longer than 4.29 Gbp is not supported",
-                                min_pos
-                            ))
-                        })?;
                         ws.buffer.push(min_h);
-                        ws.positions_fwd.push(pos_u32);
+                        ws.positions_fwd.push(cast_pos(min_pos)?);
                         last_min = Some(min_h);
                     }
                 }
@@ -506,6 +516,146 @@ pub fn extract_dual_strand_into(
         }
     }
     (fwd_mins, rc_mins)
+}
+
+/// Extract minimizers and their forward-strand positions from both strands.
+///
+/// Position-aware variant of [`extract_dual_strand_into`]. Same sliding-window
+/// algorithm and the same consecutive-duplicate-hash dedup per strand; the
+/// only difference is that each emitted minimizer is paired with its position.
+///
+/// # Position semantics
+///
+/// Both strands report **forward-normalized** positions — the same
+/// `pos = i + 1 - k` offset into `seq` is used for the forward minimizer
+/// emitted at iteration `i` and for the RC minimizer emitted at iteration `i`.
+/// A caller that wants the RC-strand coordinate of the same k-mer computes
+/// `seq.len() - forward_pos - k`. This matches the [`extract_strand_minimizers`]
+/// convention and is what skani-style chaining expects.
+///
+/// # Arguments
+/// * `seq` - DNA sequence as bytes (A, G, T, C, case insensitive)
+/// * `k` - K-mer size (must be 16, 32, or 64)
+/// * `w` - Window size for minimizer selection
+/// * `salt` - XOR salt applied to k-mer hashes
+/// * `ws` - Workspace; `buffer`/`positions_fwd` (forward) and
+///   `rc_buffer`/`positions_rc` (reverse complement) are all cleared and
+///   refilled.
+///
+/// # Output
+/// `ws.buffer` ‖ `ws.positions_fwd` and `ws.rc_buffer` ‖ `ws.positions_rc`
+/// are written index-parallel within each strand.
+///
+/// # Errors
+/// Returns `RypeError::validation` if any emitted position exceeds `u32::MAX`
+/// (requires `seq.len() > 4.29 Gbp`; never reachable on realistic single
+/// contigs but the guard exists to fail loud rather than silent-truncate).
+pub fn extract_dual_strand_into_with_positions(
+    seq: &[u8],
+    k: usize,
+    w: usize,
+    salt: u64,
+    ws: &mut MinimizerWorkspace,
+) -> Result<()> {
+    ws.buffer.clear();
+    ws.rc_buffer.clear();
+    ws.positions_fwd.clear();
+    ws.positions_rc.clear();
+    ws.q_fwd.clear();
+    ws.q_rc.clear();
+
+    let len = seq.len();
+    if len < k {
+        return Ok(());
+    }
+
+    let k_mask = if k == 64 { u64::MAX } else { (1u64 << k) - 1 };
+    let rc_shift = k - 1;
+
+    let mut current_val: u64 = 0;
+    let mut current_rc: u64 = 0;
+    let mut valid_bases_count = 0;
+
+    let mut last_fwd: Option<u64> = None;
+    let mut last_rc: Option<u64> = None;
+
+    for i in 0..len {
+        let bit = base_to_bit(seq[i]);
+
+        if bit == u64::MAX {
+            valid_bases_count = 0;
+            ws.q_fwd.clear();
+            ws.q_rc.clear();
+            current_val = 0;
+            current_rc = 0;
+            last_fwd = None;
+            last_rc = None;
+            continue;
+        }
+
+        valid_bases_count += 1;
+        current_val = ((current_val << 1) | bit) & k_mask;
+        current_rc = (current_rc >> 1) | ((bit ^ 1) << rc_shift);
+
+        if valid_bases_count >= k {
+            let pos = i + 1 - k;
+            let h_fwd = current_val ^ salt;
+            let h_rc = current_rc ^ salt;
+
+            // Forward strand deque
+            while let Some(&(p, _)) = ws.q_fwd.front() {
+                if p + w <= pos {
+                    ws.q_fwd.pop_front();
+                } else {
+                    break;
+                }
+            }
+            while let Some(&(_, v)) = ws.q_fwd.back() {
+                if v >= h_fwd {
+                    ws.q_fwd.pop_back();
+                } else {
+                    break;
+                }
+            }
+            ws.q_fwd.push_back((pos, h_fwd));
+
+            // Reverse complement deque
+            while let Some(&(p, _)) = ws.q_rc.front() {
+                if p + w <= pos {
+                    ws.q_rc.pop_front();
+                } else {
+                    break;
+                }
+            }
+            while let Some(&(_, v)) = ws.q_rc.back() {
+                if v >= h_rc {
+                    ws.q_rc.pop_back();
+                } else {
+                    break;
+                }
+            }
+            ws.q_rc.push_back((pos, h_rc));
+
+            if valid_bases_count >= k + w - 1 {
+                if let Some(&(min_pos, min_h)) = ws.q_fwd.front() {
+                    if Some(min_h) != last_fwd {
+                        ws.buffer.push(min_h);
+                        ws.positions_fwd.push(cast_pos(min_pos)?);
+                        last_fwd = Some(min_h);
+                    }
+                }
+                if let Some(&(min_pos, min_h)) = ws.q_rc.front() {
+                    if Some(min_h) != last_rc {
+                        ws.rc_buffer.push(min_h);
+                        ws.positions_rc.push(cast_pos(min_pos)?);
+                        last_rc = Some(min_h);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Extract minimizers from paired-end reads.
@@ -1143,5 +1293,140 @@ mod tests {
         // Sanity: the first call did produce something.
         assert!(!after_a.0.is_empty());
         assert_eq!(after_a.0.len(), after_a.1.len());
+    }
+
+    // ---- Plan 1.2 phase 2: extract_dual_strand_into_with_positions ----
+
+    // WHY: short seq must yield empty output for BOTH strands and BOTH position
+    // buffers, and must succeed (Ok). A caller looping over short reads would
+    // otherwise hit spurious validation errors.
+    #[test]
+    fn extract_dual_strand_into_with_positions_short_sequence() {
+        let mut ws = MinimizerWorkspace::new();
+        let seq = b"ACGT";
+        extract_dual_strand_into_with_positions(seq, 16, 4, 0, &mut ws)
+            .expect("short seq must succeed");
+        assert!(ws.buffer.is_empty());
+        assert!(ws.positions_fwd.is_empty());
+        assert!(ws.rc_buffer.is_empty());
+        assert!(ws.positions_rc.is_empty());
+    }
+
+    // WHY: BOTH (buffer, positions_fwd) and (rc_buffer, positions_rc) must
+    // stay index-parallel. A mismatch on either pair silently corrupts
+    // chain DP — it would associate the wrong position with each minimizer.
+    #[test]
+    fn extract_dual_strand_into_with_positions_parallel_arrays_both_strands() {
+        let mut ws = MinimizerWorkspace::new();
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        extract_dual_strand_into_with_positions(seq, 16, 4, 0, &mut ws).unwrap();
+        assert_eq!(ws.buffer.len(), ws.positions_fwd.len());
+        assert_eq!(ws.rc_buffer.len(), ws.positions_rc.len());
+    }
+
+    // WHY: hash sequences from the new function (both strands) must match
+    // the old extract_dual_strand_into bit-for-bit. Any divergence means
+    // the new path silently changed dedup-by-hash semantics, which would
+    // invalidate every test pinning the old function's output.
+    #[test]
+    fn extract_dual_strand_into_with_positions_forward_hashes_match() {
+        let seqs: &[&[u8]] = &[
+            b"ACGTACGTACGTACGTACGTACGT",
+            b"GCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCAT",
+            b"AAAAAAAAAAAAAAAAAAAAAAAAA",
+            b"ACGTACGTNNNNACGTACGTACGTACGTACGTACGT",
+        ];
+        for &seq in seqs {
+            let mut a = MinimizerWorkspace::new();
+            let (a_fwd, a_rc) = extract_dual_strand_into(seq, 16, 4, 0, &mut a);
+            let mut b = MinimizerWorkspace::new();
+            extract_dual_strand_into_with_positions(seq, 16, 4, 0, &mut b).unwrap();
+            assert_eq!(
+                a_fwd, b.buffer,
+                "forward hashes diverged for seq: {:?}",
+                seq
+            );
+            assert_eq!(a_rc, b.rc_buffer, "RC hashes diverged for seq: {:?}", seq);
+        }
+    }
+
+    // WHY: every emitted position on BOTH strands must point to a valid
+    // k-mer (p + k <= len). Positions are forward-normalized — RC positions
+    // share the same coordinate system as forward, NOT the RC-strand
+    // coordinate system. Downstream computes len - pos - k if needed.
+    #[test]
+    fn extract_dual_strand_into_with_positions_positions_are_valid_both_strands() {
+        let mut ws = MinimizerWorkspace::new();
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let k = 16;
+        extract_dual_strand_into_with_positions(seq, k, 4, 0, &mut ws).unwrap();
+        for &p in &ws.positions_fwd {
+            assert!(
+                (p as usize) + k <= seq.len(),
+                "fwd position {} out of bounds for len={}, k={}",
+                p,
+                seq.len(),
+                k
+            );
+        }
+        for &p in &ws.positions_rc {
+            assert!(
+                (p as usize) + k <= seq.len(),
+                "rc position {} out of bounds for len={}, k={}",
+                p,
+                seq.len(),
+                k
+            );
+        }
+    }
+
+    // WHY: on a homopolymer the same forward hash AND the same RC hash
+    // dominate many windows. Both strands must dedup by hash keeping the
+    // earliest position. A bug that kept only the latest position would
+    // bias chain start coordinates forward by up to w-1 bases on either
+    // strand independently.
+    #[test]
+    fn extract_dual_strand_into_with_positions_dedup_keeps_first_position_both_strands() {
+        let mut ws = MinimizerWorkspace::new();
+        let seq = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        extract_dual_strand_into_with_positions(seq, 16, 4, 0, &mut ws).unwrap();
+        // Parallel arrays must agree even after dedup.
+        assert_eq!(ws.buffer.len(), ws.positions_fwd.len());
+        assert_eq!(ws.rc_buffer.len(), ws.positions_rc.len());
+        // Within a single extract pass the deque front always carries the
+        // earliest position for the current minimum, so positions emitted
+        // for a given strand must be non-decreasing.
+        for win in ws.positions_fwd.windows(2) {
+            assert!(win[0] <= win[1], "fwd positions not non-decreasing");
+        }
+        for win in ws.positions_rc.windows(2) {
+            assert!(win[0] <= win[1], "rc positions not non-decreasing");
+        }
+    }
+
+    // WHY: the u32 overflow guard exists for future genome-scale callers
+    // (seq.len() > 4.29 Gbp) where the cast would silently truncate.
+    // No realistic test sequence can trigger it on actual extract paths,
+    // so we extract the cast into a helper and pin the contract here.
+    // If anyone removes the guard, this test fires immediately.
+    #[test]
+    fn cast_pos_rejects_overflow() {
+        // Below the limit: succeeds.
+        assert_eq!(cast_pos(0).unwrap(), 0);
+        assert_eq!(cast_pos(u32::MAX as usize).unwrap(), u32::MAX);
+
+        // Above the limit: fails with a clear message.
+        // On a 32-bit usize platform u32::MAX as usize == usize::MAX, so
+        // the over-the-limit case is unreachable — skip the negative test.
+        #[cfg(target_pointer_width = "64")]
+        {
+            let err = cast_pos((u32::MAX as usize) + 1).unwrap_err();
+            let msg = format!("{}", err);
+            assert!(
+                msg.contains("exceeds u32::MAX"),
+                "error should mention overflow: {}",
+                msg
+            );
+        }
     }
 }

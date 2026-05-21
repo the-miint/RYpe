@@ -69,8 +69,8 @@ pub use indices::{InvertedIndex, ShardedInvertedIndex};
 
 // Minimizer extraction
 pub use core::{
-    extract_into, extract_into_with_positions, get_paired_minimizers_into, MinimizerWorkspace,
-    Strand,
+    extract_dual_strand_into_with_positions, extract_into, extract_into_with_positions,
+    get_paired_minimizers_into, MinimizerWorkspace, Strand,
 };
 
 // Classification functions
