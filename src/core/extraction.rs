@@ -298,10 +298,12 @@ pub fn extract_into(seq: &[u8], k: usize, w: usize, salt: u64, ws: &mut Minimize
 /// difference is that each emitted minimizer is paired with its position (a
 /// zero-based offset into `seq`) in [`MinimizerWorkspace::positions_fwd`].
 ///
-/// On a homopolymer or other run where successive windows select the same
-/// hash, only the FIRST position is kept — this is required for downstream
-/// `ClusterBucketData::validate` (which rejects duplicate minimizers within
-/// a bucket) and matches skani's "earliest anchor wins" convention.
+/// # Dedup semantics
+/// Consecutive duplicate hashes are dropped, keeping the FIRST position seen
+/// for each hash. Output has no two adjacent entries with the same hash. This
+/// matches skani's "earliest anchor wins" convention and is exactly what a
+/// downstream index that requires hash-unique-per-bucket needs (one such
+/// caller is the `.ryci` cluster index, but the contract stands on its own).
 ///
 /// # Arguments
 /// * `seq` - DNA sequence as bytes (A, G, T, C, case insensitive)
@@ -329,6 +331,13 @@ pub fn extract_into_with_positions(
 ) -> Result<()> {
     ws.buffer.clear();
     ws.positions_fwd.clear();
+    // Also clear the dual-strand output buffers so a caller alternating
+    // single-strand and dual-strand extracts on one workspace can't read
+    // stale RC data left over from a prior dual-strand call. The single-
+    // strand path never writes to these — the doc on `rc_buffer` promises
+    // they're empty after a single-strand extract, so we keep that promise.
+    ws.rc_buffer.clear();
+    ws.positions_rc.clear();
     ws.q_fwd.clear();
 
     let len = seq.len();
@@ -368,7 +377,13 @@ pub fn extract_into_with_positions(
                 }
             }
             while let Some(&(_, v)) = ws.q_fwd.back() {
-                if v >= hash {
+                // Strict `>` (not `>=`): ties on hash must keep the EARLIER
+                // position. With `>=`, a later equal-hash entry would pop
+                // earlier ones from the back, leaving the LATEST occurrence
+                // at the front — wrong for skani's "earliest anchor"
+                // convention. The position-less `extract_into` uses `>=`
+                // because it only cares about the hash value.
+                if v > hash {
                     ws.q_fwd.pop_back();
                 } else {
                     break;
@@ -380,7 +395,8 @@ pub fn extract_into_with_positions(
                 if let Some(&(min_pos, min_h)) = ws.q_fwd.front() {
                     if Some(min_h) != last_min {
                         // The deque front carries the earliest position for
-                        // this hash in the current window — exactly the
+                        // this hash in the current window (guaranteed by the
+                        // strict-`>` back-prune above) — exactly the
                         // "first occurrence" position skani chaining wants.
                         ws.buffer.push(min_h);
                         ws.positions_fwd.push(cast_pos(min_pos)?);
@@ -611,7 +627,10 @@ pub fn extract_dual_strand_into_with_positions(
                 }
             }
             while let Some(&(_, v)) = ws.q_fwd.back() {
-                if v >= h_fwd {
+                // Strict `>` (not `>=`): ties on hash must keep the EARLIER
+                // position. See the matching comment in
+                // `extract_into_with_positions` for the full rationale.
+                if v > h_fwd {
                     ws.q_fwd.pop_back();
                 } else {
                     break;
@@ -628,7 +647,8 @@ pub fn extract_dual_strand_into_with_positions(
                 }
             }
             while let Some(&(_, v)) = ws.q_rc.back() {
-                if v >= h_rc {
+                // Strict `>` for the same reason as the forward strand.
+                if v > h_rc {
                     ws.q_rc.pop_back();
                 } else {
                     break;
@@ -1198,12 +1218,19 @@ mod tests {
     // one, chains built on this output would point downstream of the actual
     // first-occurrence k-mer skani conventions assume, biasing chain start
     // coordinates forward by up to w-1 bases.
+    //
+    // Earlier this test only checked "non-decreasing positions" — which
+    // trivially passes when the homopolymer dedups to a single emission. The
+    // strict `assert_eq!(positions_fwd[0], 0)` below is the load-bearing
+    // assertion: any regression of the back-prune `>` to `>=` would emit
+    // position k+w-2 = 18 instead of 0 and this fires immediately.
     #[test]
     fn extract_into_with_positions_dedup_keeps_first_position() {
         let mut ws_baseline = MinimizerWorkspace::new();
         let mut ws = MinimizerWorkspace::new();
-        // Long homopolymer guarantees the same hash dominates many windows
-        // in a row, triggering the consecutive-duplicate path.
+        // Long homopolymer: every k-mer has the same (purine-only) RY hash,
+        // so the algorithm sees consecutive duplicates from the moment the
+        // first window completes.
         let seq = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         extract_into(seq, 16, 4, 0, &mut ws_baseline);
         extract_into_with_positions(seq, 16, 4, 0, &mut ws).unwrap();
@@ -1216,16 +1243,13 @@ mod tests {
             ws.positions_fwd.len(),
             "parallel arrays must agree even after dedup"
         );
-        // Every emitted position must be the FIRST occurrence of that hash.
-        // For a homopolymer the deque always carries the smallest position.
-        for win in ws.positions_fwd.windows(2) {
-            // Monotone non-decreasing within a single extract pass is required
-            // by the extract_into algorithm (deque front advances forward).
-            assert!(
-                win[0] <= win[1],
-                "positions within one extract pass must be non-decreasing"
-            );
-        }
+        // Load-bearing: a homopolymer dedups to exactly ONE emission, and that
+        // emission MUST be at position 0 (the earliest occurrence).
+        assert_eq!(ws.buffer.len(), 1, "homopolymer must dedup to one emit");
+        assert_eq!(
+            ws.positions_fwd[0], 0,
+            "emitted position must be the EARLIEST occurrence (0), not the latest"
+        );
     }
 
     // WHY: the hash sequence from the new function must match the old function
@@ -1385,23 +1409,37 @@ mod tests {
     // earliest position. A bug that kept only the latest position would
     // bias chain start coordinates forward by up to w-1 bases on either
     // strand independently.
+    //
+    // Same load-bearing assertion as the single-strand test: a homopolymer
+    // dedups to exactly one emission per strand at position 0. The earlier
+    // version of this test only checked "non-decreasing positions" which
+    // can't distinguish earliest from latest when there's only one emission.
     #[test]
     fn extract_dual_strand_into_with_positions_dedup_keeps_first_position_both_strands() {
         let mut ws = MinimizerWorkspace::new();
         let seq = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         extract_dual_strand_into_with_positions(seq, 16, 4, 0, &mut ws).unwrap();
-        // Parallel arrays must agree even after dedup.
         assert_eq!(ws.buffer.len(), ws.positions_fwd.len());
         assert_eq!(ws.rc_buffer.len(), ws.positions_rc.len());
-        // Within a single extract pass the deque front always carries the
-        // earliest position for the current minimum, so positions emitted
-        // for a given strand must be non-decreasing.
-        for win in ws.positions_fwd.windows(2) {
-            assert!(win[0] <= win[1], "fwd positions not non-decreasing");
-        }
-        for win in ws.positions_rc.windows(2) {
-            assert!(win[0] <= win[1], "rc positions not non-decreasing");
-        }
+        // Both strands must dedup to exactly one emission at position 0.
+        assert_eq!(
+            ws.buffer.len(),
+            1,
+            "fwd: homopolymer must dedup to one emit"
+        );
+        assert_eq!(
+            ws.rc_buffer.len(),
+            1,
+            "rc: homopolymer must dedup to one emit"
+        );
+        assert_eq!(
+            ws.positions_fwd[0], 0,
+            "fwd emitted position must be earliest (0)"
+        );
+        assert_eq!(
+            ws.positions_rc[0], 0,
+            "rc emitted position must be earliest (0)"
+        );
     }
 
     // WHY: the u32 overflow guard exists for future genome-scale callers
