@@ -1,366 +1,65 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Project-specific instructions for Claude Code. For design rationale (RY encoding, minimizers, Parquet layout, lifecycle), see `docs/architecture.md`. For data structures, constants, and algorithms, read the code directly — it's the source of truth.
 
 ## Project Overview
 
-**Rype** is a high-performance genomic sequence classification library using minimizer-based k-mer sketching in RY (purine/pyrimidine) space. It's written in Rust and provides both a Rust library, CLI tool, and C API for FFI integration.
+**Rype** is a Rust library + CLI + C API for genomic sequence classification using minimizer-based k-mer sketching in RY (purine/pyrimidine) space. Indices are stored as `.ryxdi` Parquet directories.
 
-All indices are stored in Parquet format (`.ryxdi` directories).
+## Rules
 
-## Build and Development Commands
+These rules apply to every task in this project unless explicitly overridden.
 
-### Building
+### Rule 1 — Think Before Coding
+Bias caution over speed on non-trivial work. State assumptions explicitly; ask rather than guess. Push back when a simpler approach exists. Stop when confused.
+
+### Rule 2 — Simplicity First
+Minimum code that solves the problem. Nothing speculative. No abstractions for single-use code.
+
+### Rule 3 — Surgical Changes
+Touch only what you must. Don't improve adjacent code. Match existing style. Don't refactor what isn't broken.
+
+### Rule 4 — Goal-Driven Execution
+Define success criteria up front. Loop until verified. For correctness changes, "verified" means `cargo test` passes (and any new test you added fails without the fix). For performance changes, "verified" means `/usr/bin/time -v` measurements — both wall time and peak RSS — recorded against a baseline.
+
+### Rule 5 — Surface conflicts, don't average them
+If two patterns contradict, pick one (more recent / more tested). Explain why. Flag the other for cleanup.
+
+### Rule 6 — Read before you write
+Before adding code, read its exports, immediate callers, and the shared utilities it will touch. If you can't explain why existing code is structured a certain way, ask before changing it.
+
+### Rule 7 — Tests verify intent, not just behavior
+Tests must encode WHY behavior matters, not just WHAT it does. A test that can't fail when business logic changes is wrong.
+
+### Rule 8 — Checkpoint at task boundaries
+After each completed task in a TaskCreate list — or any change that crosses module boundaries — summarize what was done, what's verified, and what's left. Don't continue from a state you can't describe back.
+
+### Rule 9 — Match the codebase's conventions, even if you disagree
+Conformance > taste inside the codebase. If you think a convention is harmful, surface it. Don't fork silently.
+
+### Rule 10 — Fail loud
+"Completed" is wrong if anything was skipped silently. Don't silently skip tests you caused to be skipped (commented out, `#[ignore]`'d, missed) — existing `require-env` skips for optional deps/oracles are legitimate and expected. Default to surfacing uncertainty, not hiding it.
+
+## Build and Test
+
 ```bash
-# Build the project
-cargo build --release
-
-# Build for development with debug symbols
-cargo build
+cargo build --release        # production binary at target/release/rype
+cargo build                  # dev build with debug symbols
+cargo test                   # all tests
+cargo test -- --nocapture    # show output
 ```
 
-### Testing
-```bash
-# Run all tests
-cargo test
+`rype --help` (and each subcommand's `--help`) is authoritative for CLI usage. C and Python integration examples live in `examples/`.
 
-# Run tests with output
-cargo test -- --nocapture
+## Operational Rules (project-specific)
 
-# Run specific test
-cargo test test_name
-```
+**Use `target/release/rype` directly, not `cargo run`.** `cargo run --release --bin rype --` can inject empty-string arguments. Always invoke the compiled binary.
 
-### C API Development
-```bash
-# Build C example
-gcc example.c -L target/debug -lrype -o c_example
+**Temporary files go in `scratch/`, not `/tmp`.** `/tmp` has insufficient space on this system. The `scratch/` directory is gitignored.
 
-# Set library path and run
-LD_LIBRARY_PATH=target/debug ./c_example
-```
+**Never run performance tests in parallel.** Benchmarks are I/O-bound (shard loading dominates). Concurrent tests produce misleading timings due to disk contention. Run perf tests strictly sequentially.
 
-### Python Examples
-```bash
-# ctypes extraction example (no extra dependencies)
-python3 examples/ctypes_extraction_example.py
-
-# PyArrow extraction example (requires pyarrow via conda env)
-conda run -n rype-pyarrow python3 examples/pyarrow_extraction_example.py
-```
-
-### CLI Usage
-```bash
-# Create an index from reference sequences
-cargo run --release -- index create -o index.ryxdi -r ref1.fasta -r ref2.fasta -k 64 -w 50
-
-# Create index with one bucket per sequence
-cargo run --release -- index create -o genes.ryxdi -r genes.fasta --separate-buckets
-
-# Show index statistics
-cargo run --release -- index stats -i index.ryxdi
-
-# Show source details for a bucket
-cargo run --release -- index bucket-source-detail -i index.ryxdi -b 1
-
-# Build index from a TOML configuration file
-cargo run --release -- index from-config -c config.toml
-
-# Merge two indices into one
-cargo run --release -- index merge --index-primary idx1.ryxdi --index-secondary idx2.ryxdi -o merged.ryxdi
-
-# Merge with subtraction (remove secondary minimizers that exist in primary)
-# Useful for creating non-host indices
-cargo run --release -- index merge --index-primary host.ryxdi --index-secondary sample.ryxdi \
-    -o non_host.ryxdi --subtract-from-primary
-
-# Classify sequences (single-end)
-cargo run --release -- classify run -i index.ryxdi -1 reads.fastq -t 0.1
-
-# Classify sequences (paired-end)
-cargo run --release -- classify run -i index.ryxdi -1 reads_R1.fastq -2 reads_R2.fastq -t 0.1
-
-# Classify with negative filtering (host depletion)
-cargo run --release -- classify run -i target.ryxdi -N host.ryxdi -1 reads.fastq -t 0.1
-
-# Aggregate classification (for higher sensitivity)
-cargo run --release -- classify aggregate -i index.ryxdi -1 reads.fastq -t 0.05
-
-# Best-hit-only classification
-cargo run --release -- classify run -i index.ryxdi -1 reads.fastq --best-hit
-
-# Classify with sequence trimming (use first N bases only)
-# Useful when read starts are more reliable than ends
-cargo run --release -- classify run -i index.ryxdi -1 reads.fastq -t 0.1 --trim-to 100
-```
-
-## Architecture Overview
-
-### RY Encoding (Core Concept)
-
-The library uses a reduced 2-bit alphabet that collapses purines and pyrimidines:
-- **Purines** (A/G) → 1
-- **Pyrimidines** (T/C) → 0
-- **Other bases** (N, ambiguous) → invalid (resets k-mer extraction)
-
-This enables purine/pyrimidine-aware matching where AG-purine mutations don't break matches, and allows 64bp k-mers to fit in a single u64.
-
-### Minimizer Sketching Algorithm
-
-The library reduces sequence representation using minimizers:
-1. Sliding window of size `w` over k-mers
-2. Select minimum hash value within each window as representative
-3. Deduplicate consecutive identical minimizers
-
-Implementation uses monotonic deque for O(n) time complexity (see `extract_into()` in src/core.rs).
-
-### Key Data Structures
-
-**InvertedIndex** (src/indices/):
-- Minimizer → bucket ID mappings for fast classification
-- Loaded from Parquet shards on-demand
-
-**ShardedInvertedIndex** (src/indices/):
-- Memory-efficient sharded inverted index
-- Holds manifest; shards loaded on-demand during classification
-
-**MinimizerWorkspace** (src/core.rs):
-- Reusable workspace to avoid allocations in hot loops
-- Contains deques for forward/reverse-complement k-mer tracking
-- `buffer: Vec<u64>` - Output minimizers
-
-**HitResult** (src/types.rs):
-- Classification result: query_id, bucket_id, score
-
-**BucketData** (src/indices/parquet/):
-- Used during index creation: bucket_id, bucket_name, sources, minimizers
-
-### Constants Module (src/constants.rs)
-
-Centralized constants for consistency and maintainability:
-
-**Safety Limits:**
-- `MAX_INVERTED_MINIMIZERS` - Maximum minimizers in inverted index (1 trillion)
-- `MAX_INVERTED_BUCKET_IDS` - Maximum bucket ID entries (4 billion)
-- `MAX_SEQUENCE_LENGTH` - Max sequence size for C API (2GB)
-- `MAX_READS` - Bit-packing limit (2^31 - 1)
-
-**Performance Tuning:**
-- `GALLOP_THRESHOLD` = 16 - Merge-join vs galloping switch point
-- `QUERY_HASHSET_THRESHOLD` = 1000 - Linear vs HashSet lookup
-- `PARQUET_BATCH_SIZE`, `DEFAULT_ROW_GROUP_SIZE` - Parquet I/O sizing
-
-**Delimiters:**
-- `BUCKET_SOURCE_DELIM` = "::" - Separates filename from sequence name in bucket sources
-
-### Core Algorithms
-
-**Minimizer Extraction** (src/core.rs):
-- `extract_into()` - Single-strand minimizer extraction
-- `extract_dual_strand_into()` - Forward + reverse-complement extraction
-- `get_paired_minimizers_into()` - Paired-end read handling
-
-**Classification** (src/classify.rs):
-- `classify_batch_sharded_merge_join()` - Default classification using merge-join
-- `classify_batch_sharded_parallel_rg()` - Classification with parallel row group processing
-- `classify_with_sharded_negative()` - Classification with negative filtering
-
-**Index Building** (src/indices/parquet/):
-- `create_parquet_inverted_index()` - Create Parquet index from BucketData
-
-### C API (src/c_api.rs)
-
-FFI layer exposing core functionality to C:
-
-**Thread Safety**:
-- Index loading/freeing: NOT thread-safe
-- Classification (`rype_classify`): Thread-safe (multiple threads can use same Index)
-- Results: NOT thread-safe (each thread needs own RypeResultArray)
-
-**Key Functions**:
-- `rype_index_load(path)` - Load index from disk
-- `rype_classify(index, queries, num_queries, threshold)` - Batch classify
-- `rype_results_free(results)` - Free result array
-- `rype_get_last_error()` - Get thread-local error message
-
-**Safety**:
-- Input validation for all C pointers and sizes
-- Thread-local error reporting
-- MAX_SEQUENCE_LENGTH limit (2GB)
-- Panic catching in `rype_classify`
-
-### CLI (src/main.rs)
-
-Nested subcommands using clap:
-
-**`rype index`** - Index operations:
-- `create` - Build Parquet index from FASTA/FASTQ
-- `stats` - Show index statistics
-- `bucket-source-detail` - Show source details for a specific bucket
-- `bucket-add` - Add sequences to existing index as new bucket (development pending)
-- `from-config` - Build index from TOML configuration file
-- `bucket-add-config` - Add files using TOML config (development pending)
-- `merge` - Merge two indices into one (with optional subtraction)
-- `summarize` - Show detailed minimizer statistics
-
-**`rype classify`** - Classification operations:
-- `run` - Per-read classification
-- `aggregate` - Aggregated classification for paired-end (alias: `agg`)
-
-**`rype inspect`** - Debugging operations:
-- `matches` - Show matching minimizers between queries and buckets (not supported with Parquet)
-
-## Important Constants
-
-- `K ∈ {16, 32, 64}` - K-mer size (configurable per-index, always uses u64 representation)
-- `MAX_SEQUENCE_LENGTH = 2_000_000_000` - Max sequence size for C API
-
-## Critical Implementation Details
-
-### K-mer Encoding
-The `base_to_bit()` function uses unsafe lookup table for performance. Invalid bases return `u64::MAX` which triggers window reset.
-
-### Canonical K-mers
-K-mers and their reverse complements are treated as equivalent. Reverse complement calculated via bitwise NOT: `!kmer` in RY-space.
-
-### Parallel Processing
-Uses `rayon` for data parallelism:
-- Classification parallelizes minimizer extraction AND bucket scoring
-- `map_init()` pattern provides per-thread workspace to avoid allocations
-
-### Parquet Index Format
-
-All indices use Parquet format stored as `.ryxdi` directories:
-
-```
-index.ryxdi/
-├── manifest.toml           # TOML metadata (k, w, salt, bucket info)
-├── buckets.parquet         # (bucket_id, bucket_name, sources)
-└── inverted/
-    ├── shard.0.parquet     # (minimizer: u64, bucket_id: u32) sorted pairs
-    └── ...                 # Additional shards for large indices
-```
-
-**Manifest Format (TOML)**:
-```toml
-magic = "RYPE_PARQUET_V1"
-format_version = 1
-k = 64
-w = 50
-salt = "0x5555555555555555"  # Hex string for large values
-source_hash = "0xDEADBEEF"
-num_buckets = 10
-total_minimizers = 1000000
-
-[inverted]
-num_shards = 2
-total_entries = 5000000
-has_overlapping_shards = true  # Buckets may share minimizers across shards
-```
-
-**Benefits**:
-- Parquet provides efficient columnar storage with DELTA_BINARY_PACKED encoding
-- Streaming k-way merge enables building large indices with bounded memory
-- Human-readable TOML manifest for easy inspection
-- Shards loaded on-demand during classification
-
-**Memory Benefits**:
-- Manifest loads instantly (no minimizer data)
-- Classification loads one shard at a time via `classify_batch_sharded_merge_join`
-- Memory usage: O(batch_size × minimizers_per_read) + O(single_shard_size)
-- Enables classification when total index exceeds available RAM
-
-### Error Handling
-- Rust API: Uses `anyhow::Result<T>` for all fallible operations
-- C API: Returns NULL on error, call `rype_get_last_error()` for details
-- Safe loading: Validates format, enforces size limits
-
-## Memory Management Notes
-
-### Rust Side
-- Workspace reuse pattern minimizes allocations (pass `&mut MinimizerWorkspace`)
-- Shards loaded on-demand, not all at once
-
-### C API Side
-- Index ownership transferred via `Box::into_raw()` / `Box::from_raw()`
-- Results allocated in Rust, freed by caller with `rype_results_free()`
-- Never free Index while classification is in progress (use-after-free)
-- Never double-free RypeResultArray (undefined behavior)
-
-## Testing Strategy
-
-Existing tests cover:
-- Minimizer extraction correctness
-- Index creation and loading
-- Classification accuracy
-- C API validation logic
-
-When adding features:
-1. Add unit tests for core logic
-2. Add error path tests
-3. Test with C example if touching FFI
-4. Consider edge cases: empty sequences, N-bases, very long sequences
-
-## Performance Considerations
-
-- **Hot path**: `extract_into()`, classification functions - avoid allocations
-- **Deque capacity**: Pre-sized to avoid reallocation during sliding window
-- **Parallelism**: Batch processing amortizes thread pool overhead
-- **Inverted index**: Reduces per-bucket work from O(queries × minimizers) to O(unique_minimizers)
-- **Row group filtering**: Bloom filters can reduce I/O by rejecting row groups early
-
-## Common Pitfalls
-
-1. **K-mer size**: K must be 16, 32, or 64. K is set at index creation and stored in the index.
-2. **C API thread safety**: Don't share RypeResultArray across threads
-3. **Index compatibility**: Indices with different k, w, or salt cannot be used together for negative filtering
-4. **Short sequences**: Sequences < K bases produce no minimizers
-
-## Performance Test Data (Local Only)
-
-The `perf-assessment/` and `perf-data/` directories contain real-world test data for benchmarking (not checked into git):
-
-- **Genomes**: `perf-data/wol2-genomes/` — ~16,000 compressed FASTA genomes (WoL2 database)
-- **Query files** (symlinks in `perf-assessment/query-files/`):
-  - `short_read_R1.fastq.gz` / `short_read_R2.fastq.gz` — paired-end short reads (~108MB/113MB)
-  - `long_read.fastq.gz` — long reads (~2.2GB)
-  - `short_read.parquet` / `long_read.parquet` — Parquet-converted versions
-- **Pre-built indices**:
-  - `perf-assessment/parquet-index/n100-w200.ryxdi/` — 160-bucket index (k=64, w=200, 8 shards, ~486M minimizers)
-  - `perf-assessment/config/numerator-w200.ryxdi/` — single-bucket index (8000 genomes from buckets 1-80, 267M minimizers)
-  - `perf-assessment/config/denominator-w200.ryxdi/` — single-bucket index (7952 genomes from buckets 81-160, 216M minimizers)
-- **Index configs**: `perf-assessment/config/n100-w200.toml` etc. — TOML configs for rebuilding indices
-
-Tests using this data should be `#[ignore]` since it's local-only.
-
-### Building Single-Bucket Indices for Log-Ratio Testing
-
-Log-ratio mode (`classify log-ratio`) requires single-bucket indices (exactly 1 bucket each). The multi-bucket `n100-w200.ryxdi` cannot be used. To build single-bucket indices:
-
-1. **Config format** — each config has `[index]` section and one `[buckets.<name>]` section with a `files` array:
-   ```toml
-   [index]
-   window = 200
-   salt = 6148914691236517205
-   output = "numerator-w200.ryxdi"
-
-   [buckets.numerator]
-   files = [ "../../perf-data/wol2-genomes/G001873845.fasta.gz", ... ]
-   ```
-
-2. **Build command** — output path is relative to the config file location:
-   ```bash
-   target/release/rype index from-config -c perf-assessment/config/numerator-w200.toml
-   ```
-
-3. **Verify** — must show exactly 1 bucket:
-   ```bash
-   target/release/rype index stats -i perf-assessment/config/numerator-w200.ryxdi
-   ```
-
-### Running Performance Tests
-
-**Always measure both time and space.** Use `/usr/bin/time -v` to capture peak RSS (resident set size) alongside `--timing` for per-phase breakdowns. Record both in plan docs.
+**Always measure both time and peak RSS.** Use `/usr/bin/time -v` alongside `--timing` for per-phase breakdowns. Record both in plan docs.
 
 ```bash
 # Log-ratio with minimum-length filter (the OOM-prone scenario):
@@ -370,19 +69,49 @@ Log-ratio mode (`classify log-ratio`) requires single-bucket indices (exactly 1 
   -1 perf-assessment/query-files/long_read.parquet \
   --minimum-length 100 --max-memory 4G --timing \
   -o scratch/log-ratio-test.tsv
-
-# Standard classification with timing (for build_query_index benchmarking):
-/usr/bin/time -v target/release/rype classify run \
-  -i perf-assessment/parquet-index/n100-w200.ryxdi \
-  -1 perf-assessment/query-files/long_read.parquet \
-  -t 0.01 --timing \
-  -o scratch/classify-test.tsv
 ```
 
-**Important**: Always use `target/release/rype` (absolute or relative path to the binary) rather than `cargo run --release --bin rype --` which can insert empty string arguments.
+## Key Constraints (gotchas not obvious from code)
 
-**CRITICAL**: NEVER run multiple performance tests in parallel. These benchmarks are I/O-bound (shard loading dominates), so concurrent tests produce misleading timings due to disk contention. Always run performance tests sequentially — one at a time.
+- **K-mer size**: K must be 16, 32, or 64. K is set at index creation and stored in the manifest.
+- **Index compatibility**: Indices with different `k`, `w`, or `salt` cannot be combined (negative filtering, log-ratio, merge).
+- **C API thread safety**:
+  - Index loading/freeing — NOT thread-safe.
+  - `rype_classify` — thread-safe (multiple threads can share one Index).
+  - `RypeResultArray` — NOT thread-safe; each thread needs its own.
+  - Never free an Index while classification is in progress (use-after-free). Never double-free a result array.
+- **Log-ratio mode requires single-bucket indices** (exactly 1 bucket per index). The multi-bucket `n100-w200.ryxdi` cannot be used.
+- **Short sequences**: sequences < K bases produce no minimizers.
 
-## Development Environment Notes
+## Local-Only Performance Test Data
 
-- **Temporary files**: Do NOT use `/tmp` - it has insufficient space on this system. Use `scratch/` directory within the project for temporary files and test data. This directory is gitignored.
+`perf-assessment/` and `perf-data/` contain real-world benchmark data, not checked into git:
+
+- **Genomes**: `perf-data/wol2-genomes/` — ~16,000 compressed FASTA genomes (WoL2 database)
+- **Query files** (symlinks in `perf-assessment/query-files/`):
+  - `short_read_R1.fastq.gz` / `short_read_R2.fastq.gz` — paired-end short reads
+  - `long_read.fastq.gz` — long reads (~2.2GB)
+  - Parquet-converted versions also present (`*.parquet`)
+- **Pre-built indices**:
+  - `perf-assessment/parquet-index/n100-w200.ryxdi/` — 160-bucket index (k=64, w=200, 8 shards, ~486M minimizers)
+  - `perf-assessment/config/numerator-w200.ryxdi/` — single-bucket (8000 genomes, buckets 1–80, 267M minimizers)
+  - `perf-assessment/config/denominator-w200.ryxdi/` — single-bucket (7952 genomes, buckets 81–160, 216M minimizers)
+- **Index configs**: `perf-assessment/config/*.toml`
+
+Tests using this data should be `#[ignore]`.
+
+### Building single-bucket indices
+
+Each config has `[index]` and one `[buckets.<name>]` section with a `files` array:
+
+```toml
+[index]
+window = 200
+salt = 6148914691236517205
+output = "numerator-w200.ryxdi"
+
+[buckets.numerator]
+files = [ "../../perf-data/wol2-genomes/G001873845.fasta.gz", ... ]
+```
+
+Build with `target/release/rype index from-config -c <config.toml>`. Output path is relative to the config file location. Verify with `rype index stats -i <index.ryxdi>` — must show exactly 1 bucket.
