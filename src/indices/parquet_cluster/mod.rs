@@ -16,6 +16,8 @@
 //! ```
 
 pub mod manifest;
+pub mod options;
+pub mod streaming;
 
 /// Format version for the `.ryci` cluster-index format. Bumped on breaking change.
 pub const FORMAT_VERSION_CLUSTER: u32 = 1;
@@ -38,3 +40,5 @@ pub use manifest::{
     create_cluster_index_directory, is_cluster_parquet_index, ClusterBucketData,
     ClusterInvertedManifest, ClusterInvertedShardInfo, ClusterParquetManifest,
 };
+pub use options::ClusterParquetWriteOptions;
+pub use streaming::{create_cluster_parquet_index, create_cluster_parquet_index_with_options};
