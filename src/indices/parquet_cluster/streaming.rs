@@ -1,8 +1,8 @@
 //! Streaming writer for the `.ryci` cluster-index format.
 //!
-//! Phase 2 ships only the single-shard sequential entry point and the
-//! `ClusterShardWriter`. Multi-shard k-way merge lands in Phase 3; the
-//! parallel range-partitioned path from `.ryxdi` is intentionally not
+//! Phase 3: sequential k-way merge over `(minimizer, bucket_id, position)`
+//! triples with optional shard rollover when `max_shard_bytes` is set.
+//! The parallel range-partitioned path from `.ryxdi` is intentionally not
 //! ported here (the cluster scale — ≤10K contigs, single-digit GB — does
 //! not require it; see plan §"Deferred").
 
@@ -11,7 +11,8 @@ use arrow::array::{ArrayRef, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -46,11 +47,11 @@ fn compute_source_hash(counts: &HashMap<u32, usize>) -> u64 {
     hasher.finish()
 }
 
-/// Build a `.ryci` cluster index from validated bucket data, writing a single shard.
+/// Build a `.ryci` cluster index from validated bucket data.
 ///
-/// Phase 2 entry point: input is held in memory, sorted by `(minimizer, bucket_id)`,
-/// and streamed into one shard. Phase 3 will add a `max_shard_bytes` parameter and
-/// switch to a k-way-merge path; for now everything fits in one shard.
+/// Convenience entry: single-shard, default options. Use
+/// [`create_cluster_parquet_index_with_options`] for shard rollover or
+/// non-default compression / row group sizes.
 ///
 /// # Arguments
 /// * `output_dir` — path to create (e.g. `cluster.ryci`).
@@ -64,16 +65,22 @@ pub fn create_cluster_parquet_index(
     w: usize,
     salt: u64,
 ) -> Result<ClusterParquetManifest> {
-    create_cluster_parquet_index_with_options(output_dir, buckets, k, w, salt, None)
+    create_cluster_parquet_index_with_options(output_dir, buckets, k, w, salt, None, None)
 }
 
-/// As [`create_cluster_parquet_index`] but with caller-supplied write options.
+/// As [`create_cluster_parquet_index`] but with caller-supplied options.
+///
+/// When `max_shard_bytes` is `Some(n)`, the writer rolls over to a new shard once
+/// the current shard's on-disk size reaches `n` bytes (checked between batches),
+/// matching the `.ryxdi` sequential mode contract. When `None`, all triples go
+/// into a single shard.
 pub fn create_cluster_parquet_index_with_options(
     output_dir: &Path,
     buckets: Vec<ClusterBucketData>,
     k: usize,
     w: usize,
     salt: u64,
+    max_shard_bytes: Option<usize>,
     options: Option<&ClusterParquetWriteOptions>,
 ) -> Result<ClusterParquetManifest> {
     let opts = options.cloned().unwrap_or_default();
@@ -120,11 +127,12 @@ pub fn create_cluster_parquet_index_with_options(
     }
     write_buckets_parquet(output_dir, &bucket_names, &bucket_sources, None)?;
 
-    // Sort (minimizer, bucket_id, position) triples and write a single shard.
-    let shard_info = write_single_shard(output_dir, &buckets, &opts)?;
+    // K-way merge over (minimizer, bucket_id, position) triples, rolling over
+    // to a new shard when the current shard hits `max_shard_bytes`.
+    let shard_infos = stream_to_shards_sequential(output_dir, &buckets, max_shard_bytes, &opts)?;
 
     let source_hash = compute_source_hash(&bucket_minimizer_counts);
-    let total_entries = shard_info.num_entries;
+    let total_entries: u64 = shard_infos.iter().map(|s| s.num_entries).sum();
 
     let manifest = ClusterParquetManifest {
         magic: FORMAT_MAGIC_CLUSTER.to_string(),
@@ -136,12 +144,15 @@ pub fn create_cluster_parquet_index_with_options(
         num_buckets: bucket_names.len() as u32,
         total_minimizers,
         inverted: Some(ClusterInvertedManifest {
-            num_shards: 1,
+            num_shards: shard_infos.len() as u32,
             total_entries,
-            // Single shard cannot overlap with itself; phase 3 sets this true for
-            // sequential multi-shard mode.
-            has_overlapping_shards: false,
-            shards: vec![shard_info],
+            // Sequential k-way merge emits size-bounded shards that may share
+            // minimizers across shard boundaries (each bucket's minimizers are
+            // unique within its own bucket, but two buckets can both contribute
+            // the same minimizer value to adjacent shards). Matches .ryxdi
+            // sequential semantics; readers must dedupe across shards.
+            has_overlapping_shards: true,
+            shards: shard_infos,
         }),
     };
     manifest.save(output_dir)?;
@@ -149,75 +160,147 @@ pub fn create_cluster_parquet_index_with_options(
     Ok(manifest)
 }
 
-/// Materialize all triples, sort by `(minimizer, bucket_id)`, write one shard.
-fn write_single_shard(
+/// K-way merge heap entry: `(Reverse((minimizer, bucket_id)), bucket_index, pos_in_bucket)`.
+/// Sort key is `(minimizer, bucket_id)`; position is looked up from the bucket
+/// when the entry is popped.
+type MergeHeapEntry = (Reverse<(u64, u32)>, usize, usize);
+
+/// Sequential k-way merge over per-bucket sorted minimizer streams, with
+/// shard rollover once a shard's on-disk size reaches `max_shard_bytes`.
+///
+/// Mirrors `crate::indices::parquet::streaming::stream_to_shards_sequential`
+/// but reads one extra column (positions) from each bucket and writes one
+/// extra column (position) into each shard.
+fn stream_to_shards_sequential(
     output_dir: &Path,
     buckets: &[ClusterBucketData],
+    max_shard_bytes: Option<usize>,
     options: &ClusterParquetWriteOptions,
-) -> Result<ClusterInvertedShardInfo> {
-    let total: usize = buckets.iter().map(|b| b.minimizers.len()).sum();
+) -> Result<Vec<ClusterInvertedShardInfo>> {
+    let rollover_bytes = max_shard_bytes.unwrap_or(usize::MAX);
 
-    let shard_path = output_dir
-        .join(files::INVERTED_DIR)
-        .join(files::inverted_shard(0));
-
-    if total == 0 {
-        // Empty input still gets a shard file so the reader has something to open.
+    // Empty input still emits a single empty shard so the reader has something
+    // to open. Empty-range sentinel: min > max signals "covers no minimizers".
+    if buckets.is_empty() || buckets.iter().all(|b| b.minimizers.is_empty()) {
+        let shard_path = output_dir
+            .join(files::INVERTED_DIR)
+            .join(files::inverted_shard(0));
         let writer = ClusterShardWriter::new(&shard_path, options)?;
         writer.finish()?;
-        // Empty-range sentinel: max < min. Lets a future range-skip
-        // optimization treat an empty shard as covering nothing rather than
-        // as covering minimizer 0 (which is a valid value).
-        return Ok(ClusterInvertedShardInfo {
+        return Ok(vec![ClusterInvertedShardInfo {
             shard_id: 0,
             min_minimizer: u64::MAX,
             max_minimizer: 0,
             num_entries: 0,
+        }]);
+    }
+
+    // Index buckets by their non-empty subset; the heap stores indices into
+    // this slice, not into the original `buckets` Vec.
+    let bucket_data: Vec<(u32, &[u64], &[u32])> = buckets
+        .iter()
+        .filter(|b| !b.minimizers.is_empty())
+        .map(|b| (b.bucket_id, b.minimizers.as_slice(), b.positions.as_slice()))
+        .collect();
+
+    let mut heap: BinaryHeap<MergeHeapEntry> = BinaryHeap::with_capacity(bucket_data.len());
+    for (idx, &(bid, mins, _)) in bucket_data.iter().enumerate() {
+        heap.push((Reverse((mins[0], bid)), idx, 0));
+    }
+
+    let mut shard_infos: Vec<ClusterInvertedShardInfo> = Vec::new();
+    let mut current_shard_id: u32 = 0;
+    let mut current_writer: Option<ClusterShardWriter> = None;
+    let mut current_shard_entries: u64 = 0;
+    let mut current_shard_min: u64 = u64::MAX;
+    let mut current_shard_max: u64 = 0;
+
+    // Flush the in-memory batch on row-group boundaries, not just at
+    // PARQUET_BATCH_SIZE. Otherwise a small test (or any workload smaller than
+    // PARQUET_BATCH_SIZE rows) never causes ArrowWriter to finalize a row group
+    // during the merge, so `bytes_written` stays near zero and `max_shard_bytes`
+    // can't fire. Capping at row_group_size guarantees one row group flushes
+    // per batch — bytes_written then advances on a cadence the rollover check
+    // can observe.
+    let batch_cap = std::cmp::min(PARQUET_BATCH_SIZE, options.row_group_size);
+    let mut min_batch: Vec<u64> = Vec::with_capacity(batch_cap);
+    let mut bid_batch: Vec<u32> = Vec::with_capacity(batch_cap);
+    let mut pos_batch: Vec<u32> = Vec::with_capacity(batch_cap);
+
+    while let Some((Reverse((minimizer, bucket_id)), bucket_idx, pos_in_bucket)) = heap.pop() {
+        // Rollover check: only meaningful after a writer exists AND at least
+        // one batch has flushed (so bytes_written reflects real data, not
+        // just the header). The `!min_batch.is_empty()` guard avoids
+        // spinning on the same boundary if bytes_written already passed it.
+        let need_new_shard = match current_writer.as_ref() {
+            None => true,
+            Some(w) => w.bytes_written() >= rollover_bytes && !min_batch.is_empty(),
+        };
+
+        if need_new_shard {
+            if let Some(mut w) = current_writer.take() {
+                if !min_batch.is_empty() {
+                    w.write_batch(&min_batch, &bid_batch, &pos_batch)?;
+                    min_batch.clear();
+                    bid_batch.clear();
+                    pos_batch.clear();
+                }
+                w.finish()?;
+                shard_infos.push(ClusterInvertedShardInfo {
+                    shard_id: current_shard_id,
+                    min_minimizer: current_shard_min,
+                    max_minimizer: current_shard_max,
+                    num_entries: current_shard_entries,
+                });
+                current_shard_id += 1;
+            }
+            let shard_path = output_dir
+                .join(files::INVERTED_DIR)
+                .join(files::inverted_shard(current_shard_id));
+            current_writer = Some(ClusterShardWriter::new(&shard_path, options)?);
+            current_shard_entries = 0;
+            current_shard_min = minimizer;
+        }
+
+        let position = bucket_data[bucket_idx].2[pos_in_bucket];
+        min_batch.push(minimizer);
+        bid_batch.push(bucket_id);
+        pos_batch.push(position);
+        current_shard_entries += 1;
+        // The heap pop order guarantees `minimizer` is non-decreasing within
+        // a shard, so this is a real max.
+        current_shard_max = minimizer;
+
+        if min_batch.len() >= batch_cap {
+            if let Some(ref mut w) = current_writer {
+                w.write_batch(&min_batch, &bid_batch, &pos_batch)?;
+            }
+            min_batch.clear();
+            bid_batch.clear();
+            pos_batch.clear();
+        }
+
+        let mins = bucket_data[bucket_idx].1;
+        let next_pos = pos_in_bucket + 1;
+        if next_pos < mins.len() {
+            heap.push((Reverse((mins[next_pos], bucket_id)), bucket_idx, next_pos));
+        }
+    }
+
+    if let Some(mut w) = current_writer.take() {
+        if !min_batch.is_empty() {
+            w.write_batch(&min_batch, &bid_batch, &pos_batch)?;
+        }
+        w.finish()?;
+        shard_infos.push(ClusterInvertedShardInfo {
+            shard_id: current_shard_id,
+            min_minimizer: current_shard_min,
+            max_minimizer: current_shard_max,
+            num_entries: current_shard_entries,
         });
     }
 
-    // Build a flat triple list then sort. Phase 3 will switch to a k-way merge
-    // for memory-bounded operation; Phase 2 trades that for simplicity.
-    let mut triples: Vec<(u64, u32, u32)> = Vec::with_capacity(total);
-    for b in buckets {
-        // ClusterBucketData::validate already enforced parallel-array length.
-        for (i, &m) in b.minimizers.iter().enumerate() {
-            triples.push((m, b.bucket_id, b.positions[i]));
-        }
-    }
-    // Sort by (minimizer, bucket_id) — same merge-join contract as .ryxdi.
-    // The position tiebreak is unreachable in well-formed input (validate()
-    // rejects duplicate minimizers within a bucket, so (minimizer, bucket_id)
-    // is already unique) but we include it to keep the sort total.
-    triples.sort_unstable_by_key(|&(m, b, p)| (m, b, p));
-
-    let min_minimizer = triples.first().map(|t| t.0).unwrap_or(0);
-    let max_minimizer = triples.last().map(|t| t.0).unwrap_or(0);
-    let num_entries = triples.len() as u64;
-
-    let mut writer = ClusterShardWriter::new(&shard_path, options)?;
-    let mut mins: Vec<u64> = Vec::with_capacity(PARQUET_BATCH_SIZE);
-    let mut bids: Vec<u32> = Vec::with_capacity(PARQUET_BATCH_SIZE);
-    let mut poss: Vec<u32> = Vec::with_capacity(PARQUET_BATCH_SIZE);
-    for chunk in triples.chunks(PARQUET_BATCH_SIZE) {
-        mins.clear();
-        bids.clear();
-        poss.clear();
-        for &(m, b, p) in chunk {
-            mins.push(m);
-            bids.push(b);
-            poss.push(p);
-        }
-        writer.write_batch(&mins, &bids, &poss)?;
-    }
-    writer.finish()?;
-
-    Ok(ClusterInvertedShardInfo {
-        shard_id: 0,
-        min_minimizer,
-        max_minimizer,
-        num_entries,
-    })
+    Ok(shard_infos)
 }
 
 /// Helper for writing a single `.ryci` shard file.
@@ -241,6 +324,15 @@ impl ClusterShardWriter {
             .map_err(|e| RypeError::io(path.to_path_buf(), "create cluster shard", e))?;
         let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
         Ok(Self { writer, schema })
+    }
+
+    /// Bytes physically flushed to the underlying file so far. Used by the
+    /// sequential merge to decide when to roll over to a new shard. Note: the
+    /// in-progress row group buffer is NOT counted here, so the value only
+    /// advances on row-group flush — callers expecting precise byte budgets
+    /// should size `row_group_size` accordingly.
+    pub(crate) fn bytes_written(&self) -> usize {
+        self.writer.bytes_written()
     }
 
     pub(crate) fn write_batch(

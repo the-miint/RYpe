@@ -354,7 +354,7 @@ fn create_cluster_index_with_zstd_options_round_trips() {
     };
 
     let manifest =
-        create_cluster_parquet_index_with_options(&dir, vec![bucket], 64, 50, 0, Some(&opts))
+        create_cluster_parquet_index_with_options(&dir, vec![bucket], 64, 50, 0, None, Some(&opts))
             .expect("create cluster index with options");
     assert_eq!(manifest.total_minimizers, 3);
 
@@ -368,4 +368,138 @@ fn create_cluster_index_with_zstd_options_round_trips() {
     expected.insert((20u64, 0u32, 200u32));
     expected.insert((30u64, 0u32, 300u32));
     assert_eq!(actual, expected);
+}
+
+// ----- Phase 3 tests: multi-shard sequential k-way merge -----
+
+/// WHY: this is the load-bearing test for Phase 3. When max_shard_bytes is set,
+/// the writer must roll over to a new shard, the manifest must accurately reflect
+/// per-shard ranges, and no triple may be lost or duplicated across the boundary.
+/// A bug here corrupts every downstream consumer.
+#[test]
+fn create_cluster_index_rolls_over_at_max_shard_bytes() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("multi-shard.ryci");
+
+    // Two buckets, 1000 minimizers each, interleaved by parity to force the
+    // merge join to alternate buckets across the run. Small row_group_size
+    // makes bytes_written update frequently enough that a tiny max_shard_bytes
+    // can trigger rollover with this small dataset.
+    let n: u64 = 1000;
+    let b0_mins: Vec<u64> = (0..n).map(|i| 2 * i).collect();
+    let b0_pos: Vec<u32> = (0..n).map(|i| i as u32).collect();
+    let b1_mins: Vec<u64> = (0..n).map(|i| 2 * i + 1).collect();
+    let b1_pos: Vec<u32> = (0..n).map(|i| (i + 100_000) as u32).collect();
+
+    let b0 = ClusterBucketData {
+        bucket_id: 0,
+        bucket_name: "a".into(),
+        sources: vec!["a.fa".into()],
+        minimizers: b0_mins.clone(),
+        positions: b0_pos.clone(),
+    };
+    let b1 = ClusterBucketData {
+        bucket_id: 1,
+        bucket_name: "b".into(),
+        sources: vec!["b.fa".into()],
+        minimizers: b1_mins.clone(),
+        positions: b1_pos.clone(),
+    };
+
+    let opts = ClusterParquetWriteOptions {
+        row_group_size: 50,
+        ..Default::default()
+    };
+
+    let manifest = create_cluster_parquet_index_with_options(
+        &dir,
+        vec![b0, b1],
+        64,
+        50,
+        0,
+        Some(2048), // max_shard_bytes — small enough to force rollover with row_group_size=50
+        Some(&opts),
+    )
+    .expect("create multi-shard cluster index");
+
+    let inv = manifest
+        .inverted
+        .as_ref()
+        .expect("inverted manifest must be set");
+    assert!(
+        inv.num_shards >= 2,
+        "expected ≥2 shards with max_shard_bytes=2048, got {}",
+        inv.num_shards
+    );
+    assert!(
+        inv.has_overlapping_shards,
+        "sequential multi-shard must set has_overlapping_shards=true"
+    );
+    assert_eq!(inv.shards.len() as u32, inv.num_shards);
+
+    // Per-shard: file exists, manifest min/max/num_entries matches actual file data.
+    let mut all_triples: std::collections::HashSet<(u64, u32, u32)> =
+        std::collections::HashSet::new();
+    let mut total_entries: u64 = 0;
+    for shard in &inv.shards {
+        let shard_path = dir
+            .join(cluster_files::INVERTED_DIR)
+            .join(cluster_files::inverted_shard(shard.shard_id));
+        assert!(
+            shard_path.exists(),
+            "shard file {} missing on disk",
+            shard.shard_id
+        );
+        let triples = read_shard_triples(&shard_path);
+        assert_eq!(
+            triples.len() as u64,
+            shard.num_entries,
+            "shard {} num_entries mismatch",
+            shard.shard_id
+        );
+        // Manifest claims must be honest — they drive the Phase 3+ range-skip path.
+        let actual_min = triples.iter().map(|t| t.0).min().expect("nonempty shard");
+        let actual_max = triples.iter().map(|t| t.0).max().expect("nonempty shard");
+        assert_eq!(
+            actual_min, shard.min_minimizer,
+            "shard {} min_minimizer mismatch (manifest={:#x}, actual={:#x})",
+            shard.shard_id, shard.min_minimizer, actual_min
+        );
+        assert_eq!(
+            actual_max, shard.max_minimizer,
+            "shard {} max_minimizer mismatch (manifest={:#x}, actual={:#x})",
+            shard.shard_id, shard.max_minimizer, actual_max
+        );
+        for t in triples {
+            all_triples.insert(t);
+        }
+        total_entries += shard.num_entries;
+    }
+
+    assert_eq!(total_entries, 2 * n, "sum of per-shard entries != total");
+    assert_eq!(inv.total_entries, 2 * n);
+    assert_eq!(manifest.total_minimizers, 2 * n);
+
+    // Every input triple must appear exactly once across the union of shards.
+    let mut expected: std::collections::HashSet<(u64, u32, u32)> = std::collections::HashSet::new();
+    for i in 0..n as usize {
+        expected.insert((b0_mins[i], 0, b0_pos[i]));
+        expected.insert((b1_mins[i], 1, b1_pos[i]));
+    }
+    assert_eq!(
+        all_triples, expected,
+        "union of shard triples doesn't match input"
+    );
+
+    // Shard ranges must be ascending (sequential mode emits shards in sorted order).
+    for w in inv.shards.windows(2) {
+        assert!(
+            w[0].max_minimizer <= w[1].min_minimizer,
+            "shard {} ends at {:#x} but shard {} starts at {:#x} — ranges out of order",
+            w[0].shard_id,
+            w[0].max_minimizer,
+            w[1].shard_id,
+            w[1].min_minimizer
+        );
+    }
 }
