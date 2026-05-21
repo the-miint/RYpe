@@ -19,7 +19,10 @@ use super::workspace::MinimizerWorkspace;
 /// overflow contract is testable in isolation: no realistic test sequence can
 /// trigger `len > u32::MAX`, but if a future change quietly removes the guard
 /// the unit test catches it immediately.
-fn cast_pos(p: usize) -> Result<u32> {
+///
+/// Visible to the crate (Plan 1.3 chain DP also needs to cast `usize`
+/// positions to `u32` and should not duplicate this two-line guard).
+pub(crate) fn cast_pos(p: usize) -> Result<u32> {
     u32::try_from(p).map_err(|_| {
         RypeError::validation(format!(
             "minimizer position {} exceeds u32::MAX; \
