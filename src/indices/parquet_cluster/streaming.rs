@@ -260,6 +260,14 @@ fn stream_to_shards_sequential(
             current_writer = Some(ClusterShardWriter::new(&shard_path, options)?);
             current_shard_entries = 0;
             current_shard_min = minimizer;
+            // Defensive reset: the unconditional `current_shard_max = minimizer`
+            // below overwrites this on the next statement today, but a future
+            // `continue` (e.g. a cross-shard dedup filter) would otherwise
+            // carry the previous shard's max into the new shard's manifest.
+            #[allow(unused_assignments)]
+            {
+                current_shard_max = 0;
+            }
         }
 
         let position = bucket_data[bucket_idx].2[pos_in_bucket];
