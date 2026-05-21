@@ -361,6 +361,140 @@ impl ClusterShardWriter {
     }
 }
 
+/// Opened-for-read handle to a `.ryci` cluster-index directory.
+///
+/// `open` loads the manifest and bucket metadata; shard data stays on disk
+/// until `load_shard` is called. Plan 1.3 will add a streaming / CSR
+/// representation for the chaining DP hot path; Plan 1.1 only returns raw
+/// `(minimizer, bucket_id, position)` triples in file order.
+#[derive(Debug, Clone)]
+pub struct ClusterParquetIndex {
+    base_path: std::path::PathBuf,
+    manifest: ClusterParquetManifest,
+    bucket_names: HashMap<u32, String>,
+    bucket_sources: HashMap<u32, Vec<String>>,
+}
+
+impl ClusterParquetIndex {
+    /// Open a `.ryci` cluster-index directory.
+    ///
+    /// Refuses `.ryxdi` (classify-side) directories with a clear error so a
+    /// caller who mixed up the two readers learns at open time, not deep in
+    /// a downstream chain DP that's trying to interpret a missing column.
+    pub fn open(base_path: &Path) -> Result<Self> {
+        // Guard against the wrong-format case first. is_parquet_index checks
+        // the manifest magic, so it won't false-positive on an unrelated dir.
+        if crate::indices::parquet::is_parquet_index(base_path) {
+            return Err(RypeError::format(
+                base_path,
+                "This is a .ryxdi classify index, not a .ryci cluster index. \
+                 Use ShardedInvertedIndex::open (classify-side reader) instead \
+                 of ClusterParquetIndex::open.",
+            ));
+        }
+
+        let manifest = ClusterParquetManifest::load(base_path)?;
+        // Bucket metadata schema is shared with .ryxdi (5 file_stats columns
+        // present but NaN-filled); we discard the stats here since they're not
+        // meaningful for cluster-index callers.
+        let (bucket_names, bucket_sources, _bucket_file_stats) =
+            crate::indices::parquet::read_buckets_parquet(base_path)?;
+
+        Ok(Self {
+            base_path: base_path.to_path_buf(),
+            manifest,
+            bucket_names,
+            bucket_sources,
+        })
+    }
+
+    pub fn manifest(&self) -> &ClusterParquetManifest {
+        &self.manifest
+    }
+
+    /// Number of shards in this index. Equals `manifest.inverted.num_shards`
+    /// when the inverted section is present; zero otherwise (legacy/partial
+    /// indices, currently not produced by the Phase 3 writer).
+    pub fn num_shards(&self) -> u32 {
+        self.manifest
+            .inverted
+            .as_ref()
+            .map(|inv| inv.num_shards)
+            .unwrap_or(0)
+    }
+
+    pub fn bucket_name(&self, bucket_id: u32) -> Option<&str> {
+        self.bucket_names.get(&bucket_id).map(|s| s.as_str())
+    }
+
+    pub fn bucket_sources(&self, bucket_id: u32) -> Option<&[String]> {
+        self.bucket_sources.get(&bucket_id).map(|v| v.as_slice())
+    }
+
+    /// Load one shard's triples in file order (sorted by `(minimizer, bucket_id)`).
+    ///
+    /// Returns an error for an out-of-range `shard_id`, even if a stray file
+    /// happens to exist at the predicted path — the manifest is the source of
+    /// truth for what shards belong to the index.
+    pub fn load_shard(&self, shard_id: u32) -> Result<Vec<(u64, u32, u32)>> {
+        let n = self.num_shards();
+        if shard_id >= n {
+            return Err(RypeError::validation(format!(
+                "shard {} out of range (index has {} shard(s))",
+                shard_id, n
+            )));
+        }
+        let shard_path = self
+            .base_path
+            .join(files::INVERTED_DIR)
+            .join(files::inverted_shard(shard_id));
+        read_shard_triples(&shard_path)
+    }
+}
+
+/// Read every `(minimizer, bucket_id, position)` triple from a shard Parquet
+/// file, in file order. Phase 1.3 will add a streaming reader; here we
+/// materialize because each shard is bounded by `max_shard_bytes` at write
+/// time and cluster-scale indices are single-digit GB total.
+fn read_shard_triples(path: &Path) -> Result<Vec<(u64, u32, u32)>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file =
+        File::open(path).map_err(|e| RypeError::io(path.to_path_buf(), "open cluster shard", e))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+
+    let mut triples = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let minimizers = batch
+            .column_by_name("minimizer")
+            .ok_or_else(|| RypeError::format(path, "missing minimizer column".to_string()))?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                RypeError::format(path, "minimizer column must be UInt64".to_string())
+            })?;
+        let bucket_ids = batch
+            .column_by_name("bucket_id")
+            .ok_or_else(|| RypeError::format(path, "missing bucket_id column".to_string()))?
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| {
+                RypeError::format(path, "bucket_id column must be UInt32".to_string())
+            })?;
+        let positions = batch
+            .column_by_name("position")
+            .ok_or_else(|| RypeError::format(path, "missing position column".to_string()))?
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| RypeError::format(path, "position column must be UInt32".to_string()))?;
+        for i in 0..batch.num_rows() {
+            triples.push((minimizers.value(i), bucket_ids.value(i), positions.value(i)));
+        }
+    }
+    Ok(triples)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

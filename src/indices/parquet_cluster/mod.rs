@@ -41,4 +41,6 @@ pub use manifest::{
     ClusterInvertedManifest, ClusterInvertedShardInfo, ClusterParquetManifest,
 };
 pub use options::ClusterParquetWriteOptions;
-pub use streaming::{create_cluster_parquet_index, create_cluster_parquet_index_with_options};
+pub use streaming::{
+    create_cluster_parquet_index, create_cluster_parquet_index_with_options, ClusterParquetIndex,
+};

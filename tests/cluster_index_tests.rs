@@ -8,7 +8,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rype::parquet_cluster_index::{
     create_cluster_index_directory, create_cluster_parquet_index,
     create_cluster_parquet_index_with_options, files as cluster_files, is_cluster_parquet_index,
-    ClusterBucketData, ClusterParquetManifest, ClusterParquetWriteOptions,
+    ClusterBucketData, ClusterParquetIndex, ClusterParquetManifest, ClusterParquetWriteOptions,
 };
 use rype::{is_parquet_index, ParquetCompression, ParquetManifest, ShardedInvertedIndex};
 use std::collections::HashSet;
@@ -502,4 +502,160 @@ fn create_cluster_index_rolls_over_at_max_shard_bytes() {
             w[1].min_minimizer
         );
     }
+}
+
+// ----- Phase 4 tests: ClusterParquetIndex (open + load_shard) -----
+
+/// WHY: this is the load-bearing reader test. Write a known multi-shard index,
+/// open it via the public API, load every shard, and assert the union of triples
+/// equals the input. Also covers: manifest fields are exposed faithfully through
+/// the open index; per-shard ranges from the manifest match each shard's data.
+#[test]
+fn cluster_parquet_index_open_and_load_shards_round_trip() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("reader.ryci");
+
+    // Same multi-shard setup as the Phase 3 rollover test — gives us ≥2 shards
+    // so load_shard actually exercises the multi-file path.
+    let n: u64 = 800;
+    let b0_mins: Vec<u64> = (0..n).map(|i| 2 * i).collect();
+    let b0_pos: Vec<u32> = (0..n).map(|i| i as u32).collect();
+    let b1_mins: Vec<u64> = (0..n).map(|i| 2 * i + 1).collect();
+    let b1_pos: Vec<u32> = (0..n).map(|i| (i + 100_000) as u32).collect();
+
+    let b0 = ClusterBucketData {
+        bucket_id: 0,
+        bucket_name: "alpha".into(),
+        sources: vec!["alpha.fa".into()],
+        minimizers: b0_mins.clone(),
+        positions: b0_pos.clone(),
+    };
+    let b1 = ClusterBucketData {
+        bucket_id: 1,
+        bucket_name: "beta".into(),
+        sources: vec!["beta.fa".into(), "beta2.fa".into()],
+        minimizers: b1_mins.clone(),
+        positions: b1_pos.clone(),
+    };
+
+    let opts = ClusterParquetWriteOptions {
+        row_group_size: 50,
+        ..Default::default()
+    };
+    create_cluster_parquet_index_with_options(
+        &dir,
+        vec![b0, b1],
+        64,
+        50,
+        0x1234_5678,
+        Some(2048),
+        Some(&opts),
+    )
+    .expect("create multi-shard index");
+
+    // Open via the public reader.
+    let index = ClusterParquetIndex::open(&dir).expect("open .ryci");
+
+    // Manifest fields exposed faithfully.
+    let m = index.manifest();
+    assert_eq!(m.k, 64);
+    assert_eq!(m.w, 50);
+    assert_eq!(m.salt, 0x1234_5678);
+    assert_eq!(m.num_buckets, 2);
+    assert_eq!(m.total_minimizers, 2 * n);
+    assert!(index.num_shards() >= 2, "expected ≥2 shards");
+
+    // Bucket metadata round-trips (names + sources).
+    assert_eq!(index.bucket_name(0), Some("alpha"));
+    assert_eq!(index.bucket_name(1), Some("beta"));
+    assert_eq!(
+        index.bucket_sources(1).map(|s| s.to_vec()),
+        Some(vec!["beta.fa".to_string(), "beta2.fa".to_string()])
+    );
+
+    // Load every shard and check its triples agree with the manifest's
+    // claimed min/max/num_entries for that shard.
+    let mut all_triples: HashSet<(u64, u32, u32)> = HashSet::new();
+    for shard_id in 0..index.num_shards() {
+        let triples = index.load_shard(shard_id).expect("load shard");
+        let info = &m.inverted.as_ref().unwrap().shards[shard_id as usize];
+        assert_eq!(triples.len() as u64, info.num_entries);
+        let actual_min = triples.iter().map(|t| t.0).min().expect("nonempty shard");
+        let actual_max = triples.iter().map(|t| t.0).max().expect("nonempty shard");
+        assert_eq!(actual_min, info.min_minimizer);
+        assert_eq!(actual_max, info.max_minimizer);
+        // load_shard returns "file order" per the plan — that's sorted by
+        // (minimizer, bucket_id) from the writer.
+        for w in triples.windows(2) {
+            assert!(
+                (w[0].0, w[0].1) <= (w[1].0, w[1].1),
+                "load_shard violated (minimizer, bucket_id) order"
+            );
+        }
+        for t in triples {
+            all_triples.insert(t);
+        }
+    }
+
+    // Union across all shards must equal the input set, exactly.
+    let mut expected: HashSet<(u64, u32, u32)> = HashSet::new();
+    for i in 0..n as usize {
+        expected.insert((b0_mins[i], 0, b0_pos[i]));
+        expected.insert((b1_mins[i], 1, b1_pos[i]));
+    }
+    assert_eq!(all_triples, expected);
+}
+
+/// WHY: the wrong-reader-for-wrong-format failure mode must produce a clear,
+/// actionable error. A user who hands a `.ryxdi` to the cluster reader should
+/// be pointed at the classify reader, not get a confusing TOML parse error.
+#[test]
+fn cluster_parquet_index_open_rejects_ryxdi() {
+    let tmp = TempDir::new().unwrap();
+
+    // Build a minimal valid .ryxdi.
+    let ryxdi = tmp.path().join("classify.ryxdi");
+    rype::parquet_index::create_index_directory(&ryxdi).unwrap();
+    ParquetManifest::new(64, 50, 0).save(&ryxdi).unwrap();
+
+    let err = ClusterParquetIndex::open(&ryxdi)
+        .expect_err("ClusterParquetIndex::open must reject a .ryxdi directory");
+    let msg = format!("{}", err);
+    // Error must name the format the user actually has so they can switch tools.
+    assert!(
+        msg.contains(".ryxdi") || msg.contains("classify"),
+        "error should point at .ryxdi/classify reader: {}",
+        msg
+    );
+}
+
+/// WHY: load_shard with an out-of-range id used to silently open a missing file
+/// (or worse, succeed if a stray file with the predicted name existed). The
+/// reader must validate against the manifest, not against filesystem reality.
+#[test]
+fn cluster_parquet_index_load_shard_rejects_out_of_range() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("oob.ryci");
+
+    let bucket = ClusterBucketData {
+        bucket_id: 0,
+        bucket_name: "g".into(),
+        sources: vec!["g.fa".into()],
+        minimizers: vec![1, 2, 3],
+        positions: vec![10, 20, 30],
+    };
+    create_cluster_parquet_index(&dir, vec![bucket], 64, 50, 0).unwrap();
+
+    let index = ClusterParquetIndex::open(&dir).unwrap();
+    assert_eq!(index.num_shards(), 1);
+
+    let err = index
+        .load_shard(99)
+        .expect_err("out-of-range shard_id must error");
+    let msg = format!("{}", err);
+    assert!(
+        msg.contains("shard") && (msg.contains("99") || msg.contains("range")),
+        "error should mention shard id or range: {}",
+        msg
+    );
 }

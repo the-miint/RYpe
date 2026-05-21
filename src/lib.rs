@@ -130,3 +130,10 @@ pub use indices::parquet as parquet_index;
 
 // Re-export parquet_cluster module for qualified access (cluster-index format, .ryci)
 pub use indices::parquet_cluster as parquet_cluster_index;
+
+// Crate-level re-exports for the .ryci cluster-index format. Names are
+// `Cluster*`-prefixed and never collide with the .ryxdi exports above.
+pub use indices::parquet_cluster::{
+    create_cluster_parquet_index, is_cluster_parquet_index, ClusterBucketData, ClusterParquetIndex,
+    ClusterParquetManifest,
+};
