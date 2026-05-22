@@ -39,3 +39,8 @@ Thumbs.db
 
 # Scratch directory for temporary test files
 /scratch/
+
+# Local-only design / planning docs (never committed; see CLAUDE.md
+# convention). Was a project convention enforced only by reminders;
+# making it mechanical here so accidental `git add -A` can't ship.
+/localdocs/
