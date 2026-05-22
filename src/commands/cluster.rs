@@ -31,6 +31,11 @@ pub fn run_cluster(args: ClusterArgs) -> Result<()> {
             "--chain-threshold requires chain to be enabled; remove --no-chain or drop --chain-threshold"
         ));
     }
+    if args.no_chain && args.chain_min_anchors.is_some() {
+        return Err(anyhow!(
+            "--chain-min-anchors requires chain to be enabled; remove --no-chain or drop --chain-min-anchors"
+        ));
+    }
     if let Some(t) = args.chain_threshold {
         if !t.is_finite() || t <= 0.0 || t > 1.0 {
             return Err(anyhow!(

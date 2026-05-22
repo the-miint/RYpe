@@ -678,22 +678,37 @@ mod tests {
                 // chain that does form by chance must be below the DP's
                 // min_anchors threshold (which makes the DP return None).
                 // If we somehow get a Some result, anchors must still be
-                // bounded by the edge's `shared` count.
-                assert!(
-                    chain.anchors as u64 <= edge.shared,
-                    "chain.anchors {} > shared {} — anchors must be a subset of shared",
-                    chain.anchors,
-                    edge.shared
-                );
+                // bounded by the edge's `shared` count — BUT only when the
+                // forward strand wins. `shared = round(score * |fwd|)` only
+                // equals the matched-anchor count on the winning strand
+                // when fwd wins; if rc wins and `|fwd| < |rc|`, `shared`
+                // can drop below `rc_hits ≥ chain.anchors` without
+                // violating any invariant. See module header line 9.
+                if chain.strand == Strand::Forward {
+                    assert!(
+                        chain.anchors as u64 <= edge.shared,
+                        "chain.anchors {} > shared {} (fwd-win edge) — anchors must be a subset of shared",
+                        chain.anchors,
+                        edge.shared
+                    );
+                }
             }
         }
     }
 
     /// WHY: `chain.anchors` counts a SUBSET of the shared minimizers
-    /// (specifically those that fall into the best colinear chain). It
-    /// can never exceed `shared`. The debug_assert in `run_chain_for_hit`
-    /// pins the upper bound `chain.containment ≤ 1.0`; this test pins
-    /// the lower-level invariant on the anchor count.
+    /// (specifically those that fall into the best colinear chain). When
+    /// the forward strand wins the classify race, `shared` exactly equals
+    /// the matched-anchor count on that strand, so the bound
+    /// `chain.anchors <= shared` is algorithmically guaranteed. When rc
+    /// wins, `shared = round(rc_hits * |fwd| / |rc|)` is only
+    /// approximately the matched-anchor count and can drop below
+    /// `chain.anchors` without violating any invariant — see the module
+    /// header at line 9.
+    ///
+    /// The test data here (`b` is a forward fragment of `a`) is designed
+    /// so fwd wins on every edge; the strand guard pins that property and
+    /// makes the test robust against future inputs where rc could win.
     #[test]
     fn build_edges_chain_anchors_bounded_by_shared() {
         let dir = tempdir().unwrap();
@@ -712,17 +727,27 @@ mod tests {
             },
         ];
         let out = build_edges(&inputs, &test_cfg_with_chain(0.5, 1), dir.path()).unwrap();
+        let mut checked_fwd_win = false;
         for edge in &out.edges {
             if let Some(chain) = edge.chain {
-                assert!(
-                    chain.anchors as u64 <= edge.shared,
-                    "edge {:?} has chain.anchors {} > shared {}",
-                    edge,
-                    chain.anchors,
-                    edge.shared
-                );
+                if chain.strand == Strand::Forward {
+                    checked_fwd_win = true;
+                    assert!(
+                        chain.anchors as u64 <= edge.shared,
+                        "edge {:?} has chain.anchors {} > shared {} (fwd-win)",
+                        edge,
+                        chain.anchors,
+                        edge.shared
+                    );
+                }
             }
         }
+        // The test is meaningless if no fwd-win edge made it through; pin
+        // that the input actually produces the case the assertion checks.
+        assert!(
+            checked_fwd_win,
+            "expected at least one fwd-win chain edge in the output"
+        );
     }
 
     /// WHY: the par_iter + map_init pattern reuses per-thread workspaces

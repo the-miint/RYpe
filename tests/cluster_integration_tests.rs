@@ -1,5 +1,6 @@
 //! End-to-end integration tests for the clustering API.
 
+use rype::cluster::edges::build_edges;
 use rype::cluster::{cluster_contigs, ClusterConfig, ContigInput};
 use rype::ChainParams;
 
@@ -214,6 +215,45 @@ fn cluster_chain_gate_filters_random_match() {
         chain_params: Some(ChainParams::starting_for_w(20)),
         min_chain_containment: None,
     };
+
+    // Inspect the raw edges so we can discriminate "chain returned None"
+    // (DP found no colinear ≥min_anchors chain) from "chain returned Some
+    // but containment below the gate." Both behaviors are correct
+    // production outcomes, but the test would silently weaken if the only
+    // edges had `chain: None` — it would no longer prove that the gate
+    // value matters. The assertion below requires there to be at least
+    // one edge with `chain: Some(..)` whose containment is below 0.5,
+    // which is the exact case the gate is designed to filter.
+    let workdir = tempfile::tempdir().unwrap();
+    let edge_out = build_edges(&inputs(), &cfg_no_gate, workdir.path()).unwrap();
+    let b_to_a: Vec<_> = edge_out
+        .edges
+        .iter()
+        .filter(|e| {
+            let q = &edge_out.contigs[e.query_idx as usize].id;
+            let t = &edge_out.contigs[e.target_idx as usize].id;
+            q == "B" && t == "A"
+        })
+        .collect();
+    assert!(
+        !b_to_a.is_empty(),
+        "expected at least one B->A edge passing the set-containment threshold"
+    );
+    let saw_low_chain = b_to_a.iter().any(|e| {
+        e.chain
+            .as_ref()
+            .map(|c| c.containment < 0.5)
+            .unwrap_or(true)
+    });
+    assert!(
+        saw_low_chain,
+        "expected B->A edges to have either chain=None or \
+         chain.containment < 0.5 — without that, the gate test below \
+         wouldn't pin gate behavior. Edges: {:#?}",
+        b_to_a
+    );
+    drop(workdir);
+
     let result_no_gate = cluster_contigs(inputs(), &cfg_no_gate).unwrap();
     let absorbed_no_gate = result_no_gate
         .rows
@@ -227,8 +267,8 @@ fn cluster_chain_gate_filters_random_match() {
     );
 
     // With chain gate at 0.5: the scrambled B has no long colinear chain
-    // into A, so its `chain.containment` falls below the gate and the
-    // absorption is rejected.
+    // into A, so its `chain.containment` falls below the gate (or the DP
+    // returns None for it) and the absorption is rejected.
     let cfg_gated = ClusterConfig {
         min_chain_containment: Some(0.5),
         ..cfg_no_gate

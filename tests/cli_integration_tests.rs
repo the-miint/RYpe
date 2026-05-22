@@ -6536,6 +6536,48 @@ fn cli_no_chain_and_threshold_conflict() -> Result<()> {
     Ok(())
 }
 
+/// Plan 1.4 phase 4 review-fix: `--no-chain` together with
+/// `--chain-min-anchors` is also incoherent — the anchors override is silently
+/// dropped if chain is disabled. Reject loudly, just like the threshold case.
+#[test]
+fn cli_no_chain_and_min_anchors_conflict() -> Result<()> {
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+
+    let fasta = dir.path().join("x.fasta");
+    write_fasta(&fasta, &[("x", &cluster_cli_seq(1_500, 1))]);
+    let output_tsv = dir.path().join("out.tsv");
+
+    let output = Command::new(&binary)
+        .arg("cluster")
+        .arg("--input")
+        .arg(&fasta)
+        .arg("--output")
+        .arg(&output_tsv)
+        .arg("-k")
+        .arg("32")
+        .arg("-w")
+        .arg("10")
+        .arg("--min-length")
+        .arg("1000")
+        .arg("--no-chain")
+        .arg("--chain-min-anchors")
+        .arg("5")
+        .output()?;
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for --no-chain + --chain-min-anchors"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("chain to be enabled") || stderr.contains("--chain-min-anchors"),
+        "expected chain-min-anchors conflict message, got: {}",
+        stderr
+    );
+    Ok(())
+}
+
 /// Smoke test against the local WoL2 genomes (a subset of ~16K compressed
 /// FASTAs). This test is `#[ignore]` because the data is local-only per
 /// CLAUDE.md — invoke explicitly with `cargo test --release --test

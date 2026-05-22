@@ -133,22 +133,27 @@ pub struct ClusterArgs {
     #[arg(long, default_value_t = 500)]
     pub min_shared: u64,
 
-    /// Disable the chaining pass entirely. With this flag, `ClusterEdge.chain`
-    /// is `None` for every edge and the chain gate cannot be applied. Mutually
-    /// exclusive with `--chain-threshold`.
+    /// Explicitly disable the chaining pass. The CLI keeps chain DP disabled
+    /// by default for backwards compatibility (the library `strain_default()`
+    /// preset enables it; the CLI does not). Pass this flag to suppress the
+    /// chain pass even when another flag would otherwise enable it. Mutually
+    /// exclusive with `--chain-threshold` and `--chain-min-anchors`.
     #[arg(long)]
     pub no_chain: bool,
 
-    /// Chain containment threshold in (0.0, 1.0]. When set, an edge is absorbed
-    /// in greedy dereplication only if its winning-strand chain containment is
-    /// at least this value. Requires chaining to be enabled (the default unless
-    /// `--no-chain` is passed). When omitted, the chain field is informational
-    /// only.
+    /// Chain containment threshold in (0.0, 1.0]. Passing this flag both
+    /// enables the chain DP pass and gates greedy absorption on the winning-
+    /// strand chain containment being at least this value. When omitted, the
+    /// chain pass is disabled by default at the CLI; pass `--chain-min-anchors`
+    /// alone if you want the chain field populated without gating absorption.
+    /// Mutually exclusive with `--no-chain`.
     #[arg(long)]
     pub chain_threshold: Option<f64>,
 
-    /// Override `ChainParams::min_anchors` for the chain DP. Defaults to the
-    /// value from `ChainParams::starting_for_w(window)` (currently 3).
+    /// Override `ChainParams::min_anchors` for the chain DP, and enable the
+    /// chain pass as a side-effect (the CLI default is chain disabled).
+    /// Defaults to the value from `ChainParams::starting_for_w(window)`
+    /// (currently 3). Mutually exclusive with `--no-chain`.
     #[arg(long)]
     pub chain_min_anchors: Option<u32>,
 }

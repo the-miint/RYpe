@@ -12,7 +12,7 @@ pub mod edges;
 pub mod greedy;
 pub mod types;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 
 pub use chain::ChainParams;
 pub use types::{ChainScore, ClusterEdge, ClusterResult, ClusterRow, ContigInfo, ContigInput};
@@ -70,6 +70,17 @@ impl ClusterConfig {
 /// runs length-sorted greedy dereplication. The temp index is cleaned up
 /// when this function returns.
 pub fn cluster_contigs(inputs: Vec<ContigInput>, cfg: &ClusterConfig) -> Result<ClusterResult> {
+    // Reject the incoherent (chain disabled, chain gate enabled) combination
+    // here rather than in the CLI alone — a library caller who builds
+    // `ClusterConfig` directly would otherwise get silently empty
+    // dereplication (every edge fails the gate because `chain` is None).
+    if cfg.min_chain_containment.is_some() && cfg.chain_params.is_none() {
+        return Err(anyhow!(
+            "min_chain_containment requires chain_params to be Some — \
+             chain DP must be enabled to gate on chain containment"
+        ));
+    }
+
     let filtered: Vec<ContigInput> = inputs
         .into_iter()
         .filter(|c| (c.sequence.len() as u64) >= cfg.min_length)
@@ -127,5 +138,35 @@ mod tests {
         assert_eq!(p.band_anchors, reference.band_anchors);
         assert_eq!(p.band_bp, reference.band_bp);
         assert_eq!(p.min_anchors, reference.min_anchors);
+    }
+
+    /// WHY: `min_chain_containment = Some(_)` with `chain_params = None` is
+    /// the silent-empty-output trap — every edge ends up with `chain: None`
+    /// and the gate rejects all of them. A library caller who built
+    /// `ClusterConfig` by hand and forgot to enable chain DP would
+    /// previously get an empty (or near-empty) result with no signal.
+    /// `cluster_contigs` rejects the combination loudly, matching the CLI's
+    /// own conflict check.
+    #[test]
+    fn cluster_contigs_rejects_incoherent_chain_config() {
+        let cfg = ClusterConfig {
+            k: 32,
+            w: 20,
+            salt: 0,
+            min_length: 0,
+            threshold: 0.8,
+            min_shared: 1,
+            chain_params: None,
+            min_chain_containment: Some(0.5),
+        };
+        let err = cluster_contigs(Vec::new(), &cfg)
+            .err()
+            .expect("incoherent config must error");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("min_chain_containment") && msg.contains("chain_params"),
+            "error must name both fields, got: {}",
+            msg
+        );
     }
 }
