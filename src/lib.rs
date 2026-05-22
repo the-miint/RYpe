@@ -144,4 +144,6 @@ pub use indices::parquet_cluster::{
 // Cluster (positional chaining) — Plan 1.3 primitives. The DP itself and the
 // hash-merge-join helper live in `cluster::chain`; Plan 1.4 wires them into
 // `cluster::edges`.
-pub use cluster::chain::{compute_anchors_into, ChainParams, ChainResult, ChainWorkspace};
+pub use cluster::chain::{
+    chain_anchors, compute_anchors_into, ChainParams, ChainResult, ChainWorkspace,
+};

@@ -93,14 +93,10 @@ pub struct ChainResult {
 /// and pay the alloc cost once.
 #[derive(Debug, Default)]
 pub struct ChainWorkspace {
-    // Phase 1 reserves these for Phase 2's DP. `allow(dead_code)` is
-    // transient — Phase 2 uses both fields and removes the attribute.
     /// DP score array; `f[i]` = best chain score ending at anchor `i`.
-    #[allow(dead_code)]
     pub(crate) f: Vec<f64>,
     /// DP predecessor pointer; `p[i] = j` means anchor `j` precedes `i` in
     /// the best chain ending at `i`, or `-1` if `i` is a chain start.
-    #[allow(dead_code)]
     pub(crate) p: Vec<i32>,
 }
 
@@ -165,6 +161,151 @@ pub fn compute_anchors_into(
             ti += 1;
         }
     }
+}
+
+/// Banded-DP colinear chaining over an anchor list (skani-style).
+///
+/// `anchors` is sorted **in place** by `(q_pos, r_pos)` ascending before the
+/// DP runs — callers reusing a workspace buffer get the position-sorted view
+/// back. `compute_anchors_into` produces anchors in hash-order; this is the
+/// re-sort step required to switch into chain-traversal order.
+///
+/// `is_rc` controls the sign of the reference-position delta in the score:
+///   - `false` (fwd chain): valid predecessor when `r_pos[i] − r_pos[j] > 0`.
+///   - `true`  (rc chain):  valid predecessor when `r_pos[j] − r_pos[i] > 0`.
+///
+/// Both modes require `q_pos[i] > q_pos[j]` (anchors are q-sorted, so
+/// `dq == 0` at the same q-position is the only same-q case and is rejected).
+///
+/// The score for transition `j → i` is `anchor_credit − |Δr − Δq|`, where
+/// `Δq = q_pos[i] − q_pos[j]` and `Δr` is the strand-signed delta. A
+/// transition is rejected if `|Δr − Δq| > max_gap_length` (off-diagonal) or
+/// `min(Δq, |Δr|) > max_lin_length` (jump too long).
+///
+/// The inner loop **breaks** (does not skip) when `i − j > band_anchors` or
+/// `Δq > band_bp` — both monotonic-in-j cutoffs, no skip heuristic.
+///
+/// Returns `None` if the best chain has fewer than `params.min_anchors`
+/// anchors; otherwise `Some(ChainResult)` describing the highest-scoring
+/// chain. The chain's score is `f[argmax]`, never less than `anchor_credit`
+/// (the chain-of-length-1 baseline).
+pub fn chain_anchors(
+    anchors: &mut [(u32, u32)],
+    is_rc: bool,
+    params: &ChainParams,
+    ws: &mut ChainWorkspace,
+) -> Option<ChainResult> {
+    let n = anchors.len();
+    if (n as u32) < params.min_anchors {
+        return None;
+    }
+
+    // Sort into chain-traversal order. `compute_anchors_into` emits hash-
+    // order; DP needs `q_pos` ascending. Secondary key `r_pos` makes the
+    // sort deterministic when multiple anchors share a `q_pos` (possible
+    // when different minimizers happen to start at the same base).
+    anchors.sort_unstable();
+
+    // Reset DP state. `clear() + resize()` is equivalent to a fresh Vec of
+    // length `n` filled with the chain-length-1 baseline `anchor_credit`,
+    // and reuses the existing allocation when `n` fits the prior capacity.
+    ws.f.clear();
+    ws.f.resize(n, params.anchor_credit);
+    ws.p.clear();
+    ws.p.resize(n, -1);
+
+    for i in 1..n {
+        let (qi, ri) = anchors[i];
+        let mut best_f = params.anchor_credit;
+        let mut best_j: i32 = -1;
+
+        // Walk predecessors in reverse anchor-index order so both band
+        // cutoffs (monotonic in `i − j` and in `Δq`) can break cleanly.
+        for j in (0..i).rev() {
+            let (qj, rj) = anchors[j];
+
+            // Band on anchor-index lookback.
+            if (i - j) as u32 > params.band_anchors {
+                break;
+            }
+            // Band on query-position lookback. `qi >= qj` (sorted).
+            let dq = qi - qj;
+            if dq > params.band_bp {
+                break;
+            }
+            // Same q-position cannot extend a chain; skip without breaking.
+            if dq == 0 {
+                continue;
+            }
+
+            // Strand-aware Δr. `i64` lets the sign of "out of order on the
+            // chosen strand" be the simple `<= 0` test below.
+            let dr_signed: i64 = if is_rc {
+                rj as i64 - ri as i64
+            } else {
+                ri as i64 - rj as i64
+            };
+            if dr_signed <= 0 {
+                continue;
+            }
+            let dr = dr_signed as u32;
+
+            // Long-jump rejection.
+            if dq.min(dr) > params.max_lin_length {
+                continue;
+            }
+            // Off-diagonal rejection: `|Δr − Δq|`.
+            let gap = dr.abs_diff(dq);
+            if gap > params.max_gap_length {
+                continue;
+            }
+
+            let new_f = ws.f[j] + params.anchor_credit - gap as f64;
+            if new_f > best_f {
+                best_f = new_f;
+                best_j = j as i32;
+            }
+        }
+
+        ws.f[i] = best_f;
+        ws.p[i] = best_j;
+    }
+
+    // Argmax over f[]. With ties (rare with f64), the smallest index wins;
+    // this is deterministic given the deterministic sort above.
+    let mut argmax = 0usize;
+    let mut max_f = ws.f[0];
+    for i in 1..n {
+        if ws.f[i] > max_f {
+            max_f = ws.f[i];
+            argmax = i;
+        }
+    }
+
+    // Backtrack from `argmax` to chain start, counting length and capturing
+    // the start anchor. No allocation: we don't store the chain, we just
+    // need the endpoints and the count.
+    let end_anchor = anchors[argmax];
+    let mut start_idx = argmax;
+    let mut chain_len: u32 = 1;
+    while ws.p[start_idx] >= 0 {
+        start_idx = ws.p[start_idx] as usize;
+        chain_len += 1;
+    }
+    let start_anchor = anchors[start_idx];
+
+    if chain_len < params.min_anchors {
+        return None;
+    }
+
+    Some(ChainResult {
+        score: max_f,
+        anchors: chain_len,
+        q_start: start_anchor.0,
+        q_end: end_anchor.0,
+        r_start: start_anchor.1,
+        r_end: end_anchor.1,
+    })
 }
 
 #[cfg(test)]
@@ -311,5 +452,265 @@ mod tests {
     fn compute_anchors_into_panics_on_target_length_mismatch() {
         let mut out = Vec::new();
         compute_anchors_into(&[1, 2], &[10, 20], &[1, 2], &[100], &mut out);
+    }
+
+    // ---- Plan 1.3 phase 2: chain_anchors ----
+
+    /// Build a ChainParams with sane defaults for the tests below. Each test
+    /// overrides only the fields it cares about.
+    fn test_params() -> ChainParams {
+        ChainParams {
+            anchor_credit: 10.0,
+            max_gap_length: 100,
+            max_lin_length: 100_000,
+            band_anchors: 50,
+            band_bp: 100_000,
+            min_anchors: 3,
+        }
+    }
+
+    /// WHY: empty anchors is a real case — disjoint genomes share no
+    /// minimizers and the DP must not panic on n=0 indexing.
+    #[test]
+    fn chain_anchors_empty_returns_none() {
+        let mut anchors = Vec::new();
+        let mut ws = ChainWorkspace::new();
+        assert!(chain_anchors(&mut anchors, false, &test_params(), &mut ws).is_none());
+    }
+
+    /// WHY: `min_anchors` is the false-positive gate. Two perfectly colinear
+    /// anchors with `min_anchors=3` must return None — otherwise random
+    /// matches in unrelated genomes could fake a chain.
+    #[test]
+    fn chain_anchors_below_min_returns_none() {
+        let mut anchors = vec![(0u32, 0u32), (50, 50)];
+        let mut ws = ChainWorkspace::new();
+        assert!(chain_anchors(&mut anchors, false, &test_params(), &mut ws).is_none());
+    }
+
+    /// WHY (headline): score = anchor count when all gaps are zero. This
+    /// is the contract that makes `chain_score` interpretable as
+    /// "co-linear anchor count" downstream (chaining-research.md §5.2).
+    #[test]
+    fn chain_anchors_three_colinear_fwd() {
+        let mut anchors = vec![(0u32, 0u32), (50, 50), (100, 100)];
+        let mut ws = ChainWorkspace::new();
+        let result = chain_anchors(&mut anchors, false, &test_params(), &mut ws).unwrap();
+        assert_eq!(result.anchors, 3);
+        assert_eq!(result.score, 30.0, "3 × anchor_credit when gaps are zero");
+        assert_eq!(result.q_start, 0);
+        assert_eq!(result.q_end, 100);
+        assert_eq!(result.r_start, 0);
+        assert_eq!(result.r_end, 100);
+    }
+
+    /// WHY: the rc strand reads ref positions backwards as q advances.
+    /// `r_start`/`r_end` track query-traversal order, not r-value order —
+    /// so `r_start ≥ r_end` on the rc strand, and any caller computing
+    /// `r_end - r_start` must use signed arithmetic. Pinning this here
+    /// prevents a silent regression where the rc chain reports endpoints
+    /// in r-value order.
+    #[test]
+    fn chain_anchors_three_colinear_rc() {
+        let mut anchors = vec![(0u32, 100u32), (50, 50), (100, 0)];
+        let mut ws = ChainWorkspace::new();
+        let result = chain_anchors(&mut anchors, true, &test_params(), &mut ws).unwrap();
+        assert_eq!(result.anchors, 3);
+        assert_eq!(result.score, 30.0);
+        assert_eq!(result.q_start, 0);
+        assert_eq!(result.q_end, 100);
+        assert_eq!(result.r_start, 100, "rc chain starts at the largest r");
+        assert_eq!(result.r_end, 0, "rc chain ends at the smallest r");
+    }
+
+    /// WHY: an off-diagonal anchor must NOT be linked, even when the chain
+    /// could "skip" it via a direct end-to-end transition. The DP picks
+    /// the best chain by score; the off-diagonal middle anchor reduces the
+    /// chain to length 2, falling below `min_anchors=3` and returning None.
+    /// This is the central insight of chaining vs. set-containment: weak
+    /// off-diagonal anchors must be discounted.
+    #[test]
+    fn chain_anchors_off_diagonal_rejected() {
+        // Anchor 1 sits at r=500 — wildly off-diagonal from the (0,0)→(100,100)
+        // line. The 0→1 and 1→2 transitions both fail (gap too big), and the
+        // 0→2 transition still works (gap=0) but is only a length-2 chain.
+        let mut anchors = vec![(0u32, 0u32), (50, 500), (100, 100)];
+        let mut ws = ChainWorkspace::new();
+        assert!(chain_anchors(&mut anchors, false, &test_params(), &mut ws).is_none());
+    }
+
+    /// WHY: `band_bp` IS the algorithm — without the break, the inner loop
+    /// is O(n²); without an effective break, the band is dead code. Test
+    /// pins the break by constructing two anchors whose `dq` exceeds
+    /// `band_bp` exactly, then sanity-checks that loosening the band lets
+    /// the chain form.
+    #[test]
+    fn chain_anchors_band_bp_breaks_inner_loop() {
+        let params_tight = ChainParams {
+            band_bp: 500,
+            min_anchors: 2,
+            ..test_params()
+        };
+        let mut anchors = vec![(0u32, 0u32), (1000, 1000)];
+        let mut ws = ChainWorkspace::new();
+        // dq=1000 > band_bp=500 → break before scoring → no chain.
+        assert!(chain_anchors(&mut anchors, false, &params_tight, &mut ws).is_none());
+
+        let params_wide = ChainParams {
+            band_bp: 1500,
+            ..params_tight
+        };
+        let mut anchors_ok = vec![(0u32, 0u32), (1000, 1000)];
+        let result = chain_anchors(&mut anchors_ok, false, &params_wide, &mut ws).unwrap();
+        assert_eq!(result.anchors, 2);
+    }
+
+    /// WHY: `band_anchors` is the other half of the band — `i − j` cutoff.
+    /// Same shape of test as `band_bp_breaks`: design four anchors so that
+    /// the dominant predecessor is `j = i − 2` (forcing `band_anchors=1`
+    /// to break before scoring it), and the immediate neighbor is an
+    /// off-diagonal trap.
+    #[test]
+    fn chain_anchors_band_anchors_breaks_inner_loop() {
+        // anchor 0 (q=0,   r=0)    — chain start
+        // anchor 1 (q=100, r=100)  — colinear with 0
+        // anchor 2 (q=110, r=10000) — off-diagonal trap (immediate predecessor of 3)
+        // anchor 3 (q=200, r=200)  — colinear with 0,1
+        let params_tight = ChainParams {
+            band_anchors: 1,
+            ..test_params()
+        };
+        let mut anchors = vec![(0u32, 0u32), (100, 100), (110, 10_000), (200, 200)];
+        let mut ws = ChainWorkspace::new();
+        // band_anchors=1: anchor 3 can only see anchor 2 → rejected → f[3]=10.
+        // Chain length for anchor 3 stays 1. The best chain (anchor 1 from 0)
+        // has length 2, which is below min_anchors=3 → None.
+        assert!(chain_anchors(&mut anchors, false, &params_tight, &mut ws).is_none());
+
+        let params_wide = ChainParams {
+            band_anchors: 10,
+            ..params_tight
+        };
+        let mut anchors_ok = vec![(0u32, 0u32), (100, 100), (110, 10_000), (200, 200)];
+        let result = chain_anchors(&mut anchors_ok, false, &params_wide, &mut ws).unwrap();
+        // anchor 3 can now reach anchor 1 (skipping the trap) → chain [0,1,3].
+        assert_eq!(result.anchors, 3);
+        assert_eq!(result.q_start, 0);
+        assert_eq!(result.q_end, 200);
+    }
+
+    /// WHY: when two disjoint chains exist, argmax picks the higher-scoring
+    /// one. A bug here (e.g. backtracking from the highest INDEX instead of
+    /// the highest SCORE) would silently report the wrong chain.
+    #[test]
+    fn chain_anchors_two_chains_returns_best() {
+        // Chain A (q=0..100):    gap=5 transitions → score = 10 + 5 + 5 = 20.
+        // Chain B (q=10000..):   gap=0 transitions → score = 10 + 10 + 10 = 30.
+        // Inter-chain: dq ≈ 9900, dr ≈ 4890 → gap ≈ 5010 > max_gap_length=100
+        // → no cross-chain linkage. argmax = B's last anchor.
+        let mut anchors = vec![
+            (0u32, 0u32),
+            (50, 55),
+            (100, 110),
+            (10_000, 5_000),
+            (10_050, 5_050),
+            (10_100, 5_100),
+        ];
+        let mut ws = ChainWorkspace::new();
+        let result = chain_anchors(&mut anchors, false, &test_params(), &mut ws).unwrap();
+        assert_eq!(result.anchors, 3);
+        assert_eq!(result.score, 30.0);
+        assert_eq!(result.q_start, 10_000);
+        assert_eq!(result.q_end, 10_100);
+        assert_eq!(result.r_start, 5_000);
+        assert_eq!(result.r_end, 5_100);
+    }
+
+    /// WHY: `max_lin_length` prevents two distant but on-diagonal anchors
+    /// from being merged into a single chain. Without it, a real chain at
+    /// one end of the contig and a random match at the other end would
+    /// spuriously join. The same anchor pair is tested with the limit
+    /// raised, to prove the rejection is causal.
+    #[test]
+    fn chain_anchors_max_lin_length_rejects_long_jump() {
+        let params_tight = ChainParams {
+            max_lin_length: 5_000,
+            min_anchors: 2,
+            ..test_params()
+        };
+        let mut anchors = vec![(0u32, 0u32), (10_000, 10_000)];
+        let mut ws = ChainWorkspace::new();
+        // dq=dr=10_000 (gap=0, would be allowed), but min(dq,dr)=10_000 > 5_000 → reject.
+        assert!(chain_anchors(&mut anchors, false, &params_tight, &mut ws).is_none());
+
+        let params_wide = ChainParams {
+            max_lin_length: 20_000,
+            ..params_tight
+        };
+        let mut anchors_ok = vec![(0u32, 0u32), (10_000, 10_000)];
+        let result = chain_anchors(&mut anchors_ok, false, &params_wide, &mut ws).unwrap();
+        assert_eq!(result.anchors, 2);
+    }
+
+    /// WHY: the strand flag is the strand decision; calling with the wrong
+    /// `is_rc` on real data produces silent zero-anchor chains. This test
+    /// proves the flag is causal: same anchors, both flags, opposite
+    /// outcomes.
+    #[test]
+    fn chain_anchors_strand_purity_via_is_rc() {
+        // Forward-colinear: r ascends with q. fwd chain forms; rc rejects
+        // every transition (dr_signed = rj - ri < 0).
+        let anchors_fwd = vec![(0u32, 0u32), (50, 50), (100, 100)];
+        let mut ws = ChainWorkspace::new();
+
+        let mut fwd_copy = anchors_fwd.clone();
+        let r_fwd = chain_anchors(&mut fwd_copy, false, &test_params(), &mut ws).unwrap();
+        assert_eq!(r_fwd.anchors, 3);
+
+        let mut rc_copy = anchors_fwd;
+        assert!(
+            chain_anchors(&mut rc_copy, true, &test_params(), &mut ws).is_none(),
+            "rc chain on fwd-colinear anchors must not form"
+        );
+    }
+
+    /// WHY: workspace reuse is the alloc-amortization story. If `f`/`p`
+    /// leak state across calls, the second call's results are silently
+    /// wrong. Test by running a 5-anchor case then a 3-anchor case and
+    /// asserting the second's results are clean.
+    #[test]
+    fn chain_anchors_workspace_reuse_clears_dp_state() {
+        let mut ws = ChainWorkspace::new();
+        let params = test_params();
+
+        let mut long_anchors = vec![(0u32, 0u32), (50, 50), (100, 100), (150, 150), (200, 200)];
+        let r1 = chain_anchors(&mut long_anchors, false, &params, &mut ws).unwrap();
+        assert_eq!(r1.anchors, 5);
+        assert_eq!(r1.score, 50.0);
+
+        let mut short_anchors = vec![(0u32, 0u32), (50, 50), (100, 100)];
+        let r2 = chain_anchors(&mut short_anchors, false, &params, &mut ws).unwrap();
+        assert_eq!(r2.anchors, 3);
+        assert_eq!(r2.score, 30.0);
+
+        assert_eq!(ws.f.len(), 3, "workspace must shrink to match second call");
+        assert_eq!(ws.p.len(), 3);
+    }
+
+    /// WHY: `compute_anchors_into` emits hash-order; chain DP needs
+    /// q_pos-order. The DP sorts in place. Test that passing anchors in
+    /// hash-order (i.e. NOT q_pos-order) still produces the correct chain.
+    #[test]
+    fn chain_anchors_sorts_unsorted_input() {
+        // Same 3 colinear anchors as chain_anchors_three_colinear_fwd, but
+        // shuffled to simulate hash-order output from compute_anchors_into.
+        let mut anchors = vec![(50u32, 50u32), (100, 100), (0, 0)];
+        let mut ws = ChainWorkspace::new();
+        let result = chain_anchors(&mut anchors, false, &test_params(), &mut ws).unwrap();
+        assert_eq!(result.anchors, 3);
+        assert_eq!(result.q_start, 0);
+        assert_eq!(result.q_end, 100);
+        // Side-effect: anchors are now sorted by (q,r) in place.
+        assert_eq!(anchors, vec![(0, 0), (50, 50), (100, 100)]);
     }
 }
