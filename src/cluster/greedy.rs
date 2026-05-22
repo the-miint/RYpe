@@ -135,7 +135,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)] // Phase 3 tests use this. Allow transient unused-ness.
     fn edge_with_chain(
         q: u32,
         t: u32,
@@ -273,5 +272,104 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].rep_contig, "A");
         assert_eq!(rows[0].member_contig, "A");
+    }
+
+    // ---- Plan 1.4 phase 3: chain gate tests ----
+    //
+    // WHY these tests: the chain gate is the new behavior Plan 1.4 layers on
+    // top of set-containment. Each test pins one branch of the gate's
+    // truth table (`min_chain_containment` × `edge.chain`) so a regression
+    // in the filter expression can't slip past silently.
+
+    #[test]
+    fn greedy_chain_gate_disabled_passthrough() {
+        // WHY: `min_chain_containment: None` must be a true no-op. Mixing
+        // edges with and without chain data should match the legacy
+        // (pre-Plan 1.4) absorption behavior — both get absorbed because the
+        // chain field is ignored.
+        let contigs = vec![ci("A", 5000), ci("B", 3000), ci("C", 2000)];
+        let edges = vec![
+            edge_with_chain(1, 0, 0.90, 270, 0.95, 100), // B->A with chain
+            edge(2, 0, 0.95, 190),                       // C->A without chain
+        ];
+
+        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100, None);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].member_contig, "A");
+        assert_eq!(rows[1].rep_contig, "A");
+        assert_eq!(rows[1].member_contig, "B");
+        assert_eq!(rows[2].rep_contig, "A");
+        assert_eq!(rows[2].member_contig, "C");
+    }
+
+    #[test]
+    fn greedy_chain_gate_rejects_no_chain_present() {
+        // WHY: When the gate is enabled, an edge with `chain: None` cannot
+        // satisfy any containment threshold. The edge must be rejected even
+        // though set-containment alone would have absorbed it.
+        let contigs = vec![ci("A", 5000), ci("B", 3000)];
+        let edges = vec![edge(1, 0, 0.99, 500)]; // would absorb under set-containment
+
+        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100, Some(0.5));
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].rep_contig, "A");
+        assert_eq!(rows[0].member_contig, "A");
+        assert_eq!(rows[1].rep_contig, "B");
+        assert_eq!(rows[1].member_contig, "B");
+    }
+
+    #[test]
+    fn greedy_chain_gate_rejects_low_containment() {
+        // WHY: set-containment may pass (score >= threshold) while chain
+        // containment falls below the gate — the "shared minimizers
+        // scattered without colinearity" case Plan 1.4 is designed to filter.
+        let contigs = vec![ci("A", 5000), ci("B", 3000)];
+        let edges = vec![edge_with_chain(1, 0, 0.99, 500, 0.30, 20)];
+
+        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100, Some(0.5));
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].member_contig, "A");
+        assert_eq!(rows[1].member_contig, "B");
+        assert_eq!(rows[1].rep_contig, "B");
+    }
+
+    #[test]
+    fn greedy_chain_gate_accepts_high_containment() {
+        // WHY: When chain containment is above the gate, the edge is
+        // absorbed — confirming the gate is a filter not a hard block.
+        let contigs = vec![ci("A", 5000), ci("B", 3000)];
+        let edges = vec![edge_with_chain(1, 0, 0.99, 500, 0.80, 100)];
+
+        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100, Some(0.5));
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].member_contig, "A");
+        assert_eq!(rows[1].rep_contig, "A");
+        assert_eq!(rows[1].member_contig, "B");
+        assert!((rows[1].containment - 0.99).abs() < 1e-9);
+    }
+
+    #[test]
+    fn greedy_chain_does_not_change_tiebreak_order() {
+        // WHY: The chain field is a filter, not a ranker. Two absorbed
+        // members must still appear in `contigs`-index order, regardless of
+        // their chain containment. Sorting by chain would silently break the
+        // documented contract at the top of `greedy_dereplicate`.
+        let contigs = vec![ci("A", 5000), ci("B", 3000), ci("C", 2000)];
+        let edges = vec![
+            edge_with_chain(1, 0, 0.90, 270, 0.55, 30), // B->A, low chain
+            edge_with_chain(2, 0, 0.95, 190, 0.99, 200), // C->A, high chain
+        ];
+
+        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100, Some(0.5));
+
+        // Both absorbed; order is by query_idx (B before C), not by chain.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].member_contig, "A");
+        assert_eq!(rows[1].member_contig, "B");
+        assert_eq!(rows[2].member_contig, "C");
     }
 }

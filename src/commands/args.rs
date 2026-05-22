@@ -132,6 +132,25 @@ pub struct ClusterArgs {
     /// shared mobile element. Strain-level starting point: 500.
     #[arg(long, default_value_t = 500)]
     pub min_shared: u64,
+
+    /// Disable the chaining pass entirely. With this flag, `ClusterEdge.chain`
+    /// is `None` for every edge and the chain gate cannot be applied. Mutually
+    /// exclusive with `--chain-threshold`.
+    #[arg(long)]
+    pub no_chain: bool,
+
+    /// Chain containment threshold in (0.0, 1.0]. When set, an edge is absorbed
+    /// in greedy dereplication only if its winning-strand chain containment is
+    /// at least this value. Requires chaining to be enabled (the default unless
+    /// `--no-chain` is passed). When omitted, the chain field is informational
+    /// only.
+    #[arg(long)]
+    pub chain_threshold: Option<f64>,
+
+    /// Override `ChainParams::min_anchors` for the chain DP. Defaults to the
+    /// value from `ChainParams::starting_for_w(window)` (currently 3).
+    #[arg(long)]
+    pub chain_min_anchors: Option<u32>,
 }
 
 #[derive(Subcommand)]

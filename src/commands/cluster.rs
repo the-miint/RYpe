@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use needletail::parse_fastx_file;
 
 use rype::cluster::{cluster_contigs, ClusterConfig, ClusterResult, ContigInput};
-use rype::BUCKET_SOURCE_DELIM;
+use rype::{ChainParams, BUCKET_SOURCE_DELIM};
 
 use super::args::ClusterArgs;
 
@@ -26,6 +26,19 @@ pub fn run_cluster(args: ClusterArgs) -> Result<()> {
             args.threshold
         ));
     }
+    if args.no_chain && args.chain_threshold.is_some() {
+        return Err(anyhow!(
+            "--chain-threshold requires chain to be enabled; remove --no-chain or drop --chain-threshold"
+        ));
+    }
+    if let Some(t) = args.chain_threshold {
+        if !t.is_finite() || t <= 0.0 || t > 1.0 {
+            return Err(anyhow!(
+                "--chain-threshold must be finite in (0.0, 1.0] (got {})",
+                t
+            ));
+        }
+    }
 
     log::info!(
         "Loading contigs from {} input file(s)...",
@@ -39,6 +52,21 @@ pub fn run_cluster(args: ClusterArgs) -> Result<()> {
         total_bytes as f64 / 1_048_576.0,
     );
 
+    // Chain is opt-in at the CLI to preserve the historical default behavior.
+    // Any of `--chain-threshold`, `--chain-min-anchors` flips chain on with
+    // `starting_for_w(window)`; `--no-chain` is explicit and overrides those.
+    let chain_params = if args.no_chain {
+        None
+    } else if args.chain_threshold.is_some() || args.chain_min_anchors.is_some() {
+        let mut params = ChainParams::starting_for_w(args.window);
+        if let Some(m) = args.chain_min_anchors {
+            params.min_anchors = m;
+        }
+        Some(params)
+    } else {
+        None
+    };
+
     let cfg = ClusterConfig {
         k: args.kmer_size,
         w: args.window,
@@ -46,12 +74,8 @@ pub fn run_cluster(args: ClusterArgs) -> Result<()> {
         min_length: args.min_length,
         threshold: args.threshold,
         min_shared: args.min_shared,
-        // Phase 1: CLI exposes no chain flags yet (Phase 3 adds --no-chain,
-        // --chain-threshold, --chain-min-anchors). Default to chain disabled
-        // at the CLI for now so behavior matches today; `strain_default()`
-        // enables chain for library callers that want it.
-        chain_params: None,
-        min_chain_containment: None,
+        chain_params,
+        min_chain_containment: args.chain_threshold,
     };
 
     log::info!(

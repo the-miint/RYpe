@@ -1,6 +1,7 @@
 //! End-to-end integration tests for the clustering API.
 
 use rype::cluster::{cluster_contigs, ClusterConfig, ContigInput};
+use rype::ChainParams;
 
 /// Deterministic pseudo-random DNA, seeded so tests are reproducible.
 fn seq_from_seed(len: usize, seed: u64) -> Vec<u8> {
@@ -144,6 +145,109 @@ fn length_floor_excludes_short_contigs_entirely() {
 fn empty_input_returns_empty_result() {
     let result = cluster_contigs(Vec::new(), &cfg_relaxed()).unwrap();
     assert!(result.rows.is_empty());
+}
+
+/// Plan 1.4 phase 3 — load-bearing test that justifies the chain feature.
+///
+/// Construct a query genome `B` whose minimizer **set** is almost identical
+/// to representative `A` (high set-containment) but whose minimizer
+/// **positions** are scrambled relative to `A` (low chain containment).
+///
+/// WHY this is the right test for Plan 1.4: set-containment alone cannot
+/// distinguish "real syntenic match" from "shared minimizers scattered
+/// without colinearity" (chaining-research.md §5.1). Without the chain
+/// gate, `B` is absorbed into `A`. With the gate set, the colinearity
+/// check rejects the absorption.
+///
+/// Construction: take 40 non-overlapping 200-bp chunks of `A` and emit
+/// them in a deterministic shuffled order. Each chunk's minimizers are
+/// internally colinear (yielding short within-chunk chains) but
+/// inter-chunk anchors are off-diagonal (the chain DP breaks at every
+/// boundary).
+#[test]
+fn cluster_chain_gate_filters_random_match() {
+    let a = seq_from_seed(10_000, 42);
+
+    // Build B by permuting 200-bp chunks of A. Deterministic Fisher-Yates
+    // shuffle via a seeded LCG so the test is reproducible.
+    let chunk_size = 200usize;
+    let num_chunks = 40usize; // B = 8000 bp (shorter than A so A wins length sort)
+    let mut order: Vec<usize> = (0..num_chunks).collect();
+    let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_F00D;
+    for i in (1..num_chunks).rev() {
+        rng_state = rng_state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let j = (rng_state >> 33) as usize % (i + 1);
+        order.swap(i, j);
+    }
+    let mut b = Vec::with_capacity(num_chunks * chunk_size);
+    for &idx in &order {
+        b.extend_from_slice(&a[idx * chunk_size..(idx + 1) * chunk_size]);
+    }
+    assert_eq!(b.len(), num_chunks * chunk_size);
+
+    let inputs = || {
+        vec![
+            ContigInput {
+                id: "A".to_string(),
+                source_mag: Some("mag_a".to_string()),
+                sequence: a.clone(),
+            },
+            ContigInput {
+                id: "B".to_string(),
+                source_mag: Some("mag_b".to_string()),
+                sequence: b.clone(),
+            },
+        ]
+    };
+
+    // Baseline: chain enabled but gate disabled. Set-containment alone
+    // absorbs B into A — the failure mode the gate exists to prevent.
+    let cfg_no_gate = ClusterConfig {
+        k: 32,
+        w: 20,
+        salt: 0x5555_5555_5555_5555,
+        min_length: 1_000,
+        threshold: 0.80,
+        min_shared: 50,
+        chain_params: Some(ChainParams::starting_for_w(20)),
+        min_chain_containment: None,
+    };
+    let result_no_gate = cluster_contigs(inputs(), &cfg_no_gate).unwrap();
+    let absorbed_no_gate = result_no_gate
+        .rows
+        .iter()
+        .any(|r| r.member_contig == "B" && r.rep_contig == "A");
+    assert!(
+        absorbed_no_gate,
+        "without chain gate, set-containment should absorb the scrambled B \
+         into A; rows: {:#?}",
+        result_no_gate.rows
+    );
+
+    // With chain gate at 0.5: the scrambled B has no long colinear chain
+    // into A, so its `chain.containment` falls below the gate and the
+    // absorption is rejected.
+    let cfg_gated = ClusterConfig {
+        min_chain_containment: Some(0.5),
+        ..cfg_no_gate
+    };
+    let result_gated = cluster_contigs(inputs(), &cfg_gated).unwrap();
+    assert_eq!(
+        result_gated.rows.len(),
+        2,
+        "expected two singleton clusters with the chain gate on; got {:#?}",
+        result_gated.rows
+    );
+    for row in &result_gated.rows {
+        assert_eq!(
+            row.rep_contig, row.member_contig,
+            "every row must be its own rep when chain gate rejects the only \
+             candidate edge; got {:?}",
+            row
+        );
+    }
 }
 
 #[test]
