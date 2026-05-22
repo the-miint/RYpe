@@ -135,6 +135,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)] // Phase 3 tests use this. Allow transient unused-ness.
     fn edge_with_chain(
         q: u32,
         t: u32,
