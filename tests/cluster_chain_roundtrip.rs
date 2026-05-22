@@ -322,9 +322,17 @@ fn cluster_chain_roundtrip_uses_research_doc_starting_params() {
     let mut ws = ChainWorkspace::new();
     let r_fwd = chain_anchors(&mut anchors_fwd, false, &params, &mut ws)
         .expect("starting_for_w(50) must produce a chain on a 1%-mutated 50kb copy");
+    // Threshold of 100 sits an order of magnitude above min_anchors=3 and an
+    // order of magnitude below the empirically observed ~1500 on this fixture
+    // — comfortable signal for "chain forms well on real-ish data" while
+    // tolerating noise from `mutate_random`'s LCG. A trivial `>= min_anchors`
+    // assertion would be a tautology: chain_anchors only returns Some when
+    // chain length already meets min_anchors.
     assert!(
-        r_fwd.anchors >= params.min_anchors,
-        "expected ≥{} chained anchors, got {}",
+        r_fwd.anchors >= 100,
+        "expected ≥100 chained anchors (vs ≥{} as a tautology check); got {}. \
+         If starting_for_w(50) becomes too tight, this fires before Plan 1.4 \
+         integration discovers it.",
         params.min_anchors,
         r_fwd.anchors,
     );

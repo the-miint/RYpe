@@ -684,7 +684,10 @@ mod tests {
         };
         let mut anchors = vec![(0u32, 0u32), (10_000, 10_000)];
         let mut ws = ChainWorkspace::new();
-        // dq=dr=10_000 (gap=0, would be allowed), but min(dq,dr)=10_000 > 5_000 → reject.
+        // dq=dr=10_000 (gap=0, would be allowed), but max(dq,dr)=10_000 > 5_000 → reject.
+        // This symmetric case can't distinguish `min` from `max` —
+        // `chain_anchors_max_lin_length_rejects_asymmetric_jump` pins the
+        // operator choice; this one only proves the threshold is checked.
         assert!(chain_anchors(&mut anchors, false, &params_tight, &mut ws).is_none());
 
         let params_wide = ChainParams {
