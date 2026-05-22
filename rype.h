@@ -1010,6 +1010,42 @@ typedef struct {
 } RypeClusterConfig;
 
 /**
+ * Chain DP configuration (Plan 1.4).
+ *
+ * Sidecar to RypeClusterConfig, passed as a separate optional pointer to
+ * rype_cluster() and rype_cluster_arrow(). Pass NULL to keep chain
+ * disabled (the legacy pre-Plan-1.4 behavior — classify-only set-
+ * containment edges, no chain output).
+ *
+ * When non-NULL, all six chain DP parameters must be set. Use
+ * rype::cluster::ChainParams::starting_for_w(w) from the Rust API to get
+ * uncalibrated research-doc starting values, or set fields explicitly.
+ * Plan 1.6 will publish calibrated defaults.
+ *
+ * - anchor_credit:        Credit per anchor in the DP score. Default 1.0.
+ * - max_gap_length:       Max |Δr − Δq| per transition. 4×w by default.
+ * - max_lin_length:       Max max(Δr, Δq) per transition. 100×w by default.
+ * - band_anchors:         Anchor-index lookback band. Default 50.
+ * - band_bp:              Query-position lookback band in bp. 50×w by default.
+ * - min_anchors:          Min chain length for the DP to return Some. Default 3.
+ * - min_chain_containment: Greedy gate. NaN disables (chain is informational).
+ *                          Finite value in (0.0, 1.0] requires chain
+ *                          containment ≥ threshold for absorption.
+ *
+ * Setting min_chain_containment to a finite value while the rest are
+ * unset is incoherent: chain must be enabled for the gate to mean anything.
+ */
+typedef struct {
+    double anchor_credit;
+    uint32_t max_gap_length;
+    uint32_t max_lin_length;
+    uint32_t band_anchors;
+    uint32_t band_bp;
+    uint32_t min_anchors;
+    double min_chain_containment;
+} RypeChainConfig;
+
+/**
  * One contig to be clustered. Caller owns all three string/byte pointers;
  * rype borrows them only for the duration of the rype_cluster() call.
  *
@@ -1086,7 +1122,8 @@ typedef struct {
 RypeClusterRowArray* rype_cluster(
     const RypeClusterInput* contigs,
     size_t num_contigs,
-    const RypeClusterConfig* config
+    const RypeClusterConfig* config,
+    const RypeChainConfig* chain_config  /* Plan 1.4: NULL = chain disabled */
 );
 
 /**
@@ -1643,6 +1680,7 @@ int rype_arrow_cluster_result_schema(struct ArrowSchema* out_schema);
 int rype_cluster_arrow(
     struct ArrowArrayStream* input_stream,
     const RypeClusterConfig* config,
+    const RypeChainConfig* chain_config,  /* Plan 1.4: NULL = chain disabled */
     struct ArrowArrayStream* out_stream
 );
 

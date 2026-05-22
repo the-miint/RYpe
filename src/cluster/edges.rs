@@ -153,6 +153,10 @@ pub fn build_edges(
             target_idx,
             score: hit.score,
             shared,
+            // Plan 1.4 phase 1: chain field present but unpopulated. Phase 2
+            // wires the chain DP into build_edges and sets this to Some(_)
+            // when cfg.chain_params is enabled.
+            chain: None,
         });
     }
 
@@ -198,6 +202,10 @@ mod tests {
             min_length: 0,
             threshold,
             min_shared,
+            // Phase 1: chain disabled by default in this test helper. Phase 2's
+            // build_edges tests will use a separate helper that enables chain.
+            chain_params: None,
+            min_chain_containment: None,
         }
     }
 

@@ -46,6 +46,12 @@ pub fn run_cluster(args: ClusterArgs) -> Result<()> {
         min_length: args.min_length,
         threshold: args.threshold,
         min_shared: args.min_shared,
+        // Phase 1: CLI exposes no chain flags yet (Phase 3 adds --no-chain,
+        // --chain-threshold, --chain-min-anchors). Default to chain disabled
+        // at the CLI for now so behavior matches today; `strain_default()`
+        // enables chain for library callers that want it.
+        chain_params: None,
+        min_chain_containment: None,
     };
 
     log::info!(

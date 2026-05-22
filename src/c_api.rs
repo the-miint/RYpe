@@ -283,6 +283,32 @@ pub struct RypeClusterConfig {
     pub min_shared: u64,
 }
 
+/// Chain DP configuration — sidecar to `RypeClusterConfig` (Plan 1.4).
+///
+/// Passed as a separate optional pointer argument to `rype_cluster` and
+/// `rype_cluster_arrow`. NULL means "chain disabled" (legacy behavior:
+/// classify-only set-containment edges, no chain output).
+///
+/// When non-NULL: all six chain DP parameters must be set (mirrors
+/// `rype::cluster::ChainParams::starting_for_w(w)` if you want default
+/// research-doc starting values — Plan 1.6 calibration will revise).
+/// `min_chain_containment` is `f64::NAN` to disable the greedy chain gate
+/// (chain computed but informational only); a finite value in `(0.0, 1.0]`
+/// enables the gate.
+#[repr(C)]
+pub struct RypeChainConfig {
+    pub anchor_credit: c_double,
+    pub max_gap_length: u32,
+    pub max_lin_length: u32,
+    pub band_anchors: u32,
+    pub band_bp: u32,
+    pub min_anchors: u32,
+    /// Greedy gate. `NaN` disables (chain is informational). Finite value
+    /// in `(0.0, 1.0]` requires `chain.containment >= min_chain_containment`
+    /// for absorption.
+    pub min_chain_containment: c_double,
+}
+
 /// One contig to be clustered.
 ///
 /// Caller owns all three pointers; rype borrows them only for the duration
@@ -1407,7 +1433,15 @@ pub extern "C" fn rype_log_ratio_results_free(ptr: *mut RypeLogRatioResultArray)
 // torn down before this function returns.
 
 /// Validate a RypeClusterConfig and convert it to the internal form.
-fn cluster_config_from_c(cfg: &RypeClusterConfig) -> Result<crate::cluster::ClusterConfig, String> {
+///
+/// `chain` is the optional sidecar pointer from `rype_cluster`-family
+/// functions: `None` leaves chain disabled (matches pre-Plan-1.4 behavior),
+/// `Some(rc)` populates `chain_params` and `min_chain_containment` on the
+/// resulting `ClusterConfig`.
+fn cluster_config_from_c(
+    cfg: &RypeClusterConfig,
+    chain: Option<&RypeChainConfig>,
+) -> Result<crate::cluster::ClusterConfig, String> {
     if !matches!(cfg.k, 16 | 32 | 64) {
         return Err(format!("k must be 16, 32, or 64 (got {})", cfg.k));
     }
@@ -1420,6 +1454,42 @@ fn cluster_config_from_c(cfg: &RypeClusterConfig) -> Result<crate::cluster::Clus
             cfg.threshold
         ));
     }
+    let (chain_params, min_chain_containment) = match chain {
+        None => (None, None),
+        Some(rc) => {
+            if !rc.anchor_credit.is_finite() {
+                return Err(format!(
+                    "chain anchor_credit must be finite (got {})",
+                    rc.anchor_credit
+                ));
+            }
+            // `min_chain_containment = NaN` is the documented sentinel for
+            // "no gate". Any other non-finite value or out-of-range value is
+            // a caller error.
+            let gate = if rc.min_chain_containment.is_nan() {
+                None
+            } else if !rc.min_chain_containment.is_finite()
+                || rc.min_chain_containment <= 0.0
+                || rc.min_chain_containment > 1.0
+            {
+                return Err(format!(
+                    "min_chain_containment must be NaN (disabled) or finite in (0.0, 1.0] (got {})",
+                    rc.min_chain_containment
+                ));
+            } else {
+                Some(rc.min_chain_containment)
+            };
+            let params = crate::cluster::ChainParams {
+                anchor_credit: rc.anchor_credit,
+                max_gap_length: rc.max_gap_length,
+                max_lin_length: rc.max_lin_length,
+                band_anchors: rc.band_anchors,
+                band_bp: rc.band_bp,
+                min_anchors: rc.min_anchors,
+            };
+            (Some(params), gate)
+        }
+    };
     Ok(crate::cluster::ClusterConfig {
         k: cfg.k,
         w: cfg.w,
@@ -1427,6 +1497,8 @@ fn cluster_config_from_c(cfg: &RypeClusterConfig) -> Result<crate::cluster::Clus
         min_length: cfg.min_length,
         threshold: cfg.threshold,
         min_shared: cfg.min_shared,
+        chain_params,
+        min_chain_containment,
     })
 }
 
@@ -1466,6 +1538,7 @@ pub extern "C" fn rype_cluster(
     contigs: *const RypeClusterInput,
     num_contigs: size_t,
     config: *const RypeClusterConfig,
+    chain_config: *const RypeChainConfig,
 ) -> *mut RypeClusterRowArray {
     if !is_nonnull_aligned(config) {
         set_last_error("config is NULL or misaligned".to_string());
@@ -1481,7 +1554,17 @@ pub extern "C" fn rype_cluster(
     }
 
     let cfg_ref = unsafe { &*config };
-    let cluster_cfg = match cluster_config_from_c(cfg_ref) {
+    // `chain_config` is optional — NULL means chain disabled, matching
+    // pre-Plan-1.4 behavior.
+    let chain_ref = if chain_config.is_null() {
+        None
+    } else if !is_nonnull_aligned(chain_config) {
+        set_last_error("chain_config is misaligned".to_string());
+        return std::ptr::null_mut();
+    } else {
+        Some(unsafe { &*chain_config })
+    };
+    let cluster_cfg = match cluster_config_from_c(cfg_ref, chain_ref) {
         Ok(c) => c,
         Err(e) => {
             set_last_error(format!("Invalid config: {}", e));
@@ -3008,6 +3091,7 @@ mod arrow_ffi {
     pub unsafe extern "C" fn rype_cluster_arrow(
         input_stream: *mut FFI_ArrowArrayStream,
         config: *const RypeClusterConfig,
+        chain_config: *const RypeChainConfig,
         out_stream: *mut FFI_ArrowArrayStream,
     ) -> i32 {
         if input_stream.is_null() {
@@ -3036,7 +3120,16 @@ mod arrow_ffi {
             return -1;
         }
         let cfg_ref = &*config;
-        let cluster_cfg = match cluster_config_from_c(cfg_ref) {
+        // `chain_config` is optional — NULL means chain disabled.
+        let chain_ref = if chain_config.is_null() {
+            None
+        } else if !is_nonnull_aligned(chain_config) {
+            set_last_error("chain_config is misaligned".to_string());
+            return -1;
+        } else {
+            Some(&*chain_config)
+        };
+        let cluster_cfg = match cluster_config_from_c(cfg_ref, chain_ref) {
             Ok(c) => c,
             Err(e) => {
                 set_last_error(format!("Invalid config: {}", e));

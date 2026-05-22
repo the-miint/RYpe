@@ -492,7 +492,8 @@ fn rype_cluster_arrow_roundtrip_fragment_clusters_with_parent() -> Result<()> {
         min_shared: 50,
     };
 
-    let rc = unsafe { rype_cluster_arrow(input_stream_ptr, &cfg, &mut out_stream) };
+    let rc =
+        unsafe { rype_cluster_arrow(input_stream_ptr, &cfg, std::ptr::null(), &mut out_stream) };
     assert_eq!(rc, 0, "rype_cluster_arrow returned {}", rc);
 
     // Read result batch
@@ -566,6 +567,13 @@ fn rype_cluster_arrow_null_input_returns_error() {
         min_shared: 50,
     };
     let mut out_stream = FFI_ArrowArrayStream::empty();
-    let rc = unsafe { rype_cluster_arrow(std::ptr::null_mut(), &cfg, &mut out_stream) };
+    let rc = unsafe {
+        rype_cluster_arrow(
+            std::ptr::null_mut(),
+            &cfg,
+            std::ptr::null(),
+            &mut out_stream,
+        )
+    };
     assert_eq!(rc, -1);
 }

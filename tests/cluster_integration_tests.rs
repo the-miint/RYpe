@@ -27,6 +27,8 @@ fn cfg_relaxed() -> ClusterConfig {
         min_length: 1_000,
         threshold: 0.80,
         min_shared: 50,
+        chain_params: None,
+        min_chain_containment: None,
     }
 }
 

@@ -84,7 +84,10 @@ static int run_cluster_example(void) {
         .min_shared = 50,
     };
 
-    RypeClusterRowArray* result = rype_cluster(inputs, 3, &cfg);
+    /* Pass NULL for the chain config to keep chain disabled (Plan 1.4
+     * sidecar — new callers populate a RypeChainConfig to enable
+     * positional chain confirmation). */
+    RypeClusterRowArray* result = rype_cluster(inputs, 3, &cfg, NULL);
     if (!result) {
         const char* err = rype_get_last_error();
         fprintf(stderr, "rype_cluster failed: %s\n", err ? err : "unknown");

@@ -1780,7 +1780,9 @@ fn test_calculate_batch_config_capped_path_memory_fields() -> Result<()> {
 // Cluster API tests
 // =============================================================================
 
-use rype::c_api::{rype_cluster, rype_cluster_results_free, RypeClusterConfig, RypeClusterInput};
+use rype::c_api::{
+    rype_cluster, rype_cluster_results_free, RypeChainConfig, RypeClusterConfig, RypeClusterInput,
+};
 
 /// Deterministic pseudo-random DNA, seeded so tests are reproducible.
 fn cluster_seq_from_seed(len: usize, seed: u64) -> Vec<u8> {
@@ -1841,7 +1843,7 @@ fn cluster_c_api_fragment_of_genome_clusters_with_parent() -> Result<()> {
     ];
 
     let cfg = relaxed_c_cluster_cfg();
-    let result_ptr = rype_cluster(inputs.as_ptr(), inputs.len(), &cfg);
+    let result_ptr = rype_cluster(inputs.as_ptr(), inputs.len(), &cfg, ptr::null());
     assert!(!result_ptr.is_null(), "rype_cluster returned NULL");
 
     let result = unsafe { &*result_ptr };
@@ -1897,7 +1899,7 @@ fn cluster_c_api_fragment_of_genome_clusters_with_parent() -> Result<()> {
 #[test]
 fn cluster_c_api_empty_input_returns_empty_array() {
     let cfg = relaxed_c_cluster_cfg();
-    let result_ptr = rype_cluster(ptr::null(), 0, &cfg);
+    let result_ptr = rype_cluster(ptr::null(), 0, &cfg, ptr::null());
     assert!(!result_ptr.is_null());
     let result = unsafe { &*result_ptr };
     assert_eq!(result.len, 0);
@@ -1907,7 +1909,7 @@ fn cluster_c_api_empty_input_returns_empty_array() {
 
 #[test]
 fn cluster_c_api_null_config_returns_null_and_sets_error() {
-    let result_ptr = rype_cluster(ptr::null(), 0, ptr::null());
+    let result_ptr = rype_cluster(ptr::null(), 0, ptr::null(), ptr::null());
     assert!(result_ptr.is_null());
     let err = unsafe { std::ffi::CStr::from_ptr(rype_get_last_error()) }
         .to_str()
@@ -1929,7 +1931,7 @@ fn cluster_c_api_invalid_k_returns_null() {
         threshold: 0.85,
         min_shared: 50,
     };
-    let result_ptr = rype_cluster(ptr::null(), 0, &cfg);
+    let result_ptr = rype_cluster(ptr::null(), 0, &cfg, ptr::null());
     assert!(result_ptr.is_null());
     let err = unsafe { std::ffi::CStr::from_ptr(rype_get_last_error()) }
         .to_str()
@@ -1947,7 +1949,7 @@ fn cluster_c_api_invalid_threshold_returns_null() {
         threshold: 1.5, // invalid; must be in (0, 1]
         min_shared: 50,
     };
-    let result_ptr = rype_cluster(ptr::null(), 0, &cfg);
+    let result_ptr = rype_cluster(ptr::null(), 0, &cfg, ptr::null());
     assert!(result_ptr.is_null());
     let err = unsafe { std::ffi::CStr::from_ptr(rype_get_last_error()) }
         .to_str()
@@ -1969,7 +1971,7 @@ fn cluster_c_api_null_id_returns_null() {
         sequence_len: seq.len(),
     };
     let cfg = relaxed_c_cluster_cfg();
-    let result_ptr = rype_cluster(&input, 1, &cfg);
+    let result_ptr = rype_cluster(&input, 1, &cfg, ptr::null());
     assert!(result_ptr.is_null());
     let err = unsafe { std::ffi::CStr::from_ptr(rype_get_last_error()) }
         .to_str()
@@ -1993,7 +1995,7 @@ fn cluster_c_api_zero_sequence_len_returns_null() {
         sequence_len: 0,
     };
     let cfg = relaxed_c_cluster_cfg();
-    let result_ptr = rype_cluster(&input, 1, &cfg);
+    let result_ptr = rype_cluster(&input, 1, &cfg, ptr::null());
     assert!(result_ptr.is_null());
     let err = unsafe { std::ffi::CStr::from_ptr(rype_get_last_error()) }
         .to_str()
@@ -2001,6 +2003,115 @@ fn cluster_c_api_zero_sequence_len_returns_null() {
     assert!(
         err.contains("sequence_len is zero"),
         "expected zero-length error, got: {}",
+        err
+    );
+}
+
+/// WHY: a NULL `chain_config` sidecar pointer must produce the same behavior
+/// as pre-Plan-1.4 (chain disabled). This is the load-bearing ABI back-compat
+/// claim — old C callers that compile against the new header AND pass NULL
+/// for the new arg get unchanged semantics. Verifies the result succeeds
+/// AND that the path through `cluster_config_from_c` doesn't error on NULL.
+#[test]
+fn cluster_c_api_null_chain_config_disables_chain() {
+    let seq_a = cluster_seq_from_seed(20_000, 1);
+    let seq_b = seq_a[2_000..10_000].to_vec(); // fragment of A
+    let id_a = std::ffi::CString::new("A").unwrap();
+    let id_b = std::ffi::CString::new("B").unwrap();
+    let inputs = vec![
+        RypeClusterInput {
+            id: id_a.as_ptr(),
+            source_mag: ptr::null(),
+            sequence: seq_a.as_ptr() as *const i8,
+            sequence_len: seq_a.len(),
+        },
+        RypeClusterInput {
+            id: id_b.as_ptr(),
+            source_mag: ptr::null(),
+            sequence: seq_b.as_ptr() as *const i8,
+            sequence_len: seq_b.len(),
+        },
+    ];
+    let cfg = relaxed_c_cluster_cfg();
+    let result_ptr = rype_cluster(inputs.as_ptr(), inputs.len(), &cfg, ptr::null());
+    assert!(
+        !result_ptr.is_null(),
+        "rype_cluster with NULL chain_config must succeed (legacy behavior)"
+    );
+    unsafe { rype_cluster_results_free(result_ptr) };
+}
+
+/// WHY: a populated `RypeChainConfig` must translate to `ClusterConfig`
+/// with `chain_params: Some(_)` and (when finite) `min_chain_containment:
+/// Some(_)`. This pins the sidecar translator's contract — Plan 1.4's
+/// signature change only buys us anything if the values actually propagate.
+/// Test runs end-to-end so a translation bug surfaces as either an error
+/// return or a successful run we can free.
+#[test]
+fn cluster_c_api_populated_chain_config_runs_successfully() {
+    let seq_a = cluster_seq_from_seed(20_000, 1);
+    let seq_b = seq_a[2_000..10_000].to_vec();
+    let id_a = std::ffi::CString::new("A").unwrap();
+    let id_b = std::ffi::CString::new("B").unwrap();
+    let inputs = vec![
+        RypeClusterInput {
+            id: id_a.as_ptr(),
+            source_mag: ptr::null(),
+            sequence: seq_a.as_ptr() as *const i8,
+            sequence_len: seq_a.len(),
+        },
+        RypeClusterInput {
+            id: id_b.as_ptr(),
+            source_mag: ptr::null(),
+            sequence: seq_b.as_ptr() as *const i8,
+            sequence_len: seq_b.len(),
+        },
+    ];
+    let cfg = relaxed_c_cluster_cfg();
+    // Research-doc starting values mirrored from ChainParams::starting_for_w(20).
+    let chain_cfg = RypeChainConfig {
+        anchor_credit: 1.0,
+        max_gap_length: 80,
+        max_lin_length: 2000,
+        band_anchors: 50,
+        band_bp: 1000,
+        min_anchors: 3,
+        min_chain_containment: f64::NAN, // gate disabled — chain informational
+    };
+    let result_ptr = rype_cluster(inputs.as_ptr(), inputs.len(), &cfg, &chain_cfg);
+    assert!(
+        !result_ptr.is_null(),
+        "rype_cluster with populated chain_config must succeed"
+    );
+    unsafe { rype_cluster_results_free(result_ptr) };
+}
+
+/// WHY: `min_chain_containment` outside `(0.0, 1.0]` (other than the NaN
+/// sentinel) must produce a clear error. Pins the cluster_config_from_c
+/// validation so a bad caller value can't reach the DP.
+#[test]
+fn cluster_c_api_invalid_chain_containment_rejected() {
+    let cfg = relaxed_c_cluster_cfg();
+    let chain_cfg = RypeChainConfig {
+        anchor_credit: 1.0,
+        max_gap_length: 80,
+        max_lin_length: 2000,
+        band_anchors: 50,
+        band_bp: 1000,
+        min_anchors: 3,
+        min_chain_containment: 1.5, // > 1.0 — invalid, NOT NaN
+    };
+    let result_ptr = rype_cluster(ptr::null(), 0, &cfg, &chain_cfg);
+    assert!(
+        result_ptr.is_null(),
+        "rype_cluster with min_chain_containment > 1.0 must reject"
+    );
+    let err = unsafe { std::ffi::CStr::from_ptr(rype_get_last_error()) }
+        .to_str()
+        .unwrap();
+    assert!(
+        err.contains("min_chain_containment"),
+        "error message must mention min_chain_containment, got: {}",
         err
     );
 }

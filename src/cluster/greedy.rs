@@ -3,7 +3,12 @@
 //! Pure function over a precomputed edge list and per-contig metadata; no
 //! allocation of workspaces and no I/O.
 
-use super::types::{ClusterEdge, ClusterRow, ContigInfo};
+use super::types::{ChainScore, ClusterEdge, ClusterRow, ContigInfo};
+
+/// Per-target absorption candidate, projected from `ClusterEdge` into the
+/// minimal tuple the greedy loop reads: `(query_idx, score, shared, chain)`.
+/// `Option<ChainScore>` mirrors `ClusterEdge.chain`.
+type Candidate = (u32, f64, u64, Option<ChainScore>);
 
 /// Run length-sorted greedy dereplication.
 ///
@@ -14,25 +19,31 @@ use super::types::{ClusterEdge, ClusterRow, ContigInfo};
 ///
 /// Self-edges in `edges` are ignored. Duplicate `(query, target)` pairs
 /// resolve to the first occurrence in iteration order.
+///
+/// `min_chain_containment` (Plan 1.4) is the optional chain-gate threshold:
+///   - `None`: chain field on `ClusterEdge` is ignored (legacy behavior).
+///   - `Some(m)`: an edge absorbs only if its `chain` is `Some(c)` with
+///     `c.containment >= m`. Edges with `chain == None` are rejected.
 pub fn greedy_dereplicate(
     edges: &[ClusterEdge],
     contigs: &[ContigInfo],
     threshold: f64,
     min_shared: u64,
+    min_chain_containment: Option<f64>,
 ) -> Vec<ClusterRow> {
     let n = contigs.len();
     if n == 0 {
         return Vec::new();
     }
 
-    let mut edges_by_target: Vec<Vec<(u32, f64, u64)>> = (0..n).map(|_| Vec::new()).collect();
+    let mut edges_by_target: Vec<Vec<Candidate>> = (0..n).map(|_| Vec::new()).collect();
     for e in edges {
         if e.query_idx == e.target_idx {
             continue;
         }
         let ti = e.target_idx as usize;
         if ti < n {
-            edges_by_target[ti].push((e.query_idx, e.score, e.shared));
+            edges_by_target[ti].push((e.query_idx, e.score, e.shared, e.chain));
         }
     }
 
@@ -69,9 +80,17 @@ pub fn greedy_dereplicate(
         let mut absorbed: Vec<(u32, f64)> = candidates
             .iter()
             .copied()
-            .filter(|&(q, _, _)| !processed[q as usize])
-            .filter(|&(_, score, shared)| score >= threshold && shared >= min_shared)
-            .map(|(q, score, _)| (q, score))
+            .filter(|&(q, _, _, _)| !processed[q as usize])
+            .filter(|&(_, score, shared, chain)| {
+                score >= threshold
+                    && shared >= min_shared
+                    && match (min_chain_containment, chain) {
+                        (None, _) => true,
+                        (Some(m), Some(c)) => c.containment >= m,
+                        (Some(_), None) => false,
+                    }
+            })
+            .map(|(q, score, _, _)| (q, score))
             .collect();
         absorbed.sort_by_key(|&(q, _)| q);
 
@@ -112,6 +131,29 @@ mod tests {
             target_idx: t,
             score,
             shared,
+            chain: None,
+        }
+    }
+
+    fn edge_with_chain(
+        q: u32,
+        t: u32,
+        score: f64,
+        shared: u64,
+        chain_containment: f64,
+        chain_anchors: u32,
+    ) -> ClusterEdge {
+        ClusterEdge {
+            query_idx: q,
+            target_idx: t,
+            score,
+            shared,
+            chain: Some(ChainScore {
+                score: chain_anchors as f64,
+                anchors: chain_anchors,
+                containment: chain_containment,
+                strand: crate::Strand::Forward,
+            }),
         }
     }
 
@@ -126,7 +168,7 @@ mod tests {
             edge(0, 2, 0.38, 190), // A->C
         ];
 
-        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100);
+        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100, None);
 
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].rep_contig, "A");
@@ -147,7 +189,7 @@ mod tests {
         let contigs = vec![ci("A", 5000), ci("B", 5000), ci("C", 3000)];
         let edges = vec![edge(2, 0, 0.967, 290), edge(2, 1, 0.967, 290)];
 
-        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100);
+        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100, None);
 
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].rep_contig, "A");
@@ -161,7 +203,7 @@ mod tests {
     #[test]
     fn no_edges_makes_every_contig_its_own_rep() {
         let contigs = vec![ci("X", 5000), ci("Y", 3000), ci("Z", 1000)];
-        let rows = greedy_dereplicate(&[], &contigs, 0.85, 100);
+        let rows = greedy_dereplicate(&[], &contigs, 0.85, 100, None);
 
         assert_eq!(rows.len(), 3);
         for row in &rows {
@@ -182,7 +224,7 @@ mod tests {
             edge(2, 0, 0.25, 50),  // C->A below threshold
         ];
 
-        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100);
+        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100, None);
 
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].rep_contig, "A");
@@ -196,7 +238,7 @@ mod tests {
         let contigs = vec![ci("A", 5000), ci("B", 3000)];
         let edges = vec![edge(1, 0, 0.667, 200)]; // score below T=0.85
 
-        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100);
+        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100, None);
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].rep_contig, "A");
@@ -208,7 +250,7 @@ mod tests {
         let contigs = vec![ci("A", 100_000), ci("B", 500)];
         let edges = vec![edge(1, 0, 1.0, 50)]; // shared=50 < min_shared=500
 
-        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 500);
+        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 500, None);
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].rep_contig, "A");
@@ -217,7 +259,7 @@ mod tests {
 
     #[test]
     fn empty_input_returns_empty() {
-        let rows = greedy_dereplicate(&[], &[], 0.85, 100);
+        let rows = greedy_dereplicate(&[], &[], 0.85, 100, None);
         assert!(rows.is_empty());
     }
 
@@ -226,7 +268,7 @@ mod tests {
         let contigs = vec![ci("A", 5000)];
         let edges = vec![edge(0, 0, 1.0, 500)];
 
-        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100);
+        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100, None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].rep_contig, "A");
         assert_eq!(rows[0].member_contig, "A");
