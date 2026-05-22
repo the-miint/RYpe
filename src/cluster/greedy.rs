@@ -70,6 +70,7 @@ pub fn greedy_dereplicate(
             member_contig: seed.id.clone(),
             source_mag: seed.source_mag.clone(),
             containment: 1.0,
+            chain: None,
         });
 
         let candidates = &edges_by_target[si];
@@ -77,7 +78,7 @@ pub fn greedy_dereplicate(
             continue;
         }
 
-        let mut absorbed: Vec<(u32, f64)> = candidates
+        let mut absorbed: Vec<(u32, f64, Option<ChainScore>)> = candidates
             .iter()
             .copied()
             .filter(|&(q, _, _, _)| !processed[q as usize])
@@ -90,11 +91,11 @@ pub fn greedy_dereplicate(
                         (Some(_), None) => false,
                     }
             })
-            .map(|(q, score, _, _)| (q, score))
+            .map(|(q, score, _, chain)| (q, score, chain))
             .collect();
-        absorbed.sort_by_key(|&(q, _)| q);
+        absorbed.sort_by_key(|&(q, _, _)| q);
 
-        for (q, score) in absorbed {
+        for (q, score, chain) in absorbed {
             let qi = q as usize;
             if processed[qi] {
                 continue;
@@ -106,6 +107,7 @@ pub fn greedy_dereplicate(
                 member_contig: member.id.clone(),
                 source_mag: member.source_mag.clone(),
                 containment: score,
+                chain,
             });
         }
     }
@@ -371,5 +373,91 @@ mod tests {
         assert_eq!(rows[0].member_contig, "A");
         assert_eq!(rows[1].member_contig, "B");
         assert_eq!(rows[2].member_contig, "C");
+    }
+
+    // ---- Plan 1.5 phase 1: chain forwarding into ClusterRow ----
+    //
+    // WHY these tests: Plan 1.4 left chain visible only on `ClusterEdge`;
+    // Plan 1.5 forwards it through `greedy_dereplicate` into `ClusterRow`
+    // so downstream surfaces (Arrow / Parquet CLI / C-API) can surface
+    // chain per row. These tests pin the forwarding contract at the
+    // single conversion site that downstream code depends on.
+
+    #[test]
+    fn greedy_forwards_chain_into_absorbed_rows() {
+        // WHY: An edge with `chain: Some(_)` must propagate its chain
+        // payload into the absorbed-member row. Without this forwarding,
+        // every downstream surface would see `chain: None` on every row
+        // regardless of whether chain DP ran.
+        let contigs = vec![ci("A", 5000), ci("B", 3000)];
+        let edges = vec![edge_with_chain(1, 0, 0.95, 270, 0.91, 88)];
+
+        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100, None);
+
+        // Find the absorbed row for B.
+        let b_row = rows
+            .iter()
+            .find(|r| r.member_contig == "B" && r.rep_contig == "A")
+            .expect("B should be absorbed into A");
+        let chain = b_row
+            .chain
+            .as_ref()
+            .expect("absorbed row must carry the edge's chain");
+        assert_eq!(chain.anchors, 88);
+        assert!((chain.containment - 0.91).abs() < 1e-9);
+    }
+
+    #[test]
+    fn greedy_representative_rows_have_no_chain() {
+        // WHY: A representative row (rep == member) has no edge driving
+        // its absorption; chain is semantically inapplicable. Even when
+        // ALL input edges carry `chain: Some(_)`, the rep row must emit
+        // `chain: None`. Downstream surfaces rely on this to know which
+        // rows can sensibly carry chain output.
+        let contigs = vec![ci("A", 5000), ci("B", 3000)];
+        let edges = vec![edge_with_chain(1, 0, 0.95, 270, 0.91, 88)];
+
+        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100, None);
+
+        let a_row = rows
+            .iter()
+            .find(|r| r.rep_contig == "A" && r.member_contig == "A")
+            .expect("A should be its own rep");
+        assert!(
+            a_row.chain.is_none(),
+            "representative row must have chain: None, got {:?}",
+            a_row.chain
+        );
+    }
+
+    #[test]
+    fn greedy_rejected_absorption_does_not_leak_chain() {
+        // WHY: When the chain gate rejects a candidate, the candidate
+        // must NOT appear in the output rows at all (it becomes its own
+        // representative with `chain: None`). Plan 1.4's gate is the
+        // critical filter; a regression that "rejected but still emitted
+        // the absorbed row with a chain payload" would silently break
+        // the gate's purpose. Guards against future refactors that
+        // accidentally treat gate-rejected candidates as absorbed.
+        let contigs = vec![ci("A", 5000), ci("B", 3000)];
+        // chain.containment = 0.30 < gate (0.5) → rejected.
+        let edges = vec![edge_with_chain(1, 0, 0.99, 500, 0.30, 20)];
+
+        let rows = greedy_dereplicate(&edges, &contigs, 0.85, 100, Some(0.5));
+
+        // B must appear as its OWN rep, not absorbed into A.
+        let b_row = rows
+            .iter()
+            .find(|r| r.member_contig == "B")
+            .expect("B must appear in output");
+        assert_eq!(
+            b_row.rep_contig, "B",
+            "rejected candidate must be its own rep, not absorbed"
+        );
+        assert!(
+            b_row.chain.is_none(),
+            "rejected-candidate row must have chain: None (it's a rep), got {:?}",
+            b_row.chain
+        );
     }
 }

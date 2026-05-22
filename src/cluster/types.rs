@@ -74,12 +74,23 @@ pub struct ClusterEdge {
 /// One row of clustering output — either a representative pointing at
 /// itself (`rep_contig == member_contig`, `containment == 1.0`) or an
 /// absorbed member with its containment in the representative.
+///
+/// `chain` carries the chain DP output for the edge that drove this row's
+/// absorption. `None` means:
+///   - the row is a representative (no edge, so chain doesn't apply), OR
+///   - chain DP was globally disabled (`ClusterConfig.chain_params` was `None`), OR
+///   - chain DP returned `None` for the edge (fewer than `min_anchors` colinear anchors).
+///
+/// All four downstream surfaces (Rust callers, Arrow record batches, Parquet
+/// CLI output, C-API `RypeClusterRow`) map `None` to their respective null
+/// representation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClusterRow {
     pub rep_contig: String,
     pub member_contig: String,
     pub source_mag: Option<String>,
     pub containment: f64,
+    pub chain: Option<ChainScore>,
 }
 
 /// Full clustering result — one row per input contig (a complete partition).

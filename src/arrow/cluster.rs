@@ -501,6 +501,7 @@ mod tests {
             member_contig: member.to_string(),
             source_mag: mag.map(|s| s.to_string()),
             containment: c,
+            chain: None,
         }
     }
 
