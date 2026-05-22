@@ -6,6 +6,7 @@
 //!
 //! Entry point: [`cluster_contigs`].
 
+pub mod chain;
 pub mod containment;
 pub mod edges;
 pub mod greedy;
