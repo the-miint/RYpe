@@ -2,12 +2,16 @@
 //!
 //! # Output Schema (cluster result rows)
 //!
-//! | Column          | Arrow Type | Nullable | Description |
-//! |-----------------|------------|----------|-------------|
-//! | `rep_contig`    | Utf8       | No       | Representative contig id |
-//! | `member_contig` | Utf8       | No       | Member contig id (equals rep_contig for representatives themselves) |
-//! | `source_mag`    | Utf8       | Yes      | MAG/assembly id the member came from |
-//! | `containment`   | Float64    | No       | Containment of member in representative (1.0 for representatives) |
+//! | Column              | Arrow Type | Nullable | Description |
+//! |---------------------|------------|----------|-------------|
+//! | `rep_contig`        | Utf8       | No       | Representative contig id |
+//! | `member_contig`     | Utf8       | No       | Member contig id (equals rep_contig for representatives themselves) |
+//! | `source_mag`        | Utf8       | Yes      | MAG/assembly id the member came from |
+//! | `containment`       | Float64    | No       | Set-containment of member in representative (1.0 for representatives) |
+//! | `chain_score`       | Float64    | Yes      | Banded-DP chain score for the edge that drove this row's absorption. Null when chain DP disabled, the row is a representative, or the DP returned None. |
+//! | `chain_anchors`     | UInt32     | Yes      | Number of anchors in the winning chain. Null in the same cases as `chain_score`. |
+//! | `chain_containment` | Float64    | Yes      | `chain.anchors / |q.<winning_strand>_minimizers|` — chain analog of `containment`. Null in the same cases as `chain_score`. |
+//! | `chain_strand`      | Utf8       | Yes      | `"Forward"` or `"ReverseComplement"` — query strand that produced the winning chain. Null in the same cases as `chain_score`. |
 //!
 //! # Input Schema (contigs to be clustered)
 //!
@@ -18,8 +22,8 @@
 //! | `sequence`   | Binary/LargeBinary/BinaryView/Utf8/LargeUtf8/Utf8View | No | DNA bytes |
 
 use arrow::array::{
-    Array, BinaryArray, BinaryViewArray, Float64Array, LargeBinaryArray, LargeStringArray,
-    StringArray, StringBuilder, StringViewArray,
+    Array, BinaryArray, BinaryViewArray, Float64Array, Float64Builder, LargeBinaryArray,
+    LargeStringArray, StringArray, StringBuilder, StringViewArray, UInt32Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -27,6 +31,7 @@ use std::sync::Arc;
 
 use super::error::{ArrowClassifyError, MAX_SEQUENCE_LENGTH};
 use crate::cluster::{cluster_contigs, ClusterConfig, ClusterResult, ContigInput};
+use crate::Strand;
 use std::collections::HashSet;
 
 /// Column name for representative contig id in cluster output.
@@ -37,6 +42,15 @@ pub const COL_MEMBER_CONTIG: &str = "member_contig";
 pub const COL_SOURCE_MAG: &str = "source_mag";
 /// Column name for containment score in cluster output.
 pub const COL_CONTAINMENT: &str = "containment";
+/// Column name for banded-DP chain score in cluster output. Nullable.
+pub const COL_CHAIN_SCORE: &str = "chain_score";
+/// Column name for chained anchor count in cluster output. Nullable.
+pub const COL_CHAIN_ANCHORS: &str = "chain_anchors";
+/// Column name for chain containment score in cluster output. Nullable.
+pub const COL_CHAIN_CONTAINMENT: &str = "chain_containment";
+/// Column name for winning-chain strand in cluster output. Nullable Utf8
+/// with values `"Forward"` or `"ReverseComplement"`.
+pub const COL_CHAIN_STRAND: &str = "chain_strand";
 
 /// Column name for contig id in cluster input batches.
 pub const COL_CONTIG_ID: &str = "contig_id";
@@ -44,13 +58,35 @@ pub const COL_CONTIG_ID: &str = "contig_id";
 pub const COL_CLUSTER_SEQUENCE: &str = "sequence";
 
 /// Returns the schema for cluster result batches.
+///
+/// 8-column schema: 4 core columns (rep/member/mag/containment) followed by 4
+/// nullable chain columns (chain_score/chain_anchors/chain_containment/
+/// chain_strand). The chain columns are nullable so representative rows,
+/// chain-disabled runs, and edges where the DP returned None all surface as
+/// true Arrow nulls. Schema is fixed regardless of whether chain DP ran
+/// globally — Parquet/Arrow consumers see a consistent shape.
 pub fn cluster_result_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new(COL_REP_CONTIG, DataType::Utf8, false),
         Field::new(COL_MEMBER_CONTIG, DataType::Utf8, false),
         Field::new(COL_SOURCE_MAG, DataType::Utf8, true),
         Field::new(COL_CONTAINMENT, DataType::Float64, false),
+        Field::new(COL_CHAIN_SCORE, DataType::Float64, true),
+        Field::new(COL_CHAIN_ANCHORS, DataType::UInt32, true),
+        Field::new(COL_CHAIN_CONTAINMENT, DataType::Float64, true),
+        Field::new(COL_CHAIN_STRAND, DataType::Utf8, true),
     ]))
+}
+
+/// Map a `Strand` enum value to the Utf8 string the Arrow/Parquet output uses.
+///
+/// The string matches the Rust variant name verbatim so downstream consumers
+/// can round-trip through `serde` or pattern-match without a custom decoder.
+fn strand_to_arrow_str(s: Strand) -> &'static str {
+    match s {
+        Strand::Forward => "Forward",
+        Strand::ReverseComplement => "ReverseComplement",
+    }
 }
 
 /// Convert a [`ClusterResult`] into an Arrow `RecordBatch` with
@@ -59,6 +95,9 @@ pub fn cluster_result_schema() -> SchemaRef {
 /// The conversion copies all strings into Arrow buffers (unavoidable —
 /// `ClusterRow` owns `String`s). For typical dereplication runs (one row per
 /// input contig) this is bounded by the input size, not the all-vs-all space.
+///
+/// Chain columns are populated from `row.chain`; `None` produces a true
+/// Arrow null in each of the four chain columns at that row index.
 pub fn cluster_result_to_record_batch(
     result: &ClusterResult,
 ) -> Result<RecordBatch, ArrowClassifyError> {
@@ -73,6 +112,10 @@ pub fn cluster_result_to_record_batch(
     let mut member = StringBuilder::new();
     let mut mag = StringBuilder::new();
     let mut containment = Vec::with_capacity(n);
+    let mut chain_score = Float64Builder::with_capacity(n);
+    let mut chain_anchors = UInt32Builder::with_capacity(n);
+    let mut chain_containment = Float64Builder::with_capacity(n);
+    let mut chain_strand = StringBuilder::new();
 
     for row in &result.rows {
         rep.append_value(&row.rep_contig);
@@ -82,6 +125,20 @@ pub fn cluster_result_to_record_batch(
             None => mag.append_null(),
         }
         containment.push(row.containment);
+        match &row.chain {
+            Some(c) => {
+                chain_score.append_value(c.score);
+                chain_anchors.append_value(c.anchors);
+                chain_containment.append_value(c.containment);
+                chain_strand.append_value(strand_to_arrow_str(c.strand));
+            }
+            None => {
+                chain_score.append_null();
+                chain_anchors.append_null();
+                chain_containment.append_null();
+                chain_strand.append_null();
+            }
+        }
     }
 
     RecordBatch::try_new(
@@ -91,6 +148,10 @@ pub fn cluster_result_to_record_batch(
             Arc::new(member.finish()),
             Arc::new(mag.finish()),
             Arc::new(Float64Array::from(containment)),
+            Arc::new(chain_score.finish()),
+            Arc::new(chain_anchors.finish()),
+            Arc::new(chain_containment.finish()),
+            Arc::new(chain_strand.finish()),
         ],
     )
     .map_err(ArrowClassifyError::from)
@@ -393,16 +454,30 @@ pub fn validate_cluster_input_schema(schema: &Schema) -> Result<(), ArrowClassif
 mod tests {
     use super::*;
 
+    /// WHY: locks the column order + count so a silent reordering or drop
+    /// (e.g. someone removes `chain_strand` from the schema builder without
+    /// updating the doc comment) fires a test rather than producing a
+    /// silently-wrong Parquet/Arrow output that downstream consumers
+    /// would mis-parse.
     #[test]
-    fn output_schema_has_four_columns_in_documented_order() {
+    fn output_schema_has_eight_columns_in_documented_order() {
         let schema = cluster_result_schema();
-        assert_eq!(schema.fields().len(), 4);
+        assert_eq!(schema.fields().len(), 8);
         assert_eq!(schema.field(0).name(), COL_REP_CONTIG);
         assert_eq!(schema.field(1).name(), COL_MEMBER_CONTIG);
         assert_eq!(schema.field(2).name(), COL_SOURCE_MAG);
         assert_eq!(schema.field(3).name(), COL_CONTAINMENT);
+        assert_eq!(schema.field(4).name(), COL_CHAIN_SCORE);
+        assert_eq!(schema.field(5).name(), COL_CHAIN_ANCHORS);
+        assert_eq!(schema.field(6).name(), COL_CHAIN_CONTAINMENT);
+        assert_eq!(schema.field(7).name(), COL_CHAIN_STRAND);
     }
 
+    /// WHY: locks types AND nullability. The chain columns MUST be nullable
+    /// (representative rows have no chain; downstream MUST distinguish
+    /// "absent" from "zero"). The four core columns retain their pre-Plan-1.5
+    /// shape — a regression that flipped any of them to nullable (or vice
+    /// versa) would silently change consumer semantics.
     #[test]
     fn output_schema_types_and_nullability_match_docs() {
         let schema = cluster_result_schema();
@@ -414,6 +489,26 @@ mod tests {
         assert!(schema.field(2).is_nullable(), "source_mag must be nullable");
         assert_eq!(schema.field(3).data_type(), &DataType::Float64);
         assert!(!schema.field(3).is_nullable());
+        assert_eq!(schema.field(4).data_type(), &DataType::Float64);
+        assert!(
+            schema.field(4).is_nullable(),
+            "chain_score must be nullable"
+        );
+        assert_eq!(schema.field(5).data_type(), &DataType::UInt32);
+        assert!(
+            schema.field(5).is_nullable(),
+            "chain_anchors must be nullable"
+        );
+        assert_eq!(schema.field(6).data_type(), &DataType::Float64);
+        assert!(
+            schema.field(6).is_nullable(),
+            "chain_containment must be nullable"
+        );
+        assert_eq!(schema.field(7).data_type(), &DataType::Utf8);
+        assert!(
+            schema.field(7).is_nullable(),
+            "chain_strand must be nullable"
+        );
     }
 
     #[test]
@@ -571,6 +666,185 @@ mod tests {
         let from_conversion = cluster_result_to_record_batch(&ClusterResult::default()).unwrap();
         assert_eq!(from_helper.schema(), from_conversion.schema());
         assert_eq!(from_helper.num_rows(), from_conversion.num_rows());
+    }
+
+    // ---- Plan 1.5 phase 2: chain columns in the Arrow output ----
+
+    use crate::cluster::ChainScore;
+    use arrow::array::{Float64Array, StringArray, UInt32Array};
+
+    /// Build a row with a populated `ChainScore`. Helper for the chain tests.
+    fn row_with_chain(
+        rep: &str,
+        member: &str,
+        mag: Option<&str>,
+        c: f64,
+        chain_score: f64,
+        chain_anchors: u32,
+        chain_containment: f64,
+        strand: Strand,
+    ) -> ClusterRow {
+        ClusterRow {
+            rep_contig: rep.to_string(),
+            member_contig: member.to_string(),
+            source_mag: mag.map(|s| s.to_string()),
+            containment: c,
+            chain: Some(ChainScore {
+                score: chain_score,
+                anchors: chain_anchors,
+                containment: chain_containment,
+                strand,
+            }),
+        }
+    }
+
+    /// WHY: when chain DP runs and an edge produces a `ChainScore`, the
+    /// four chain columns must carry those values at the absorbed-row
+    /// index. Without this test, a regression that wired the schema but
+    /// forgot to populate the builders (e.g. always appending null) would
+    /// silently produce all-null chain output.
+    #[test]
+    fn cluster_record_batch_emits_chain_columns_for_absorbed_rows() {
+        let result = ClusterResult {
+            rows: vec![
+                row("A", "A", Some("mag1"), 1.0),
+                row_with_chain(
+                    "A",
+                    "B",
+                    Some("mag2"),
+                    0.91,
+                    27.0,
+                    27,
+                    0.55,
+                    Strand::Forward,
+                ),
+            ],
+        };
+
+        let batch = cluster_result_to_record_batch(&result).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+
+        let chain_score = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let chain_anchors = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let chain_containment = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let chain_strand = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        // Row 0 is the representative; all chain columns null.
+        assert!(chain_score.is_null(0));
+        assert!(chain_anchors.is_null(0));
+        assert!(chain_containment.is_null(0));
+        assert!(chain_strand.is_null(0));
+
+        // Row 1 is the absorbed-member edge; all chain columns populated.
+        assert!(!chain_score.is_null(1));
+        assert_eq!(chain_score.value(1), 27.0);
+        assert_eq!(chain_anchors.value(1), 27);
+        assert!((chain_containment.value(1) - 0.55).abs() < 1e-12);
+        assert_eq!(chain_strand.value(1), "Forward");
+    }
+
+    /// WHY: a result built entirely from rows with `chain: None` (the
+    /// "chain disabled globally" or "all-representatives" case) must
+    /// produce true Arrow nulls in every chain column at every row index.
+    /// A regression that wrote zero/empty-string instead of null would
+    /// silently corrupt downstream "absent vs zero" semantics.
+    #[test]
+    fn cluster_record_batch_emits_nulls_for_chain_absent_rows() {
+        let result = ClusterResult {
+            rows: vec![
+                row("A", "A", Some("mag1"), 1.0),
+                row("A", "B", Some("mag2"), 0.93),
+                row("C", "C", None, 1.0),
+            ],
+        };
+
+        let batch = cluster_result_to_record_batch(&result).unwrap();
+        let chain_score = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let chain_anchors = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let chain_containment = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let chain_strand = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..3 {
+            assert!(chain_score.is_null(i), "row {} chain_score must be null", i);
+            assert!(
+                chain_anchors.is_null(i),
+                "row {} chain_anchors must be null",
+                i
+            );
+            assert!(
+                chain_containment.is_null(i),
+                "row {} chain_containment must be null",
+                i
+            );
+            assert!(
+                chain_strand.is_null(i),
+                "row {} chain_strand must be null",
+                i
+            );
+        }
+    }
+
+    /// WHY: the Utf8 string representation of `Strand` is the user-facing
+    /// surface (Parquet column values, Arrow string array values). Pin
+    /// both variants so a future enum rename or repr change can't
+    /// silently shift the strings downstream consumers parse.
+    #[test]
+    fn cluster_record_batch_strand_string_round_trips() {
+        let result = ClusterResult {
+            rows: vec![
+                row_with_chain("A", "B", None, 0.9, 10.0, 10, 0.5, Strand::Forward),
+                row_with_chain(
+                    "A",
+                    "C",
+                    None,
+                    0.9,
+                    10.0,
+                    10,
+                    0.5,
+                    Strand::ReverseComplement,
+                ),
+            ],
+        };
+
+        let batch = cluster_result_to_record_batch(&result).unwrap();
+        let strand = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(strand.value(0), "Forward");
+        assert_eq!(strand.value(1), "ReverseComplement");
     }
 
     use arrow::array::BinaryArray;

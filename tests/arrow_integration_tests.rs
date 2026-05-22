@@ -422,7 +422,9 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow::record_batch::RecordBatchIterator;
 use rype::arrow::{cluster_result_schema, COL_CLUSTER_SEQUENCE, COL_CONTIG_ID, COL_SOURCE_MAG};
-use rype::c_api::{rype_arrow_cluster_result_schema, rype_cluster_arrow, RypeClusterConfig};
+use rype::c_api::{
+    rype_arrow_cluster_result_schema, rype_cluster_arrow, RypeChainConfig, RypeClusterConfig,
+};
 
 fn cluster_seed_seq(len: usize, seed: u64) -> Vec<u8> {
     let bases = [b'A', b'C', b'G', b'T'];
@@ -537,6 +539,102 @@ fn rype_cluster_arrow_roundtrip_fragment_clusters_with_parent() -> Result<()> {
     }
     assert!(b_absorbed_by_a);
     assert!(c_self_rep);
+
+    Ok(())
+}
+
+/// WHY: end-to-end check that chain output makes it through the Arrow FFI
+/// stream when chain DP is enabled via the sidecar `RypeChainConfig`.
+/// The unit tests in `arrow::cluster::tests` exercise the Rust-level
+/// `cluster_result_to_record_batch` path; this test pins the **C-API +
+/// FFI stream + record-batch builder** end-to-end so a regression in
+/// any of those layers (e.g. someone forgets to plumb the chain config
+/// in `rype_cluster_arrow`) fires here rather than silently producing
+/// all-null chain output.
+#[test]
+fn rype_cluster_arrow_with_chain_config_populates_chain_columns() -> Result<()> {
+    let a = cluster_seed_seq(20_000, 1);
+    let b = a[2_000..10_000].to_vec();
+
+    let batch = build_cluster_input_batch(&["A", "B"], &[Some("mag1"), Some("mag2")], &[a, b]);
+
+    let input_schema = batch.schema();
+    let batches: Vec<Result<RecordBatch, arrow::error::ArrowError>> = vec![Ok(batch)];
+    let reader = RecordBatchIterator::new(batches.into_iter(), input_schema);
+    let input_stream = Box::new(FFI_ArrowArrayStream::new(Box::new(reader)));
+    let input_stream_ptr = Box::into_raw(input_stream);
+
+    let mut out_stream = FFI_ArrowArrayStream::empty();
+    let cfg = RypeClusterConfig {
+        k: 32,
+        w: 20,
+        salt: 0x5555_5555_5555_5555,
+        min_length: 1_000,
+        threshold: 0.80,
+        min_shared: 50,
+    };
+    let chain_cfg = RypeChainConfig {
+        anchor_credit: 1.0,
+        max_gap_length: 80,
+        max_lin_length: 2_000,
+        band_anchors: 50,
+        band_bp: 1_000,
+        min_anchors: 3,
+        // f64::NAN disables the gate (chain is informational only — the
+        // test asserts on chain output, not on gate behavior).
+        min_chain_containment: f64::NAN,
+    };
+
+    let rc = unsafe { rype_cluster_arrow(input_stream_ptr, &cfg, &chain_cfg, &mut out_stream) };
+    assert_eq!(rc, 0, "rype_cluster_arrow returned {}", rc);
+
+    let result_reader = unsafe { ArrowArrayStreamReader::from_raw(&mut out_stream) }
+        .expect("Failed to read output stream");
+    let batches: Vec<RecordBatch> = result_reader.collect::<Result<_, _>>()?;
+    assert_eq!(batches.len(), 1);
+    let out_batch = &batches[0];
+    assert_eq!(out_batch.num_columns(), 8);
+
+    let member = out_batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let chain_score = out_batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    let chain_anchors = out_batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt32Array>()
+        .unwrap();
+    let chain_strand = out_batch
+        .column(7)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // B is the absorbed-member row; chain columns must be populated.
+    let b_idx = (0..out_batch.num_rows())
+        .find(|&i| member.value(i) == "B")
+        .expect("B must appear in output");
+    assert!(
+        !chain_score.is_null(b_idx),
+        "B row chain_score must be populated when chain DP runs"
+    );
+    assert!(chain_anchors.value(b_idx) >= 3, "min_anchors satisfied");
+    assert_eq!(chain_strand.value(b_idx), "Forward");
+
+    // A is its own representative; chain columns must be null.
+    let a_idx = (0..out_batch.num_rows())
+        .find(|&i| member.value(i) == "A")
+        .expect("A must appear in output");
+    assert!(
+        chain_score.is_null(a_idx),
+        "A (representative) chain_score must be null"
+    );
 
     Ok(())
 }
