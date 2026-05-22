@@ -34,6 +34,9 @@ arrow = { version = "57", default-features = false }
 tempfile = "3.24.0"
 
 [dev-dependencies]
+# Compile-time `assert_not_impl_any!` for negative-existence trait checks
+# (e.g. proving ChainParams intentionally has no Default impl — Plan 1.3).
+static_assertions = "1.1"
 
 [[bin]]
 name = "debug_inverted"

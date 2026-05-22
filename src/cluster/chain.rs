@@ -180,7 +180,12 @@ pub fn compute_anchors_into(
 /// The score for transition `j → i` is `anchor_credit − |Δr − Δq|`, where
 /// `Δq = q_pos[i] − q_pos[j]` and `Δr` is the strand-signed delta. A
 /// transition is rejected if `|Δr − Δq| > max_gap_length` (off-diagonal) or
-/// `min(Δq, |Δr|) > max_lin_length` (jump too long).
+/// `max(Δq, |Δr|) > max_lin_length` (either side jumps too long).
+///
+/// The `max` form matches skani's `lchain.rs` — a transition is too long if
+/// EITHER side exceeds the limit. An earlier draft (research-doc §5.1) used
+/// `min` (both sides must exceed); switching to `max` was an early-review
+/// fix to match the reference algorithm.
 ///
 /// The inner loop **breaks** (does not skip) when `i − j > band_anchors` or
 /// `Δq > band_bp` — both monotonic-in-j cutoffs, no skip heuristic.
@@ -250,8 +255,12 @@ pub fn chain_anchors(
             }
             let dr = dr_signed as u32;
 
-            // Long-jump rejection.
-            if dq.min(dr) > params.max_lin_length {
+            // Long-jump rejection: reject if EITHER side jumps farther than
+            // `max_lin_length`. Matches skani's `chain.rs` semantics. Earlier
+            // research-doc §5.1 had this as `min`; switched to `max` per
+            // early-review feedback so a one-sided long jump can't sneak
+            // past `max_gap_length` when the gap itself happens to be small.
+            if dq.max(dr) > params.max_lin_length {
                 continue;
             }
             // Off-diagonal rejection: `|Δr − Δq|`.
@@ -313,6 +322,15 @@ mod tests {
     use super::*;
 
     // ---- Plan 1.3 phase 1: ChainParams ----
+
+    /// WHY: `ChainParams` deliberately has no `Default` impl — the starting
+    /// values are uncalibrated and Plan 1.6 will revise them. A future PR
+    /// adding `#[derive(Default)]` would silently bypass that intent. This
+    /// compile-time assertion makes the absence machine-verifiable.
+    #[test]
+    fn chain_params_no_default_impl() {
+        static_assertions::assert_not_impl_any!(ChainParams: Default);
+    }
 
     /// Pins the `chaining-research.md` §5.2 starting values for `w=50`.
     /// WHY: Plan 1.6 will revise these — this test catches silent drift in
@@ -523,17 +541,16 @@ mod tests {
         assert_eq!(result.r_end, 0, "rc chain ends at the smallest r");
     }
 
-    /// WHY: an off-diagonal anchor must NOT be linked, even when the chain
-    /// could "skip" it via a direct end-to-end transition. The DP picks
-    /// the best chain by score; the off-diagonal middle anchor reduces the
-    /// chain to length 2, falling below `min_anchors=3` and returning None.
-    /// This is the central insight of chaining vs. set-containment: weak
-    /// off-diagonal anchors must be discounted.
+    /// WHY: an off-diagonal anchor must isolate itself — both transitions
+    /// touching it are rejected by `max_gap_length` (transition 0→1 has
+    /// gap=450; transition 1→2 has dr_signed = 100−500 = −400 → wrong
+    /// direction). The remaining valid transition 0→2 has gap=0 and forms
+    /// a length-2 chain — below `min_anchors=3`, so the DP returns None.
+    /// This is the central insight of chaining vs. set-containment: a weak
+    /// off-diagonal anchor counted by set containment does NOT extend a
+    /// chain, and a 2-anchor "chain" is rejected as a false positive.
     #[test]
     fn chain_anchors_off_diagonal_rejected() {
-        // Anchor 1 sits at r=500 — wildly off-diagonal from the (0,0)→(100,100)
-        // line. The 0→1 and 1→2 transitions both fail (gap too big), and the
-        // 0→2 transition still works (gap=0) but is only a length-2 chain.
         let mut anchors = vec![(0u32, 0u32), (50, 500), (100, 100)];
         let mut ws = ChainWorkspace::new();
         assert!(chain_anchors(&mut anchors, false, &test_params(), &mut ws).is_none());
@@ -604,10 +621,12 @@ mod tests {
     /// the highest SCORE) would silently report the wrong chain.
     #[test]
     fn chain_anchors_two_chains_returns_best() {
-        // Chain A (q=0..100):    gap=5 transitions → score = 10 + 5 + 5 = 20.
-        // Chain B (q=10000..):   gap=0 transitions → score = 10 + 10 + 10 = 30.
-        // Inter-chain: dq ≈ 9900, dr ≈ 4890 → gap ≈ 5010 > max_gap_length=100
-        // → no cross-chain linkage. argmax = B's last anchor.
+        // Chain A (q=0..100):  gap=5 transitions → 3·anchor_credit − 2·gap
+        //                      = 30 − 10 = 20. (f[0]=10, f[1]=15, f[2]=20.)
+        // Chain B (q=10000..): gap=0 transitions → 3·anchor_credit
+        //                      = 30. (f[3]=10, f[4]=20, f[5]=30.)
+        // Inter-chain transitions: dq ≈ 9900, dr ≈ 4890 → gap ≈ 5010
+        // > max_gap_length=100 → no cross-chain linkage. argmax = anchor 5.
         let mut anchors = vec![
             (0u32, 0u32),
             (50, 55),
@@ -624,6 +643,31 @@ mod tests {
         assert_eq!(result.q_end, 10_100);
         assert_eq!(result.r_start, 5_000);
         assert_eq!(result.r_end, 5_100);
+    }
+
+    /// WHY: `max_lin_length` uses the `max(Δq, |Δr|)` form — reject if
+    /// EITHER side jumps too far. An asymmetric anchor pair pins the
+    /// choice: `dq=4900 < limit=5000`, `dr=5100 > limit`, `gap=200` at
+    /// the gap limit (so gap rejection doesn't fire). Under the `min`
+    /// form this would survive; under `max` (skani semantics) it is
+    /// rejected. If someone "fixes" the `dq.max(dr)` line back to `min`,
+    /// this test fails.
+    #[test]
+    fn chain_anchors_max_lin_length_rejects_asymmetric_jump() {
+        let params = ChainParams {
+            anchor_credit: 10.0,
+            max_gap_length: 200,
+            max_lin_length: 5_000,
+            band_anchors: 10,
+            band_bp: 100_000,
+            min_anchors: 2,
+        };
+        let mut anchors = vec![(0u32, 0u32), (4_900, 5_100)];
+        let mut ws = ChainWorkspace::new();
+        // dq=4900 (≤ limit), dr=5100 (> limit), gap=200 (= max_gap_length, allowed).
+        // max(4900, 5100) = 5100 > 5000 → reject. min(4900, 5100) = 4900 ≤ 5000
+        // would NOT reject — proving the operator choice matters.
+        assert!(chain_anchors(&mut anchors, false, &params, &mut ws).is_none());
     }
 
     /// WHY: `max_lin_length` prevents two distant but on-diagonal anchors
