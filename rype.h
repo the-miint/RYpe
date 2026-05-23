@@ -1100,6 +1100,9 @@ typedef struct {
  *                  row's absorbing edge; 0 when the row is a representative,
  *                  chain was disabled, or the DP returned None. When 0, the
  *                  chain fields are zero-initialized.
+ *                  Type is int32_t (not bool/uint8_t) to match the strand
+ *                  field's encoding pattern and avoid C compilers' `bool`
+ *                  ABI portability surprises.
  * - chain:         Banded-DP chain score; valid iff has_chain != 0.
  */
 typedef struct {
@@ -1110,6 +1113,28 @@ typedef struct {
     int32_t has_chain;
     RypeChainScore chain;
 } RypeClusterRow;
+
+/* Compile-time ABI safety check: catch Rust/C cluster struct layout drift.
+ * Values verified empirically via std::mem::size_of at Plan 1.5 phase 5
+ * (verified on x86_64 Linux; layout is determined by `#[repr(C)]` and
+ * f64 alignment so it's identical on every supported platform).
+ *
+ * RypeChainScore = 32 bytes (score:8 + anchors:4 + pad:4 + containment:8 +
+ *                            strand:4 + trailing-pad:4).
+ * RypeClusterRow = 72 bytes (3 pointers @ 8 = 24 + containment:8 +
+ *                            has_chain:4 + pad-to-8:4 + chain:32).
+ */
+#ifdef __cplusplus
+static_assert(sizeof(RypeChainScore) == 32,
+    "RypeChainScore layout mismatch - update rype.h if struct fields changed");
+static_assert(sizeof(RypeClusterRow) == 72,
+    "RypeClusterRow layout mismatch - update rype.h if struct fields changed");
+#else
+_Static_assert(sizeof(RypeChainScore) == 32,
+    "RypeChainScore layout mismatch - update rype.h if struct fields changed");
+_Static_assert(sizeof(RypeClusterRow) == 72,
+    "RypeClusterRow layout mismatch - update rype.h if struct fields changed");
+#endif
 
 /**
  * Array of cluster rows returned by rype_cluster().
@@ -1665,21 +1690,32 @@ int rype_extract_strand_minimizers_arrow(
 // - sequence    (Binary/LargeBinary/BinaryView/Utf8/LargeUtf8/Utf8View,
 //                non-nullable) — DNA bytes
 //
-// ## Output Schema
+// ## Output Schema (8 columns since Plan 1.5)
 //
-// - rep_contig    (Utf8, non-nullable)
-// - member_contig (Utf8, non-nullable)
-// - source_mag    (Utf8, nullable)
-// - containment   (Float64, non-nullable)
+// - rep_contig         (Utf8,    non-nullable)
+// - member_contig      (Utf8,    non-nullable)
+// - source_mag         (Utf8,    nullable)
+// - containment        (Float64, non-nullable) — set-containment of member in rep
+// - chain_score        (Float64, nullable)     — banded-DP chain score
+// - chain_anchors      (UInt32,  nullable)     — count in the winning chain
+// - chain_containment  (Float64, nullable)     — anchors / |q_<winning_strand>|
+// - chain_strand       (Utf8,    nullable)     — "Forward" or "ReverseComplement"
+//
+// The four chain columns are nullable; null when the row is a representative,
+// chain DP was disabled, or the DP returned None (chain too short). When
+// chain ran AND the absorbed-member edge produced a chain, all four are
+// populated.
 //
 // Use rype_arrow_cluster_result_schema() to retrieve this schema as an
 // FFI_ArrowSchema for pre-allocation or validation.
 
 /**
- * Get the output schema for Arrow cluster results.
+ * Get the output schema for Arrow cluster results (8 columns since Plan 1.5).
  *
  * Schema: rep_contig (Utf8), member_contig (Utf8), source_mag (Utf8 nullable),
- * containment (Float64).
+ * containment (Float64), chain_score (Float64 nullable), chain_anchors
+ * (UInt32 nullable), chain_containment (Float64 nullable), chain_strand
+ * (Utf8 nullable, "Forward" or "ReverseComplement").
  *
  * @param out_schema  Pointer to uninitialized ArrowSchema (caller-allocated).
  *                    Caller is responsible for releasing it per the Arrow C

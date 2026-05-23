@@ -2298,6 +2298,16 @@ fn cluster_c_api_chain_strand_int_encoding() {
     }
 
     // Case 2: reverse-complement fragment → strand == 1 (ReverseComplement).
+    //
+    // WHY this is deterministic: B is the EXACT revcomp of A[2000..10000].
+    // The RC-strand minimizers of B match a contiguous run of A's reference
+    // minimizers; the forward-strand minimizers of B are essentially random
+    // against A's reference (no shared k-mers above chance). The chain DP
+    // run on the RC strand finds a long colinear chain (≥ thousands of
+    // anchors); the forward DP returns None or a tiny chain. The strand
+    // selector picks the RC winner unambiguously. The same pattern is used
+    // by `build_edges_chain_picks_winning_strand_on_rc_fragment` in
+    // src/cluster/edges.rs and has been stable since Plan 1.4 phase 2.
     {
         let a = cluster_seq_from_seed(20_000, 1);
         let b_rc = revcomp(&a[2_000..10_000]);

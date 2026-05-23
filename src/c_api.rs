@@ -363,6 +363,9 @@ pub struct RypeChainScore {
 /// `has_chain` is `0` when the row is a representative (no edge), chain DP
 /// was disabled, or the DP returned None (chain too short). When
 /// `has_chain == 0`, `chain` is zero-initialized.
+///
+/// `has_chain` is `i32` (not `bool` / `u8`) to match the `strand` field's
+/// encoding pattern and avoid C compilers' `bool` ABI portability surprises.
 #[repr(C)]
 pub struct RypeClusterRow {
     pub rep_contig: *mut c_char,
