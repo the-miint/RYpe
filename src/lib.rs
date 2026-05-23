@@ -52,8 +52,10 @@ pub fn log_timing(phase: &str, elapsed_ms: u128) {
     }
 }
 
-// Arrow FFI integration (optional feature for exporting RecordBatches)
-#[cfg(feature = "arrow-ffi")]
+// Arrow integration (schema + record-batch building). The module itself uses
+// only the always-available `arrow` crate types (no FFI). The optional
+// `arrow-ffi` feature unlocks the FFI-stream consumers in `c_api.rs`, which
+// gate their own imports at the call site.
 pub mod arrow;
 
 // ============================================================================

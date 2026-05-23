@@ -6240,8 +6240,25 @@ fn write_fasta(path: &Path, entries: &[(&str, &[u8])]) {
     }
 }
 
+/// Read a Parquet file produced by `rype cluster` into a single concatenated
+/// vector of record batches. Used by every cluster CLI integration test
+/// since Plan 1.5 phase 3 dropped TSV.
+fn read_cluster_parquet(path: &Path) -> Vec<RecordBatch> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let file = std::fs::File::open(path).expect("opening Parquet output");
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .expect("building Parquet reader")
+        .build()
+        .expect("finalizing Parquet reader");
+    reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("reading batches")
+}
+
 #[test]
 fn test_cli_cluster_basic_fragment_clusters_with_parent() -> Result<()> {
+    use arrow::array::{Array, Float64Array, StringArray};
+
     let dir = tempdir()?;
     let binary = get_binary_path();
 
@@ -6256,7 +6273,7 @@ fn test_cli_cluster_basic_fragment_clusters_with_parent() -> Result<()> {
     write_fasta(&mag_a_path, &[("A", &a), ("B", &b)]);
     write_fasta(&mag_c_path, &[("C", &c)]);
 
-    let output_tsv = dir.path().join("clusters.tsv");
+    let output_pq = dir.path().join("clusters.parquet");
 
     let status = Command::new(&binary)
         .arg("cluster")
@@ -6265,7 +6282,7 @@ fn test_cli_cluster_basic_fragment_clusters_with_parent() -> Result<()> {
         .arg("--input")
         .arg(&mag_c_path)
         .arg("--output")
-        .arg(&output_tsv)
+        .arg(&output_pq)
         .arg("-k")
         .arg("32")
         .arg("-w")
@@ -6279,49 +6296,61 @@ fn test_cli_cluster_basic_fragment_clusters_with_parent() -> Result<()> {
         .status()?;
     assert!(status.success(), "rype cluster exited with {:?}", status);
 
-    let content = std::fs::read_to_string(&output_tsv)?;
-    let lines: Vec<&str> = content.lines().collect();
-    assert!(!lines.is_empty(), "output is empty");
-    assert_eq!(
-        lines[0],
-        "rep_contig\tmember_contig\tsource_mag\tcontainment"
-    );
+    let batches = read_cluster_parquet(&output_pq);
+    assert!(!batches.is_empty(), "no Parquet batches");
+    let batch = &batches[0];
+
+    // Plan 1.5 phase 2 schema: 8 columns.
+    assert_eq!(batch.num_columns(), 8);
+    assert_eq!(batch.schema().field(0).name(), "rep_contig");
+    assert_eq!(batch.schema().field(3).name(), "containment");
+    assert_eq!(batch.schema().field(4).name(), "chain_score");
 
     // Three input contigs => three data rows
-    let data_rows: Vec<&str> = lines[1..].to_vec();
-    assert_eq!(
-        data_rows.len(),
-        3,
-        "expected 3 data rows, got {}: {:?}",
-        data_rows.len(),
-        data_rows
-    );
+    assert_eq!(batch.num_rows(), 3);
 
-    // Verify structure: A is a rep, B is absorbed by A, C is its own rep.
+    let rep = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let member = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mag = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let containment = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+
     let mut a_is_rep = false;
     let mut b_absorbed_by_a = false;
     let mut c_self_rep = false;
-    for row in &data_rows {
-        let cols: Vec<&str> = row.split('\t').collect();
-        assert_eq!(cols.len(), 4, "row has wrong column count: {:?}", row);
-        let rep = cols[0];
-        let member = cols[1];
-        let mag = cols[2];
-        let containment: f64 = cols[3].parse().unwrap();
-
-        if member == "mag_a::A" && rep == "mag_a::A" {
-            assert!((containment - 1.0).abs() < 1e-6);
-            assert_eq!(mag, "mag_a");
+    for i in 0..batch.num_rows() {
+        let r = rep.value(i);
+        let m = member.value(i);
+        let mg = if mag.is_null(i) { "" } else { mag.value(i) };
+        let c = containment.value(i);
+        if m == "mag_a::A" && r == "mag_a::A" {
+            assert!((c - 1.0).abs() < 1e-6);
+            assert_eq!(mg, "mag_a");
             a_is_rep = true;
         }
-        if member == "mag_a::B" && rep == "mag_a::A" {
-            assert!(containment >= 0.80);
-            assert_eq!(mag, "mag_a");
+        if m == "mag_a::B" && r == "mag_a::A" {
+            assert!(c >= 0.80);
+            assert_eq!(mg, "mag_a");
             b_absorbed_by_a = true;
         }
-        if member == "mag_c::C" && rep == "mag_c::C" {
-            assert!((containment - 1.0).abs() < 1e-6);
-            assert_eq!(mag, "mag_c");
+        if m == "mag_c::C" && r == "mag_c::C" {
+            assert!((c - 1.0).abs() < 1e-6);
+            assert_eq!(mg, "mag_c");
             c_self_rep = true;
         }
     }
@@ -6334,6 +6363,8 @@ fn test_cli_cluster_basic_fragment_clusters_with_parent() -> Result<()> {
 
 #[test]
 fn test_cli_cluster_length_filter_excludes_short_contigs() -> Result<()> {
+    use arrow::array::StringArray;
+
     let dir = tempdir()?;
     let binary = get_binary_path();
 
@@ -6343,14 +6374,14 @@ fn test_cli_cluster_length_filter_excludes_short_contigs() -> Result<()> {
     let fasta = dir.path().join("input.fasta");
     write_fasta(&fasta, &[("long", &long_seq), ("short", &short_seq)]);
 
-    let output_tsv = dir.path().join("clusters.tsv");
+    let output_pq = dir.path().join("clusters.parquet");
 
     let status = Command::new(&binary)
         .arg("cluster")
         .arg("--input")
         .arg(&fasta)
         .arg("--output")
-        .arg(&output_tsv)
+        .arg(&output_pq)
         .arg("-k")
         .arg("32")
         .arg("-w")
@@ -6364,10 +6395,15 @@ fn test_cli_cluster_length_filter_excludes_short_contigs() -> Result<()> {
         .status()?;
     assert!(status.success(), "rype cluster exited with {:?}", status);
 
-    let content = std::fs::read_to_string(&output_tsv)?;
-    let data_rows: Vec<&str> = content.lines().skip(1).collect();
-    assert_eq!(data_rows.len(), 1, "expected 1 data row (short filtered)");
-    assert!(data_rows[0].starts_with("input::long\tinput::long\t"));
+    let batches = read_cluster_parquet(&output_pq);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 1, "expected 1 row (short filtered)");
+    let member = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(member.value(0), "input::long");
     Ok(())
 }
 
@@ -6379,13 +6415,13 @@ fn test_cli_cluster_invalid_k_returns_error() -> Result<()> {
     let fasta = dir.path().join("x.fasta");
     write_fasta(&fasta, &[("x", b"ACGT")]);
 
-    let output_tsv = dir.path().join("out.tsv");
+    let output_pq = dir.path().join("out.parquet");
     let output = Command::new(&binary)
         .arg("cluster")
         .arg("--input")
         .arg(&fasta)
         .arg("--output")
-        .arg(&output_tsv)
+        .arg(&output_pq)
         .arg("-k")
         .arg("17") // invalid; must be 16/32/64
         .output()?;
@@ -6409,7 +6445,7 @@ fn test_cli_cluster_missing_input_arg_returns_error() -> Result<()> {
     let output = Command::new(&binary)
         .arg("cluster")
         .arg("--output")
-        .arg(dir.path().join("out.tsv"))
+        .arg(dir.path().join("out.parquet"))
         .output()?;
     assert!(
         !output.status.success(),
@@ -6418,8 +6454,11 @@ fn test_cli_cluster_missing_input_arg_returns_error() -> Result<()> {
     Ok(())
 }
 
+/// Plan 1.5 phase 3 (was: dash-stdout test). The cluster CLI now writes
+/// only Parquet (binary), so `--output -` is rejected with a named error
+/// rather than producing a binary mess on the user's terminal.
 #[test]
-fn test_cli_cluster_dash_output_writes_to_stdout() -> Result<()> {
+fn test_cli_cluster_dash_output_rejected() -> Result<()> {
     let dir = tempdir()?;
     let binary = get_binary_path();
     let seq = cluster_cli_seq(5_000, 42);
@@ -6441,22 +6480,17 @@ fn test_cli_cluster_dash_output_writes_to_stdout() -> Result<()> {
         .arg("--min-shared")
         .arg("10")
         .output()?;
-    assert!(output.status.success(), "rype cluster exited non-zero");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(
-        lines[0],
-        "rep_contig\tmember_contig\tsource_mag\tcontainment"
-    );
     assert!(
-        lines.len() >= 2,
-        "expected at least one data row, got: {:?}",
-        lines
+        !output.status.success(),
+        "rype cluster --output - must exit non-zero (Parquet is binary)"
     );
-    assert!(lines[1].starts_with("solo::solo\tsolo::solo\tsolo\t1.0"));
-
-    // No file should have been created in the working dir named '-'
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("stdout") || stderr.contains("`-`"),
+        "expected stdout-rejection message, got: {}",
+        stderr
+    );
+    // No file should have been created in the working dir named '-'.
     assert!(
         !std::path::Path::new("-").exists(),
         "rype cluster -o - should not create a file named '-'"
@@ -6465,8 +6499,11 @@ fn test_cli_cluster_dash_output_writes_to_stdout() -> Result<()> {
     Ok(())
 }
 
+/// Plan 1.5 phase 3 (was: omitted-output-stdout test). `--output` is now
+/// REQUIRED (no implicit stdout default). The CLI rejects omission with a
+/// message naming the flag, before any clustering work begins.
 #[test]
-fn test_cli_cluster_omitted_output_writes_to_stdout() -> Result<()> {
+fn test_cli_cluster_omitted_output_rejected() -> Result<()> {
     let dir = tempdir()?;
     let binary = get_binary_path();
     let seq = cluster_cli_seq(5_000, 43);
@@ -6486,10 +6523,60 @@ fn test_cli_cluster_omitted_output_writes_to_stdout() -> Result<()> {
         .arg("--min-shared")
         .arg("10")
         .output()?;
-    assert!(output.status.success(), "rype cluster exited non-zero");
+    assert!(
+        !output.status.success(),
+        "rype cluster without --output must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--output"),
+        "expected missing-output error, got: {}",
+        stderr
+    );
+    Ok(())
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("rep_contig\tmember_contig\t"));
+/// Plan 1.5 phase 3: `.tsv` extension on the output path is rejected so
+/// users notice the TSV→Parquet format change immediately rather than
+/// producing a corrupt Parquet file at a `.tsv` filename.
+#[test]
+fn test_cli_cluster_tsv_extension_rejected() -> Result<()> {
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+    let seq = cluster_cli_seq(5_000, 11);
+    let fasta = dir.path().join("solo.fasta");
+    write_fasta(&fasta, &[("solo", &seq)]);
+
+    let output_tsv = dir.path().join("clusters.tsv");
+    let output = Command::new(&binary)
+        .arg("cluster")
+        .arg("--input")
+        .arg(&fasta)
+        .arg("--output")
+        .arg(&output_tsv)
+        .arg("-k")
+        .arg("32")
+        .arg("-w")
+        .arg("20")
+        .arg("--min-length")
+        .arg("1000")
+        .arg("--min-shared")
+        .arg("10")
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "rype cluster with .tsv output must exit non-zero (format dropped)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Parquet") && stderr.contains("TSV"),
+        "expected format-change message, got: {}",
+        stderr
+    );
+    assert!(
+        !output_tsv.exists(),
+        "no file should be created at the rejected path"
+    );
     Ok(())
 }
 
@@ -6504,14 +6591,14 @@ fn cli_no_chain_and_threshold_conflict() -> Result<()> {
 
     let fasta = dir.path().join("x.fasta");
     write_fasta(&fasta, &[("x", &cluster_cli_seq(1_500, 1))]);
-    let output_tsv = dir.path().join("out.tsv");
+    let output_pq = dir.path().join("out.parquet");
 
     let output = Command::new(&binary)
         .arg("cluster")
         .arg("--input")
         .arg(&fasta)
         .arg("--output")
-        .arg(&output_tsv)
+        .arg(&output_pq)
         .arg("-k")
         .arg("32")
         .arg("-w")
@@ -6546,14 +6633,14 @@ fn cli_no_chain_and_min_anchors_conflict() -> Result<()> {
 
     let fasta = dir.path().join("x.fasta");
     write_fasta(&fasta, &[("x", &cluster_cli_seq(1_500, 1))]);
-    let output_tsv = dir.path().join("out.tsv");
+    let output_pq = dir.path().join("out.parquet");
 
     let output = Command::new(&binary)
         .arg("cluster")
         .arg("--input")
         .arg(&fasta)
         .arg("--output")
-        .arg(&output_tsv)
+        .arg(&output_pq)
         .arg("-k")
         .arg("32")
         .arg("-w")
@@ -6575,6 +6662,181 @@ fn cli_no_chain_and_min_anchors_conflict() -> Result<()> {
         "expected chain-min-anchors conflict message, got: {}",
         stderr
     );
+    Ok(())
+}
+
+/// Plan 1.5 phase 3: when chain DP runs (via `--chain-threshold` or
+/// `--chain-min-anchors`), the Parquet output's chain columns must be
+/// populated for absorbed-member rows and null for representative rows.
+/// This is the load-bearing CLI-level pin that chain output reaches the
+/// user when chain ran globally.
+#[test]
+fn cli_cluster_parquet_emits_chain_columns_when_enabled() -> Result<()> {
+    use arrow::array::{Array, Float64Array, StringArray, UInt32Array};
+
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+
+    // A is a full genome; B is a forward fragment of A (will be absorbed
+    // into A with a populated chain).
+    let a = cluster_cli_seq(20_000, 1);
+    let b = a[2_000..10_000].to_vec();
+
+    let fasta = dir.path().join("mag.fasta");
+    write_fasta(&fasta, &[("A", &a), ("B", &b)]);
+
+    let output_pq = dir.path().join("clusters.parquet");
+    let status = Command::new(&binary)
+        .arg("cluster")
+        .arg("--input")
+        .arg(&fasta)
+        .arg("--output")
+        .arg(&output_pq)
+        .arg("-k")
+        .arg("32")
+        .arg("-w")
+        .arg("20")
+        .arg("--min-length")
+        .arg("1000")
+        .arg("--threshold")
+        .arg("0.80")
+        .arg("--min-shared")
+        .arg("50")
+        // Flipping chain on — gate disabled (informational only) so
+        // absorption behavior matches the no-chain baseline.
+        .arg("--chain-min-anchors")
+        .arg("3")
+        .status()?;
+    assert!(status.success(), "rype cluster exited with {:?}", status);
+
+    let batches = read_cluster_parquet(&output_pq);
+    let batch = &batches[0];
+    assert_eq!(batch.num_columns(), 8);
+
+    let member = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let chain_score = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let chain_anchors = batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    let chain_strand = batch
+        .column(7)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    let mut saw_populated_chain = false;
+    let mut saw_null_rep_chain = false;
+    for i in 0..batch.num_rows() {
+        let m = member.value(i);
+        if m == "mag::A" {
+            // A is its own rep -> chain must be NULL.
+            assert!(chain_score.is_null(i), "rep row chain_score must be null");
+            assert!(chain_strand.is_null(i), "rep row chain_strand must be null");
+            saw_null_rep_chain = true;
+        }
+        if m == "mag::B" {
+            // B is absorbed by A; chain must be populated.
+            assert!(
+                !chain_score.is_null(i),
+                "B (absorbed) chain_score must be populated when chain DP ran"
+            );
+            assert!(chain_anchors.value(i) >= 3, "min_anchors must hold");
+            assert_eq!(chain_strand.value(i), "Forward");
+            saw_populated_chain = true;
+        }
+    }
+    assert!(
+        saw_null_rep_chain,
+        "expected A as its own rep with null chain"
+    );
+    assert!(
+        saw_populated_chain,
+        "expected B absorbed with populated chain columns"
+    );
+    Ok(())
+}
+
+/// Plan 1.5 phase 3: the default `rype cluster` (no chain flag) keeps
+/// chain DP DISABLED at the CLI for backwards compatibility (Plan 1.4
+/// deviation). The Parquet output still has the fixed 8-column schema
+/// (no dynamic schema) but ALL chain columns are null in every row.
+/// Downstream consumers see a stable schema regardless of whether chain
+/// ran.
+#[test]
+fn cli_cluster_parquet_no_chain_columns_all_null_by_default() -> Result<()> {
+    use arrow::array::{Array, Float64Array, StringArray, UInt32Array};
+
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+
+    let a = cluster_cli_seq(20_000, 1);
+    let b = a[2_000..10_000].to_vec();
+    let fasta = dir.path().join("mag.fasta");
+    write_fasta(&fasta, &[("A", &a), ("B", &b)]);
+
+    let output_pq = dir.path().join("clusters.parquet");
+    let status = Command::new(&binary)
+        .arg("cluster")
+        .arg("--input")
+        .arg(&fasta)
+        .arg("--output")
+        .arg(&output_pq)
+        .arg("-k")
+        .arg("32")
+        .arg("-w")
+        .arg("20")
+        .arg("--min-length")
+        .arg("1000")
+        .arg("--threshold")
+        .arg("0.80")
+        .arg("--min-shared")
+        .arg("50")
+        // No chain flag — chain DP stays disabled at the CLI default.
+        .status()?;
+    assert!(status.success(), "rype cluster exited with {:?}", status);
+
+    let batches = read_cluster_parquet(&output_pq);
+    let batch = &batches[0];
+
+    // Fixed 8-column schema even when chain disabled.
+    assert_eq!(batch.num_columns(), 8);
+
+    let chain_score = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let chain_anchors = batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    let chain_containment = batch
+        .column(6)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let chain_strand = batch
+        .column(7)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for i in 0..batch.num_rows() {
+        assert!(chain_score.is_null(i));
+        assert!(chain_anchors.is_null(i));
+        assert!(chain_containment.is_null(i));
+        assert!(chain_strand.is_null(i));
+    }
     Ok(())
 }
 
@@ -6613,7 +6875,7 @@ fn test_cli_cluster_wol2_subset_smoke() -> Result<()> {
         genomes_dir.display()
     );
 
-    let output_tsv = dir.path().join("wol2_50.tsv");
+    let output_pq = dir.path().join("wol2_50.parquet");
 
     let mut cmd = Command::new(&binary);
     cmd.arg("--verbose").arg("cluster");
@@ -6621,7 +6883,7 @@ fn test_cli_cluster_wol2_subset_smoke() -> Result<()> {
         cmd.arg("--input").arg(f);
     }
     cmd.arg("--output")
-        .arg(&output_tsv)
+        .arg(&output_pq)
         // Use strain defaults — these are real microbial genomes.
         .arg("-k")
         .arg("64")
@@ -6637,12 +6899,12 @@ fn test_cli_cluster_wol2_subset_smoke() -> Result<()> {
     let status = cmd.status()?;
     assert!(status.success(), "rype cluster failed on WoL2 subset");
 
-    // Verify output exists and has at least the header line.
-    let content = fs::read_to_string(&output_tsv)?;
-    assert!(content.starts_with("rep_contig\tmember_contig\t"));
-    let row_count = content.lines().count() - 1; // minus header
-    eprintln!("WoL2 subset clustering produced {} rows", row_count);
-    assert!(row_count > 0, "expected at least one cluster row");
+    // Verify Parquet exists and has expected 8-column schema.
+    let batches = read_cluster_parquet(&output_pq);
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    eprintln!("WoL2 subset clustering produced {} rows", total_rows);
+    assert!(total_rows > 0, "expected at least one cluster row");
+    assert_eq!(batches[0].num_columns(), 8);
 
     Ok(())
 }

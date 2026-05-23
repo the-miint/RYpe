@@ -1,12 +1,17 @@
 //! CLI handler for `rype cluster`.
 
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::BufWriter;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use needletail::parse_fastx_file;
+use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 
+use rype::arrow::cluster::{cluster_result_schema, cluster_result_to_record_batch};
 use rype::cluster::{cluster_contigs, ClusterConfig, ClusterResult, ContigInput};
 use rype::{ChainParams, BUCKET_SOURCE_DELIM};
 
@@ -26,6 +31,7 @@ pub fn run_cluster(args: ClusterArgs) -> Result<()> {
             args.threshold
         ));
     }
+    let output_path = validate_output_path(args.output.as_deref())?;
     if args.no_chain && args.chain_threshold.is_some() {
         return Err(anyhow!(
             "--chain-threshold requires chain to be enabled; remove --no-chain or drop --chain-threshold"
@@ -100,16 +106,64 @@ pub fn run_cluster(args: ClusterArgs) -> Result<()> {
         result.rows.len().saturating_sub(rep_count),
     );
 
-    write_cluster_output(args.output.as_deref(), &result).with_context(|| {
-        format!(
-            "writing cluster TSV to {}",
-            args.output
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<stdout>".to_string())
-        )
+    write_cluster_parquet(&output_path, &result)
+        .with_context(|| format!("writing cluster Parquet to {}", output_path.display()))?;
+
+    Ok(())
+}
+
+/// Validate the `--output` argument and resolve it to a concrete Parquet path.
+///
+/// Phase 1.5 dropped TSV support; the cluster CLI now writes only Parquet.
+/// `--output -` (stdout) is rejected because Parquet is binary. A `.tsv`
+/// extension is rejected with a named error so users notice the format
+/// change immediately rather than producing a corrupt Parquet file with a
+/// `.tsv` extension.
+fn validate_output_path(output: Option<&Path>) -> Result<std::path::PathBuf> {
+    let path = output.ok_or_else(|| {
+        anyhow!("--output is required (rype cluster writes Parquet; pass a .parquet path)")
     })?;
 
+    if path.as_os_str() == "-" {
+        return Err(anyhow!(
+            "rype cluster writes Parquet (binary); stdout (`-`) is not supported. \
+             Pass an explicit path ending in `.parquet`."
+        ));
+    }
+
+    if let Some(ext) = path.extension() {
+        let ext_lower = ext.to_ascii_lowercase();
+        if ext_lower == "tsv" {
+            return Err(anyhow!(
+                "rype cluster now writes Parquet, not TSV (the cluster output \
+                 grew nullable chain columns that don't round-trip cleanly \
+                 through TSV). Use a `.parquet` extension (or no extension); \
+                 read the result via duckdb/pandas/the parquet crate."
+            ));
+        }
+    }
+
+    Ok(path.to_path_buf())
+}
+
+/// Write the cluster result to a Parquet file using the 8-column schema
+/// defined by [`cluster_result_schema`].
+fn write_cluster_parquet(path: &Path, result: &ClusterResult) -> Result<()> {
+    let batch = cluster_result_to_record_batch(result)
+        .context("building Arrow RecordBatch from cluster result")?;
+    let file = File::create(path)
+        .with_context(|| format!("creating Parquet output file {}", path.display()))?;
+    let buf = BufWriter::new(file);
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+    let schema: Arc<arrow::datatypes::Schema> = cluster_result_schema();
+    let mut writer = ArrowWriter::try_new(buf, schema, Some(props))
+        .context("opening Parquet writer for cluster output")?;
+    writer
+        .write(&batch)
+        .context("writing cluster RecordBatch to Parquet")?;
+    writer.close().context("closing Parquet writer")?;
     Ok(())
 }
 
@@ -198,34 +252,6 @@ fn mag_name_from_path(p: &Path) -> Option<String> {
     p.file_stem()?.to_str().map(|s| s.to_string())
 }
 
-/// Write the TSV to the given path (or stdout if `None` or `"-"`).
-fn write_cluster_output(path: Option<&Path>, result: &ClusterResult) -> Result<()> {
-    match path {
-        Some(p) if p.as_os_str() == "-" => {
-            write_tsv(&mut BufWriter::new(io::stdout().lock()), result)
-        }
-        None => write_tsv(&mut BufWriter::new(io::stdout().lock()), result),
-        Some(p) => {
-            let file = File::create(p)?;
-            write_tsv(&mut BufWriter::new(file), result)
-        }
-    }
-}
-
-fn write_tsv<W: Write>(w: &mut W, result: &ClusterResult) -> Result<()> {
-    writeln!(w, "rep_contig\tmember_contig\tsource_mag\tcontainment")?;
-    for row in &result.rows {
-        let mag = row.source_mag.as_deref().unwrap_or("");
-        writeln!(
-            w,
-            "{}\t{}\t{}\t{:.6}",
-            row.rep_contig, row.member_contig, mag, row.containment
-        )?;
-    }
-    w.flush()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +309,57 @@ mod tests {
     fn mag_name_returns_none_for_paths_without_filename() {
         assert!(mag_name_from_path(Path::new("/")).is_none());
         assert!(mag_name_from_path(Path::new("..")).is_none()); // file_stem of ".." is ""
+    }
+
+    /// WHY: the CLI must reject `.tsv` with a named error rather than
+    /// silently producing a corrupt Parquet file at a `.tsv` path. The
+    /// message must mention "Parquet" so users notice the format change.
+    #[test]
+    fn validate_output_path_rejects_tsv_extension() {
+        let err = validate_output_path(Some(Path::new("out.tsv"))).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("Parquet") && msg.contains("TSV"),
+            "error must explain the format change, got: {}",
+            msg
+        );
+    }
+
+    /// WHY: Parquet is binary; stdout is not a useful sink. Reject `-`
+    /// explicitly so a user piping the output sees a clear error rather
+    /// than a binary mess on their terminal.
+    #[test]
+    fn validate_output_path_rejects_stdout_dash() {
+        let err = validate_output_path(Some(Path::new("-"))).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("stdout") || msg.contains("`-`"),
+            "error must explain stdout-rejection, got: {}",
+            msg
+        );
+    }
+
+    /// WHY: `--output` is now mandatory (stdout is rejected, no implicit
+    /// default file). A missing argument must error early — before the
+    /// expensive clustering work — with a message naming the flag.
+    #[test]
+    fn validate_output_path_requires_output_arg() {
+        let err = validate_output_path(None).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("--output"),
+            "error must name the missing flag, got: {}",
+            msg
+        );
+    }
+
+    /// WHY: a `.parquet` (or extensionless) path is the supported case;
+    /// it must round-trip the validator unchanged.
+    #[test]
+    fn validate_output_path_accepts_parquet_and_extensionless() {
+        let p = validate_output_path(Some(Path::new("out.parquet"))).unwrap();
+        assert_eq!(p, Path::new("out.parquet"));
+        let p = validate_output_path(Some(Path::new("out"))).unwrap();
+        assert_eq!(p, Path::new("out"));
     }
 }
