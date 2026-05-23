@@ -327,18 +327,50 @@ pub struct RypeClusterInput {
     pub sequence_len: size_t,
 }
 
+/// Banded-DP chain score for one absorbed-member edge.
+///
+/// Populated by [`rype_cluster`] when the caller passed a non-NULL
+/// `RypeChainConfig` AND the chain DP returned a valid chain for the edge.
+/// All four fields are valid only if the containing [`RypeClusterRow`] has
+/// `has_chain != 0`; when `has_chain == 0` the fields are zero-initialized
+/// for safety (consumers reading them anyway see deterministic zeros, not
+/// undefined memory).
+///
+/// - `score`: sum of `(anchor_credit − gap)` over chained transitions plus
+///   the initial chain-start credit.
+/// - `anchors`: count of chained anchors (≥ `ChainParams.min_anchors`).
+/// - `containment`: `anchors / |q_<winning_strand>_minimizers|` — chain
+///   analog of `RypeClusterRow.containment`, on the same `[0, 1]` axis.
+/// - `strand`: query strand that produced the winning chain.
+///   `0 = Forward`, `1 = ReverseComplement`.
+#[repr(C)]
+pub struct RypeChainScore {
+    pub score: c_double,
+    pub anchors: u32,
+    pub containment: c_double,
+    pub strand: i32,
+}
+
 /// One row of clustering output.
 ///
 /// `rep_contig` and `member_contig` are owned by rype (allocated as CStrings)
 /// and freed by `rype_cluster_results_free`. `source_mag` is NULL when the
 /// member contig had no source MAG; otherwise it is owned by rype too.
 /// `containment` is in `[0.0, 1.0]`; 1.0 for representatives' self-rows.
+///
+/// `has_chain` is `1` when the chain DP ran AND produced a valid chain for
+/// the edge that drove this row's absorption; `chain` is then valid.
+/// `has_chain` is `0` when the row is a representative (no edge), chain DP
+/// was disabled, or the DP returned None (chain too short). When
+/// `has_chain == 0`, `chain` is zero-initialized.
 #[repr(C)]
 pub struct RypeClusterRow {
     pub rep_contig: *mut c_char,
     pub member_contig: *mut c_char,
     pub source_mag: *mut c_char,
     pub containment: c_double,
+    pub has_chain: i32,
+    pub chain: RypeChainScore,
 }
 
 /// Array of cluster rows returned by `rype_cluster`.
@@ -1677,11 +1709,41 @@ pub extern "C" fn rype_cluster(
                 }
             },
         };
+        // Plan 1.5 phase 4: surface ChainScore inline. `has_chain == 0`
+        // implies the chain fields are zero-initialized so C consumers
+        // that read them anyway see deterministic zeros (not undefined
+        // memory). `Strand::Forward` → 0, `Strand::ReverseComplement`
+        // → 1; matches the documented int encoding.
+        let (has_chain, chain) = match row.chain {
+            Some(c) => (
+                1,
+                RypeChainScore {
+                    score: c.score,
+                    anchors: c.anchors,
+                    containment: c.containment,
+                    strand: match c.strand {
+                        crate::Strand::Forward => 0,
+                        crate::Strand::ReverseComplement => 1,
+                    },
+                },
+            ),
+            None => (
+                0,
+                RypeChainScore {
+                    score: 0.0,
+                    anchors: 0,
+                    containment: 0.0,
+                    strand: 0,
+                },
+            ),
+        };
         c_rows.push(RypeClusterRow {
             rep_contig: rep,
             member_contig: member,
             source_mag: mag,
             containment: row.containment,
+            has_chain,
+            chain,
         });
     }
 

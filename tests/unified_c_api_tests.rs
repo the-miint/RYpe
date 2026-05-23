@@ -2115,3 +2115,246 @@ fn cluster_c_api_invalid_chain_containment_rejected() {
         err
     );
 }
+
+// ---- Plan 1.5 phase 4: RypeClusterRow chain output ----
+
+/// Build a fragment-of-parent input pair and the relaxed C cluster config.
+/// Returns the owned `CString`s and the input array (callers must keep the
+/// `CString` vec alive for the duration of `rype_cluster`).
+fn fragment_pair_for_chain_test() -> (
+    Vec<std::ffi::CString>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<RypeClusterInput>,
+) {
+    let a = cluster_seq_from_seed(20_000, 1);
+    let b = a[2_000..10_000].to_vec();
+    let id_a = std::ffi::CString::new("A").unwrap();
+    let id_b = std::ffi::CString::new("B").unwrap();
+    let inputs = vec![
+        RypeClusterInput {
+            id: id_a.as_ptr(),
+            source_mag: ptr::null(),
+            sequence: a.as_ptr() as *const i8,
+            sequence_len: a.len(),
+        },
+        RypeClusterInput {
+            id: id_b.as_ptr(),
+            source_mag: ptr::null(),
+            sequence: b.as_ptr() as *const i8,
+            sequence_len: b.len(),
+        },
+    ];
+    (vec![id_a, id_b], a, b, inputs)
+}
+
+/// WHY: NULL `RypeChainConfig*` is the back-compat case (callers from
+/// before Plan 1.4 pass NULL). The cluster output must still come back
+/// with `has_chain == 0` on every row, and the chain fields must be
+/// zero-initialized (not garbage), so a C consumer that reads them
+/// anyway sees deterministic zeros.
+#[test]
+fn cluster_c_api_has_chain_zero_when_chain_disabled() {
+    let (_keepalive, _a, _b, inputs) = fragment_pair_for_chain_test();
+    let cfg = relaxed_c_cluster_cfg();
+    let result_ptr = rype_cluster(inputs.as_ptr(), inputs.len(), &cfg, ptr::null());
+    assert!(!result_ptr.is_null(), "rype_cluster returned NULL");
+
+    let result = unsafe { &*result_ptr };
+    let rows = unsafe { std::slice::from_raw_parts(result.data, result.len) };
+    assert!(result.len >= 2, "expected at least 2 rows");
+    for row in rows {
+        assert_eq!(
+            row.has_chain, 0,
+            "every row must have has_chain == 0 when chain_config is NULL"
+        );
+        // Zero-initialized chain fields — read them anyway.
+        assert_eq!(row.chain.score, 0.0);
+        assert_eq!(row.chain.anchors, 0);
+        assert_eq!(row.chain.containment, 0.0);
+        assert_eq!(row.chain.strand, 0);
+    }
+    rype_cluster_results_free(result_ptr);
+}
+
+/// WHY: with chain enabled, an absorbed-member edge (B → A) must surface
+/// `has_chain == 1` and populated fields; the representative row (A → A)
+/// must surface `has_chain == 0`. This is the load-bearing C-API pin
+/// that chain output reaches C consumers when chain ran.
+#[test]
+fn cluster_c_api_has_chain_one_with_populated_fields_when_enabled() {
+    let (_keepalive, _a, _b, inputs) = fragment_pair_for_chain_test();
+    let cfg = relaxed_c_cluster_cfg();
+    let chain_cfg = RypeChainConfig {
+        anchor_credit: 1.0,
+        max_gap_length: 80,
+        max_lin_length: 2000,
+        band_anchors: 50,
+        band_bp: 1000,
+        min_anchors: 3,
+        min_chain_containment: f64::NAN, // gate off — informational only
+    };
+    let result_ptr = rype_cluster(inputs.as_ptr(), inputs.len(), &cfg, &chain_cfg);
+    assert!(!result_ptr.is_null(), "rype_cluster returned NULL");
+
+    let result = unsafe { &*result_ptr };
+    let rows = unsafe { std::slice::from_raw_parts(result.data, result.len) };
+
+    let mut saw_populated_chain = false;
+    let mut saw_rep_no_chain = false;
+    for row in rows {
+        let rep = unsafe { std::ffi::CStr::from_ptr(row.rep_contig) }
+            .to_str()
+            .unwrap();
+        let member = unsafe { std::ffi::CStr::from_ptr(row.member_contig) }
+            .to_str()
+            .unwrap();
+        if rep == "A" && member == "A" {
+            assert_eq!(
+                row.has_chain, 0,
+                "representative row must have has_chain == 0 (no edge drove its absorption)"
+            );
+            saw_rep_no_chain = true;
+        }
+        if rep == "A" && member == "B" {
+            assert_eq!(
+                row.has_chain, 1,
+                "absorbed-member row must have has_chain == 1 when chain DP ran"
+            );
+            assert!(
+                row.chain.anchors >= 3,
+                "min_anchors=3 must hold, got {}",
+                row.chain.anchors
+            );
+            assert!(
+                row.chain.containment > 0.0 && row.chain.containment <= 1.0,
+                "chain.containment must be in (0, 1], got {}",
+                row.chain.containment
+            );
+            saw_populated_chain = true;
+        }
+    }
+    assert!(
+        saw_rep_no_chain,
+        "expected A as its own rep with has_chain==0"
+    );
+    assert!(
+        saw_populated_chain,
+        "expected B absorbed with populated chain"
+    );
+
+    rype_cluster_results_free(result_ptr);
+}
+
+/// WHY: pin the `Strand` → int mapping at the C-API boundary. A future
+/// change that reordered the Rust enum variants or shifted the int
+/// encoding (e.g. -1/+1 instead of 0/1) would silently break every
+/// existing C consumer. This test fires on either change.
+///
+/// Construction: query B is the reverse complement of a fragment of A,
+/// so the rc strand wins classification and the chain DP picks the rc
+/// winner.
+#[test]
+fn cluster_c_api_chain_strand_int_encoding() {
+    fn revcomp(seq: &[u8]) -> Vec<u8> {
+        seq.iter()
+            .rev()
+            .map(|b| match b {
+                b'A' => b'T',
+                b'C' => b'G',
+                b'G' => b'C',
+                b'T' => b'A',
+                b => *b,
+            })
+            .collect()
+    }
+
+    // Case 1: forward fragment → strand == 0 (Forward).
+    {
+        let (_keepalive, _a, _b, inputs) = fragment_pair_for_chain_test();
+        let cfg = relaxed_c_cluster_cfg();
+        let chain_cfg = RypeChainConfig {
+            anchor_credit: 1.0,
+            max_gap_length: 80,
+            max_lin_length: 2000,
+            band_anchors: 50,
+            band_bp: 1000,
+            min_anchors: 3,
+            min_chain_containment: f64::NAN,
+        };
+        let result_ptr = rype_cluster(inputs.as_ptr(), inputs.len(), &cfg, &chain_cfg);
+        assert!(!result_ptr.is_null());
+        let result = unsafe { &*result_ptr };
+        let rows = unsafe { std::slice::from_raw_parts(result.data, result.len) };
+        for row in rows {
+            if row.has_chain == 1 {
+                assert_eq!(
+                    row.chain.strand, 0,
+                    "forward fragment must produce strand == 0 (Forward)"
+                );
+            }
+        }
+        rype_cluster_results_free(result_ptr);
+    }
+
+    // Case 2: reverse-complement fragment → strand == 1 (ReverseComplement).
+    {
+        let a = cluster_seq_from_seed(20_000, 1);
+        let b_rc = revcomp(&a[2_000..10_000]);
+        let id_a = std::ffi::CString::new("A").unwrap();
+        let id_b = std::ffi::CString::new("B").unwrap();
+        let inputs = vec![
+            RypeClusterInput {
+                id: id_a.as_ptr(),
+                source_mag: ptr::null(),
+                sequence: a.as_ptr() as *const i8,
+                sequence_len: a.len(),
+            },
+            RypeClusterInput {
+                id: id_b.as_ptr(),
+                source_mag: ptr::null(),
+                sequence: b_rc.as_ptr() as *const i8,
+                sequence_len: b_rc.len(),
+            },
+        ];
+        let cfg = relaxed_c_cluster_cfg();
+        let chain_cfg = RypeChainConfig {
+            anchor_credit: 1.0,
+            max_gap_length: 80,
+            max_lin_length: 2000,
+            band_anchors: 50,
+            band_bp: 1000,
+            min_anchors: 3,
+            min_chain_containment: f64::NAN,
+        };
+        let result_ptr = rype_cluster(inputs.as_ptr(), inputs.len(), &cfg, &chain_cfg);
+        assert!(!result_ptr.is_null());
+        let result = unsafe { &*result_ptr };
+        let rows = unsafe { std::slice::from_raw_parts(result.data, result.len) };
+        let mut saw_rc_strand = false;
+        for row in rows {
+            let rep = unsafe { std::ffi::CStr::from_ptr(row.rep_contig) }
+                .to_str()
+                .unwrap();
+            let member = unsafe { std::ffi::CStr::from_ptr(row.member_contig) }
+                .to_str()
+                .unwrap();
+            if rep == "A" && member == "B" {
+                assert_eq!(
+                    row.has_chain, 1,
+                    "rc-fragment absorbed-member row must have has_chain == 1"
+                );
+                assert_eq!(
+                    row.chain.strand, 1,
+                    "rc fragment must produce strand == 1 (ReverseComplement)"
+                );
+                saw_rc_strand = true;
+            }
+        }
+        assert!(
+            saw_rc_strand,
+            "expected an absorbed B → A row with rc strand"
+        );
+        rype_cluster_results_free(result_ptr);
+    }
+}

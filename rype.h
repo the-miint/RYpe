@@ -1064,6 +1064,31 @@ typedef struct {
 } RypeClusterInput;
 
 /**
+ * Banded-DP chain score for one absorbed-member edge (Plan 1.5).
+ *
+ * Populated by rype_cluster() when the caller passed a non-NULL
+ * RypeChainConfig AND the chain DP returned a valid chain for the edge.
+ * All four fields are valid only if the containing RypeClusterRow has
+ * has_chain != 0; when has_chain == 0 the fields are zero-initialized so
+ * consumers reading them anyway see deterministic zeros, not undefined
+ * memory.
+ *
+ * - score:        Sum of (anchor_credit - gap) over chained transitions plus
+ *                 the initial chain-start credit.
+ * - anchors:      Count of chained anchors (>= ChainParams.min_anchors).
+ * - containment:  anchors / |q_<winning_strand>_minimizers| -- chain analog
+ *                 of RypeClusterRow.containment, on the same [0, 1] axis.
+ * - strand:       Query strand that produced the winning chain.
+ *                 0 = Forward, 1 = ReverseComplement.
+ */
+typedef struct {
+    double score;
+    uint32_t anchors;
+    double containment;
+    int32_t strand;
+} RypeChainScore;
+
+/**
  * One row of clustering output.
  *
  * - rep_contig:    Owned by rype (CString); freed by rype_cluster_results_free.
@@ -1071,12 +1096,19 @@ typedef struct {
  * - source_mag:    Owned by rype, or NULL if the member had no source MAG.
  * - containment:   Containment of the member in the representative. 1.0 for
  *                  representatives' self-rows.
+ * - has_chain:     1 when chain DP ran AND produced a valid chain for this
+ *                  row's absorbing edge; 0 when the row is a representative,
+ *                  chain was disabled, or the DP returned None. When 0, the
+ *                  chain fields are zero-initialized.
+ * - chain:         Banded-DP chain score; valid iff has_chain != 0.
  */
 typedef struct {
     char* rep_contig;
     char* member_contig;
     char* source_mag;
     double containment;
+    int32_t has_chain;
+    RypeChainScore chain;
 } RypeClusterRow;
 
 /**
