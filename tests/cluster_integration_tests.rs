@@ -255,6 +255,41 @@ fn cluster_chain_gate_filters_random_match() {
     drop(workdir);
 
     let result_no_gate = cluster_contigs(inputs(), &cfg_no_gate).unwrap();
+    // Plan 1.5 phase 3.1 review-fix: the absorbed-member row for B must
+    // carry through whatever chain data the edge had — `Some` if the DP
+    // found ≥ min_anchors anchors anywhere in the scrambled B, `None`
+    // otherwise. Either is acceptable for this input (the test's purpose
+    // is to pin the gate's filter behavior, not to require a specific
+    // chain outcome); but `row.chain` must MATCH the originating edge's
+    // chain shape — Plan 1.5 phase 1 forwarding contract.
+    let b_row_no_gate = result_no_gate
+        .rows
+        .iter()
+        .find(|r| r.member_contig == "B" && r.rep_contig == "A")
+        .expect("B should be absorbed into A without the chain gate");
+    let any_edge_had_chain = b_to_a.iter().any(|e| e.chain.is_some());
+    let any_edge_had_no_chain = b_to_a.iter().any(|e| e.chain.is_none());
+    assert!(
+        (any_edge_had_chain && b_row_no_gate.chain.is_some())
+            || (any_edge_had_no_chain && b_row_no_gate.chain.is_none()),
+        "row.chain must match the originating edge's chain presence \
+         (edges chain.is_some={}, chain.is_none={}; row.chain={:?})",
+        any_edge_had_chain,
+        any_edge_had_no_chain,
+        b_row_no_gate.chain
+    );
+    // Representative row (A) must NEVER carry chain regardless of input.
+    let a_rep_no_gate = result_no_gate
+        .rows
+        .iter()
+        .find(|r| r.rep_contig == "A" && r.member_contig == "A")
+        .expect("A must appear as its own representative");
+    assert!(
+        a_rep_no_gate.chain.is_none(),
+        "representative row must have chain: None, got {:?}",
+        a_rep_no_gate.chain
+    );
+
     let absorbed_no_gate = result_no_gate
         .rows
         .iter()
@@ -288,6 +323,75 @@ fn cluster_chain_gate_filters_random_match() {
             row
         );
     }
+}
+
+/// Plan 1.5 phase 3.1 review-fix (mid-plan linus review Finding 11):
+/// pin the end-to-end chain-forwarding contract at the `cluster_contigs`
+/// API. The greedy unit tests pin this with synthetic edges; the CLI
+/// integration tests pin it via the binary. This test fills the gap
+/// in between: a real fragment-of-parent case, real sequence data,
+/// real `cluster_contigs()` call, real `Vec<ClusterRow>` output. If
+/// somebody breaks the forwarding path between `edges::build_edges`
+/// output and `greedy_dereplicate` input — a path that no unit test
+/// touches — this test fires.
+#[test]
+fn cluster_contigs_forwards_chain_into_absorbed_rows() {
+    // Forward fragment of A — chain DP will easily find a long colinear
+    // chain (k=32, w=20, fragment is 8KB of A's 20KB).
+    let a = seq_from_seed(20_000, 1);
+    let b = a[2_000..10_000].to_vec();
+
+    let inputs = vec![
+        ContigInput {
+            id: "A".to_string(),
+            source_mag: Some("mag_a".to_string()),
+            sequence: a,
+        },
+        ContigInput {
+            id: "B".to_string(),
+            source_mag: Some("mag_b".to_string()),
+            sequence: b,
+        },
+    ];
+
+    let cfg = ClusterConfig {
+        chain_params: Some(ChainParams::starting_for_w(20)),
+        min_chain_containment: None,
+        ..cfg_relaxed()
+    };
+    let result = cluster_contigs(inputs, &cfg).unwrap();
+    assert_eq!(result.rows.len(), 2);
+
+    let b_row = result
+        .rows
+        .iter()
+        .find(|r| r.member_contig == "B" && r.rep_contig == "A")
+        .expect("B should be absorbed into A");
+    let chain = b_row
+        .chain
+        .as_ref()
+        .expect("absorbed-member row must carry chain when chain DP ran on a real fragment");
+    assert!(
+        chain.anchors >= 3,
+        "fragment-of-parent chain must clear min_anchors, got {}",
+        chain.anchors
+    );
+    assert!(
+        chain.containment > 0.0 && chain.containment <= 1.0,
+        "chain.containment must be a valid containment, got {}",
+        chain.containment
+    );
+
+    let a_rep = result
+        .rows
+        .iter()
+        .find(|r| r.rep_contig == "A" && r.member_contig == "A")
+        .expect("A must appear as its own representative");
+    assert!(
+        a_rep.chain.is_none(),
+        "representative row must have chain: None even when chain DP ran, got {:?}",
+        a_rep.chain
+    );
 }
 
 #[test]
