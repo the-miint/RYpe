@@ -538,6 +538,20 @@ fn run_calibration_sweep() -> Result<()> {
         "[calib] {} positive label pairs after threshold",
         labels.len()
     );
+    // WHY: a zero-positive label set produces TP=0, FN=0, recall=NaN
+    // across every cell. The Parquet looks like "no positives exist"
+    // rather than "your ANI threshold or labels TSV is wrong" — an
+    // operator who misses the eprintln above analyzes a useless file
+    // for hours. Fail loud (Rule 10).
+    if labels.is_empty() {
+        return Err(anyhow!(
+            "label set is empty after applying ani_threshold={}% — \
+             check RYPE_CALIB_ANI_THRESHOLD is in percent scale (0–100), \
+             and that {} contains pairs at or above the threshold",
+            ani_threshold,
+            labels_path.display()
+        ));
+    }
 
     let grid = sweep_grid()?;
     eprintln!("[calib] sweep grid: {} cells", grid.len());
@@ -591,6 +605,39 @@ fn run_calibration_sweep() -> Result<()> {
     Ok(())
 }
 
+/// WHY: `load_mag_directory` and `mag_name_from_path` here are
+/// duplicates of private helpers in `src/commands/cluster.rs`. A
+/// regression in either implementation that desynced the contig-ID
+/// shape would cause every label join to silently miss, producing
+/// TP=0 across a 35-cell sweep — hours of wasted run time before the
+/// operator notices. This test pins the contract end-to-end: build
+/// one tiny FASTA on disk, call `load_mag_directory`, assert the
+/// `<mag-name>::<header-first-token>` shape matches what the labels
+/// TSV is expected to use.
+#[cfg(feature = "fastx")]
+#[test]
+fn load_mag_directory_constructs_mag_scoped_contig_ids() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("genome_alpha.fasta");
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, ">contig_one with trailing description").unwrap();
+        writeln!(f, "ACGTACGT").unwrap();
+        writeln!(f, ">contig_two").unwrap();
+        writeln!(f, "TTGGCCAA").unwrap();
+    }
+    let inputs = load_mag_directory(dir.path()).unwrap();
+    assert_eq!(inputs.len(), 2);
+    // The MAG name strips the `.fasta` extension; the contig id is
+    // `<mag>::<header-first-token>`, header trimmed at whitespace.
+    assert_eq!(inputs[0].id, "genome_alpha::contig_one");
+    assert_eq!(inputs[0].source_mag.as_deref(), Some("genome_alpha"));
+    assert_eq!(inputs[0].sequence, b"ACGTACGT");
+    assert_eq!(inputs[1].id, "genome_alpha::contig_two");
+    assert_eq!(inputs[1].source_mag.as_deref(), Some("genome_alpha"));
+}
+
 /// Required-env helper: return the value as a `PathBuf` or a clear error.
 #[cfg(feature = "fastx")]
 fn require_env_path(name: &str) -> Result<std::path::PathBuf> {
@@ -610,6 +657,15 @@ fn base_config_from_env() -> Result<rype::cluster::ClusterConfig> {
         base.k = s
             .parse()
             .with_context(|| format!("RYPE_CALIB_K must parse as usize (got {:?})", s))?;
+        // Mirror the CLI's K-validation gate at src/commands/cluster.rs.
+        // Without this, K=100 would fail somewhere deep in minimizer
+        // extraction with a non-obvious error.
+        if !matches!(base.k, 16 | 32 | 64) {
+            return Err(anyhow!(
+                "RYPE_CALIB_K must be 16, 32, or 64 (got {})",
+                base.k
+            ));
+        }
     }
     if let Ok(s) = std::env::var("RYPE_CALIB_W") {
         base.w = s
@@ -925,13 +981,13 @@ A\tB\t99.0
     /// makes that pairing mechanical.
     #[test]
     fn sweep_grid_default_is_seven_by_five() {
-        // Clear any env overrides so the test sees defaults regardless of
-        // ambient shell state. (Other tests in this module don't touch
-        // these vars; setting them just to be defensive.)
-        unsafe {
-            std::env::remove_var("RYPE_CALIB_CONTAINMENT_GRID");
-            std::env::remove_var("RYPE_CALIB_MIN_ANCHORS_GRID");
-        }
+        // env-var-driven overrides are out of scope for this test: we
+        // assert the shape that ships when no operator overrides are
+        // active. Mutating `std::env` from inside a parallel test
+        // harness is unsound (Rust 1.87 made `remove_var` unsafe for
+        // this reason), so the test cannot defensively clear the vars
+        // — if a CI environment ever sets them, that's a real bug worth
+        // surfacing rather than papering over.
         let grid = sweep_grid().unwrap();
         assert_eq!(grid.len(), 35, "default grid must be 7 × 5 = 35 cells");
         // First and last cells pin the iteration order: containment is
@@ -971,6 +1027,7 @@ A\tB\t99.0
     /// edit must update this test together with the spec.
     #[test]
     fn parquet_writer_round_trip() {
+        use arrow::array::Float64Array;
         use arrow::datatypes::DataType;
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use std::fs::File;
@@ -1050,6 +1107,37 @@ A\tB\t99.0
         assert_eq!(schema.field(2).data_type(), &DataType::UInt64);
         assert_eq!(schema.field(5).data_type(), &DataType::Float64);
         assert_eq!(schema.field(7).data_type(), &DataType::Float64);
+
+        // WHY: NaN is the documented sentinel for "denominator was zero"
+        // in precision/recall/F1. A regression that emitted Arrow nulls
+        // (or 0.0) instead of NaN would silently let degenerate cells
+        // tie with real ones in downstream `ORDER BY f1` queries. Pin
+        // that NaN survives the Parquet round-trip on both axes.
+        let precision = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let recall = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        // Cell 1 (idx 1): no positives → recall NaN, precision 0.
+        assert!(
+            recall.value(1).is_nan(),
+            "recall must round-trip NaN for the no-positives cell, got {}",
+            recall.value(1)
+        );
+        // Cell 2 (idx 2): no predictions → precision NaN, recall 0.
+        assert!(
+            precision.value(2).is_nan(),
+            "precision must round-trip NaN for the no-predictions cell, got {}",
+            precision.value(2)
+        );
+        // Cell 0 (idx 0) is a sanity check on non-NaN preservation.
+        assert_eq!(precision.value(0), 1.0);
+        assert_eq!(recall.value(0), 1.0);
     }
 
     /// WHY: pin canonicalization for the absorbed-pair set. The harness
