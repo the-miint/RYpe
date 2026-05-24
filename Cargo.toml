@@ -42,6 +42,10 @@ static_assertions = "1.1"
 # feature); the calibration_sweep integration test needs it in its own
 # namespace.
 needletail = { version = "0.6", default-features = false, features = ["flate2", "zstd"] }
+# Used in calibration_sweep's ID-construction test to emit a gzipped
+# FASTA, exercising needletail's gz decoding alongside the mag-name
+# stripping logic. flate2 is already a direct production dependency.
+flate2 = "1.1.8"
 
 [[bin]]
 name = "debug_inverted"

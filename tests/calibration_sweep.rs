@@ -520,14 +520,10 @@ fn run_calibration_sweep() -> Result<()> {
         Err(_) => DEFAULT_ANI_THRESHOLD_PCT,
     };
 
-    eprintln!("[calib] loading MAGs from {}", genomes_dir.display());
-    let inputs = load_mag_directory(&genomes_dir)?;
-    eprintln!(
-        "[calib] loaded {} contigs ({:.2} MB total sequence)",
-        inputs.len(),
-        inputs.iter().map(|c| c.sequence.len() as f64).sum::<f64>() / 1_048_576.0,
-    );
-
+    // Preflight: parse + validate labels BEFORE the multi-hour MAG load.
+    // An operator with the wrong ANI threshold or wrong labels path
+    // shouldn't wait for 16K MAGs to load just to hit an "empty labels"
+    // error — labels parsing is cheap I/O, do it first.
     eprintln!(
         "[calib] parsing skani labels at {} (ani >= {}%)",
         labels_path.display(),
@@ -553,8 +549,19 @@ fn run_calibration_sweep() -> Result<()> {
         ));
     }
 
+    // Preflight: parse the sweep grid (cheap) before the MAG load too,
+    // so an operator with a malformed RYPE_CALIB_*_GRID env var hits
+    // the error in seconds, not hours.
     let grid = sweep_grid()?;
     eprintln!("[calib] sweep grid: {} cells", grid.len());
+
+    eprintln!("[calib] loading MAGs from {}", genomes_dir.display());
+    let inputs = load_mag_directory(&genomes_dir)?;
+    eprintln!(
+        "[calib] loaded {} contigs ({:.2} MB total sequence)",
+        inputs.len(),
+        inputs.iter().map(|c| c.sequence.len() as f64).sum::<f64>() / 1_048_576.0,
+    );
 
     // Base config: strain defaults except chain_params/min_chain_containment,
     // which the sweep overrides per cell. Operator-overridable knobs
@@ -610,32 +617,57 @@ fn run_calibration_sweep() -> Result<()> {
 /// regression in either implementation that desynced the contig-ID
 /// shape would cause every label join to silently miss, producing
 /// TP=0 across a 35-cell sweep — hours of wasted run time before the
-/// operator notices. This test pins the contract end-to-end: build
-/// one tiny FASTA on disk, call `load_mag_directory`, assert the
+/// operator notices. This test pins the contract end-to-end: build a
+/// FASTA on disk (both plain and `.fasta.gz` cases — gz is the
+/// dominant WoL2 corpus shape), call `load_mag_directory`, assert the
 /// `<mag-name>::<header-first-token>` shape matches what the labels
-/// TSV is expected to use.
+/// TSV is expected to use. The gz arm also exercises needletail's
+/// transparent gz decoding alongside the suffix-stripping logic.
 #[cfg(feature = "fastx")]
 #[test]
 fn load_mag_directory_constructs_mag_scoped_contig_ids() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression as GzCompression;
     use std::io::Write;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("genome_alpha.fasta");
+
+    // Plain `.fasta` case (what cluster.rs ships test fixtures for).
+    let plain = dir.path().join("genome_alpha.fasta");
     {
-        let mut f = std::fs::File::create(&path).unwrap();
+        let mut f = std::fs::File::create(&plain).unwrap();
         writeln!(f, ">contig_one with trailing description").unwrap();
         writeln!(f, "ACGTACGT").unwrap();
         writeln!(f, ">contig_two").unwrap();
         writeln!(f, "TTGGCCAA").unwrap();
     }
+
+    // Gzipped `.fasta.gz` case — the dominant WoL2 shape. Stripping
+    // BOTH suffixes is the load-bearing semantic; needletail
+    // transparently decompresses based on the magic bytes.
+    let gz_path = dir.path().join("genome_beta.fasta.gz");
+    {
+        let f = std::fs::File::create(&gz_path).unwrap();
+        let mut enc = GzEncoder::new(f, GzCompression::default());
+        writeln!(enc, ">ctgX").unwrap();
+        writeln!(enc, "AAAACCCC").unwrap();
+        enc.finish().unwrap();
+    }
+
     let inputs = load_mag_directory(dir.path()).unwrap();
-    assert_eq!(inputs.len(), 2);
-    // The MAG name strips the `.fasta` extension; the contig id is
-    // `<mag>::<header-first-token>`, header trimmed at whitespace.
+    // Files are sorted lexicographically by path; "genome_alpha.fasta"
+    // sorts before "genome_beta.fasta.gz", so inputs[0..2] are the
+    // plain FASTA's two contigs and inputs[2] is the gz FASTA's one.
+    assert_eq!(inputs.len(), 3);
     assert_eq!(inputs[0].id, "genome_alpha::contig_one");
     assert_eq!(inputs[0].source_mag.as_deref(), Some("genome_alpha"));
     assert_eq!(inputs[0].sequence, b"ACGTACGT");
     assert_eq!(inputs[1].id, "genome_alpha::contig_two");
     assert_eq!(inputs[1].source_mag.as_deref(), Some("genome_alpha"));
+    // The gz arm: both `.fasta` and `.gz` suffixes stripped to derive
+    // the MAG name. Sequence is decoded via needletail's gz support.
+    assert_eq!(inputs[2].id, "genome_beta::ctgX");
+    assert_eq!(inputs[2].source_mag.as_deref(), Some("genome_beta"));
+    assert_eq!(inputs[2].sequence, b"AAAACCCC");
 }
 
 /// Required-env helper: return the value as a `PathBuf` or a clear error.
@@ -1102,11 +1134,20 @@ A\tB\t99.0
                 "total_positives",
             ]
         );
-        assert_eq!(schema.field(0).data_type(), &DataType::Float64);
-        assert_eq!(schema.field(1).data_type(), &DataType::UInt32);
-        assert_eq!(schema.field(2).data_type(), &DataType::UInt64);
-        assert_eq!(schema.field(5).data_type(), &DataType::Float64);
-        assert_eq!(schema.field(7).data_type(), &DataType::Float64);
+        // All 10 column dtypes pinned. The WHY comment promises to pin
+        // "their dtypes" plural — leaving even the UInt64 columns
+        // unchecked would let a future Int64-vs-UInt64 change slip
+        // through and break duckdb queries that assume unsignedness.
+        assert_eq!(schema.field(0).data_type(), &DataType::Float64); // min_chain_containment
+        assert_eq!(schema.field(1).data_type(), &DataType::UInt32); // min_anchors
+        assert_eq!(schema.field(2).data_type(), &DataType::UInt64); // true_positives
+        assert_eq!(schema.field(3).data_type(), &DataType::UInt64); // false_positives
+        assert_eq!(schema.field(4).data_type(), &DataType::UInt64); // false_negatives
+        assert_eq!(schema.field(5).data_type(), &DataType::Float64); // precision
+        assert_eq!(schema.field(6).data_type(), &DataType::Float64); // recall
+        assert_eq!(schema.field(7).data_type(), &DataType::Float64); // f1
+        assert_eq!(schema.field(8).data_type(), &DataType::UInt64); // total_absorbed
+        assert_eq!(schema.field(9).data_type(), &DataType::UInt64); // total_positives
 
         // WHY: NaN is the documented sentinel for "denominator was zero"
         // in precision/recall/F1. A regression that emitted Arrow nulls
