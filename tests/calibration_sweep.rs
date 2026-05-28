@@ -470,15 +470,15 @@ fn mag_name_from_path(path: &Path) -> Option<String> {
     Some(trimmed)
 }
 
-/// Build an `(absorbed_pairs, labels)`-style canonical pair set from a
-/// `ClusterResult`. Each row with `rep_contig != member_contig` becomes
-/// one canonical pair; representative rows (the partition's
-/// self-loops) are dropped.
+/// Build an `(absorbed_pairs, labels)`-style canonical pair set from
+/// cluster output rows. Each row with `rep_contig != member_contig`
+/// becomes one canonical pair; representative rows (the partition's
+/// self-loops) are dropped. Used by both the new precomputed-edges
+/// sweep path and the old full-pipeline path the equivalence test
+/// cross-checks against.
 #[cfg(feature = "fastx")]
-fn absorbed_pairs_from_result(result: &rype::cluster::ClusterResult) -> HashSet<(String, String)> {
-    result
-        .rows
-        .iter()
+fn absorbed_pairs_from_rows(rows: &[rype::cluster::ClusterRow]) -> HashSet<(String, String)> {
+    rows.iter()
         .filter(|r| r.rep_contig != r.member_contig)
         .map(|r| canonical_pair(&r.rep_contig, &r.member_contig))
         .collect()
@@ -507,7 +507,9 @@ fn absorbed_pairs_from_result(result: &rype::cluster::ClusterResult) -> HashSet<
 #[test]
 #[ignore]
 fn run_calibration_sweep() -> Result<()> {
-    use rype::cluster::{cluster_contigs, ClusterConfig};
+    use rype::cluster::edges::build_edges;
+    use rype::cluster::greedy::greedy_dereplicate;
+    use rype::cluster::{ClusterConfig, ClusterEdge};
     use rype::ChainParams;
 
     let genomes_dir = require_env_path("RYPE_CALIB_GENOMES")?;
@@ -570,23 +572,86 @@ fn run_calibration_sweep() -> Result<()> {
     let base = base_config_from_env()?;
     let chain_window = base.w;
 
+    // Phase A — INVARIANT WORK done ONCE PER RUN.
+    //
+    // The sweep varies only two knobs: `min_chain_containment` (the greedy
+    // gate threshold) and `ChainParams.min_anchors` (a post-DP filter on
+    // chain length). Neither affects minimizer extraction, the temp
+    // inverted index, classify hits, anchor merge-join, or the banded-DP
+    // score itself — those depend solely on (k, w, salt, min_shared,
+    // threshold), all fixed across the sweep. So we run `build_edges` ONCE
+    // with the most permissive `min_anchors = 1` to capture every chain
+    // the sweep could possibly care about, then per cell we just:
+    //   - rewrite each edge's `chain` to `None` if its anchor count falls
+    //     below this cell's `min_anchors` (greedy treats those as "chain
+    //     DP returned None" and rejects them when the gate is `Some`); and
+    //   - call `greedy_dereplicate` with the cell's containment.
+    //
+    // On 16K WoL2 MAGs this turns a ~12-hour run (35× full pipeline) into
+    // a ~25-minute run (1× full pipeline + 35× cheap greedy). The
+    // `precomputed_sweep_matches_full_pipeline_per_cell` test below pins
+    // this is exactly equivalent to running cluster_contigs per cell.
+    let mut invariant_chain_params = ChainParams::starting_for_w(chain_window);
+    invariant_chain_params.min_anchors = 1;
+    let invariant_cfg = ClusterConfig {
+        chain_params: Some(invariant_chain_params),
+        // Gate disabled during build_edges — it's applied per cell in greedy.
+        min_chain_containment: None,
+        ..base.clone()
+    };
+
+    // Mirror cluster_contigs' min_length filter — build_edges itself does
+    // not apply it, but the production cluster_contigs always does, so a
+    // per-cell equivalence requires the same pre-filter here.
+    let filtered: Vec<rype::cluster::ContigInput> = inputs
+        .into_iter()
+        .filter(|c| (c.sequence.len() as u64) >= base.min_length)
+        .collect();
+    if filtered.is_empty() {
+        return Err(anyhow!(
+            "no inputs survive min_length={} filter — every MAG was shorter than threshold",
+            base.min_length
+        ));
+    }
+
+    eprintln!(
+        "[calib] phase A: extracting minimizers, building temp index, classifying, running chain DP (once per run)"
+    );
+    let workdir = tempfile::tempdir().context("creating clustering workdir")?;
+    let t_phase_a = std::time::Instant::now();
+    let edge_out = build_edges(&filtered, &invariant_cfg, workdir.path())
+        .context("phase A build_edges failed")?;
+    eprintln!(
+        "[calib] phase A complete: {} contigs, {} edges ({:.1}s)",
+        edge_out.contigs.len(),
+        edge_out.edges.len(),
+        t_phase_a.elapsed().as_secs_f64()
+    );
+    // Reclaim memory: input MAG bytes (~38 GB on WoL2) and the temp
+    // Parquet shards (~tens of GB) are not needed by phase B.
+    drop(filtered);
+    drop(workdir);
+
+    // Phase B — per cell — adjust chain visibility + greedy + score.
     let mut results: Vec<(f64, u32, CellResult)> = Vec::with_capacity(grid.len());
     for (cell_idx, (containment, min_anchors)) in grid.iter().enumerate() {
-        let mut chain_params = ChainParams::starting_for_w(chain_window);
-        chain_params.min_anchors = *min_anchors;
-        let cfg = ClusterConfig {
-            chain_params: Some(chain_params),
-            min_chain_containment: Some(*containment),
-            ..base.clone()
-        };
         let t0 = std::time::Instant::now();
-        let result = cluster_contigs(inputs.clone(), &cfg).with_context(|| {
-            format!(
-                "cluster_contigs failed for cell ({}, {})",
-                containment, min_anchors
-            )
-        })?;
-        let absorbed = absorbed_pairs_from_result(&result);
+        let cell_edges: Vec<ClusterEdge> = edge_out
+            .edges
+            .iter()
+            .map(|e| ClusterEdge {
+                chain: e.chain.filter(|c| c.anchors >= *min_anchors),
+                ..*e
+            })
+            .collect();
+        let rows = greedy_dereplicate(
+            &cell_edges,
+            &edge_out.contigs,
+            base.threshold,
+            base.min_shared,
+            Some(*containment),
+        );
+        let absorbed = absorbed_pairs_from_rows(&rows);
         let cell = score_cell(&absorbed, &labels);
         let (p, r, f1) = metrics(&cell);
         eprintln!(
@@ -668,6 +733,151 @@ fn load_mag_directory_constructs_mag_scoped_contig_ids() {
     assert_eq!(inputs[2].id, "genome_beta::ctgX");
     assert_eq!(inputs[2].source_mag.as_deref(), Some("genome_beta"));
     assert_eq!(inputs[2].sequence, b"AAAACCCC");
+}
+
+/// WHY: this is the load-bearing correctness check for the Plan 1.6.1
+/// optimization. The new harness runs `build_edges` ONCE per sweep with
+/// permissive `min_anchors = 1`, then per cell rewrites each edge's
+/// `chain` to `None` if `anchors < cell.min_anchors` and calls
+/// `greedy_dereplicate`. The hypothesis is: that's exactly equivalent
+/// to running the full pipeline with `chain_params.min_anchors =
+/// cell.min_anchors` directly. If the equivalence ever breaks (e.g.
+/// chain DP's internal scoring changes to depend on `min_anchors`
+/// beyond the post-filter), this test catches it. We test multiple
+/// (containment, min_anchors) cells covering permissive AND strict
+/// gate regimes so the gate-rejection path and the gate-accept path
+/// both run.
+#[cfg(feature = "fastx")]
+#[test]
+fn precomputed_sweep_matches_full_pipeline_per_cell() {
+    use rype::cluster::edges::build_edges;
+    use rype::cluster::greedy::greedy_dereplicate;
+    use rype::cluster::{cluster_contigs, ClusterConfig, ClusterEdge, ContigInput};
+    use rype::ChainParams;
+
+    // Deterministic synthetic seed used by other cluster tests in this
+    // workspace (mirrors `tests/cluster_chain_roundtrip.rs::seq_from_seed`).
+    fn seq_from_seed(len: usize, seed: u64) -> Vec<u8> {
+        let bases = b"ACGT";
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                bases[(state >> 33) as usize % 4]
+            })
+            .collect()
+    }
+
+    // 4 contigs:
+    //   A (30 KB seed 1) — full genome.
+    //   B = A[2000..28000] — 26 KB fragment of A, should chain & absorb.
+    //   C (30 KB seed 99) — independent, should never absorb into A/B.
+    //   D = C[3000..27000] — 24 KB fragment of C, should chain & absorb into C.
+    // All > min_length so the filter doesn't drop them.
+    let seq_a = seq_from_seed(30_000, 1);
+    let seq_b = seq_a[2_000..28_000].to_vec();
+    let seq_c = seq_from_seed(30_000, 99);
+    let seq_d = seq_c[3_000..27_000].to_vec();
+    let inputs = vec![
+        ContigInput {
+            id: "A".into(),
+            source_mag: Some("magA".into()),
+            sequence: seq_a,
+        },
+        ContigInput {
+            id: "B".into(),
+            source_mag: Some("magA".into()),
+            sequence: seq_b,
+        },
+        ContigInput {
+            id: "C".into(),
+            source_mag: Some("magC".into()),
+            sequence: seq_c,
+        },
+        ContigInput {
+            id: "D".into(),
+            source_mag: Some("magC".into()),
+            sequence: seq_d,
+        },
+    ];
+
+    let base = ClusterConfig {
+        k: 32,
+        w: 50,
+        salt: 0x5555_5555_5555_5555,
+        min_length: 10_000,
+        threshold: 0.50,
+        min_shared: 1,
+        chain_params: None, // overridden per path below
+        min_chain_containment: None,
+    };
+
+    // PHASE A (new path): build_edges ONCE with permissive min_anchors=1.
+    let mut invariant_chain = ChainParams::starting_for_w(base.w);
+    invariant_chain.min_anchors = 1;
+    let invariant_cfg = ClusterConfig {
+        chain_params: Some(invariant_chain),
+        ..base.clone()
+    };
+    let workdir = tempfile::tempdir().unwrap();
+    let edge_out = build_edges(&inputs, &invariant_cfg, workdir.path())
+        .expect("invariant build_edges must succeed on fixture");
+
+    // Test cells covering permissive AND strict regimes on BOTH axes so
+    // the gate-accept (cell.containment small) and gate-reject
+    // (cell.containment large) paths AND the
+    // anchor-suppression-rewrites-chain-to-None path all execute.
+    let cells = [(0.30_f64, 3_u32), (0.80, 3), (0.30, 50), (0.99, 10_000)];
+    for (containment, min_anchors) in cells {
+        // NEW PATH: rewrite + greedy.
+        let cell_edges: Vec<ClusterEdge> = edge_out
+            .edges
+            .iter()
+            .map(|e| ClusterEdge {
+                chain: e.chain.filter(|c| c.anchors >= min_anchors),
+                ..*e
+            })
+            .collect();
+        let new_rows = greedy_dereplicate(
+            &cell_edges,
+            &edge_out.contigs,
+            base.threshold,
+            base.min_shared,
+            Some(containment),
+        );
+        let new_absorbed = absorbed_pairs_from_rows(&new_rows);
+
+        // OLD PATH: full cluster_contigs with this cell's chain config.
+        let mut chain_params = ChainParams::starting_for_w(base.w);
+        chain_params.min_anchors = min_anchors;
+        let old_cfg = ClusterConfig {
+            chain_params: Some(chain_params),
+            min_chain_containment: Some(containment),
+            ..base.clone()
+        };
+        let old_result = cluster_contigs(inputs.clone(), &old_cfg)
+            .expect("old-path cluster_contigs must succeed on fixture");
+        let old_absorbed = absorbed_pairs_from_rows(&old_result.rows);
+
+        assert_eq!(
+            new_absorbed, old_absorbed,
+            "absorbed-pair sets must match for cell (containment={}, min_anchors={}). \
+             new={:?} old={:?}",
+            containment, min_anchors, new_absorbed, old_absorbed
+        );
+        // Also assert the row count matches — catches a regression where the
+        // new path produces extra/missing representatives even if the
+        // absorbed pairs happen to align.
+        assert_eq!(
+            new_rows.len(),
+            old_result.rows.len(),
+            "row count must match for cell (containment={}, min_anchors={})",
+            containment,
+            min_anchors
+        );
+    }
 }
 
 /// Required-env helper: return the value as a `PathBuf` or a clear error.
