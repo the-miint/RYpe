@@ -56,6 +56,16 @@ extension needed — uses the same `librype.so` shared library.
 - Requires `pyarrow` (tested with 23.0.0, Python 3.13)
 - Requires `cargo build --release --lib --features arrow-ffi`
 
+### pyarrow_build_example.py
+
+Demonstrates building a `.ryxdi` index from streaming Arrow data via
+`rype_index_build_from_arrow()`. Mirrors a DuckDB/DuckLake pipeline that stores
+genome sequences as fixed-size chunks (`feature_idx`, `chunk_index`,
+`chunk_data`) plus a small `feature_idx -> bucket_name` mapping.
+
+- `rype_index_build_from_arrow()` — build an index from two Arrow streams
+- Requires `pyarrow` and `cargo build --release --lib --features arrow-ffi`
+
 **These Python examples are NOT part of the regular test suite or build
 dependencies.** They have been manually verified but are not run by `cargo test`.
 

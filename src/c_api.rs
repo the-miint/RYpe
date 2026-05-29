@@ -2198,6 +2198,124 @@ mod arrow_ffi {
         )
     }
 
+    // -------------------------------------------------------------------------
+    // Public API: Build an index from streaming Arrow data
+    // -------------------------------------------------------------------------
+
+    /// Build a `.ryxdi` index from two Arrow streams: a chunk stream of genome
+    /// sequences split into ordered blocks, plus a small feature→bucket mapping.
+    ///
+    /// Both streams are **consumed** (the Arrow C release callback is invoked); do
+    /// not release or reuse them after this call.
+    ///
+    /// # Chunk stream schema
+    /// - `feature_idx`: Int64 — genome / read identifier
+    /// - `chunk_index`: Int32 or Int64 — block order within a feature (0-based,
+    ///   contiguous, ascending; a feature's chunks must arrive together)
+    /// - `chunk_data`: Binary/LargeBinary/Utf8/LargeUtf8/BinaryView/Utf8View — bytes
+    ///
+    /// # Mapping stream schema
+    /// - `feature_idx`: Int64
+    /// - `bucket_name`: Utf8/LargeUtf8/Utf8View — target bucket label
+    ///
+    /// # Arguments
+    /// - `output_path`: NUL-terminated path to the `.ryxdi` directory to create
+    /// - `chunk_stream`, `mapping_stream`: Arrow C streams (consumed)
+    /// - `k`: k-mer size — must be 16, 32, or 64
+    /// - `w`: minimizer window size
+    /// - `salt`: hash salt
+    /// - `orient`: non-zero to orient sequences within each bucket
+    /// - `max_memory_bytes`: memory budget; 0 = auto-detect
+    ///
+    /// # Safety
+    /// - `output_path` must be a valid NUL-terminated C string.
+    /// - `chunk_stream` and `mapping_stream` must be valid, non-null pointers to
+    ///   `FFI_ArrowArrayStream`; ownership is taken by this call. (On a NULL-arg
+    ///   error the function returns -1 before taking ownership of either stream.)
+    ///
+    /// # On error
+    /// The output directory is written incrementally and is not atomic; on a -1
+    /// return a partial, manifest-less directory may remain at `output_path` and
+    /// should be discarded.
+    ///
+    /// # Returns
+    /// 0 on success, -1 on error. Call `rype_get_last_error()` for details.
+    #[no_mangle]
+    pub unsafe extern "C" fn rype_index_build_from_arrow(
+        output_path: *const c_char,
+        chunk_stream: *mut FFI_ArrowArrayStream,
+        mapping_stream: *mut FFI_ArrowArrayStream,
+        k: size_t,
+        w: size_t,
+        salt: u64,
+        orient: c_int,
+        max_memory_bytes: size_t,
+    ) -> i32 {
+        if output_path.is_null() {
+            set_last_error("output_path is NULL".to_string());
+            return -1;
+        }
+        if chunk_stream.is_null() {
+            set_last_error("chunk_stream is NULL".to_string());
+            return -1;
+        }
+        if mapping_stream.is_null() {
+            set_last_error("mapping_stream is NULL".to_string());
+            return -1;
+        }
+
+        let path = match CStr::from_ptr(output_path).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                set_last_error(format!("Invalid UTF-8 in output_path: {}", e));
+                return -1;
+            }
+        };
+
+        // from_raw takes ownership of each stream (consuming it).
+        let chunk_reader = match ArrowArrayStreamReader::from_raw(chunk_stream) {
+            Ok(r) => r,
+            Err(e) => {
+                set_last_error(format!("Failed to read chunk stream: {}", e));
+                return -1;
+            }
+        };
+        let mapping_reader = match ArrowArrayStreamReader::from_raw(mapping_stream) {
+            Ok(r) => r,
+            Err(e) => {
+                set_last_error(format!("Failed to read mapping stream: {}", e));
+                return -1;
+            }
+        };
+
+        let max_memory = if max_memory_bytes == 0 {
+            None
+        } else {
+            Some(max_memory_bytes)
+        };
+
+        match crate::parquet_index::build_index_from_arrow(
+            std::path::Path::new(path),
+            chunk_reader,
+            mapping_reader,
+            k,
+            w,
+            salt,
+            orient != 0,
+            max_memory,
+            None,
+        ) {
+            Ok(_stats) => {
+                clear_last_error();
+                0
+            }
+            Err(e) => {
+                set_last_error(format!("Index build failed: {}", e));
+                -1
+            }
+        }
+    }
+
     /// Returns the schema for classification result batches as an FFI_ArrowSchema.
     ///
     /// This allows callers to pre-allocate memory or validate expected output format.
@@ -2618,6 +2736,166 @@ pub use arrow_ffi::*;
 #[cfg(test)]
 mod c_api_tests {
     use super::*;
+
+    // ===== Arrow build FFI (Phase 6) =====
+
+    #[cfg(feature = "arrow-ffi")]
+    fn export_stream(
+        batches: Vec<RecordBatch>,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> FFI_ArrowArrayStream {
+        let reader = arrow::record_batch::RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema,
+        );
+        FFI_ArrowArrayStream::new(Box::new(reader))
+    }
+
+    #[cfg(feature = "arrow-ffi")]
+    #[test]
+    fn test_build_from_arrow_ffi_roundtrip() {
+        use arrow::array::{ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let (k, w, salt) = (16usize, 5usize, 0x5555_5555_5555_5555u64);
+        // A sequence split across two chunks (forces boundary reassembly).
+        let seq: Vec<u8> =
+            b"ACGTACGTTGCAACGTGGTTACACGGTACACACGTTTGACACGTGGTACTTACAGGTAACGTACGT".to_vec();
+        let mid = seq.len() / 2;
+
+        let chunk_schema = Arc::new(Schema::new(vec![
+            Field::new("feature_idx", DataType::Int64, false),
+            Field::new("chunk_index", DataType::Int32, false),
+            Field::new("chunk_data", DataType::Binary, false),
+        ]));
+        let chunk_batch = RecordBatch::try_new(
+            chunk_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 1])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![0i32, 1])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![&seq[..mid], &seq[mid..]])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let map_schema = Arc::new(Schema::new(vec![
+            Field::new("feature_idx", DataType::Int64, false),
+            Field::new("bucket_name", DataType::Utf8, false),
+        ]));
+        let map_batch = RecordBatch::try_new(
+            map_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["g1"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("idx.ryxdi");
+        let out_c = CString::new(out.to_str().unwrap()).unwrap();
+
+        let mut chunk_stream = export_stream(vec![chunk_batch], chunk_schema);
+        let mut map_stream = export_stream(vec![map_batch], map_schema);
+
+        let rc = unsafe {
+            rype_index_build_from_arrow(
+                out_c.as_ptr(),
+                &mut chunk_stream as *mut _,
+                &mut map_stream as *mut _,
+                k,
+                w,
+                salt,
+                0,
+                64 << 20,
+            )
+        };
+        assert_eq!(rc, 0, "build failed: {}", unsafe {
+            CStr::from_ptr(rype_get_last_error()).to_string_lossy()
+        });
+
+        let idx = crate::ShardedInvertedIndex::open(&out).unwrap();
+        assert_eq!(idx.manifest().k, k);
+        assert_eq!(idx.manifest().w, w);
+        assert!(idx.total_minimizers() > 0);
+    }
+
+    #[cfg(feature = "arrow-ffi")]
+    #[test]
+    fn test_build_from_arrow_ffi_invalid_k() {
+        use arrow::array::{ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let chunk_schema = Arc::new(Schema::new(vec![
+            Field::new("feature_idx", DataType::Int64, false),
+            Field::new("chunk_index", DataType::Int32, false),
+            Field::new("chunk_data", DataType::Binary, false),
+        ]));
+        let chunk_batch = RecordBatch::try_new(
+            chunk_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![0i32])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![b"ACGTACGTACGTACGT".as_ref()])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let map_schema = Arc::new(Schema::new(vec![
+            Field::new("feature_idx", DataType::Int64, false),
+            Field::new("bucket_name", DataType::Utf8, false),
+        ]));
+        let map_batch = RecordBatch::try_new(
+            map_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["g1"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_c = CString::new(dir.path().join("idx.ryxdi").to_str().unwrap()).unwrap();
+        let mut chunk_stream = export_stream(vec![chunk_batch], chunk_schema);
+        let mut map_stream = export_stream(vec![map_batch], map_schema);
+
+        let rc = unsafe {
+            rype_index_build_from_arrow(
+                out_c.as_ptr(),
+                &mut chunk_stream as *mut _,
+                &mut map_stream as *mut _,
+                20, // invalid k
+                5,
+                0,
+                0,
+                64 << 20,
+            )
+        };
+        assert_eq!(rc, -1);
+        let msg = unsafe { CStr::from_ptr(rype_get_last_error()).to_string_lossy() };
+        assert!(msg.contains("16, 32, or 64"), "{msg}");
+    }
+
+    #[cfg(feature = "arrow-ffi")]
+    #[test]
+    fn test_build_from_arrow_ffi_null_args() {
+        let rc = unsafe {
+            rype_index_build_from_arrow(
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                16,
+                5,
+                0,
+                0,
+                0,
+            )
+        };
+        assert_eq!(rc, -1);
+        let msg = unsafe { CStr::from_ptr(rype_get_last_error()).to_string_lossy() };
+        assert!(msg.contains("output_path is NULL"), "{msg}");
+    }
 
     #[test]
     fn test_validate_query_null_seq() {
