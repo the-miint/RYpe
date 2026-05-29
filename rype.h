@@ -1199,6 +1199,72 @@ struct ArrowArrayStream {
 #endif // ARROW_C_DATA_INTERFACE
 
 // ----------------------------------------------------------------------------
+// Arrow Index Building
+// ----------------------------------------------------------------------------
+
+/**
+ * Build a .ryxdi index from streaming Arrow data.
+ *
+ * Consumes two Arrow streams: a chunk stream of genome sequences split into
+ * ordered blocks (e.g. 64 KB), and a small feature->bucket name mapping. Each
+ * feature's chunks are reassembled (in chunk_index order) before minimizer
+ * extraction, so minimizers are correct across chunk boundaries. Bucket IDs are
+ * assigned internally over the sorted unique bucket names.
+ *
+ * @param output_path      NUL-terminated path to the .ryxdi directory to create
+ * @param chunk_stream     Input ArrowArrayStream of sequence chunks (see schema)
+ * @param mapping_stream   Input ArrowArrayStream of feature->bucket rows
+ * @param k                K-mer size; must be 16, 32, or 64
+ * @param w                Minimizer window size
+ * @param salt             XOR salt for k-mer hashing
+ * @param orient           Non-zero to orient sequences within each bucket
+ * @param max_memory_bytes Memory budget in bytes; 0 = auto-detect
+ * @return                 0 on success, -1 on error (see rype_get_last_error())
+ *
+ * ## Chunk stream schema
+ *
+ * | Column      | Type                              | Description                  |
+ * |-------------|-----------------------------------|------------------------------|
+ * | feature_idx | Int64                             | Genome / read identifier     |
+ * | chunk_index | Int32 or Int64                    | Block order (0-based, ascend)|
+ * | chunk_data  | Binary/LargeBinary/Utf8/LargeUtf8 | Sequence bytes for the block |
+ *
+ * A feature's chunks must arrive contiguously and in ascending, 0-based,
+ * gap-free chunk_index order; violations are reported as errors.
+ *
+ * ## Mapping stream schema
+ *
+ * | Column      | Type   | Description         |
+ * |-------------|--------|---------------------|
+ * | feature_idx | Int64  | Genome / read id    |
+ * | bucket_name | Utf8   | Target bucket label |
+ *
+ * ## Memory Management
+ *
+ * - This function TAKES OWNERSHIP of both chunk_stream and mapping_stream
+ *   (their release callbacks are invoked); do not release or reuse them.
+ *   Exception: if a NULL argument is detected the function returns -1 before
+ *   taking ownership of either stream, so the caller still owns them.
+ *
+ * ## On Error
+ *
+ * The index directory is written incrementally and is NOT atomic. If this
+ * function returns -1 partway through, a partial (manifest-less, unusable)
+ * directory may remain at output_path; discard it. Build into a temporary path
+ * and move it into place on success if atomicity is required.
+ */
+int rype_index_build_from_arrow(
+    const char* output_path,
+    struct ArrowArrayStream* chunk_stream,
+    struct ArrowArrayStream* mapping_stream,
+    size_t k,
+    size_t w,
+    uint64_t salt,
+    int orient,
+    size_t max_memory_bytes
+);
+
+// ----------------------------------------------------------------------------
 // Arrow Classification Functions
 // ----------------------------------------------------------------------------
 

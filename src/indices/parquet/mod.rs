@@ -14,6 +14,7 @@
 //! Note: The main index uses the single-file format (.ryidx) only.
 //! Parquet format is only used for the inverted index.
 
+mod arrow_build;
 mod buckets;
 mod manifest;
 pub mod merge;
@@ -41,6 +42,7 @@ pub mod files {
 }
 
 // Re-export public types from submodules
+pub use arrow_build::{build_index_from_arrow, ArrowBuildStats};
 pub use buckets::{read_buckets_parquet, write_buckets_parquet};
 pub use manifest::{
     create_index_directory, is_parquet_index, BucketData, BucketMetadata, InvertedManifest,
