@@ -2744,10 +2744,8 @@ mod c_api_tests {
         batches: Vec<RecordBatch>,
         schema: arrow::datatypes::SchemaRef,
     ) -> FFI_ArrowArrayStream {
-        let reader = arrow::record_batch::RecordBatchIterator::new(
-            batches.into_iter().map(Ok),
-            schema,
-        );
+        let reader =
+            arrow::record_batch::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
         FFI_ArrowArrayStream::new(Box::new(reader))
     }
 

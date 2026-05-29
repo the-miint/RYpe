@@ -169,8 +169,7 @@ fn build_index_from_arrow_inner(
     let mut pending_bytes: usize = 0;
 
     for batch in chunks {
-        let batch =
-            batch.map_err(|e| RypeError::validation(format!("chunk stream error: {e}")))?;
+        let batch = batch.map_err(|e| RypeError::validation(format!("chunk stream error: {e}")))?;
         for (fid, seq) in reasm.push_batch(&batch)? {
             pending_bytes += seq.len();
             pending.push((fid, seq));
@@ -232,7 +231,12 @@ fn build_index_from_arrow_inner(
     } else {
         Some(&file_stats)
     };
-    write_buckets_parquet(output_dir, &bmap.bucket_names, &bucket_sources, file_stats_opt)?;
+    write_buckets_parquet(
+        output_dir,
+        &bmap.bucket_names,
+        &bucket_sources,
+        file_stats_opt,
+    )?;
 
     let source_hash = compute_source_hash(&bucket_min_counts);
     let num_buckets = bmap.num_buckets();
@@ -285,10 +289,11 @@ fn write_feature_minimizers(
     // there is no file in this data model, so the path-part is the literal "feature_idx"
     // and the seq-part is the integer id, e.g. "feature_idx::12345". This keeps
     // `index bucket-source-detail` (which splits on the delimiter) well-formed.
-    bucket_sources
-        .entry(bucket_id)
-        .or_default()
-        .push(format!("feature_idx{}{}", crate::BUCKET_SOURCE_DELIM, fid));
+    bucket_sources.entry(bucket_id).or_default().push(format!(
+        "feature_idx{}{}",
+        crate::BUCKET_SOURCE_DELIM,
+        fid
+    ));
     bucket_file_lengths
         .entry(bucket_id)
         .or_default()
@@ -534,10 +539,9 @@ impl<'a> IndexColumn<'a> {
 
 /// Look up a required column index by name.
 fn column_index(batch: &RecordBatch, name: &str) -> RypeResult<usize> {
-    batch
-        .schema()
-        .index_of(name)
-        .map_err(|_| RypeError::validation(format!("chunk batch missing required column '{}'", name)))
+    batch.schema().index_of(name).map_err(|_| {
+        RypeError::validation(format!("chunk batch missing required column '{}'", name))
+    })
 }
 
 /// Decode the three chunk columns from a batch into typed accessors.
@@ -852,7 +856,8 @@ mod tests {
     fn chunk_batch(rows: &[(i64, i32, &[u8])]) -> RecordBatch {
         let features: Int64Array = rows.iter().map(|(f, _, _)| *f).collect();
         let indices: Int32Array = rows.iter().map(|(_, c, _)| *c).collect();
-        let data: BinaryArray = BinaryArray::from(rows.iter().map(|(_, _, d)| *d).collect::<Vec<_>>());
+        let data: BinaryArray =
+            BinaryArray::from(rows.iter().map(|(_, _, d)| *d).collect::<Vec<_>>());
         let schema = Schema::new(vec![
             Field::new(COL_FEATURE_IDX, DataType::Int64, false),
             Field::new(COL_CHUNK_INDEX, DataType::Int32, false),
@@ -889,7 +894,10 @@ mod tests {
             (2, 0, b"GGGG"),
         ]);
         let out = reassemble(&[batch]).unwrap();
-        assert_eq!(out, vec![(1, b"ACGTTTGGCC".to_vec()), (2, b"GGGG".to_vec())]);
+        assert_eq!(
+            out,
+            vec![(1, b"ACGTTTGGCC".to_vec()), (2, b"GGGG".to_vec())]
+        );
     }
 
     #[test]
@@ -897,7 +905,10 @@ mod tests {
         let b1 = chunk_batch(&[(7, 0, b"AAAA"), (7, 1, b"CCCC")]);
         let b2 = chunk_batch(&[(7, 2, b"GGGG"), (8, 0, b"TTTT")]);
         let out = reassemble(&[b1, b2]).unwrap();
-        assert_eq!(out, vec![(7, b"AAAACCCCGGGG".to_vec()), (8, b"TTTT".to_vec())]);
+        assert_eq!(
+            out,
+            vec![(7, b"AAAACCCCGGGG".to_vec()), (8, b"TTTT".to_vec())]
+        );
     }
 
     #[test]
@@ -919,7 +930,10 @@ mod tests {
     fn rejects_nonzero_first_chunk() {
         let batch = chunk_batch(&[(1, 1, b"AC")]);
         let err = reassemble(&[batch]).unwrap_err();
-        assert!(err.to_string().contains("first chunk_index must be 0"), "{err}");
+        assert!(
+            err.to_string().contains("first chunk_index must be 0"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -967,8 +981,12 @@ mod tests {
     #[test]
     fn assigns_deterministic_ids_over_sorted_names() {
         // Two distinct names; "alpha" sorts before "zeta" → alpha=1, zeta=2.
-        let m = bucket_map(vec![mapping_batch(&[(10, "zeta"), (20, "alpha"), (30, "alpha")])])
-            .unwrap();
+        let m = bucket_map(vec![mapping_batch(&[
+            (10, "zeta"),
+            (20, "alpha"),
+            (30, "alpha"),
+        ])])
+        .unwrap();
         assert_eq!(m.num_buckets(), 2);
         let alpha = m.bucket_of(20).unwrap();
         let zeta = m.bucket_of(10).unwrap();
@@ -1015,7 +1033,10 @@ mod tests {
         assert!(!m.mark_feature_done(a), "first of two should not complete");
         assert!(m.mark_feature_done(a), "second of two should complete");
         // bucket b has 1 feature.
-        assert!(m.mark_feature_done(b), "single feature completes immediately");
+        assert!(
+            m.mark_feature_done(b),
+            "single feature completes immediately"
+        );
     }
 
     #[test]
@@ -1210,12 +1231,17 @@ mod tests {
         )
         .unwrap();
 
-        let (_names, sources, _stats) =
-            crate::parquet_index::read_buckets_parquet(&out).unwrap();
+        let (_names, sources, _stats) = crate::parquet_index::read_buckets_parquet(&out).unwrap();
         let bucket_sources = sources.values().next().unwrap();
         let mut got: Vec<&String> = bucket_sources.iter().collect();
         got.sort();
-        assert_eq!(got, vec![&"feature_idx::10".to_string(), &"feature_idx::20".to_string()]);
+        assert_eq!(
+            got,
+            vec![
+                &"feature_idx::10".to_string(),
+                &"feature_idx::20".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1267,7 +1293,10 @@ mod tests {
         )
         .unwrap();
         let got_on = load_all_minimizers(&ShardedInvertedIndex::open(&out_on).unwrap()).unwrap();
-        assert_eq!(got_on, want, "orientation should flip RC feature back to baseline");
+        assert_eq!(
+            got_on, want,
+            "orientation should flip RC feature back to baseline"
+        );
 
         let out_off = dir.path().join("off.ryxdi");
         build(
@@ -1321,7 +1350,10 @@ mod tests {
         )
         .unwrap();
         let got = load_all_minimizers(&ShardedInvertedIndex::open(&out).unwrap()).unwrap();
-        assert_eq!(got, want, "interleaved orientation must keep g1's baseline live for f3");
+        assert_eq!(
+            got, want,
+            "interleaved orientation must keep g1's baseline live for f3"
+        );
     }
 
     #[test]
