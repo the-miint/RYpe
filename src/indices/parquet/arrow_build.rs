@@ -128,9 +128,9 @@ fn build_index_from_arrow_inner(
     options: Option<&ParquetWriteOptions>,
 ) -> RypeResult<ArrowBuildStats> {
     use crate::parquet_index::{
-        compute_source_hash, create_index_directory, write_buckets_parquet, InvertedManifest,
-        ParquetManifest, ParquetShardFormat, ShardAccumulator, FORMAT_MAGIC, FORMAT_VERSION,
-        MIN_SHARD_BYTES,
+        compute_source_hash, consolidate_shards_streaming, create_index_directory,
+        write_buckets_parquet, InvertedManifest, ParquetManifest, ParquetShardFormat,
+        ShardAccumulator, FORMAT_MAGIC, FORMAT_VERSION, MIN_SHARD_BYTES,
     };
     use crate::BucketFileStats;
     use std::collections::HashMap;
@@ -216,11 +216,32 @@ fn build_index_from_arrow_inner(
         )?;
     }
 
-    // Finalize: mirror the multi-bucket streaming tail (no consolidation; shards may
-    // overlap in minimizer range across buckets → has_overlapping_shards: true).
-    let shard_infos = acc.finish()?;
+    // Finalize by consolidating the size-thresholded intermediate shards into final,
+    // globally-deduplicated, non-overlapping shards — matching the CLI single-bucket
+    // streaming build (`commands::index::consolidate_streaming_shards`). The streaming
+    // accumulator dedups only within each flush buffer, so a minimizer carried by
+    // features that fall in different flush windows is re-stored once per shard. Without
+    // this merge a single-bucket index bloats by the average number of shards a minimizer
+    // spans — measured ~60x on a real human-reference build. The k-way merge streams
+    // pairs (peak memory O(num_shards * batch + shard_size)), so it does not rebuild the
+    // corpus-wide footprint the windowed feed exists to avoid.
+    let intermediate = acc.finish()?;
+    let (shard_infos, total_entries) = if intermediate.len() <= 1 {
+        // A lone shard is already sorted + deduped by ShardAccumulator::flush_shard, so
+        // it already satisfies the non-overlapping / deduplicated contract.
+        let total = intermediate.iter().map(|s| s.num_entries).sum();
+        (intermediate, total)
+    } else {
+        // `bucket_id` is only a log label inside consolidation (the merge preserves each
+        // pair's own bucket_id, read from the shard), so 0 is correct even for a
+        // multi-bucket build.
+        consolidate_shards_streaming(output_dir, &intermediate, 0, shard_size, &opts)?
+    };
     let num_shards = shard_infos.len() as u32;
-    let total_entries: u64 = shard_infos.iter().map(|s| s.num_entries).sum();
+    // After consolidation every (minimizer, bucket_id) pair is stored exactly once, so the
+    // physical entry count is the true minimizer total — the CLI reports it the same way
+    // (commands::index sets the manifest's total_minimizers from the consolidated count).
+    total_minimizers = total_entries;
 
     let file_stats: HashMap<u32, BucketFileStats> = bucket_file_lengths
         .iter()
@@ -254,7 +275,7 @@ fn build_index_from_arrow_inner(
             format: ParquetShardFormat::Parquet,
             num_shards,
             total_entries,
-            has_overlapping_shards: true,
+            has_overlapping_shards: false,
             shards: shard_infos,
         }),
     };
@@ -1409,5 +1430,101 @@ mod tests {
         assert_eq!(stats_small.num_buckets, 3);
         assert_eq!(stats_small.num_features, stats_big.num_features);
         assert_eq!(stats_small.num_buckets, stats_big.num_buckets);
+    }
+
+    #[test]
+    fn arrow_build_consolidates_cross_shard_duplicates() {
+        // A single bucket of many IDENTICAL features makes every minimizer recur in
+        // every flush window. With a tiny shard budget the streaming accumulator writes
+        // several intermediate shards that each re-contain the full minimizer set; an
+        // un-consolidated build stores each (minimizer, bucket) pair once per shard,
+        // inflating the index by the number of shards (measured ~60x on a real
+        // human-reference build) and leaving the shards minimizer-overlapping. The Arrow
+        // build must consolidate — like the CLI single-bucket path — so the stored entry
+        // count collapses to the true unique count and the final shards are range-disjoint.
+
+        // High-diversity DNA so each feature yields ~one distinct minimizer per window
+        // (make_dna is too periodic to reliably overflow a shard); identical across
+        // features so they share every minimizer. xorshift64 — deterministic, no RNG dep.
+        fn diverse_dna(n: usize, seed: u64) -> Vec<u8> {
+            let alpha = b"ACGT";
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    alpha[(x & 3) as usize]
+                })
+                .collect()
+        }
+
+        let (k, w, salt) = (16usize, 5usize, 0x5555_5555_5555_5555u64);
+        let seq = diverse_dna(25_000, 1);
+        let nfeat = 40i64;
+        let chunks: Vec<RecordBatch> = (1..=nfeat)
+            .map(|f| single_feature_chunk_batch(f, &seq, 64))
+            .collect();
+        let map_rows: Vec<(i64, &str)> = (1..=nfeat).map(|f| (f, "g")).collect();
+        let mapping = vec![mapping_batch(&map_rows)];
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("idx.ryxdi");
+        // available = 2 MiB → shard_size = max(1 MiB, 1 MiB) = 1 MiB (~65k entries/flush);
+        // 40 identical ~25k-minimizer features each re-add the full set, forcing many
+        // intermediate flushes. batch_target_bytes large so all features extract together.
+        build_index_from_arrow_inner(
+            &out,
+            chunks.into_iter().map(Ok),
+            mapping.into_iter().map(Ok),
+            k,
+            w,
+            salt,
+            false,           // orient
+            2 << 20,         // available
+            8 * 1024 * 1024, // batch_target_bytes
+            None,
+        )
+        .unwrap();
+
+        let idx = ShardedInvertedIndex::open(&out).unwrap();
+        let unique = load_all_minimizers(&idx).unwrap();
+        assert!(!unique.is_empty(), "test sequence must yield minimizers");
+
+        let manifest = idx.manifest();
+        let stored: u64 = manifest
+            .shards
+            .iter()
+            .map(|s| s.num_minimizers as u64)
+            .sum();
+
+        // Core invariant: a single-bucket index stores each minimizer exactly once.
+        // Un-consolidated, `stored` is a multiple of `unique` (one copy per intermediate
+        // shard the minimizer landed in).
+        assert_eq!(
+            stored,
+            unique.len() as u64,
+            "single-bucket index must store each minimizer once after consolidation \
+             (stored={}, unique={})",
+            stored,
+            unique.len(),
+        );
+        assert!(
+            !manifest.has_overlapping_shards,
+            "consolidated shards must be marked non-overlapping"
+        );
+        // Final shards must be range-disjoint (consolidation invariant); shards are
+        // listed in ascending minimizer order.
+        for win in manifest.shards.windows(2) {
+            assert!(
+                win[0].min_end < win[1].min_start,
+                "shards must be range-disjoint after consolidation: \
+                 [{}..{}] then [{}..{}]",
+                win[0].min_start,
+                win[0].min_end,
+                win[1].min_start,
+                win[1].min_end,
+            );
+        }
     }
 }
