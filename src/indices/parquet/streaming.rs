@@ -813,8 +813,13 @@ impl ShardAccumulator {
             )));
         }
 
-        // Sort entries by (minimizer, bucket_id) and remove duplicates
-        self.entries.sort_unstable();
+        // Sort entries by (minimizer, bucket_id) and remove duplicates. This flush
+        // buffer holds up to ~max_shard_bytes/16 entries (≈1B at a 30 GiB build), and
+        // the sort runs on the serial flush path between parallel extraction bursts, so
+        // it is one of the build's larger single-threaded costs. par_sort_unstable
+        // parallelizes it across the rayon pool (with a sequential fallback for small
+        // buffers); the ordering — and therefore the subsequent dedup — is identical.
+        self.entries.par_sort_unstable();
         self.entries.dedup();
 
         // Extract min/max for shard info (after dedup for correct count)
