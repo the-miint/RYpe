@@ -153,6 +153,18 @@ fn build_index_from_arrow_inner(
     let opts = options.cloned().unwrap_or_default();
     let mut acc = ShardAccumulator::with_output_dir(output_dir, shard_size, Some(&opts));
 
+    // Single-bucket builds enable the cross-shard dedup filter by default: it keys on
+    // the minimizer alone (sound only with exactly one bucket) and suppresses duplicate
+    // writes at the source instead of leaving every duplicate for the finalization
+    // k-way merge to remove. The budget is a quarter of the memory budget — alongside
+    // the accumulator (available/2) and the feature batch (available/8) that keeps the
+    // working set within `available`. Once the filter fills it stops growing and the
+    // merge stays the exact backstop for whatever it could not hold. Multi-bucket
+    // builds skip it (the minimizer-only key would wrongly drop other buckets' entries).
+    if bmap.num_buckets() == 1 {
+        acc.enable_seen_filter(available / 4);
+    }
+
     // Per-bucket metadata accumulated for the manifest + buckets.parquet.
     let mut bucket_sources: HashMap<u32, Vec<String>> = HashMap::new();
     let mut bucket_min_counts: HashMap<u32, usize> = HashMap::new();
@@ -225,7 +237,27 @@ fn build_index_from_arrow_inner(
     // spans — measured ~60x on a real human-reference build. The k-way merge streams
     // pairs (peak memory O(num_shards * batch + shard_size)), so it does not rebuild the
     // corpus-wide footprint the windowed feed exists to avoid.
+    // Flush the trailing buffer first so the filter diagnostics include the final
+    // window, then read them before `finish()` consumes the accumulator. (`finish()`
+    // re-flushes, but the buffer is now empty, so that is a no-op.)
+    let verbose = std::env::var("RYPE_BUILD_VERBOSE").is_ok();
+    acc.flush_shard()?;
+    let filtered_count = acc.filtered_count();
+    let seen_len = acc.seen_len();
+    let seen_frozen = acc.seen_frozen();
+
     let intermediate = acc.finish()?;
+    if verbose {
+        let inter_entries: u64 = intermediate.iter().map(|s| s.num_entries).sum();
+        eprintln!(
+            "[arrow_build] intermediate shards: {} | entries written: {} | filtered (skipped): {} | seen retained: {} (frozen={})",
+            intermediate.len(),
+            inter_entries,
+            filtered_count,
+            seen_len,
+            seen_frozen,
+        );
+    }
     let (shard_infos, total_entries) = if intermediate.len() <= 1 {
         // A lone shard is already sorted + deduped by ShardAccumulator::flush_shard, so
         // it already satisfies the non-overlapping / deduplicated contract.
@@ -242,6 +274,9 @@ fn build_index_from_arrow_inner(
     // physical entry count is the true minimizer total — the CLI reports it the same way
     // (commands::index sets the manifest's total_minimizers from the consolidated count).
     total_minimizers = total_entries;
+    if verbose {
+        eprintln!("[arrow_build] final shards: {num_shards} | unique minimizers: {total_entries}",);
+    }
 
     let file_stats: HashMap<u32, BucketFileStats> = bucket_file_lengths
         .iter()

@@ -614,6 +614,24 @@ pub struct ShardAccumulator {
     options: ParquetWriteOptions,
     /// Accumulated shard infos from completed flushes
     shard_infos: Vec<InvertedShardInfo>,
+    /// Optional cross-shard dedup filter (SINGLE-BUCKET ONLY). When `Some`, holds —
+    /// **sorted, ascending** — the minimizers already committed to a flushed shard.
+    /// At each flush the (already sorted) buffer is differenced against this set with
+    /// a galloping two-pointer pass, so a minimizer carried across many flush windows
+    /// is written once instead of once per window. A sorted `Vec` (not a hash set) is
+    /// deliberate: the difference is sequential over both arrays — no per-key random
+    /// probes — and it costs 8 B/entry exact. Keyed on the minimizer alone, so it is
+    /// only correct when every entry shares one bucket_id (see
+    /// [`enable_seen_filter`](Self::enable_seen_filter)).
+    seen: Option<Vec<u64>>,
+    /// Stop growing `seen` once it reaches this many entries (byte budget /
+    /// [`SEEN_BYTES_PER_ENTRY`](Self::SEEN_BYTES_PER_ENTRY)). The frozen set keeps
+    /// filtering but no longer absorbs new minimizers, bounding peak RSS.
+    seen_budget_entries: usize,
+    /// True once `seen` hit `seen_budget_entries` and stopped growing.
+    seen_frozen: bool,
+    /// Count of entries dropped by the `seen` filter at flush (diagnostics).
+    filtered_count: u64,
 }
 
 /// Minimum allowed value for max_shard_bytes to prevent pathological behavior.
@@ -635,6 +653,14 @@ impl ShardAccumulator {
     /// This is intentionally conservative to ensure we flush before exceeding
     /// the memory target.
     pub const BYTES_PER_ENTRY: usize = 16;
+
+    /// Resident bytes per element held in the `seen` dedup filter.
+    ///
+    /// The filter is a sorted `Vec<u64>`, so this is exactly 8 (no hash-table
+    /// control bytes or load-factor slack). Note the merge that grows `seen`
+    /// allocates a fresh buffer, so transient peak is ~2x the steady size; the
+    /// byte budget bounds the steady size, and actual peak RSS is measured.
+    pub const SEEN_BYTES_PER_ENTRY: usize = 8;
 
     /// Create a new accumulator for size tracking only (no file writing).
     ///
@@ -658,6 +684,10 @@ impl ShardAccumulator {
             current_shard_id: 0,
             options: ParquetWriteOptions::default(),
             shard_infos: Vec::new(),
+            seen: None,
+            seen_budget_entries: 0,
+            seen_frozen: false,
+            filtered_count: 0,
         }
     }
 
@@ -689,6 +719,10 @@ impl ShardAccumulator {
             current_shard_id: 0,
             options: options.cloned().unwrap_or_default(),
             shard_infos: Vec::new(),
+            seen: None,
+            seen_budget_entries: 0,
+            seen_frozen: false,
+            filtered_count: 0,
         }
     }
 
@@ -725,6 +759,10 @@ impl ShardAccumulator {
             current_shard_id: start_shard_id,
             options: options.cloned().unwrap_or_default(),
             shard_infos: Vec::new(),
+            seen: None,
+            seen_budget_entries: 0,
+            seen_frozen: false,
+            filtered_count: 0,
         }
     }
 
@@ -749,6 +787,41 @@ impl ShardAccumulator {
     /// Returns the number of accumulated entries.
     pub fn entry_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Enable the cross-shard dedup filter with a memory budget in bytes.
+    ///
+    /// **SINGLE-BUCKET ONLY.** The filter remembers minimizers (not
+    /// (minimizer, bucket_id) pairs) that have been written to a flushed shard
+    /// and drops add-time entries whose minimizer is already known. With more
+    /// than one bucket this would discard legitimate (minimizer, other_bucket)
+    /// entries and corrupt the index, so the caller must guarantee every entry
+    /// added shares a single bucket_id.
+    ///
+    /// `budget_bytes` caps how many minimizers the filter retains
+    /// (`budget_bytes / SEEN_BYTES_PER_ENTRY`); once full it stops growing but
+    /// keeps filtering. A budget large enough to hold every unique minimizer
+    /// eliminates cross-shard duplicates entirely; a smaller one suppresses the
+    /// duplicates of whatever it captured first.
+    pub fn enable_seen_filter(&mut self, budget_bytes: usize) {
+        self.seen_budget_entries = (budget_bytes / Self::SEEN_BYTES_PER_ENTRY).max(1);
+        self.seen = Some(Vec::new());
+        self.seen_frozen = false;
+    }
+
+    /// Number of add-time entries skipped by the dedup filter (0 if disabled).
+    pub fn filtered_count(&self) -> u64 {
+        self.filtered_count
+    }
+
+    /// Number of distinct minimizers currently retained by the dedup filter.
+    pub fn seen_len(&self) -> usize {
+        self.seen.as_ref().map_or(0, |v| v.len())
+    }
+
+    /// True if the dedup filter hit its budget and stopped growing.
+    pub fn seen_frozen(&self) -> bool {
+        self.seen_frozen
     }
 
     /// Add entries to the accumulator.
@@ -822,6 +895,21 @@ impl ShardAccumulator {
         self.entries.par_sort_unstable();
         self.entries.dedup();
 
+        // Cross-shard dedup filter (single bucket): drop minimizers already written
+        // to an earlier shard. The buffer is sorted and `seen` is sorted, so this is
+        // a sequential galloping difference — not a per-key probe. Done before write
+        // so only novel minimizers hit disk.
+        if let Some(seen) = self.seen.as_ref() {
+            let dropped = drop_seen_minimizers(&mut self.entries, seen);
+            self.filtered_count += dropped;
+        }
+        // The whole window may have been seen already — nothing to write.
+        if self.entries.is_empty() {
+            self.entries.clear();
+            self.entries.shrink_to_fit();
+            return Ok(None);
+        }
+
         // Extract min/max for shard info (after dedup for correct count)
         let min_minimizer = self.entries.first().unwrap().0;
         let max_minimizer = self.entries.last().unwrap().0;
@@ -849,6 +937,48 @@ impl ShardAccumulator {
             RypeError::validation("Shard ID overflow after successful write".to_string())
         })?;
 
+        // Absorb this shard's novel minimizers into the sorted filter (kept ascending)
+        // so future windows skip them. The just-written entries are DISJOINT from
+        // `seen` (drop_seen_minimizers removed anything already present), so this is an
+        // in-place tail-merge: grow `seen` by the admitted count and merge from the
+        // back — no fresh seen.len()+novel buffer per flush, just `seen`'s own
+        // amortized growth (it can reach the GiB range). Admit at most up to the byte
+        // budget (hard cap, no overshoot); once full, freeze — the frozen set still
+        // filters and the consolidation merge removes whatever was never admitted.
+        if let Some(seen) = &mut self.seen {
+            if !self.seen_frozen {
+                let s = seen.len();
+                // Admit the first `n` novel minimizers (smallest by value, ascending),
+                // capped so `seen` never exceeds the budget.
+                let n = self
+                    .entries
+                    .len()
+                    .min(self.seen_budget_entries.saturating_sub(s));
+                if n > 0 {
+                    seen.resize(s + n, 0);
+                    // Invariant: k == i + j throughout; when j hits 0 the untouched
+                    // prefix seen[0..i] is already in its final position (k == i).
+                    let mut i = s; // original seen elements not yet placed
+                    let mut j = n; // admitted novel minimizers not yet placed
+                    let mut k = s + n; // write cursor (exclusive)
+                    while j > 0 {
+                        let novel = self.entries[j - 1].0;
+                        if i > 0 && seen[i - 1] > novel {
+                            seen[k - 1] = seen[i - 1];
+                            i -= 1;
+                        } else {
+                            seen[k - 1] = novel;
+                            j -= 1;
+                        }
+                        k -= 1;
+                    }
+                }
+                if seen.len() >= self.seen_budget_entries {
+                    self.seen_frozen = true;
+                }
+            }
+        }
+
         // Clear buffer and release memory
         self.entries.clear();
         self.entries.shrink_to_fit();
@@ -865,6 +995,44 @@ impl ShardAccumulator {
         self.flush_shard()?;
         Ok(self.shard_infos)
     }
+}
+
+/// Drop, in place, entries whose minimizer already appears in `seen`. Returns the
+/// number removed.
+///
+/// Both inputs are ascending: `entries` is sorted by (minimizer, bucket_id) and —
+/// for the single-bucket case this filter is restricted to — has strictly
+/// increasing minimizers; `seen` is sorted and unique. A single forward pass with a
+/// galloping probe over `seen` (mirroring [`core::orientation::gallop_for_each`])
+/// yields the set difference with sequential access on both arrays — no per-key
+/// random lookups.
+fn drop_seen_minimizers(entries: &mut Vec<(u64, u32)>, seen: &[u64]) -> u64 {
+    if seen.is_empty() || entries.is_empty() {
+        return 0;
+    }
+    let mut si = 0usize;
+    let mut w = 0usize;
+    let mut dropped = 0u64;
+    for ri in 0..entries.len() {
+        let m = entries[ri].0;
+        // Galloping advance: exponentially probe `seen` to the first value >= m.
+        if si < seen.len() && seen[si] < m {
+            let mut jump = 1usize;
+            while si + jump < seen.len() && seen[si + jump] < m {
+                jump *= 2;
+            }
+            let end = (si + jump + 1).min(seen.len());
+            si += seen[si..end].partition_point(|&x| x < m);
+        }
+        if si < seen.len() && seen[si] == m {
+            dropped += 1;
+        } else {
+            entries[w] = entries[ri];
+            w += 1;
+        }
+    }
+    entries.truncate(w);
+    dropped
 }
 
 /// Write (minimizer, bucket_id) pairs to a Parquet shard file.
@@ -1670,6 +1838,112 @@ mod tests {
         let shard_path = output_dir.join("inverted").join("shard.0.parquet");
         let pairs = read_shard_pairs(&shard_path).unwrap();
         assert_eq!(pairs, vec![(100, 1), (100, 2), (200, 1), (300, 1)]);
+    }
+
+    #[test]
+    fn test_seen_filter_drops_cross_shard_duplicates() {
+        // WHY: the cross-shard filter exists to ensure a single-bucket minimizer is
+        // written exactly once even when it recurs in a later flush window. A later
+        // window's already-seen minimizers must be dropped before write, while novel
+        // ones are kept — and no minimizer may be lost from the union.
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("test.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+
+        let mut acc = ShardAccumulator::with_output_dir(&output_dir, MIN_SHARD_BYTES, None);
+        acc.enable_seen_filter(1024 * 1024); // generous: holds everything
+
+        acc.add_entries_from_minimizers(&[30, 10, 20], 1);
+        acc.flush_shard().unwrap().expect("shard 0");
+
+        // 20 and 30 were already written in shard 0; 40 and 50 are novel.
+        acc.add_entries_from_minimizers(&[40, 20, 50, 30], 1);
+        let s1 = acc.flush_shard().unwrap().expect("shard 1");
+
+        assert_eq!(
+            acc.filtered_count(),
+            2,
+            "two already-seen minimizers dropped"
+        );
+        assert_eq!(s1.num_entries, 2, "only the two novel minimizers written");
+
+        let p0 = read_shard_pairs(&output_dir.join("inverted").join("shard.0.parquet")).unwrap();
+        let p1 = read_shard_pairs(&output_dir.join("inverted").join("shard.1.parquet")).unwrap();
+        assert_eq!(p0, vec![(10, 1), (20, 1), (30, 1)]);
+        assert_eq!(p1, vec![(40, 1), (50, 1)]);
+
+        // Nothing lost: every unique minimizer appears exactly once across shards.
+        let mut all: Vec<u64> = p0.iter().chain(p1.iter()).map(|(m, _)| *m).collect();
+        all.sort_unstable();
+        assert_eq!(all, vec![10, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn test_seen_filter_skips_fully_duplicate_window() {
+        // WHY: if an entire flush window is already seen, nothing should be written —
+        // no empty shard, no shard-id burn — and the buffer must still clear.
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("test.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+
+        let mut acc = ShardAccumulator::with_output_dir(&output_dir, MIN_SHARD_BYTES, None);
+        acc.enable_seen_filter(1024 * 1024);
+
+        acc.add_entries_from_minimizers(&[10, 20], 1);
+        acc.flush_shard().unwrap().expect("shard 0");
+
+        acc.add_entries_from_minimizers(&[20, 10], 1);
+        let res = acc.flush_shard().unwrap();
+        assert!(res.is_none(), "fully-duplicate window writes no shard");
+        assert_eq!(acc.filtered_count(), 2);
+        assert_eq!(
+            acc.current_shard_id(),
+            1,
+            "shard id not advanced past the no-op"
+        );
+        assert_eq!(acc.entry_count(), 0, "buffer cleared even on no-op flush");
+    }
+
+    #[test]
+    fn test_seen_filter_freezes_at_budget_and_dedups_partially() {
+        // WHY: the byte budget must HARD-bound the filter — no overshoot. The first
+        // flush has 3 distinct minimizers but the budget admits only 2, so the filter
+        // freezes at exactly 2 and the third is never tracked. Untracked minimizers
+        // recur across shards (partial dedup), which the finalization k-way merge
+        // resolves. This documents the bounded-memory contract.
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("test.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+
+        let mut acc = ShardAccumulator::with_output_dir(&output_dir, MIN_SHARD_BYTES, None);
+        // Budget for exactly 2 entries.
+        acc.enable_seen_filter(ShardAccumulator::SEEN_BYTES_PER_ENTRY * 2);
+
+        acc.add_entries_from_minimizers(&[1, 2, 3], 1);
+        acc.flush_shard().unwrap().expect("shard 0");
+        assert!(acc.seen_frozen(), "seen freezes once it reaches the budget");
+        assert_eq!(acc.seen_len(), 2, "hard-capped at the budget, no overshoot");
+
+        // 1 is in seen (dropped); 3 was capped out of seen (kept and re-written).
+        acc.add_entries_from_minimizers(&[1, 3], 1);
+        acc.flush_shard().unwrap().expect("shard 1");
+        let p1 = read_shard_pairs(&output_dir.join("inverted").join("shard.1.parquet")).unwrap();
+        assert_eq!(
+            p1,
+            vec![(3, 1)],
+            "1 dropped (in seen), 3 kept (capped out of seen)"
+        );
+
+        // 3 was never admitted, so it recurs AGAIN — the cross-shard duplicate the
+        // consolidation merge is there to remove.
+        acc.add_entries_from_minimizers(&[3], 1);
+        acc.flush_shard().unwrap().expect("shard 2");
+        let p2 = read_shard_pairs(&output_dir.join("inverted").join("shard.2.parquet")).unwrap();
+        assert_eq!(
+            p2,
+            vec![(3, 1)],
+            "untracked minimizer recurs (consolidation backstop)"
+        );
     }
 
     #[test]
