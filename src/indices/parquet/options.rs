@@ -152,7 +152,7 @@ impl ParquetWriteOptions {
             .set_writer_version(WriterVersion::PARQUET_2_0)
             .set_compression(compression)
             .set_statistics_enabled(statistics)
-            .set_max_row_group_size(self.row_group_size)
+            .set_max_row_group_row_count(Some(self.row_group_size))
             // Minimizer column: delta encoding, no dictionary
             .set_column_encoding(minimizer_col.clone(), Encoding::DELTA_BINARY_PACKED)
             .set_column_dictionary_enabled(minimizer_col.clone(), false)
@@ -168,10 +168,10 @@ impl ParquetWriteOptions {
             builder = builder
                 .set_column_bloom_filter_enabled(minimizer_col.clone(), true)
                 .set_column_bloom_filter_fpp(minimizer_col.clone(), self.bloom_filter_fpp)
-                .set_column_bloom_filter_ndv(minimizer_col, ndv)
+                .set_column_bloom_filter_max_ndv(minimizer_col, ndv)
                 .set_column_bloom_filter_enabled(bucket_id_col.clone(), true)
                 .set_column_bloom_filter_fpp(bucket_id_col.clone(), self.bloom_filter_fpp)
-                .set_column_bloom_filter_ndv(bucket_id_col, ndv);
+                .set_column_bloom_filter_max_ndv(bucket_id_col, ndv);
         }
 
         builder.build()
