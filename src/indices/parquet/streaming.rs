@@ -13,7 +13,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::constants::{MIN_ENTRIES_PER_PARALLEL_PARTITION, PARQUET_BATCH_SIZE};
 
@@ -27,6 +27,26 @@ use super::{files, FORMAT_MAGIC, FORMAT_VERSION};
 
 /// K-way merge heap entry: (Reverse((minimizer, bucket_id)), bucket_index, position)
 type MergeHeapEntry = (Reverse<(u64, u32)>, usize, usize);
+
+/// Dedicated rayon pool for the flush-buffer sort, distinct from the global pool.
+///
+/// `flush_shard` can be driven from a consumer thread that is coupled to a producer
+/// `par_iter` running on the GLOBAL rayon pool by a bounded channel (the CLI
+/// `build_parquet_index_from_config_streaming` path). Sorting on the global pool there
+/// deadlocks under a small pool: the producer holds every worker while blocked on the
+/// full channel, and the consumer's `par_sort_unstable` waits for a worker that never
+/// frees. Running the sort on a separate pool cannot be starved by the producer, so the
+/// consumer always drains the channel and the producer makes progress — while keeping
+/// the parallel sort. Built once, on first flush.
+fn flush_sort_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("rype-flush-sort-{i}"))
+            .build()
+            .expect("failed to build flush-sort thread pool")
+    })
+}
 
 /// Create a Parquet inverted index directly from bucket data.
 ///
@@ -890,9 +910,12 @@ impl ShardAccumulator {
         // buffer holds up to ~max_shard_bytes/16 entries (≈1B at a 30 GiB build), and
         // the sort runs on the serial flush path between parallel extraction bursts, so
         // it is one of the build's larger single-threaded costs. par_sort_unstable
-        // parallelizes it across the rayon pool (with a sequential fallback for small
-        // buffers); the ordering — and therefore the subsequent dedup — is identical.
-        self.entries.par_sort_unstable();
+        // parallelizes it (with a sequential fallback for small buffers); the ordering —
+        // and therefore the subsequent dedup — is identical. It runs on a dedicated pool
+        // ([`flush_sort_pool`]) rather than the global one to avoid deadlocking against a
+        // concurrent global-pool producer in the CLI streaming build.
+        let entries = &mut self.entries;
+        flush_sort_pool().install(move || entries.par_sort_unstable());
         self.entries.dedup();
 
         // Cross-shard dedup filter (single bucket): drop minimizers already written
