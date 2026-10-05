@@ -103,6 +103,15 @@ impl ShardManifest {
     pub fn has_bucket_metadata(&self) -> bool {
         !self.bucket_names.is_empty()
     }
+
+    /// Whether `classify_from_query_index_parallel_rg` falls back to the sequential
+    /// path for this manifest. Parallel RG processing cannot deduplicate across row
+    /// groups from different shards, so overlapping multi-shard manifests fall back
+    /// to the sequential path, which has cross-shard dedup (and, as a side effect,
+    /// honors bloom filters where the parallel path doesn't).
+    pub fn parallel_rg_falls_back_to_sequential(&self) -> bool {
+        self.has_overlapping_shards && self.shards.len() > 1
+    }
 }
 
 /// Handle for a sharded inverted index.

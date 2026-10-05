@@ -40,6 +40,41 @@ pub struct CommonClassifyArgs {
     pub minimum_length: Option<usize>,
 }
 
+/// Whether `--use-bloom-filter` + `--parallel-rg` will actually be a no-op.
+///
+/// `classify_from_query_index_parallel_rg` never reads `read_options`, so
+/// `--use-bloom-filter` silently has no effect when combined with `--parallel-rg` —
+/// *unless* the index falls back to the sequential path (see
+/// `ShardManifest::parallel_rg_falls_back_to_sequential`), which does honor bloom
+/// filters. For log-ratio's two indices, bloom is ignored for the run as a whole
+/// unless *both* would fall back.
+fn bloom_filter_ignored_by_parallel_rg(
+    parallel_rg: bool,
+    use_bloom_filter: bool,
+    manifests: &[&rype::ShardManifest],
+) -> bool {
+    if !parallel_rg || !use_bloom_filter {
+        return false;
+    }
+    let all_fall_back_to_sequential = manifests
+        .iter()
+        .all(|m| m.parallel_rg_falls_back_to_sequential());
+    !all_fall_back_to_sequential
+}
+
+fn warn_if_bloom_filter_ignored(
+    parallel_rg: bool,
+    use_bloom_filter: bool,
+    manifests: &[&rype::ShardManifest],
+) {
+    if bloom_filter_ignored_by_parallel_rg(parallel_rg, use_bloom_filter, manifests) {
+        eprintln!(
+            "Warning: --use-bloom-filter has no effect with --parallel-rg \
+             (parallel row-group classification does not read bloom filters)."
+        );
+    }
+}
+
 /// Arguments for the classify run command.
 pub struct ClassifyRunArgs {
     pub common: CommonClassifyArgs,
@@ -188,6 +223,12 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     let mut total_reads = 0;
     let mut batch_num = 0;
     let mut pass_num = 0usize;
+
+    warn_if_bloom_filter_ignored(
+        args.common.parallel_rg,
+        args.common.use_bloom_filter,
+        &[sharded.manifest()],
+    );
 
     if args.common.parallel_rg {
         log::info!(
@@ -791,6 +832,11 @@ pub fn run_log_ratio(args: ClassifyLogRatioArgs) -> Result<()> {
     let num_read_options = num_loaded.read_options.as_ref();
     let denom_read_options = denom_loaded.read_options.as_ref();
     let parallel_rg = args.parallel_rg;
+    warn_if_bloom_filter_ignored(
+        parallel_rg,
+        args.use_bloom_filter,
+        &[num_sharded.manifest(), denom_sharded.manifest()],
+    );
     let numerator_skip_threshold = args.numerator_skip_threshold;
     let passing_is_positive = args.passing_is_positive;
 
@@ -1438,6 +1484,82 @@ pub fn format_results_wide<S: AsRef<str>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `ShardManifest` with the given shard shape — the only two
+    /// fields `parallel_rg_falls_back_to_sequential` (and so
+    /// `bloom_filter_ignored_by_parallel_rg`) actually reads. No index or
+    /// shard file needs to exist on disk for this.
+    fn fake_manifest(num_shards: u32, has_overlapping_shards: bool) -> rype::ShardManifest {
+        rype::ShardManifest {
+            k: 32,
+            w: 10,
+            salt: 0,
+            source_hash: 0,
+            total_minimizers: 0,
+            total_bucket_ids: 0,
+            has_overlapping_shards,
+            shards: (0..num_shards)
+                .map(|shard_id| rype::ShardInfo {
+                    shard_id,
+                    min_start: 0,
+                    min_end: 0,
+                    is_last_shard: true,
+                    num_minimizers: 0,
+                    num_bucket_ids: 0,
+                })
+                .collect(),
+            bucket_names: HashMap::new(),
+            bucket_sources: HashMap::new(),
+            bucket_minimizer_counts: HashMap::new(),
+            bucket_file_stats: None,
+        }
+    }
+
+    /// The common case: a single-shard (or non-overlapping multi-shard) index
+    /// genuinely ignores `--use-bloom-filter` under `--parallel-rg`, so the
+    /// warning must fire.
+    #[test]
+    fn test_bloom_filter_ignored_by_parallel_rg_single_shard() {
+        let m = fake_manifest(1, false);
+        assert!(bloom_filter_ignored_by_parallel_rg(true, true, &[&m]));
+    }
+
+    /// Regression (found by code review of this same change): when the index
+    /// has overlapping shards and more than one shard,
+    /// `classify_from_query_index_parallel_rg` falls back to the sequential
+    /// path internally, which *does* read bloom filters — so the flag
+    /// combination is not actually a no-op and must not warn.
+    #[test]
+    fn test_bloom_filter_not_ignored_when_parallel_rg_falls_back_to_sequential() {
+        let m = fake_manifest(2, true);
+        assert!(!bloom_filter_ignored_by_parallel_rg(true, true, &[&m]));
+    }
+
+    /// For log-ratio's two indices, bloom is only truly ignored for the run
+    /// if *every* index actually takes the ignoring path — one index falling
+    /// back to sequential is not enough to call the whole run bloom-free.
+    #[test]
+    fn test_bloom_filter_ignored_requires_all_indices_to_ignore_it() {
+        let falls_back = fake_manifest(2, true);
+        let ignores = fake_manifest(1, false);
+        assert!(bloom_filter_ignored_by_parallel_rg(
+            true,
+            true,
+            &[&falls_back, &ignores]
+        ));
+        assert!(!bloom_filter_ignored_by_parallel_rg(
+            true,
+            true,
+            &[&falls_back, &falls_back]
+        ));
+    }
+
+    #[test]
+    fn test_bloom_filter_ignored_by_parallel_rg_false_when_flags_absent() {
+        let m = fake_manifest(1, false);
+        assert!(!bloom_filter_ignored_by_parallel_rg(false, true, &[&m]));
+        assert!(!bloom_filter_ignored_by_parallel_rg(true, false, &[&m]));
+    }
 
     /// Regression: `estimate_wide_format_bytes_per_read` must be nonzero
     /// and scale with bucket count, so `--wide` runs reserve budget for

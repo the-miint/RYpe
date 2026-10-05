@@ -693,7 +693,7 @@ pub fn classify_from_query_index_parallel_rg(
 
     // Parallel RG processing cannot deduplicate across row groups from different
     // shards. Fall back to the sequential shard path which has cross-shard dedup.
-    if manifest.has_overlapping_shards && manifest.shards.len() > 1 {
+    if manifest.parallel_rg_falls_back_to_sequential() {
         return classify_from_query_index(sharded, query_idx, query_ids, threshold, _read_options);
     }
 

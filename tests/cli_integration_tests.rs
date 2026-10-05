@@ -4817,12 +4817,31 @@ files = ["{}"]
 
 /// Write a Parquet input file with read_id + sequence1 columns.
 fn write_parquet_input(path: &Path, ids: &[&str], seqs: &[&str]) {
+    write_parquet_input_with_row_group_size(path, ids, seqs, None);
+}
+
+/// Write a Parquet query input file, optionally capping the row-group size so
+/// tests can control how many row groups the file ends up with (needed to
+/// exercise `--parallel-input-rg` at low/mid/above-row-group-count values).
+fn write_parquet_input_with_row_group_size(
+    path: &Path,
+    ids: &[&str],
+    seqs: &[&str],
+    max_row_group_rows: Option<usize>,
+) {
+    use parquet::file::properties::WriterProperties;
+
     let schema = Arc::new(Schema::new(vec![
         Field::new("read_id", DataType::LargeUtf8, false),
         Field::new("sequence1", DataType::LargeUtf8, false),
     ]));
+    let props = max_row_group_rows.map(|n| {
+        WriterProperties::builder()
+            .set_max_row_group_row_count(Some(n))
+            .build()
+    });
     let file = fs::File::create(path).unwrap();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), props).unwrap();
     let id_array = LargeStringArray::from_iter_values(ids.iter().copied());
     let seq_array = LargeStringArray::from_iter_values(seqs.iter().copied());
     let batch =
@@ -6464,6 +6483,277 @@ fn test_negative_index_run_reports_nonzero_passes() -> Result<()> {
         !summary_line.contains("in 0 passes"),
         "negative-index run reported 0 passes despite scanning the index at least \
          once per input batch: {summary_line}"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// --parallel-rg / --use-bloom-filter / --parallel-input-rg benchmark-support
+// tests. These flags are pure performance knobs: divergent output is a
+// correctness bug, and a knob that silently does nothing is a UX bug.
+// ============================================================================
+
+/// Build a small index with `--bloom-filter` and a small `--row-group-size`,
+/// so bloom filters actually span multiple row groups (the default
+/// `row_group_size` of 100_000 would fold this tiny fixture into one row
+/// group, making bloom filtering a no-op — see `query_loading.rs`'s own
+/// `row_group_size: 10` test fixture for the same reason).
+fn build_bloom_index(binary: &Path, phix_path: &Path, out: &Path) {
+    let output = Command::new(binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            out.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "5",
+            "--row-group-size",
+            "10",
+            "--bloom-filter",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Bloom-enabled index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Twelve distinct 60bp reads sliced out of phiX174, long enough (>= k=32) to
+/// produce minimizers and varied enough to exercise real row-group filtering.
+fn phix_query_reads(phix_seq: &str) -> (Vec<String>, Vec<String>) {
+    let ids: Vec<String> = (0..12).map(|i| format!("read{i}")).collect();
+    let seqs: Vec<String> = (0..12)
+        .map(|i| {
+            let start = i * 20;
+            phix_seq[start..start + 60].to_string()
+        })
+        .collect();
+    (ids, seqs)
+}
+
+/// Flags that are pure performance knobs must never change classification
+/// output. This is the invariant the whole benchmark rests on: if any of
+/// `--parallel-rg`, `--use-bloom-filter`, or `--parallel-input-rg` (at a low,
+/// a mid, or an above-row-group-count value) changes a single byte of
+/// output, that is a correctness bug, not a performance question.
+#[test]
+fn test_perf_flags_are_output_equivalent() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("bloom.ryxdi");
+    build_bloom_index(&binary, &phix_path, &index_path);
+
+    let phix_content = fs::read_to_string(&phix_path)?;
+    let phix_seq: String = phix_content
+        .lines()
+        .filter(|l| !l.starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("");
+    let (ids, seqs) = phix_query_reads(&phix_seq);
+    let ids_ref: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let seqs_ref: Vec<&str> = seqs.iter().map(String::as_str).collect();
+
+    // 12 reads, 2 rows/row-group -> 6 row groups in the query input file.
+    let query_path = dir.path().join("query.parquet");
+    write_parquet_input_with_row_group_size(&query_path, &ids_ref, &seqs_ref, Some(2));
+
+    // (label, extra CLI args)
+    let runs: &[(&str, &[&str])] = &[
+        ("default", &[]),
+        ("parallel-rg", &["--parallel-rg"]),
+        ("use-bloom-filter", &["--use-bloom-filter"]),
+        (
+            "parallel-rg+use-bloom-filter",
+            &["--parallel-rg", "--use-bloom-filter"],
+        ),
+        ("parallel-input-rg=1 (low)", &["--parallel-input-rg", "1"]),
+        ("parallel-input-rg=3 (mid)", &["--parallel-input-rg", "3"]),
+        (
+            "parallel-input-rg=20 (above row-group count)",
+            &["--parallel-input-rg", "20"],
+        ),
+    ];
+
+    let mut baseline: Option<Vec<u8>> = None;
+    for (label, extra_args) in runs {
+        let out_path = dir.path().join(format!("out-{label}.tsv"));
+        let mut args = vec![
+            "classify".to_string(),
+            "run".to_string(),
+            "-i".to_string(),
+            index_path.to_str().unwrap().to_string(),
+            "-1".to_string(),
+            query_path.to_str().unwrap().to_string(),
+            "-t".to_string(),
+            "0.0".to_string(),
+            "-o".to_string(),
+            out_path.to_str().unwrap().to_string(),
+        ];
+        args.extend(extra_args.iter().map(|s| s.to_string()));
+
+        let output = Command::new(&binary).args(&args).output()?;
+        assert!(
+            output.status.success(),
+            "Run '{label}' failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let bytes = fs::read(&out_path)?;
+        assert!(!bytes.is_empty(), "Run '{label}' produced empty output");
+
+        match &baseline {
+            None => baseline = Some(bytes),
+            Some(base) => assert_eq!(
+                &bytes, base,
+                "Run '{label}' output diverged from the default run — a \
+                 performance flag changed classification output"
+            ),
+        }
+    }
+
+    Ok(())
+}
+
+/// The "no bloom filters" warning must name a flag that actually exists.
+/// `--parquet-bloom-filter` was never a real CLI flag; the real one is
+/// `--bloom-filter`. A stale name here silently sends users looking for a
+/// flag that doesn't exist.
+#[test]
+fn test_bloom_filter_warning_names_real_flag() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("no_bloom.ryxdi");
+
+    // Plain index, no --bloom-filter: --use-bloom-filter should warn.
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@q0\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+            "--use-bloom-filter",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Classification failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("--parquet-bloom-filter"),
+        "warning still names the nonexistent --parquet-bloom-filter flag:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--bloom-filter"),
+        "warning should tell the user to rebuild with the real --bloom-filter flag:\n{stderr}"
+    );
+
+    Ok(())
+}
+
+/// `--parallel-rg` never reads `ParquetReadOptions`, so `--use-bloom-filter`
+/// silently has no effect when combined with it. Combining the two should
+/// warn rather than silently doing nothing.
+#[test]
+fn test_parallel_rg_with_bloom_filter_warns_ignored() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("bloom.ryxdi");
+    build_bloom_index(&binary, &phix_path, &index_path);
+
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@q0\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+            "--parallel-rg",
+            "--use-bloom-filter",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Classification failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--use-bloom-filter") && stderr.contains("--parallel-rg"),
+        "expected a warning that --use-bloom-filter is ignored with --parallel-rg, got:\n{stderr}"
     );
 
     Ok(())

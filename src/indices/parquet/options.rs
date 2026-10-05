@@ -198,7 +198,7 @@ pub struct ParquetReadOptions {
     /// I/O for sparse queries.
     ///
     /// Falls back gracefully when bloom filters are not present in the file.
-    /// Requires the index to have been built with `--parquet-bloom-filter`.
+    /// Requires the index to have been built with `--bloom-filter`.
     pub use_bloom_filter: bool,
 }
 

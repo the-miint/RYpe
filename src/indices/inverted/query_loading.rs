@@ -363,7 +363,7 @@ fn load_filtered_coo_pairs(
             if bloom_filters_found == 0 && !stats_filtered.is_empty() {
                 eprintln!(
                     "Warning: --use-bloom-filter specified but {} has no bloom filters. \
-                     Rebuild index with --parquet-bloom-filter to enable bloom filtering.",
+                     Rebuild index with --bloom-filter to enable bloom filtering.",
                     path.display()
                 );
             }
