@@ -31,7 +31,7 @@ zstd = "0.13"  # Compression for inverted index
 # input. needletail still enables flate2's default miniz_oxide backend, but flate2
 # selects zlib-rs whenever both are enabled; zlib-rs inflates much faster.
 flate2 = { version = "1.1.8", default-features = false, features = ["zlib-rs"] }
-parquet = { version = "59", default-features = false, features = ["zstd", "snap", "arrow"] }
+parquet = { version = "60", default-features = false, features = ["zstd", "snap", "arrow"] }
 bytes = "1.5"
 arrow = { version = "59", default-features = false }
 
