@@ -131,43 +131,43 @@ impl<M: MetaHeapBytes> QueryAccumulator<M> {
     /// wide-window index can have more header bytes than minimizer entry
     /// bytes), not a rounding error to leave out.
     ///
-    /// Measures `entries`/`fwd_counts`/`rc_counts` by `capacity()`, not
-    /// `len()`: `push()` grows these buffers incrementally (one read's worth
-    /// of `reserve()` at a time for `entries`; ordinary amortized-doubling
-    /// `push()` for `fwd_counts`/`rc_counts`), so real allocated capacity can
-    /// run up to ~2x live length by the time a pass flushes — for long reads
-    /// (thousands of minimizers/read), that gap is multiple GB, not noise,
-    /// and was a real contributor to `classify_byte_budget` overshooting on
-    /// long-read passes. `len()` was used for a period after the original
-    /// Finding 1 fix specifically because `drain()` used to re-reserve each
-    /// buffer's pre-drain capacity into the next (empty) fill cycle, which
-    /// made a capacity-based estimate permanently overshoot after every
-    /// flush. `drain()` now releases via `std::mem::take` — real capacity
-    /// after a drain is genuinely 0, not merely emptied `len()` — so that
-    /// trap no longer applies and this can go back to the more accurate
-    /// (and more conservative) measurement.
+    /// Measures `entries` by `len()`, everything else by `capacity()`.
+    /// `entries` is the pass's dominant buffer, and unwritten pages of a large
+    /// allocation are never resident; counting its doubling slack made the
+    /// per-read `should_flush()` fire at as little as ~60% of the budget.
+    /// The per-read buffers (`fwd_counts`, `rc_counts`, `meta`) stay counted
+    /// by capacity on purpose: their slack is headroom for per-pass costs the
+    /// budget doesn't model yet (e.g. `classify run`'s results and formatted
+    /// output), and counting them by length put a 10M-pair 8G run over its cap.
     ///
-    /// `meta` is counted the same way: its inline `size_of::<M>()` per slot
-    /// of capacity, plus each payload's heap bytes. The inline part is 24
-    /// bytes for a `String` header but well over 100 for a payload that
-    /// carries a whole read (`classify filter`).
+    /// `meta` counts its inline `size_of::<M>()` per slot plus each payload's
+    /// heap bytes. The inline part is 24 bytes for a `String` header but well
+    /// over 100 for a payload that carries a whole read (`classify filter`).
     pub fn approx_bytes(&self) -> usize {
-        self.entries.capacity() * std::mem::size_of::<(u64, u32)>()
+        self.entries.len() * std::mem::size_of::<(u64, u32)>()
             + self.fwd_counts.capacity() * std::mem::size_of::<u32>()
             + self.rc_counts.capacity() * std::mem::size_of::<u32>()
             + self.meta.capacity() * std::mem::size_of::<M>()
             + self.meta_heap_bytes
     }
 
-    /// `approx_bytes()` plus the projected cost of the classification-pass
-    /// accumulator over the reads buffered so far (see
-    /// `with_accumulator_cost_per_read`). This, not `approx_bytes()`, is
-    /// what `should_flush()` compares against the byte budget.
+    /// `approx_bytes()` plus what classifying the buffered reads will
+    /// allocate on top of them: the classification-pass accumulator (see
+    /// `with_accumulator_cost_per_read`) and the pass's unique-minimizer list
+    /// (`QueryInvertedIndex::unique_minimizers`, 8 bytes per unique minimizer,
+    /// so at most 8 per entry). This, not `approx_bytes()`, is what
+    /// `should_flush()` compares against the byte budget.
     pub fn projected_pass_bytes(&self) -> usize {
-        self.approx_bytes().saturating_add(
-            self.accumulator_bytes_per_read
-                .saturating_mul(self.meta.len()),
-        )
+        self.approx_bytes()
+            .saturating_add(
+                self.accumulator_bytes_per_read
+                    .saturating_mul(self.meta.len()),
+            )
+            .saturating_add(
+                self.entries
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
     }
 
     /// Add a read to the accumulator, flattening its minimizers into flat COO
@@ -459,13 +459,20 @@ mod tests {
         acc.extend_extracted(vec!["only_one"], vec![(vec![1], vec![]), (vec![2], vec![])]);
     }
 
+    /// Classifying a pass builds its unique-minimizer list (8 bytes per
+    /// unique minimizer) alongside the drained entries, so a pass that fits
+    /// the budget by entries alone overshoots by up to half its entry bytes
+    /// (measured ~0.6 GB on a 1.4 GB long-read pass against a human index).
+    /// The accumulator cost per read, by contrast, is opt-in and defaults to
+    /// zero.
     #[test]
-    fn test_accumulator_cost_defaults_to_zero() {
-        // Without opting in, projected_pass_bytes must equal approx_bytes —
-        // existing callers (e.g. the FFI path) see no behavior change.
+    fn test_projected_pass_bytes_counts_unique_minimizer_list() {
         let mut acc = QueryAccumulator::with_budget(usize::MAX);
         acc.push("r0", vec![100, 200], vec![300]);
-        assert_eq!(acc.projected_pass_bytes(), acc.approx_bytes());
+        assert_eq!(
+            acc.projected_pass_bytes(),
+            acc.approx_bytes() + 3 * std::mem::size_of::<u64>()
+        );
     }
 
     /// Regression: `String` header heap bytes must count toward
@@ -496,54 +503,28 @@ mod tests {
         );
     }
 
-    /// Regression: `approx_bytes()` must reflect real allocated capacity,
-    /// not just live length — many small incremental pushes (as happens
-    /// across a real multi-read accumulation, one `reserve()` call per read
-    /// rather than one for the whole pass) leave `entries` holding
-    /// meaningfully more capacity than its length, and a `len()`-based
-    /// estimate silently under-counts that gap. This was a real contributor
-    /// to `classify_byte_budget` overshooting on long-read passes (many
-    /// minimizers/read compounds the per-push growth), not just a
-    /// theoretical rounding difference — see the caller-side accounting in
-    /// `commands/helpers/batch_config.rs`.
+    /// A pass should fill its budget with entries actually written. Unwritten
+    /// `entries` capacity is never resident, and counting it made the
+    /// per-read flush fire right after each doubling, at ~60% of the budget
+    /// (one extra index scan per run on 4G short-read runs).
     #[test]
-    fn test_approx_bytes_reflects_capacity_not_just_length() {
-        let mut acc: QueryAccumulator<String> = QueryAccumulator::with_budget(usize::MAX);
-        // Many small pushes, each triggering `entries.reserve(..)` for just
-        // that read's minimizers — the incremental-growth pattern real
-        // accumulation follows, unlike a single bulk reservation.
-        for i in 0..2000u64 {
-            acc.push(format!("r{i}"), vec![i, i + 1], vec![]);
+    fn test_pass_fills_budget_with_written_entries() {
+        let budget = 1_000_000;
+        let mut acc: QueryAccumulator<&str> = QueryAccumulator::with_budget(budget);
+        let mut next = 0u64;
+        while !acc.should_flush() {
+            acc.push("r", (next..next + 100).collect(), vec![]);
+            next += 100;
         }
-
-        // What a `len()`-based `approx_bytes()` would have reported —
-        // computed independently here (not by calling `approx_bytes()`
-        // itself) so this test discriminates the actual implementation
-        // rather than trivially restating whatever it does. The `meta` terms
-        // (inline and heap) are shared by both implementations, so they're
-        // excluded from the comparison entirely rather than risk them swamping
-        // a real but small capacity/length delta.
-        let len_based_entries_counts_bytes = acc.entries.len() * std::mem::size_of::<(u64, u32)>()
-            + acc.fwd_counts.len() * std::mem::size_of::<u32>()
-            + acc.rc_counts.len() * std::mem::size_of::<u32>();
-        let cap_based_entries_counts_bytes = acc.entries.capacity()
-            * std::mem::size_of::<(u64, u32)>()
-            + acc.fwd_counts.capacity() * std::mem::size_of::<u32>()
-            + acc.rc_counts.capacity() * std::mem::size_of::<u32>();
-
+        // Entry bytes plus the unique-minimizer reservation, as written.
+        let written =
+            acc.entries.len() * (std::mem::size_of::<(u64, u32)>() + std::mem::size_of::<u64>());
         assert!(
-            cap_based_entries_counts_bytes > len_based_entries_counts_bytes,
-            "test setup: incremental per-read growth should leave spare capacity \
-             (cap_bytes={cap_based_entries_counts_bytes}, len_bytes={len_based_entries_counts_bytes})"
-        );
-
-        let meta_bytes = acc.meta.capacity() * std::mem::size_of::<String>() + acc.meta_heap_bytes;
-        let approx_bytes_entries_counts_only = acc.approx_bytes() - meta_bytes;
-        assert_eq!(
-            approx_bytes_entries_counts_only, cap_based_entries_counts_bytes,
-            "approx_bytes() (minus meta bytes: {meta_bytes}) should equal the entries/counts \
-             buffers' real allocated capacity ({cap_based_entries_counts_bytes}), not \
-             their length ({len_based_entries_counts_bytes})"
+            written >= budget * 9 / 10,
+            "flushed with only {written} of {budget} budget bytes written \
+             (entries len {}, capacity {})",
+            acc.entries.len(),
+            acc.entries.capacity()
         );
     }
 

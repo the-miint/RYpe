@@ -80,6 +80,13 @@ pub(crate) const COO_MERGE_JOIN_MAX_BUCKETS: usize = 10;
 /// amortize rayon overhead (~10μs per task) against merge-join cost (~1μs per pair).
 pub(crate) const MIN_PARALLEL_SHARD_SIZE: usize = 10_000;
 
+/// Query entries per wave in the parallel COO merge-join, split across the
+/// threads. A wave's hits (16 bytes each, about one per matching entry per
+/// bucket) are folded into the accumulator before the next wave, so the hits
+/// held at once stay ~32 MB per matching bucket whatever the pass size. A
+/// run of one minimizer is never split, so a very common one can exceed this.
+pub(crate) const COO_JOIN_WAVE_ENTRIES: usize = 1 << 21;
+
 /// Maximum `num_reads` for using per-thread dense-accumulator fold/reduce in a
 /// parallel merge-join. Above this, per-chunk accumulators are sized
 /// `num_reads × stride × 8 bytes` each — with millions of reads, N threads'

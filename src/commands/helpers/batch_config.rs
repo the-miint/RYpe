@@ -10,9 +10,28 @@ use anyhow::Result;
 use rype::memory::{
     calculate_batch_config, detect_available_memory, estimate_shard_reservation, format_bytes,
     safety_margin_bytes, InputFormat, MemoryConfig, MemorySource, ReadMemoryProfile,
+    MIN_BATCH_SIZE,
 };
 
 use super::load_index_metadata;
+
+/// Upper bound on one input batch's read bytes (~340k short-read pairs, ~9k
+/// HiFi reads), for callers whose passes span many input batches (`classify
+/// run` without a negative index, `classify filter`): there, smaller batches
+/// don't add index scans. Capping them keeps the per-batch costs the
+/// reservation doesn't model (the batch's extracted minimizers, per-read
+/// allocation overhead) from scaling with --max-memory. On the full 100M-pair
+/// short-read holdout at 24G, uncapped 2.8M-pair batches peaked at 27.1 GiB
+/// vs 18.3 GiB with ~450k.
+pub const MAX_INPUT_BATCH_BYTES: usize = 256 << 20;
+
+/// `batch_size` capped at `MAX_INPUT_BATCH_BYTES` of reads costing
+/// `read_bytes` each, but never below `MIN_BATCH_SIZE`.
+pub fn cap_input_batch(batch_size: usize, read_bytes: usize) -> usize {
+    (MAX_INPUT_BATCH_BYTES / read_bytes)
+        .max(MIN_BATCH_SIZE)
+        .min(batch_size)
+}
 
 /// Configuration for computing effective batch size.
 pub struct BatchSizeConfig<'a> {

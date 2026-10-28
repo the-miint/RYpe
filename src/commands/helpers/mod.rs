@@ -32,7 +32,7 @@ pub use arg_parsing::{
     parse_bloom_fpp, parse_max_memory_arg, parse_shard_size_arg, validate_minimum_length,
     validate_trim_to,
 };
-pub use batch_config::{compute_effective_batch_size, BatchSizeConfig};
+pub use batch_config::{cap_input_batch, compute_effective_batch_size, BatchSizeConfig};
 #[allow(unused_imports)]
 pub use deferred_denom::{DeferredDenomBuffer, DeferredMeta};
 #[allow(unused_imports)]

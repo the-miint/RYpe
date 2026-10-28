@@ -17,11 +17,12 @@ use rype::{
 
 use super::helpers::seq_writer::rewalk_and_write_passing;
 use super::helpers::{
-    accumulate_owned_batches, compute_effective_batch_size, create_input_reader,
+    accumulate_owned_batches, cap_input_batch, compute_effective_batch_size, create_input_reader,
     format_classification_results, format_log_ratio_bucket_name, format_log_ratio_output,
     is_parquet_input, load_index_for_classification, stacked_batches_to_records,
     validate_input_config, BatchSizeConfig, ClassificationInput, DeferredDenomBuffer,
-    IndexLoadOptions, InputReaderConfig, OutputFormat, OutputWriter, PassingReadTracker,
+    IndexLoadOptions, InputReaderConfig, OutputFormat, OutputWriter, OwnedFastxRecord,
+    PassingReadTracker,
 };
 
 /// Common arguments shared between classify run and log-ratio commands.
@@ -106,15 +107,25 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         is_log_ratio: false,
         denominator_index_path: None,
     })?;
-    let effective_batch_size = batch_result.batch_size;
+    // The negative-index path scans the index once per input batch, so only
+    // the accumulator path caps batches.
+    let effective_batch_size = if args.common.batch_size.is_none() && negative_sharded.is_none() {
+        cap_input_batch(
+            batch_result.batch_size,
+            std::mem::size_of::<OwnedFastxRecord>() + batch_result.avg_query_length,
+        )
+    } else {
+        batch_result.batch_size
+    };
 
     // Log adaptive batch sizing details (only for auto-computed batch sizes)
     if args.common.batch_size.is_none() {
         log::info!(
-            "Adaptive batch sizing: batch_size={}, threads={}, estimated peak memory={}, shard_reservation={}, format={:?}",
+            "Adaptive batch sizing: batch_size={} (auto {}, whose estimated peak memory={}), threads={}, shard_reservation={}, format={:?}",
+            effective_batch_size,
             batch_result.batch_size,
-            rayon::current_num_threads(),
             format_bytes(batch_result.peak_memory as u64),
+            rayon::current_num_threads(),
             format_bytes(batch_result.shard_reservation as u64),
             batch_result.input_format
         );
@@ -331,22 +342,28 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
             let t_extract = std::time::Instant::now();
             let extracted = extract_batch_minimizers(idx_k, idx_w, idx_salt, None, batch_refs);
             log_timing("batch: extract", t_extract.elapsed().as_millis());
-            acc.extend_extracted(headers, extracted);
+            assert_eq!(headers.len(), extracted.len());
 
-            if acc.should_flush() {
-                *pass_num += 1;
-                let read_count = flush_accumulated_pass(
-                    acc,
-                    &sharded,
-                    args.common.parallel_rg,
-                    effective_threshold,
-                    read_options.as_ref(),
-                    args.best_hit,
-                    wide_bucket_ids.as_deref(),
-                    &metadata.bucket_names,
-                    out_writer,
-                )?;
-                log::info!("Classification pass {}: {} reads", *pass_num, read_count);
+            // Checked per read rather than per batch, so a pass never runs
+            // past its budget by more than one read. Input batches grow with
+            // --max-memory, so a per-batch check could overshoot by GBs.
+            for (header, (fwd, rc)) in headers.into_iter().zip(extracted) {
+                acc.push(header, fwd, rc);
+                if acc.should_flush() {
+                    *pass_num += 1;
+                    let read_count = flush_accumulated_pass(
+                        acc,
+                        &sharded,
+                        args.common.parallel_rg,
+                        effective_threshold,
+                        read_options.as_ref(),
+                        args.best_hit,
+                        wide_bucket_ids.as_deref(),
+                        &metadata.bucket_names,
+                        out_writer,
+                    )?;
+                    log::info!("Classification pass {}: {} reads", *pass_num, read_count);
+                }
             }
         }
         Ok(())

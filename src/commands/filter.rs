@@ -34,8 +34,8 @@ use rype::{
 };
 
 use super::helpers::{
-    compute_effective_batch_size, is_parquet_input, load_index_for_classification, BatchSizeConfig,
-    IndexLoadOptions, OutputFormat, OwnedFastxRecord, PrefetchingIoHandler,
+    cap_input_batch, compute_effective_batch_size, is_parquet_input, load_index_for_classification,
+    BatchSizeConfig, IndexLoadOptions, OutputFormat, OwnedFastxRecord, PrefetchingIoHandler,
 };
 
 /// Arguments for the classify filter command.
@@ -79,14 +79,6 @@ const INPUT_BATCHES_IN_FLIGHT: usize = FASTX_PREFETCH_BUFFER_SLOTS + 2;
 /// Header bytes per read assumed when sizing input batches (Illumina read ids
 /// run about 40-60 bytes).
 const EST_HEADER_BYTES: usize = 64;
-
-/// Upper bound on one input batch's read bytes (~340k short-read pairs, ~9k
-/// HiFi reads). A pass spans many input batches, so smaller batches don't add
-/// index scans; capping them keeps the per-batch costs the reservation doesn't
-/// model (the batch's extracted minimizers, per-read allocation overhead) from
-/// scaling with --max-memory. On the full 100M-pair short-read holdout at 24G,
-/// uncapped 2.8M-pair batches peaked at 27.1 GiB vs 18.9 GiB with ~450k.
-const MAX_INPUT_BATCH_BYTES: usize = 256 << 20;
 
 /// Output destination: stdout/plain file, or gzip when the path ends in `.gz`.
 /// Gzip is single-threaded; for large outputs pipe stdout through a parallel
@@ -320,9 +312,8 @@ pub fn run_filter(args: ClassifyFilterArgs) -> Result<()> {
     let read_bytes =
         std::mem::size_of::<BufferedRead>() + EST_HEADER_BYTES + 2 * batch_result.avg_query_length;
     let batch_size = (batch_result.input_batch_residency / (INPUT_BATCHES_IN_FLIGHT * read_bytes))
-        .min(MAX_INPUT_BATCH_BYTES / read_bytes)
         .max(MIN_BATCH_SIZE)
-        .min(batch_result.batch_size);
+        .min(cap_input_batch(batch_result.batch_size, read_bytes));
     let batch_size = args.batch_size.map_or(batch_size, |bs| bs.min(batch_size));
     log::info!(
         "Filter pass budget: {} (input batch_size={}, threshold={}, keep={})",

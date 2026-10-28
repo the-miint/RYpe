@@ -17,7 +17,8 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 
 use crate::constants::{
-    ESTIMATED_BUCKETS_PER_READ, FOLD_REDUCE_MAX_READS, GALLOP_THRESHOLD, MIN_PARALLEL_SHARD_SIZE,
+    COO_JOIN_WAVE_ENTRIES, ESTIMATED_BUCKETS_PER_READ, FOLD_REDUCE_MAX_READS, GALLOP_THRESHOLD,
+    MIN_PARALLEL_SHARD_SIZE,
 };
 use crate::core::gallop_for_each;
 use crate::indices::{InvertedIndex, QueryInvertedIndex};
@@ -395,8 +396,10 @@ fn compute_chunk_ranges(entries: &[(u64, u32)], num_chunks: usize) -> Vec<(usize
 
 /// Parallel merge-join of query COO entries against reference COO pairs.
 ///
-/// Splits query entries into chunks by minimizer range, processes each chunk
-/// in parallel using rayon, then merges sparse hits into the accumulator.
+/// Splits query entries into chunks by minimizer range, processes them in
+/// parallel using rayon in waves of `num_threads` chunks, and merges each
+/// wave's sparse hits into the accumulator before starting the next (see
+/// `COO_JOIN_WAVE_ENTRIES`).
 /// Falls back to single-threaded `merge_join_coo` when the shard is too small
 /// or only one thread is available.
 ///
@@ -408,6 +411,15 @@ pub(super) fn merge_join_coo_parallel<A: HitAccumulator>(
     query_idx: &QueryInvertedIndex,
     ref_pairs: &[(u64, u32)],
     accumulator: &mut A,
+) {
+    merge_join_coo_waves(query_idx, ref_pairs, accumulator, COO_JOIN_WAVE_ENTRIES);
+}
+
+fn merge_join_coo_waves<A: HitAccumulator>(
+    query_idx: &QueryInvertedIndex,
+    ref_pairs: &[(u64, u32)],
+    accumulator: &mut A,
+    wave_entries: usize,
 ) {
     let entries = &query_idx.entries;
     if entries.is_empty() || ref_pairs.is_empty() {
@@ -422,8 +434,11 @@ pub(super) fn merge_join_coo_parallel<A: HitAccumulator>(
         return;
     }
 
-    // Split query entries into chunks at minimizer boundaries
-    let ranges = compute_chunk_ranges(entries, num_threads);
+    // Split query entries into chunks at minimizer boundaries, at least one
+    // per thread and about wave_entries / num_threads each.
+    let chunk_entries = (wave_entries / num_threads).max(1);
+    let num_chunks = ((entries.len() + chunk_entries - 1) / chunk_entries).max(num_threads);
+    let ranges = compute_chunk_ranges(entries, num_chunks);
 
     if ranges.len() <= 1 {
         // Single chunk (e.g., all entries share one minimizer) — no parallelism
@@ -431,30 +446,31 @@ pub(super) fn merge_join_coo_parallel<A: HitAccumulator>(
         return;
     }
 
-    // Parallel merge-join: each chunk binary-searches into ref_pairs
-    let all_hits: Vec<Vec<SparseHit>> = ranges
-        .into_par_iter()
-        .map(|(q_start, q_end)| {
-            let chunk = &entries[q_start..q_end];
-            let min_min = chunk[0].0;
-            let max_min = chunk[chunk.len() - 1].0;
+    // Each chunk binary-searches into ref_pairs.
+    for wave in ranges.chunks(num_threads) {
+        let wave_hits: Vec<Vec<SparseHit>> = wave
+            .par_iter()
+            .map(|&(q_start, q_end)| {
+                let chunk = &entries[q_start..q_end];
+                let min_min = chunk[0].0;
+                let max_min = chunk[chunk.len() - 1].0;
 
-            // Binary search into ref_pairs for the matching range
-            let r_start = ref_pairs.partition_point(|e| e.0 < min_min);
-            let r_end = ref_pairs.partition_point(|e| e.0 <= max_min);
+                // Binary search into ref_pairs for the matching range
+                let r_start = ref_pairs.partition_point(|e| e.0 < min_min);
+                let r_end = ref_pairs.partition_point(|e| e.0 <= max_min);
 
-            if r_start >= r_end {
-                return Vec::new();
+                if r_start >= r_end {
+                    return Vec::new();
+                }
+
+                merge_join_coo_slice(chunk, &ref_pairs[r_start..r_end])
+            })
+            .collect();
+
+        for chunk_hits in wave_hits {
+            for (read_idx, bucket_id, fwd, rc) in chunk_hits {
+                accumulator.record_hit_counts(read_idx as usize, bucket_id, fwd, rc);
             }
-
-            merge_join_coo_slice(chunk, &ref_pairs[r_start..r_end])
-        })
-        .collect();
-
-    // Merge sparse hits into accumulator (single-threaded)
-    for chunk_hits in all_hits {
-        for (read_idx, bucket_id, fwd, rc) in chunk_hits {
-            accumulator.record_hit_counts(read_idx as usize, bucket_id, fwd, rc);
         }
     }
 }
@@ -755,8 +771,8 @@ pub(super) fn merge_join_csr<A: HitAccumulator>(
 }
 
 /// Parallel CSR linear merge-join: splits query COO entries into
-/// `rayon::current_num_threads()` chunks at minimizer-run boundaries (same
-/// chunking as `merge_join_coo_parallel`), binary-searches each chunk's
+/// `rayon::current_num_threads()` chunks at minimizer-run boundaries (via
+/// `compute_chunk_ranges`), binary-searches each chunk's
 /// bounded range into `ref_idx.minimizers`, and joins each chunk in
 /// parallel.
 ///
@@ -1736,6 +1752,19 @@ mod tests {
         query_ids: &[i64],
         max_bucket_id: u32,
     ) {
+        assert_join_matches_sequential(queries, ref_pairs, query_ids, max_bucket_id, |q, acc| {
+            merge_join_coo_parallel(q, ref_pairs, acc)
+        });
+    }
+
+    /// Helper: compare sequential merge-join results with `parallel_join`'s.
+    fn assert_join_matches_sequential(
+        queries: &[(Vec<u64>, Vec<u64>)],
+        ref_pairs: &[(u64, u32)],
+        query_ids: &[i64],
+        max_bucket_id: u32,
+        parallel_join: impl FnOnce(&QueryInvertedIndex, &mut DenseAccumulator),
+    ) {
         let query_idx = QueryInvertedIndex::build(queries);
 
         // Sequential path
@@ -1746,10 +1775,11 @@ mod tests {
 
         // Parallel path
         let mut acc_par = DenseAccumulator::new(queries.len(), max_bucket_id);
-        merge_join_coo_parallel(&query_idx, ref_pairs, &mut acc_par);
+        parallel_join(&query_idx, &mut acc_par);
         let mut results_par = acc_par.score_and_filter(&query_idx, query_ids, 0.0);
         sort_results(&mut results_par);
 
+        assert!(!results_seq.is_empty(), "test setup: expected some hits");
         assert_eq!(
             results_seq.len(),
             results_par.len(),
@@ -1822,6 +1852,44 @@ mod tests {
         let query_ids = vec![1i64, 2];
 
         assert_parallel_matches_sequential(&queries, &ref_pairs, &query_ids, num_buckets);
+    }
+
+    /// The parallel COO join merges hits one wave of chunks at a time; a
+    /// pass larger than one wave must still count every hit exactly once,
+    /// including minimizers shared by many reads (whose runs stay whole
+    /// within a chunk).
+    #[test]
+    fn test_parallel_coo_multiple_waves_match_sequential() {
+        let num_threads = 2;
+        let num_reads = 400;
+        let mins_per_read = 300;
+        let wave_entries = 4_000;
+        // Each read draws from a shared range, so runs repeat across reads.
+        let queries: Vec<(Vec<u64>, Vec<u64>)> = (0..num_reads)
+            .map(|r| {
+                let fwd = (0..mins_per_read as u64)
+                    .map(|j| (j * 7 + r as u64) % 50_000)
+                    .collect();
+                (fwd, vec![r as u64 * 3])
+            })
+            .collect();
+        let ref_pairs: Vec<(u64, u32)> = (0..50_000u64)
+            .filter(|m| m % 3 != 0)
+            .flat_map(|m| [(m, 1), (m, 2)])
+            .collect();
+        let query_ids: Vec<i64> = (0..num_reads as i64).collect();
+        assert!(
+            num_reads * mins_per_read > 10 * wave_entries,
+            "test setup: entries must span many waves"
+        );
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .unwrap();
+        assert_join_matches_sequential(&queries, &ref_pairs, &query_ids, 2, |q, acc| {
+            pool.install(|| merge_join_coo_waves(q, &ref_pairs, acc, wave_entries))
+        });
     }
 
     #[test]
