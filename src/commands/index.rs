@@ -262,6 +262,29 @@ fn extract_bucket_minimizers(
     salt: u64,
     orient_sequences: bool,
 ) -> Result<(Vec<u64>, Vec<String>, Vec<u64>)> {
+    if orient_sequences {
+        extract_bucket_minimizers_oriented(files, config_dir, k, w, salt)
+    } else {
+        extract_bucket_minimizers_parallel(files, config_dir, k, w, salt)
+    }
+}
+
+/// Sequential, order-dependent extraction used when `--orient` is enabled.
+///
+/// Each sequence after the first is oriented (forward vs. reverse-complement)
+/// by comparing against the cumulative minimizer set built so far, so
+/// sequences must be processed in order. Kept sequential and unchanged from
+/// the original implementation: switching to a fixed-baseline comparison
+/// (as the single-bucket oriented path does) would enable parallelism but
+/// would also change which orientation gets picked for later sequences,
+/// which is an accuracy tradeoff, not just a speed one.
+fn extract_bucket_minimizers_oriented(
+    files: &[PathBuf],
+    config_dir: &Path,
+    k: usize,
+    w: usize,
+    salt: u64,
+) -> Result<(Vec<u64>, Vec<String>, Vec<u64>)> {
     use rype::config::resolve_path;
 
     let mut ws = MinimizerWorkspace::new();
@@ -292,7 +315,7 @@ fn extract_bucket_minimizers(
             let seq = rec.seq();
             file_total_bases += seq.len() as u64;
 
-            if is_first_sequence || !orient_sequences {
+            if is_first_sequence {
                 // Forward-only: extract, sort, merge in-place
                 extract_into(&seq, k, w, salt, &mut ws);
                 let mut new_mins = std::mem::take(&mut ws.buffer);
@@ -321,6 +344,105 @@ fn extract_bucket_minimizers(
 
     // bucket_mins is already sorted and deduped from merge_sorted_into
     Ok((bucket_mins, sources, file_lengths))
+}
+
+/// Parallel, order-independent extraction used when orientation is disabled.
+///
+/// The previous implementation extracted and merged one sequence at a time via
+/// `merge_sorted_into`, which costs O(bucket_size) per sequence — effectively
+/// quadratic in the number of sequences per bucket. Since orientation doesn't
+/// apply here, sequence order doesn't affect the result: minimizers can be
+/// extracted in parallel (mirroring `build_single_bucket_streaming`'s chunked
+/// approach) and combined with a single O(n log k) `kway_merge_dedup` per
+/// chunk, then merged across chunks.
+///
+/// Bucket-level processing is itself parallelized by the caller (rayon over
+/// buckets), so this divides its memory budget by the thread count to avoid
+/// many concurrently-running buckets each assuming they own the whole
+/// machine's memory.
+fn extract_bucket_minimizers_parallel(
+    files: &[PathBuf],
+    config_dir: &Path,
+    k: usize,
+    w: usize,
+    salt: u64,
+) -> Result<(Vec<u64>, Vec<String>, Vec<u64>)> {
+    use rype::config::resolve_path;
+    use rype::memory::detect_available_memory;
+
+    let available = detect_available_memory().bytes / rayon::current_num_threads().max(1);
+    let chunk_config = calculate_chunk_config(available);
+
+    let mut chunk_results: Vec<Vec<u64>> = Vec::new();
+    let mut sources: Vec<String> = Vec::new();
+    let mut file_length_map: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+
+    // Strict: an unreadable/empty file should fail the build loudly, matching
+    // the previous sequential implementation's behavior, rather than silently
+    // skipping it as SequenceChunkIterator does by default elsewhere.
+    let mut chunk_iter =
+        SequenceChunkIterator::new(files, config_dir, chunk_config.target_chunk_bytes).strict(true);
+
+    while let Some(chunk) = chunk_iter.next_chunk()? {
+        if chunk.is_empty() {
+            continue;
+        }
+
+        for (seq, src) in &chunk {
+            sources.push(src.clone());
+            if let Some(delim_pos) = src.find(BUCKET_SOURCE_DELIM) {
+                let filename = &src[..delim_pos];
+                *file_length_map.entry(filename.to_string()).or_insert(0) += seq.len() as u64;
+            }
+        }
+
+        let avg_len = chunk.iter().map(|(seq, _)| seq.len()).sum::<usize>() / chunk.len().max(1);
+        let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+
+        let chunk_mins: Vec<Vec<u64>> = chunk
+            .par_iter()
+            .map_init(
+                move || MinimizerWorkspace::with_estimate(estimated_mins),
+                |ws, (seq, _source)| {
+                    extract_into(seq, k, w, salt, ws);
+                    let mut mins = std::mem::take(&mut ws.buffer);
+                    mins.sort_unstable();
+                    mins
+                },
+            )
+            .collect();
+
+        chunk_results.push(kway_merge_dedup(chunk_mins));
+    }
+
+    // Single k-way merge across all chunks' results (O(n log chunk_count)),
+    // instead of an incremental merge_sorted_into per chunk, which cost
+    // O(bucket_size) per chunk — effectively quadratic in chunk count for a
+    // fixed chunk size. Each chunk's Vec is already sorted+deduped, so this
+    // is exactly what kway_merge_dedup is for.
+    let merged = kway_merge_dedup(chunk_results);
+
+    // One entry per input file, in file order — matches
+    // `extract_bucket_minimizers_oriented`'s per-file accounting exactly: a
+    // file that produced zero sequences (empty/skipped) still gets an entry
+    // of 0, and a duplicated file path in `files` gets one entry per
+    // occurrence, so `--orient` and non-`--orient` builds of the same config
+    // produce identical BucketFileStats.
+    let file_lengths: Vec<u64> = files
+        .iter()
+        .map(|file_path| {
+            let abs_path = resolve_path(config_dir, file_path);
+            let filename = abs_path
+                .canonicalize()
+                .unwrap_or(abs_path)
+                .to_string_lossy()
+                .to_string();
+            file_length_map.get(&filename).copied().unwrap_or(0)
+        })
+        .collect();
+
+    Ok((merged, sources, file_lengths))
 }
 
 // ============================================================================
@@ -629,10 +751,13 @@ struct SequenceChunkIterator {
     current_filename: String,
     /// Pending sequence that didn't fit in the previous chunk
     pending_sequence: Option<(Vec<u8>, String)>,
+    /// If true, fail on an unreadable/empty file instead of skipping it.
+    strict: bool,
 }
 
 impl SequenceChunkIterator {
-    /// Create a new chunk iterator.
+    /// Create a new chunk iterator. Unreadable/empty files are skipped with
+    /// a warning by default; use `.strict(true)` to fail instead.
     fn new(files: &[PathBuf], config_dir: &Path, target_chunk_bytes: usize) -> Self {
         Self {
             files: files.to_vec(),
@@ -642,7 +767,15 @@ impl SequenceChunkIterator {
             current_reader: None,
             current_filename: String::new(),
             pending_sequence: None,
+            strict: false,
         }
+    }
+
+    /// If `strict` is true, an unreadable/empty file causes an error instead
+    /// of being silently skipped.
+    fn strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 
     /// Open the next file, returning true if successful.
@@ -659,13 +792,17 @@ impl SequenceChunkIterator {
                 .to_string_lossy()
                 .to_string();
 
-            // Try to open the file, skip if empty or invalid
+            // Try to open the file, skip if empty or invalid (unless strict)
             match parse_fastx_file(&abs_path) {
                 Ok(reader) => {
                     self.current_reader = Some(reader);
                     return Ok(true);
                 }
                 Err(e) => {
+                    if self.strict {
+                        return Err(e)
+                            .context(format!("Failed to open file {}", abs_path.display()));
+                    }
                     // Log warning and skip to next file
                     log::warn!(
                         "Skipping file {} (possibly empty or invalid): {}",
@@ -1285,6 +1422,191 @@ fn build_single_bucket_streaming(
     })
 }
 
+/// Result from building one bucket of a multi-bucket streaming index in its own
+/// isolated temp directory (see [`build_bucket_streaming_isolated`]).
+struct IsolatedBucketResult {
+    bucket_id: u32,
+    bucket_name: String,
+    sources: Vec<String>,
+    shard_infos: Vec<rype::parquet_index::InvertedShardInfo>,
+    file_lengths: Vec<u64>,
+    total_excluded: u64,
+}
+
+/// Build one bucket of a multi-bucket streaming index in a private, self-contained
+/// temp directory, so it can be processed concurrently with other buckets without
+/// any cross-bucket shard-ID coordination.
+///
+/// This mirrors [`build_single_bucket_streaming`]'s memory-bounded chunk-then-consolidate
+/// pattern (streaming each chunk directly to a `ShardAccumulator`, then running
+/// [`consolidate_streaming_shards`] to eliminate cross-chunk duplicates) — see that
+/// function's module docs for why this keeps peak memory independent of a bucket's
+/// total minimizer count, unlike materializing the whole bucket as one `Vec<u64>`
+/// before writing (which is what caused a real production OOM: a single 15.9-billion-
+/// minimizer bucket alone exceeded a 400GB budget before any concurrency was even a
+/// factor).
+///
+/// Differences from `build_single_bucket_streaming`: an actual `bucket_id` (not
+/// always 1), and entries written to `output_dir` which the caller must have created via
+/// `create_index_directory` (typically a bucket-scoped temp directory, moved into the
+/// main index afterward — see `move_bucket_shards_into_main_index`).
+#[allow(clippy::too_many_arguments)]
+fn build_bucket_streaming_isolated(
+    output_dir: &Path,
+    bucket_id: u32,
+    bucket_name: &str,
+    files: &[PathBuf],
+    config_dir: &Path,
+    k: usize,
+    w: usize,
+    salt: u64,
+    chunk_target_bytes: usize,
+    shard_size: usize,
+    options: Option<&rype::parquet_index::ParquetWriteOptions>,
+    exclusion_set: Option<&HashSet<u64>>,
+) -> Result<IsolatedBucketResult> {
+    use rype::parquet_index::ShardAccumulator;
+
+    if files.is_empty() {
+        return Ok(IsolatedBucketResult {
+            bucket_id,
+            bucket_name: bucket_name.to_string(),
+            sources: vec![],
+            shard_infos: vec![],
+            file_lengths: vec![],
+            total_excluded: 0,
+        });
+    }
+
+    // Batch size for adding entries: ~1 shard worth, capped at 128MB (matches
+    // build_single_bucket_streaming's sizing).
+    let add_batch_entries = (shard_size / 16).min(8_000_000);
+
+    let mut accumulator = ShardAccumulator::with_output_dir(output_dir, shard_size, options);
+    let mut all_sources: Vec<String> = Vec::new();
+    let mut total_excluded: u64 = 0;
+    let mut file_length_map: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+
+    // Strict: an unreadable/empty file should fail the build loudly, matching
+    // extract_bucket_minimizers_parallel's behavior for the same non-oriented path.
+    let mut chunk_iter =
+        SequenceChunkIterator::new(files, config_dir, chunk_target_bytes).strict(true);
+    let mut chunk_count = 0;
+
+    while let Some(chunk) = chunk_iter.next_chunk()? {
+        chunk_count += 1;
+        let chunk_size: usize = chunk.iter().map(|(seq, _)| seq.len()).sum();
+
+        for (seq, src) in &chunk {
+            all_sources.push(src.clone());
+            if let Some(delim_pos) = src.find(BUCKET_SOURCE_DELIM) {
+                let filename = &src[..delim_pos];
+                *file_length_map.entry(filename.to_string()).or_insert(0) += seq.len() as u64;
+            }
+        }
+
+        let avg_len = chunk_size / chunk.len().max(1);
+        let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+
+        let chunk_mins: Vec<Vec<u64>> = chunk
+            .par_iter()
+            .map_init(
+                move || MinimizerWorkspace::with_estimate(estimated_mins),
+                |ws, (seq, _source)| {
+                    extract_into(seq, k, w, salt, ws);
+                    let mut mins = std::mem::take(&mut ws.buffer);
+                    mins.sort_unstable();
+                    mins
+                },
+            )
+            .collect();
+
+        let mut chunk_merged = kway_merge_dedup(chunk_mins);
+
+        if let Some(excl) = exclusion_set {
+            let original_len = chunk_merged.len();
+            chunk_merged.retain(|m| !excl.contains(m));
+            total_excluded += (original_len - chunk_merged.len()) as u64;
+        }
+
+        for batch in chunk_merged.chunks(add_batch_entries) {
+            accumulator.add_entries_from_minimizers(batch, bucket_id);
+            while accumulator.should_flush() {
+                accumulator.flush_shard()?;
+            }
+        }
+    }
+
+    let intermediate_shards = accumulator.finish()?;
+    let (shard_infos, _total_minimizers) = consolidate_streaming_shards(
+        output_dir,
+        intermediate_shards,
+        bucket_id,
+        shard_size,
+        &options.cloned().unwrap_or_default(),
+    )?;
+
+    log::info!(
+        "Completed bucket '{}': {} shards ({} chunks processed, {} excluded)",
+        bucket_name,
+        shard_infos.len(),
+        chunk_count,
+        total_excluded,
+    );
+
+    let file_lengths: Vec<u64> = file_length_map.into_values().collect();
+
+    Ok(IsolatedBucketResult {
+        bucket_id,
+        bucket_name: bucket_name.to_string(),
+        sources: all_sources,
+        shard_infos,
+        file_lengths,
+        total_excluded,
+    })
+}
+
+/// Move a bucket's finalized shard files out of its private temp directory into the
+/// main index's `inverted/` directory, renumbering them to start at `next_shard_id`.
+/// Deletes the (now-empty) temp directory afterward.
+///
+/// This is the only place multi-bucket shard-ID uniqueness is enforced: each bucket's
+/// own [`build_bucket_streaming_isolated`] call starts numbering at 0 in its own temp
+/// directory (safe, since no other bucket shares that directory), and this function —
+/// called from the single-threaded consumer — assigns the real, globally-unique IDs.
+fn move_bucket_shards_into_main_index(
+    temp_dir: &Path,
+    output_dir: &Path,
+    shard_infos: &mut [rype::parquet_index::InvertedShardInfo],
+    next_shard_id: u32,
+) -> Result<()> {
+    use rype::parquet_index::files;
+
+    let temp_inverted = temp_dir.join(files::INVERTED_DIR);
+    let output_inverted = output_dir.join(files::INVERTED_DIR);
+
+    for (i, info) in shard_infos.iter_mut().enumerate() {
+        let new_id = next_shard_id
+            .checked_add(i as u32)
+            .ok_or_else(|| anyhow!("shard ID overflow while assembling multi-bucket index"))?;
+        let old_path = temp_inverted.join(files::inverted_shard(info.shard_id));
+        let new_path = output_inverted.join(files::inverted_shard(new_id));
+        std::fs::rename(&old_path, &new_path).with_context(|| {
+            format!(
+                "Failed to move shard {} into main index",
+                old_path.display()
+            )
+        })?;
+        info.shard_id = new_id;
+    }
+
+    std::fs::remove_dir_all(temp_dir)
+        .with_context(|| format!("Failed to remove temp directory {}", temp_dir.display()))?;
+
+    Ok(())
+}
+
 /// Build a single bucket with orientation using streaming shard creation.
 ///
 /// Strategy:
@@ -1612,6 +1934,7 @@ fn build_single_bucket(
 /// * `cli_max_memory` - CLI override for max memory (None = auto-detect)
 /// * `options` - Parquet write options
 /// * `cli_orient` - CLI override for orient sequences flag (takes precedence over config)
+#[allow(clippy::too_many_arguments)]
 pub fn build_parquet_index_from_config(
     config_path: &Path,
     cli_max_memory: Option<usize>,
@@ -1876,6 +2199,8 @@ pub fn build_parquet_index_from_config(
 /// * `cli_max_shard_size` - CLI override for max shard size (takes precedence over config)
 /// * `options` - Parquet write options
 /// * `cli_orient` - CLI override for orient sequences flag
+/// * `exclusion_set` - Optional set of minimizers to exclude (for subtraction)
+#[allow(clippy::too_many_arguments)]
 pub fn build_parquet_index_from_config_streaming(
     config_path: &Path,
     cli_max_shard_size: Option<usize>,
@@ -1960,10 +2285,7 @@ pub fn build_parquet_index_from_config_streaming(
         ));
     }
 
-    // Create accumulator
     let opts = options.cloned().unwrap_or_default();
-    let mut accumulator =
-        ShardAccumulator::with_output_dir(&output_path, max_shard_size, Some(&opts));
 
     // Track bucket metadata for manifest
     let mut bucket_names_map: std::collections::HashMap<u32, String> =
@@ -1984,8 +2306,8 @@ pub fn build_parquet_index_from_config_streaming(
     // - Still has per-result synchronization overhead via channel
     //
     // Thread safety: `cfg`, `config_dir`, and `orient_sequences` are borrowed
-    // immutably across threads. Results (minimizers, sources) are moved through
-    // the channel. The consumer is sequential (shard ordering requires it).
+    // immutably across threads. Results are moved through the channel. The
+    // consumer is sequential (shard ordering requires it).
     let t_build = Instant::now();
 
     // Prepare work items: (bucket_id, bucket_name, files)
@@ -2006,163 +2328,354 @@ pub fn build_parquet_index_from_config_streaming(
         return Err(anyhow!("No buckets defined in configuration"));
     }
 
-    // Type alias for channel message clarity
-    // (bucket_id, bucket_name, minimizers, sources, file_lengths)
-    type BucketResult = Result<(u32, String, Vec<u64>, Vec<String>, Vec<u64>)>;
-
     // Track processed count for panic detection
     let processed_count = std::sync::atomic::AtomicUsize::new(0);
     // Cancellation signal for early exit
     let cancelled = std::sync::atomic::AtomicBool::new(false);
 
-    // Use std::thread::scope to allow borrowing local data while running parallel processing
-    let process_result: Result<()> = std::thread::scope(|s| {
-        // Use bounded channel to provide backpressure if consumer is slow (e.g., during disk I/O)
-        let (tx, rx) = std::sync::mpsc::sync_channel::<BucketResult>(4);
+    let shard_infos: Vec<rype::parquet_index::InvertedShardInfo> = if orient_sequences {
+        // Oriented path: unchanged from before this fix. Orientation choice depends
+        // on cumulative context (see extract_bucket_minimizers_oriented), so this
+        // stays on the original whole-bucket-in-memory approach; only the
+        // non-oriented path below gets the bounded per-bucket streaming rewrite.
+        let mut accumulator =
+            ShardAccumulator::with_output_dir(&output_path, max_shard_size, Some(&opts));
 
-        // Producer thread: uses rayon to process buckets in parallel, sends results through channel
-        let cancelled_ref = &cancelled;
-        let processed_ref = &processed_count;
-        s.spawn(move || {
-            work_items
-                .par_iter()
-                .panic_fuse() // Stop processing on first panic
-                .for_each_with(tx, |tx, (bucket_id, bucket_name, files)| {
-                    // Check cancellation before starting work
-                    if cancelled_ref.load(std::sync::atomic::Ordering::Relaxed) {
-                        return;
-                    }
+        // Type alias for channel message clarity
+        // (bucket_id, bucket_name, minimizers, sources, file_lengths)
+        type BucketResult = Result<(u32, String, Vec<u64>, Vec<String>, Vec<u64>)>;
 
-                    log::info!(
-                        "Processing bucket '{}' ({}/{}){} ...",
-                        bucket_name,
-                        bucket_id,
-                        num_buckets,
-                        if orient_sequences { " (oriented)" } else { "" }
-                    );
+        let process_result: Result<()> = std::thread::scope(|s| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<BucketResult>(4);
 
-                    let result = extract_bucket_minimizers(
-                        files,
-                        config_dir,
-                        cfg.index.k,
-                        cfg.index.window,
-                        cfg.index.salt,
-                        orient_sequences,
-                    );
-
-                    let bucket_result: BucketResult = match result {
-                        Ok((minimizers, sources, file_lengths)) => {
-                            log::info!(
-                                "Completed bucket '{}': {} minimizers",
-                                bucket_name,
-                                minimizers.len()
-                            );
-                            Ok((
-                                *bucket_id,
-                                sanitize_bucket_name(bucket_name),
-                                minimizers,
-                                sources,
-                                file_lengths,
-                            ))
+            let cancelled_ref = &cancelled;
+            let processed_ref = &processed_count;
+            s.spawn(move || {
+                work_items
+                    .par_iter()
+                    .panic_fuse() // Stop processing on first panic
+                    .for_each_with(tx, |tx, (bucket_id, bucket_name, files)| {
+                        if cancelled_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
                         }
-                        Err(e) => Err(e.context(format!(
-                            "Failed processing bucket '{}' (ID {})",
-                            bucket_name, bucket_id
-                        ))),
-                    };
 
-                    // Track successful send for panic detection
-                    if tx.send(bucket_result).is_ok() {
-                        processed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        log::info!(
+                            "Processing bucket '{}' ({}/{}) (oriented) ...",
+                            bucket_name,
+                            bucket_id,
+                            num_buckets,
+                        );
+
+                        let result = extract_bucket_minimizers(
+                            files,
+                            config_dir,
+                            cfg.index.k,
+                            cfg.index.window,
+                            cfg.index.salt,
+                            orient_sequences,
+                        );
+
+                        let bucket_result: BucketResult = match result {
+                            Ok((minimizers, sources, file_lengths)) => {
+                                log::info!(
+                                    "Completed bucket '{}': {} minimizers",
+                                    bucket_name,
+                                    minimizers.len()
+                                );
+                                Ok((
+                                    *bucket_id,
+                                    sanitize_bucket_name(bucket_name),
+                                    minimizers,
+                                    sources,
+                                    file_lengths,
+                                ))
+                            }
+                            Err(e) => Err(e.context(format!(
+                                "Failed processing bucket '{}' (ID {})",
+                                bucket_name, bucket_id
+                            ))),
+                        };
+
+                        if tx.send(bucket_result).is_ok() {
+                            processed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    });
+            });
+
+            let mut total_excluded: u64 = 0;
+            for result in rx {
+                let (bucket_id, bucket_name, minimizers, sources, file_lengths) = match result {
+                    Ok(data) => data,
+                    Err(e) => {
+                        cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Err(e);
                     }
-                });
+                };
+
+                let mut minimizers = minimizers;
+                if let Some(excl) = exclusion_set {
+                    let original_len = minimizers.len();
+                    minimizers.retain(|m| !excl.contains(m));
+                    let excluded = original_len - minimizers.len();
+                    if excluded > 0 {
+                        total_excluded += excluded as u64;
+                        log::info!(
+                            "Bucket '{}': excluded {} of {} minimizers via subtraction",
+                            bucket_name,
+                            excluded,
+                            original_len
+                        );
+                    }
+                }
+
+                bucket_names_map.insert(bucket_id, bucket_name);
+                bucket_sources_map.insert(bucket_id, sources);
+                bucket_minimizer_counts.insert(bucket_id, minimizers.len());
+
+                if let Some(stats) = rype::BucketFileStats::from_file_lengths(&file_lengths) {
+                    all_file_stats.insert(bucket_id, stats);
+                }
+                total_minimizers += minimizers.len() as u64;
+
+                accumulator.add_entries_from_minimizers(&minimizers, bucket_id);
+
+                while accumulator.should_flush() {
+                    let shard_info = accumulator.flush_shard()?;
+                    if let Some(info) = shard_info {
+                        log::info!(
+                            "Flushed shard {}: {} entries",
+                            info.shard_id,
+                            info.num_entries
+                        );
+                    }
+                }
+            }
+
+            if total_excluded > 0 {
+                log::info!(
+                    "Subtraction complete: excluded {} minimizer entries total",
+                    total_excluded
+                );
+            }
+
+            Ok(())
         });
 
-        // Consumer: receive results as buckets complete and accumulate
-        let mut total_excluded: u64 = 0;
-        for result in rx {
-            let (bucket_id, bucket_name, minimizers, sources, file_lengths) = match result {
-                Ok(data) => data,
-                Err(e) => {
-                    // Signal producers to stop on error
-                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return Err(e);
-                }
-            };
-
-            // Filter out excluded minimizers if subtraction is active
-            let mut minimizers = minimizers;
-            if let Some(excl) = exclusion_set {
-                let original_len = minimizers.len();
-                minimizers.retain(|m| !excl.contains(m));
-                let excluded = original_len - minimizers.len();
-                if excluded > 0 {
-                    total_excluded += excluded as u64;
-                    log::info!(
-                        "Bucket '{}': excluded {} of {} minimizers via subtraction",
-                        bucket_name,
-                        excluded,
-                        original_len
-                    );
-                }
-            }
-
-            // Store metadata
-            bucket_names_map.insert(bucket_id, bucket_name);
-            bucket_sources_map.insert(bucket_id, sources);
-            bucket_minimizer_counts.insert(bucket_id, minimizers.len());
-
-            // Compute file stats for this bucket
-            if let Some(stats) = rype::BucketFileStats::from_file_lengths(&file_lengths) {
-                all_file_stats.insert(bucket_id, stats);
-            }
-            total_minimizers += minimizers.len() as u64;
-
-            // Add entries directly to accumulator without intermediate allocation
-            accumulator.add_entries_from_minimizers(&minimizers, bucket_id);
-
-            // Flush in a loop until under threshold (after each bucket's entries)
-            while accumulator.should_flush() {
-                let shard_info = accumulator.flush_shard()?;
-                if let Some(info) = shard_info {
-                    log::info!(
-                        "Flushed shard {}: {} entries",
-                        info.shard_id,
-                        info.num_entries
-                    );
-                }
-            }
+        let actual_processed = processed_count.load(std::sync::atomic::Ordering::Relaxed);
+        if actual_processed != num_buckets && process_result.is_ok() {
+            return Err(anyhow!(
+                "Index creation incomplete: processed {}/{} buckets (possible panic in worker thread)",
+                actual_processed,
+                num_buckets
+            ));
         }
+        process_result?;
 
-        if total_excluded > 0 {
+        accumulator.finish()?
+    } else {
+        // Non-oriented path: each bucket streams to its own ShardAccumulator in a
+        // private temp directory, then consolidates on disk — see
+        // build_bucket_streaming_isolated's docs for why this keeps peak memory
+        // independent of any single bucket's total minimizer count (this is the
+        // fix for a real production OOM where one 15.9-billion-minimizer bucket
+        // alone exceeded a 400GB budget under the old whole-bucket-in-memory
+        // approach, regardless of concurrency).
+        //
+        // Per-bucket memory budgets are divided by effective concurrency, since up
+        // to that many buckets may have their own accumulator *and* extraction
+        // chunk active at once.
+        //
+        // Chunk sizing is derived from `max_shard_size` (not a fresh
+        // `detect_available_memory()` call) so that an explicit `--max-memory`
+        // override actually bounds extraction, not just the shard flush
+        // threshold: the caller sizes `max_shard_size` as roughly half of
+        // whatever memory budget it resolved (CLI override, config value, or
+        // 80% of detected system memory), so doubling it back recovers that
+        // budget instead of silently re-detecting real system memory and
+        // ignoring the override.
+        //
+        // `calculate_chunk_config` floors a bucket's extraction chunk at
+        // MIN_CHUNK_BYTES regardless of how little memory it's handed, so a
+        // bucket's real working set can't shrink below roughly
+        // MIN_CHUNK_BYTES * EXTRACTION_MEMORY_MULTIPLIER + MIN_SHARD_BYTES. If
+        // `concurrency` buckets all run at once, dividing the budget by thread
+        // count without accounting for that floor lets total memory exceed the
+        // requested budget by a large factor on high-core-count machines with a
+        // tight `--max-memory`. Cap actual bucket-level concurrency so the floor
+        // times concurrency stays within the overall estimate, rather than
+        // always assuming full thread-count concurrency is affordable.
+        let concurrency = rayon::current_num_threads().max(1);
+        let overall_available_estimate = max_shard_size
+            .saturating_mul(2)
+            .max(rype::parquet_index::MIN_SHARD_BYTES);
+        let per_bucket_floor = ((MIN_CHUNK_BYTES as f64 * EXTRACTION_MEMORY_MULTIPLIER) as usize)
+            .saturating_add(rype::parquet_index::MIN_SHARD_BYTES);
+        let effective_concurrency =
+            concurrency.min((overall_available_estimate / per_bucket_floor).max(1));
+        if effective_concurrency < concurrency {
             log::info!(
-                "Subtraction complete: excluded {} minimizer entries total",
-                total_excluded
+                "Limiting concurrent bucket builds to {} (of {} available threads) to keep peak \
+                 memory within the requested budget",
+                effective_concurrency,
+                concurrency
             );
         }
+        let per_bucket_available = (overall_available_estimate / effective_concurrency).max(1);
+        let per_bucket_chunk_bytes =
+            calculate_chunk_config(per_bucket_available).target_chunk_bytes;
+        let per_bucket_shard_size =
+            (max_shard_size / effective_concurrency).max(rype::parquet_index::MIN_SHARD_BYTES);
 
-        Ok(())
-    });
+        // Bound actual bucket-level (and nested per-chunk) parallelism to
+        // `effective_concurrency` threads, so the memory budget computed above is
+        // actually enforced rather than just recomputed and ignored: without
+        // this, `work_items.par_iter()` below still runs on the full global
+        // rayon pool (`concurrency` threads), independent of the per-bucket
+        // budgets it was just handed.
+        let bucket_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(effective_concurrency)
+            .build()
+            .context("Failed to build bucket-concurrency-limited thread pool")?;
 
-    // Check for incomplete processing (panic or other failure)
-    let actual_processed = processed_count.load(std::sync::atomic::Ordering::Relaxed);
-    if actual_processed != num_buckets && process_result.is_ok() {
-        return Err(anyhow!(
-            "Index creation incomplete: processed {}/{} buckets (possible panic in worker thread)",
-            actual_processed,
-            num_buckets
-        ));
-    }
+        type IsolatedResult = Result<IsolatedBucketResult>;
 
-    process_result?;
+        let process_result: Result<Vec<rype::parquet_index::InvertedShardInfo>> =
+            std::thread::scope(|s| {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<IsolatedResult>(4);
+
+                let cancelled_ref = &cancelled;
+                let processed_ref = &processed_count;
+                let output_path_ref = &output_path;
+                let bucket_pool_ref = &bucket_pool;
+                s.spawn(move || {
+                    bucket_pool_ref.install(|| {
+                        work_items.par_iter().panic_fuse().for_each_with(
+                            tx,
+                            |tx, (bucket_id, bucket_name, files)| {
+                                if cancelled_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return;
+                                }
+
+                                log::info!(
+                                    "Processing bucket '{}' ({}/{}) ...",
+                                    bucket_name,
+                                    bucket_id,
+                                    num_buckets,
+                                );
+
+                                let sanitized_name = sanitize_bucket_name(bucket_name);
+                                let temp_dir =
+                                    output_path_ref.join(format!(".tmp_bucket_{}", bucket_id));
+
+                                let result: IsolatedResult = (|| {
+                                    rype::parquet_index::create_index_directory(&temp_dir)?;
+                                    build_bucket_streaming_isolated(
+                                        &temp_dir,
+                                        *bucket_id,
+                                        &sanitized_name,
+                                        files,
+                                        config_dir,
+                                        cfg.index.k,
+                                        cfg.index.window,
+                                        cfg.index.salt,
+                                        per_bucket_chunk_bytes,
+                                        per_bucket_shard_size,
+                                        Some(&opts),
+                                        exclusion_set,
+                                    )
+                                })()
+                                .map_err(|e| {
+                                    e.context(format!(
+                                        "Failed processing bucket '{}' (ID {})",
+                                        bucket_name, bucket_id
+                                    ))
+                                });
+
+                                if tx.send(result).is_ok() {
+                                    processed_ref
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            },
+                        );
+                    });
+                });
+
+                let mut next_shard_id: u32 = 0;
+                let mut all_shard_infos: Vec<rype::parquet_index::InvertedShardInfo> = Vec::new();
+                let mut total_excluded: u64 = 0;
+
+                for result in rx {
+                    let mut bucket_result = match result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return Err(e);
+                        }
+                    };
+
+                    let temp_dir =
+                        output_path.join(format!(".tmp_bucket_{}", bucket_result.bucket_id));
+                    move_bucket_shards_into_main_index(
+                        &temp_dir,
+                        &output_path,
+                        &mut bucket_result.shard_infos,
+                        next_shard_id,
+                    )?;
+                    next_shard_id += bucket_result.shard_infos.len() as u32;
+
+                    let bucket_total: u64 = bucket_result
+                        .shard_infos
+                        .iter()
+                        .map(|s| s.num_entries)
+                        .sum();
+
+                    if bucket_result.total_excluded > 0 {
+                        log::info!(
+                            "Bucket '{}': excluded {} minimizers via subtraction",
+                            bucket_result.bucket_name,
+                            bucket_result.total_excluded
+                        );
+                    }
+                    bucket_names_map.insert(bucket_result.bucket_id, bucket_result.bucket_name);
+                    bucket_sources_map.insert(bucket_result.bucket_id, bucket_result.sources);
+                    bucket_minimizer_counts.insert(bucket_result.bucket_id, bucket_total as usize);
+                    if let Some(stats) =
+                        rype::BucketFileStats::from_file_lengths(&bucket_result.file_lengths)
+                    {
+                        all_file_stats.insert(bucket_result.bucket_id, stats);
+                    }
+                    total_minimizers += bucket_total;
+                    total_excluded += bucket_result.total_excluded;
+
+                    all_shard_infos.append(&mut bucket_result.shard_infos);
+                }
+
+                if total_excluded > 0 {
+                    log::info!(
+                        "Subtraction complete: excluded {} minimizer entries total",
+                        total_excluded
+                    );
+                }
+                Ok(all_shard_infos)
+            });
+
+        let actual_processed = processed_count.load(std::sync::atomic::Ordering::Relaxed);
+        if actual_processed != num_buckets && process_result.is_ok() {
+            return Err(anyhow!(
+                "Index creation incomplete: processed {}/{} buckets (possible panic in worker thread)",
+                actual_processed,
+                num_buckets
+            ));
+        }
+
+        process_result?
+    };
 
     log_timing(
         "streaming_index: bucket_processing",
         t_build.elapsed().as_millis(),
     );
 
-    // Finish accumulator (flush remaining entries)
-    let shard_infos = accumulator.finish()?;
     log::info!("Created {} shards total", shard_infos.len());
 
     // Validate bucket name uniqueness directly from the map
@@ -2776,6 +3289,84 @@ output = "{}"
         // Both should have minimizers
         assert!(!mins_no_orient.is_empty());
         assert!(!mins_with_orient.is_empty());
+    }
+
+    #[test]
+    fn test_extract_bucket_minimizers_non_oriented_scales_sub_quadratically() {
+        // Regression test for 9028a35: the non-oriented multi-bucket extraction
+        // path used to merge each sequence into a growing accumulator one at a
+        // time via merge_sorted_into, an O(bucket_size) merge per sequence --
+        // effectively quadratic in the number of sequences per bucket. The fix
+        // extracts+sorts each sequence in parallel and combines results with
+        // kway_merge_dedup (O(n log n)) instead.
+        //
+        // A regression back to an incremental per-sequence (or per-chunk, see
+        // bac6601) merge would still pass every correctness test in this file --
+        // sortedness, dedup, and sources are all independent of the merge
+        // strategy -- but would reintroduce quadratic wall-clock scaling. This
+        // test catches that by timing extraction at two input sizes (8x more
+        // sequences) and asserting time grows roughly linearly, not
+        // quadratically: linear predicts ~8x, quadratic predicts ~64x, so a
+        // generous 20x ceiling clearly separates the two while tolerating
+        // machine noise.
+        fn make_sequences(n: usize, len: usize) -> Vec<(String, Vec<u8>)> {
+            let bases = [b'A', b'C', b'G', b'T'];
+            (0..n)
+                .map(|i| {
+                    let name = format!("seq{i}");
+                    // Vary content deterministically so sequences aren't all identical.
+                    let seq: Vec<u8> = (0..len).map(|j| bases[(i + j) % 4]).collect();
+                    (name, seq)
+                })
+                .collect()
+        }
+
+        fn extract_and_time(n: usize) -> std::time::Duration {
+            let tmp = TempDir::new().unwrap();
+            let dir = tmp.path();
+            let owned = make_sequences(n, 150);
+            let borrowed: Vec<(&str, &[u8])> = owned
+                .iter()
+                .map(|(name, seq)| (name.as_str(), seq.as_slice()))
+                .collect();
+            let fasta_path = create_multi_fasta_file(dir, "many.fa", &borrowed);
+
+            let start = std::time::Instant::now();
+            let (minimizers, _sources, _file_lengths) = extract_bucket_minimizers(
+                &[fasta_path],
+                dir,
+                16,                 // k
+                10,                 // w
+                0x5555555555555555, // salt
+                false,              // orient_sequences
+            )
+            .unwrap();
+            assert!(!minimizers.is_empty());
+            start.elapsed()
+        }
+
+        // Warm up (file cache, allocator) without timing it.
+        let _ = extract_and_time(200);
+
+        let small_n = 2_000;
+        let large_n = 16_000; // 8x
+        let small_elapsed = extract_and_time(small_n);
+        let large_elapsed = extract_and_time(large_n);
+
+        let ratio = large_elapsed.as_secs_f64() / small_elapsed.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 20.0,
+            "extracting {}x more sequences ({} -> {}) took {:.1}x longer ({:?} -> {:?}); \
+             expected roughly linear (~8x), not quadratic (~64x) scaling -- this likely means \
+             the non-oriented multi-bucket extraction path regressed to an incremental \
+             per-sequence or per-chunk merge (see 9028a35, bac6601)",
+            large_n / small_n,
+            small_n,
+            large_n,
+            ratio,
+            small_elapsed,
+            large_elapsed
+        );
     }
 
     // ============================================================================
@@ -3430,6 +4021,257 @@ files = ["ref3.fa"]
         assert_eq!(
             manifest_ns.source_hash, manifest_s.source_hash,
             "Source hash should match (deterministic content)"
+        );
+    }
+
+    /// Test: `build_bucket_streaming_isolated` (the per-bucket, OOM-safe streaming
+    /// path used by `build_parquet_index_from_config_streaming`'s non-oriented
+    /// branch) deduplicates minimizers across chunks, exactly like
+    /// `build_single_bucket_streaming` does. Uses a non-1 bucket_id to also prove
+    /// bucket_id threading through the isolated temp-dir path.
+    #[test]
+    fn test_bucket_streaming_isolated_deduplicates_across_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        fn make_sequence(seed: u64, length: usize) -> Vec<u8> {
+            let mut state = seed;
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match (state >> 32) % 4 {
+                        0 => b'A',
+                        1 => b'C',
+                        2 => b'G',
+                        _ => b'T',
+                    }
+                })
+                .collect()
+        }
+
+        // 30 files with IDENTICAL 5MB sequences = 150MB, exceeding MIN_CHUNK_BYTES
+        // (100MB) so the isolated builder is forced through multiple chunks, each
+        // streamed into the same private ShardAccumulator.
+        let seq = make_sequence(7, 5_000_000);
+        for i in 0..30 {
+            create_fasta_file(dir, &format!("ref{}.fa", i), &seq);
+        }
+        let files: Vec<PathBuf> = (0..30).map(|i| dir.join(format!("ref{}.fa", i))).collect();
+
+        let temp_dir = dir.join("bucket_tmp");
+        rype::parquet_index::create_index_directory(&temp_dir).unwrap();
+
+        let result = build_bucket_streaming_isolated(
+            &temp_dir,
+            3, // non-1 bucket_id, proving it threads through correctly
+            "IsolatedDedupTest",
+            &files,
+            dir,
+            32,
+            10,
+            0x5555555555555555,
+            100 * 1024 * 1024, // chunk_target_bytes: force >=2 chunks over 150MB input
+            3 * 1024 * 1024,   // shard_size: force multiple intermediate shards
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !result.shard_infos.is_empty(),
+            "Should produce at least one shard"
+        );
+
+        // Read back all (minimizer, bucket_id) pairs from every produced shard and
+        // verify no duplicates survived consolidation, and every pair carries the
+        // bucket_id we passed in.
+        let mut all_pairs: Vec<(u64, u32)> = Vec::new();
+        for shard in &result.shard_infos {
+            let path = temp_dir
+                .join("inverted")
+                .join(rype::parquet_index::files::inverted_shard(shard.shard_id));
+            let pairs = rype::parquet_index::merge::read_shard_pairs(&path).unwrap();
+            for (m, b) in pairs {
+                assert_eq!(b, 3, "Every entry should carry the bucket_id passed in");
+                all_pairs.push((m, b));
+            }
+        }
+        let total_entries: u64 = result.shard_infos.iter().map(|s| s.num_entries).sum();
+        assert_eq!(
+            total_entries,
+            all_pairs.len() as u64,
+            "num_entries should match actual stored row count"
+        );
+
+        let mut dedup_pairs = all_pairs.clone();
+        dedup_pairs.sort_unstable();
+        dedup_pairs.dedup();
+        assert_eq!(
+            all_pairs.len(),
+            dedup_pairs.len(),
+            "no duplicate (minimizer, bucket_id) pairs should survive consolidation"
+        );
+    }
+
+    /// Test: the full `build_parquet_index_from_config_streaming` non-oriented
+    /// path — with multiple buckets each forced through multiple chunks/shards via
+    /// the new per-bucket isolated-temp-dir streaming — produces a duplicate-free
+    /// index whose classification results match a non-streaming baseline build.
+    /// This is the end-to-end regression guard for the OOM fix: it proves the
+    /// per-bucket isolation + shard-ID renumbering in
+    /// `move_bucket_shards_into_main_index` doesn't corrupt or duplicate data
+    /// when a bucket spans more than one intermediate shard.
+    #[test]
+    fn test_from_config_streaming_multi_chunk_matches_baseline() {
+        use rype::ShardedInvertedIndex;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        fn make_sequence(seed: u64, length: usize) -> Vec<u8> {
+            let mut state = seed;
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match (state >> 32) % 4 {
+                        0 => b'A',
+                        1 => b'C',
+                        2 => b'G',
+                        _ => b'T',
+                    }
+                })
+                .collect()
+        }
+
+        // Two buckets, each with 150MB of distinct content (>MIN_CHUNK_BYTES),
+        // forcing both buckets through the multi-chunk path concurrently.
+        let seq_a = make_sequence(11, 5_000_000);
+        let seq_b = make_sequence(22, 5_000_000);
+        let mut files_a: Vec<String> = Vec::new();
+        let mut files_b: Vec<String> = Vec::new();
+        for i in 0..30 {
+            create_fasta_file(dir, &format!("a{}.fa", i), &seq_a);
+            create_fasta_file(dir, &format!("b{}.fa", i), &seq_b);
+            files_a.push(format!("\"a{}.fa\"", i));
+            files_b.push(format!("\"b{}.fa\"", i));
+        }
+
+        let config = format!(
+            r#"[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "multi_chunk.ryidx"
+max_shard_size = 3145728
+
+[buckets.BucketA]
+files = [{}]
+
+[buckets.BucketB]
+files = [{}]
+"#,
+            files_a.join(", "),
+            files_b.join(", ")
+        );
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, &config).unwrap();
+
+        let result =
+            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
+        assert!(
+            result.is_ok(),
+            "Streaming build should succeed: {:?}",
+            result
+        );
+
+        let index = ShardedInvertedIndex::open(&dir.join("multi_chunk.ryxdi")).unwrap();
+        let manifest = index.manifest();
+        assert!(
+            manifest.shards.len() >= 2,
+            "Expected multiple shards across the two forced-multi-chunk buckets (got {})",
+            manifest.shards.len()
+        );
+
+        // No duplicate (minimizer, bucket_id) pairs anywhere in the final index.
+        let mut all_pairs: Vec<(u64, u32)> = Vec::new();
+        for shard in &manifest.shards {
+            let path = dir
+                .join("multi_chunk.ryxdi")
+                .join("inverted")
+                .join(rype::parquet_index::files::inverted_shard(shard.shard_id));
+            all_pairs.extend(rype::parquet_index::merge::read_shard_pairs(&path).unwrap());
+        }
+        let mut dedup_pairs = all_pairs.clone();
+        dedup_pairs.sort_unstable();
+        dedup_pairs.dedup();
+        assert_eq!(
+            all_pairs.len(),
+            dedup_pairs.len(),
+            "no duplicate (minimizer, bucket_id) pairs should survive the multi-bucket build"
+        );
+
+        // Build a non-streaming baseline over the same config for comparison.
+        let config_baseline = config.replace("multi_chunk.ryidx", "baseline.ryidx");
+        let config_path_baseline = dir.join("config_baseline.toml");
+        std::fs::write(&config_path_baseline, &config_baseline).unwrap();
+        let result_baseline =
+            build_parquet_index_from_config(&config_path_baseline, None, None, false, None);
+        assert!(
+            result_baseline.is_ok(),
+            "Baseline build should succeed: {:?}",
+            result_baseline
+        );
+        let index_baseline = ShardedInvertedIndex::open(&dir.join("baseline.ryxdi")).unwrap();
+        let manifest_baseline = index_baseline.manifest();
+
+        assert_eq!(
+            manifest.total_minimizers, manifest_baseline.total_minimizers,
+            "Total minimizers should match the non-streaming baseline"
+        );
+        assert_eq!(
+            manifest.source_hash, manifest_baseline.source_hash,
+            "Source hash (deterministic content) should match the non-streaming baseline"
+        );
+
+        // Classification parity: a query drawn from bucket A's sequence should hit
+        // only bucket A in both indices.
+        let query = &seq_a[0..500];
+        let bucket_a_id_stream = *manifest
+            .bucket_names
+            .iter()
+            .find(|(_, name)| *name == "BucketA")
+            .map(|(id, _)| id)
+            .unwrap();
+        let bucket_a_id_baseline = *manifest_baseline
+            .bucket_names
+            .iter()
+            .find(|(_, name)| *name == "BucketA")
+            .map(|(id, _)| id)
+            .unwrap();
+
+        let queries = vec![(1_i64, query, None)];
+        let hits_stream =
+            rype::classify_batch_sharded_merge_join(&index, None, &queries, 0.5, None).unwrap();
+        let hits_baseline =
+            rype::classify_batch_sharded_merge_join(&index_baseline, None, &queries, 0.5, None)
+                .unwrap();
+
+        assert!(
+            hits_stream
+                .iter()
+                .any(|h| h.bucket_id == bucket_a_id_stream),
+            "Streaming index should classify bucket A's own sequence into bucket A"
+        );
+        assert!(
+            hits_baseline
+                .iter()
+                .any(|h| h.bucket_id == bucket_a_id_baseline),
+            "Baseline index should classify bucket A's own sequence into bucket A"
+        );
+        assert_eq!(
+            hits_stream.len(),
+            hits_baseline.len(),
+            "Streaming and baseline should agree on number of hits for the same query"
         );
     }
 
